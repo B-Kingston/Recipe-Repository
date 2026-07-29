@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f5f2">
+  <title>{% block title %}Kindle Recipes{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="utility-bar">
+    <a class="brand" href="/" aria-label="Kindle Recipes home"><span class="brand-mark" aria-hidden="true">♨</span><span>Kindle Recipes</span></a>
+    <nav class="top-nav" aria-label="Main navigation">
+      <a href="/">Library</a>
+      <a href="/recipes/new">New Recipe</a>
+    </nav>
+  </header>
+  <main class="app-shell">
+    <div class="paper">
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

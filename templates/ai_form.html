@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}{{ heading }} · Kindle Recipes{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Cookbook / Recipe research</p>
+  <h1>{{ heading }}</h1>
+  <p class="deck">{{ guidance }}</p>
+</div>
+{% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
+<form class="panel form-panel" method="post" action="{{ action }}">
+  <label>{{ label }}<textarea name="prompt" required maxlength="4000" placeholder="A dish, loose idea, or recipe URL…">{{ prompt }}</textarea></label>
+  <div class="prompt-help">
+    <p><strong>You can include:</strong></p>
+    <ul>
+      <li>A simple idea — “spicy miso mushroom pasta”</li>
+      <li>A known recipe — “Ottolenghi’s confit tandoori chickpeas”</li>
+      <li>One or more recipe URLs to study and recreate</li>
+      <li>Constraints, substitutions, equipment, or serving size</li>
+    </ul>
+  </div>
+  <p class="muted">The web and any links are researched first. You review the complete recipe before it is saved.</p>
+  <p class="actions form-actions"><a class="button" href="{{ cancel_url }}">Cancel</a><button class="primary">{{ button }}</button></p>
+</form>
+{% endblock %}

@@ -1,0 +1,152 @@
+{% extends "base.html" %}{% block title %}{{ recipe.title }} · Kindle Recipes{% endblock %}{% block content %}
+<header class="page-header">
+  <div class="page-header-copy">
+    <p class="breadcrumb"><a href="/">Library</a> / Recipe card</p>
+    <h1>{{ recipe.title }}</h1>
+    {% if recipe.description != "" %}<p class="deck">{{ recipe.description }}</p>{% endif %}
+    <p class="metadata">
+      {% if servings_display != "" %}<span>{{ servings_display }} servings</span>{% endif %}
+      {% if prep_display != "" %}<span>{{ prep_display }} min prep</span>{% endif %}
+      {% if cook_display != "" %}<span>{{ cook_display }} min cook</span>{% endif %}
+    </p>
+    {% if sources.len() > 0 %}
+    <details class="source-disclosure">
+      <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
+      <ol class="source-popover">
+        {% for source in sources %}
+        <li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>
+        {% endfor %}
+      </ol>
+    </details>
+    {% endif %}
+  </div>
+  <div class="actions page-actions">
+    <a class="button primary" href="/recipes/{{ recipe.id }}/ai/alter">Alter with AI</a>
+    <a class="button" href="/recipes/{{ recipe.id }}?edit_meta=1">Edit</a>
+    <a class="button" href="/recipes/{{ recipe.id }}/delete">Delete</a>
+  </div>
+</header>
+
+<nav class="view-toggle" aria-label="Recipe view">
+  <a class="button compact{% if !chart_view %} primary{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}">Standard</a>
+  <a class="button compact{% if chart_view %} primary{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart">Chart</a>
+</nav>
+
+{% if !chart_view %}
+{% if edit_meta %}
+<form class="panel form-panel" method="post" action="/recipes/{{ recipe.id }}">
+  <p class="eyebrow">Edit recipe details</p>
+  <label>Title<input name="title" value="{{ recipe.title }}" required maxlength="180"></label>
+  <label>Description<textarea name="description" maxlength="1000">{{ recipe.description }}</textarea></label>
+  <div class="two-col">
+    <label>Servings<input name="servings" type="number" min="0" value="{{ servings_value }}"></label>
+    <div class="two-col">
+      <label>Prep minutes<input name="prep_minutes" type="number" min="0" value="{{ prep_value }}"></label>
+      <label>Cook minutes<input name="cook_minutes" type="number" min="0" value="{{ cook_value }}"></label>
+    </div>
+  </div>
+  <p class="actions"><button class="primary">Save details</button><a class="button" href="/recipes/{{ recipe.id }}">Cancel</a></p>
+</form>
+{% endif %}
+
+<section class="recipe-section ingredients-section">
+  <div class="column-heading"><span aria-hidden="true">I</span><h2>Ingredients</h2></div>
+  <div class="ingredients-box">
+    <ul class="ingredient-list">
+      {% for block in ingredients %}
+      <li>
+        <a class="block-link ingredient-link" data-edit-block="{{ block.id }}" href="/recipes/{{ recipe.id }}?edit={{ block.id }}">
+          <span class="block-text">{% if block.quantity != "" %}<strong>{{ block.quantity }}</strong> {% endif %}{% if block.unit != "" %}{{ block.unit }} {% endif %}{{ block.text }}{% if block.optional %} <em>(optional)</em>{% endif %}</span>
+        </a>
+        <form id="edit-{{ block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ block.id }}" {% if !block.editing %}hidden{% endif %}>
+          <label>Name<input name="text" value="{{ block.text }}" required></label>
+          <label class="inline">Quantity <input name="quantity" value="{{ block.quantity }}"></label>
+          <label class="inline">Unit <input name="unit" value="{{ block.unit }}"></label>
+          <label><input type="checkbox" name="optional" {% if block.optional %}checked{% endif %}> Optional</label>
+          <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move down">↓</button><button class="danger move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/delete">Delete</button></p>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  <form class="panel add-panel compact-panel" method="post" action="/recipes/{{ recipe.id }}/blocks">
+    <input type="hidden" name="section" value="ingredient">
+    <label>New ingredient<input name="text" required placeholder="e.g. brown onion"></label>
+    <p class="actions"><button>Add ingredient</button></p>
+  </form>
+</section>
+
+<section class="recipe-section method-section">
+  <div class="column-heading"><span aria-hidden="true">M</span><h2>Method</h2></div>
+  {% for step in steps %}
+  <div class="step-group">
+    <article class="block step-block">
+      <a class="block-link" data-edit-block="{{ step.block.id }}" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}">
+        <span class="block-index">{{ step.block.position + 1 }}.</span><span class="block-text">{{ step.block.text }}</span>
+      </a>
+      <form id="edit-{{ step.block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}" {% if !step.block.editing %}hidden{% endif %}>
+        <label>Step<textarea name="text" required>{{ step.block.text }}</textarea></label>
+        <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="500 ml water">{{ step.ingredients_text }}</textarea></label>
+        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move down">↓</button><button class="danger move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/delete">Delete</button></p>
+      </form>
+    </article>
+    {% if step.ingredients.len() > 0 %}
+    <div class="step-ingredients" aria-label="Ingredients used in step {{ step.block.position + 1 }}">
+      <span class="step-ingredients-label">Add</span>
+      {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  <form class="panel add-panel compact-panel" method="post" action="/recipes/{{ recipe.id }}/blocks">
+    <input type="hidden" name="section" value="step">
+    <label>New step<textarea name="text" required placeholder="Describe the next action…"></textarea></label>
+    <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="500 ml water"></textarea></label>
+    <p class="actions"><button>Add step</button></p>
+  </form>
+</section>
+{% else %}
+<section class="chart-view" data-chart-view data-recipe-id="{{ recipe.id }}" data-step-count="{{ chart.step_count }}">
+  <div class="chart-heading">
+    <div><p class="eyebrow">Cooking flow</p><h2>Ingredients into actions</h2></div>
+    {% match chart.detail %}
+    {% when None %}{% if chart.step_count > 0 %}<a class="button primary" data-chart-start href="/recipes/{{ recipe.id }}?view=chart&step=1">Start cooking</a>{% endif %}
+    {% when Some with (detail) %}<a class="button" data-chart-exit href="/recipes/{{ recipe.id }}?view=chart">Exit</a>{% endmatch %}
+  </div>
+  <p class="chart-help">Select an action to focus its ingredients, instruction, and timer.</p>
+  <div class="chart-scroll" tabindex="0" aria-label="Cooking-flow chart">
+    <div class="chart-table" role="group" aria-label="Recipe ingredients and cooking stages" style="--chart-steps: {{ chart.step_count }}; --chart-rows: {{ chart.leaves.len() }}">
+      {% for leaf in chart.leaves %}
+      <div class="chart-leaf{% if leaf.active %} is-active{% endif %}{% if leaf.dimmed %} is-dimmed{% endif %}" style="grid-column: 1; grid-row: {{ leaf.row + 1 }}">{{ leaf.label }}</div>
+      {% endfor %}
+      {% for cell in chart.cells %}
+      <a class="chart-cell{% if cell.active %} is-active{% endif %}{% if cell.dimmed %} is-dimmed{% endif %}" data-chart-step="{{ cell.step }}" href="{{ cell.href }}"{% if cell.active %} aria-current="step"{% endif %} style="grid-column: {{ cell.step + 1 }}; grid-row: {{ cell.row + 1 }} / span {{ cell.span }}"><span>{{ cell.label }}</span></a>
+      {% endfor %}
+    </div>
+  </div>
+  {% if chart.unlinked.len() > 0 %}<p class="chart-unlinked"><strong>Unlinked legacy ingredients:</strong>{% for item in chart.unlinked %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
+  {% match chart.detail %}
+  {% when None %}
+  <p class="chart-overview">Choose any segment above, or start at step 1.</p>
+  {% when Some with (detail) %}
+  <article class="chart-detail" data-chart-detail data-timer-seconds="{{ detail.timer_seconds }}">
+    <p class="eyebrow">Step {{ detail.step }}</p>
+    <h3>{{ detail.text }}</h3>
+    {% if detail.additions.len() > 0 %}<p class="chart-additions"><strong>Add:</strong>{% for item in detail.additions %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
+    {% if detail.timer_seconds > 0 %}<p class="chart-timer" aria-live="polite"><span data-timer-value>{{ detail.timer_seconds / 60 }}:{% if detail.timer_seconds % 60 < 10 %}0{% endif %}{{ detail.timer_seconds % 60 }}</span> timer</p>{% endif %}
+    <p class="chart-controls">
+      {% if detail.has_previous %}<a class="button" data-chart-back href="{{ detail.previous_href }}">← Back</a>{% else %}<span class="button is-disabled">← Back</span>{% endif %}
+      {% if detail.has_next %}<a class="button primary" data-chart-next href="{{ detail.next_href }}">Next →</a>{% else %}<span class="button is-disabled">Next →</span>{% endif %}
+      <a class="button" data-chart-exit href="/recipes/{{ recipe.id }}?view=chart">Exit</a>
+    </p>
+  </article>
+  {% endmatch %}
+</section>
+<section class="print-standard" aria-label="Printable recipe">
+  <h2>Ingredients</h2>
+  <ul>{% for block in ingredients %}<li>{% if block.quantity != "" %}{{ block.quantity }} {% endif %}{% if block.unit != "" %}{{ block.unit }} {% endif %}{{ block.text }}</li>{% endfor %}</ul>
+  <h2>Method</h2>
+  <ol>{% for step in steps %}<li>{{ step.block.text }}</li>{% endfor %}</ol>
+</section>
+{% endif %}
+{% endblock %}

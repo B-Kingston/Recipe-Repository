@@ -1,0 +1,43 @@
+{% extends "base.html" %}{% block title %}AI Draft · Kindle Recipes{% endblock %}{% block content %}
+<header class="page-header">
+  <div class="page-header-copy">
+    <p class="breadcrumb">AI Kitchen / Draft for review</p>
+    <h1>{{ recipe.title }}</h1>
+    <p class="deck">{{ recipe.description }}</p>
+    <p class="metadata"><span>{{ recipe.servings }} servings</span><span>{{ recipe.prep_minutes }} min prep</span><span>{{ recipe.cook_minutes }} min cook</span></p>
+    {% if sources.len() > 0 %}
+    <details class="source-disclosure">
+      <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
+      <ol class="source-popover">
+        {% for source in sources %}<li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>{% endfor %}
+      </ol>
+    </details>
+    {% endif %}
+  </div>
+  <div class="actions page-actions">
+    <form class="inline" method="post" action="/ai/drafts/{{ id }}/apply"><button class="primary">Save recipe</button></form>
+    <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel"><button>Discard</button></form>
+  </div>
+</header>
+<p class="muted top-spacer">Review this researched draft before adding it to your library.</p>
+<article class="draft-panel">
+  <section class="recipe-section ingredients-section">
+    <div class="column-heading"><span aria-hidden="true">I</span><h2>Ingredients</h2></div>
+    <div class="ingredients-box">
+      <ul class="ingredient-list">{% for item in recipe.ingredients %}<li>{% if item.quantity != "" %}<strong>{{ item.quantity }}</strong> {% endif %}{% if item.unit != "" %}{{ item.unit }} {% endif %}{{ item.name }}{% if item.optional %} <em>(optional)</em>{% endif %}</li>{% endfor %}</ul>
+    </div>
+  </section>
+  <section class="recipe-section method-section">
+    <div class="column-heading"><span aria-hidden="true">M</span><h2>Method</h2></div>
+    {% for step in recipe.steps %}
+    <div class="step-group">
+      <div class="block step-block"><span class="block-index">{{ loop.index }}.</span><span class="block-text">{{ step.text }}</span></div>
+      {% if step.ingredients.len() > 0 %}
+      <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}"><span class="step-ingredients-label">Add</span>{% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+</article>
+{% if suggestions != "" %}<div class="top-spacer">{{ suggestions|safe }}</div>{% endif %}
+{% endblock %}

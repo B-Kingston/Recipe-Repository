@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% block title %}Recipe Library · Kindle Recipes{% endblock %}{% block content %}
+<section id="all-recipes" class="library">
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Cookbook / Index</p>
+      <h1>All Recipes</h1>
+    </div>
+    <a class="button compact" href="/recipes/new">Add</a>
+  </div>
+
+  {% if recipes.len() == 0 %}
+  <div class="empty-state">
+    <span class="empty-icon" aria-hidden="true">♨</span>
+    <h2>The cupboard is bare.</h2>
+    <p class="home-prompt">Describe a dish, mention a recipe you love, or paste a URL to research.</p>
+    <div class="actions centered"><a class="button primary" href="/recipes/new">New Recipe</a></div>
+  </div>
+  {% endif %}
+
+  <div class="recipe-grid">
+  {% for recipe in recipes %}
+    <a class="recipe-card" href="/recipes/{{ recipe.id }}">
+      <span class="recipe-glyph" aria-hidden="true">♨</span>
+      <span class="recipe-copy">
+        <strong>{{ recipe.title }}</strong>
+        <em>{% if recipe.description != "" %}{{ recipe.description }}{% else %}Open recipe card{% endif %}</em>
+      </span>
+      <span class="recipe-arrow" aria-hidden="true">›</span>
+    </a>
+  {% endfor %}
+  </div>
+</section>
+{% endblock %}

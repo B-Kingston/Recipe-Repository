@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block title %}Delete {{ recipe.title }}{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Cookbook / Remove card</p>
+  <h1>Delete this recipe?</h1>
+  <p class="deck">“{{ recipe.title }}” and every ingredient, step, and source will be removed.</p>
+</div>
+<form class="panel form-panel" method="post" action="/recipes/{{ recipe.id }}/delete">
+  <p>This action cannot be undone.</p>
+  <p class="actions"><button class="danger">Delete permanently</button><a class="button" href="/recipes/{{ recipe.id }}">Keep recipe</a></p>
+</form>
+{% endblock %}
