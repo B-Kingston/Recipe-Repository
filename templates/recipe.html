@@ -5,9 +5,9 @@
     <h1>{{ recipe.title }}</h1>
     {% if recipe.description != "" %}<p class="deck">{{ recipe.description }}</p>{% endif %}
     <p class="metadata">
-      {% if servings_display != "" %}<span>{{ servings_display }} servings</span>{% endif %}
-      {% if prep_display != "" %}<span>{{ prep_display }} min prep</span>{% endif %}
-      {% if cook_display != "" %}<span>{{ cook_display }} min cook</span>{% endif %}
+      {% if servings_value != "" %}<span>{{ servings_value }} servings</span>{% endif %}
+      {% if prep_value != "" %}<span>{{ prep_value }} min prep</span>{% endif %}
+      {% if cook_value != "" %}<span>{{ cook_value }} min cook</span>{% endif %}
     </p>
     {% if sources.len() > 0 %}
     <details class="source-disclosure">
