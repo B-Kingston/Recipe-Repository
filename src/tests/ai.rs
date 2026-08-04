@@ -1,5 +1,5 @@
 use crate::ai::{
-    dedupe_sources, normalize_generated, parse_response, recipe_schema, validate_generated,
+    dedupe_sources, normalize_generated, parse_pi_response, recipe_schema, validate_generated,
 };
 use crate::{GeneratedRecipe, GeneratedStep, Ingredient, IngredientUse, Source};
 use serde_json::{Value, json};
@@ -116,37 +116,27 @@ fn duplicate_citation_urls_are_removed() {
 }
 
 #[test]
-fn grounded_response_extracts_recipe_and_citations() {
-    let response = json!({"steps":[
-        {"type":"google_search_call"},
-        {"type":"google_search_result","result":[{"search_suggestions":"Search"}]},
-        {"type":"model_output","content":[{"type":"text","text":serde_json::to_string(&recipe()).unwrap(),"annotations":[{"type":"url_citation","url":"https://example.com/toast","title":"Toast"}]}]}
-    ]});
-    let (parsed, sources, suggestions) = parse_response(&response, true).unwrap();
+fn pi_response_extracts_recipe_and_search_sources() {
+    let response = json!({
+        "recipe": recipe(),
+        "sources": [{"title":"Toast","url":"https://example.com/toast"}]
+    });
+    let (parsed, sources, suggestions) = parse_pi_response(&response, true).unwrap();
     assert_eq!(parsed.title, "Toast");
     assert_eq!(sources.len(), 1);
-    assert_eq!(suggestions, "Search");
+    assert!(suggestions.is_empty());
 }
 
 #[test]
-fn url_context_response_counts_as_grounded_research() {
-    let response = json!({"steps":[
-        {"type":"url_context_call"},
-        {"type":"model_output","content":[{"type":"text","text":serde_json::to_string(&recipe()).unwrap(),"annotations":[{"type":"url_citation","url":"https://example.com/toast"}]}]}
-    ]});
-    assert!(parse_response(&response, true).is_ok());
+fn grounded_pi_response_requires_search_sources() {
+    let response = json!({"recipe": recipe(), "sources": []});
+    assert!(parse_pi_response(&response, true).is_err());
 }
 
 #[test]
-fn grounding_without_a_search_call_is_rejected() {
-    let response = json!({"steps":[{"type":"model_output","content":[{"type":"text","text":"{}","annotations":[{"type":"url_citation","url":"https://example.com"}]}]}]});
-    assert!(parse_response(&response, true).is_err());
-}
-
-#[test]
-fn ungrounded_response_is_accepted_without_search_or_citations() {
-    let response = json!({"steps":[{"type":"model_output","content":[{"type":"text","text":serde_json::to_string(&recipe()).unwrap()}]}]});
-    let (_, sources, suggestions) = parse_response(&response, false).unwrap();
+fn ungrounded_pi_response_accepts_no_sources() {
+    let response = json!({"recipe": recipe(), "sources": []});
+    let (_, sources, suggestions) = parse_pi_response(&response, false).unwrap();
     assert!(sources.is_empty());
     assert!(suggestions.is_empty());
 }

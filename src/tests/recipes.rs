@@ -5,7 +5,10 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 fn ingredient(text: &str, quantity: &str, unit: &str) -> Block {
     Block {
@@ -57,11 +60,11 @@ async fn database() -> SqlitePool {
 fn state(db: SqlitePool) -> Arc<AppState> {
     Arc::new(AppState {
         db,
-        http: reqwest::Client::new(),
-        api_key: String::new(),
         model: String::new(),
-        gemini_base_url: String::new(),
+        pi_worker_path: String::new(),
+        auth_script_path: String::new(),
         search_grounding: false,
+        codex_flows: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

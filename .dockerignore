@@ -3,3 +3,4 @@
 target
 data
 .env
+node_modules

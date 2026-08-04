@@ -11,7 +11,13 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    process::{Command, Stdio},
+    sync::Arc,
+};
 use tracing::error;
 use uuid::Uuid;
 
@@ -48,7 +54,7 @@ pub(crate) async fn alter_page(
     render(crate::AiFormTemplate {
         heading: "Alter with AI".into(),
         guidance: format!(
-            "Tell Gemini how to change “{}”. It will return a complete replacement recipe for review.",
+            "Tell Pi how to change “{}”. It will return a complete replacement recipe for review.",
             recipe.title
         ),
         action: format!("/recipes/{id}/ai/alter"),
@@ -77,7 +83,7 @@ pub(crate) async fn alter_recipe(
         Ok(draft) => Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "Alter with AI".into(),
-            guidance: "Tell Gemini what should change.".into(),
+            guidance: "Tell Pi what should change.".into(),
             action: format!("/recipes/{id}/ai/alter"),
             label: "What should change?".into(),
             button: "Create altered draft".into(),
@@ -235,10 +241,7 @@ async fn create_draft(
     operation: &str,
     prompt: &str,
 ) -> Result<String> {
-    if state.api_key.is_empty() {
-        return Err(AppError::AiNotConfigured);
-    }
-    let (generated_recipe, sources, suggestions) = gemini(state, prompt).await?;
+    let (generated_recipe, sources, suggestions) = pi_recipe(state, prompt).await?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
@@ -260,111 +263,170 @@ async fn create_draft(
     Ok(id)
 }
 
-async fn gemini(state: &AppState, prompt: &str) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+async fn pi_recipe(
+    state: &AppState,
+    prompt: &str,
+) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+    let mut credential = crate::codex_credential(&state.db)
+        .await?
+        .ok_or(AppError::AiNotConfigured)?;
+    let model = crate::selected_model(&state.db, &state.model).await?;
     for attempt in 0..2 {
         let input = if attempt == 0 {
             prompt.to_string()
         } else if state.search_grounding {
             format!(
-                "{prompt}\n\nImportant: research this thoroughly before answering. Use Google Search, read any supplied URLs with URL Context, and return a complete recipe whose output has URL citations."
+                "{prompt}\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
             )
         } else {
             format!(
                 "{prompt}\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
             )
         };
-        let mut body = json!({"model":state.model,"input":input,"system_instruction":if state.search_grounding { GROUNDED_RECIPE_PROMPT } else { RECIPE_PROMPT },"store":false,"response_format":{"type":"text","mime_type":"application/json","schema":recipe_schema()}});
-        if state.search_grounding {
-            body["tools"] = json!([{"type":"google_search"},{"type":"url_context"}]);
+        let system_prompt = format!(
+            "{}\n\nRecipe JSON schema:\n{}",
+            if state.search_grounding {
+                GROUNDED_RECIPE_PROMPT
+            } else {
+                RECIPE_PROMPT
+            },
+            recipe_schema()
+        );
+        let request = json!({
+            "prompt": input,
+            "systemPrompt": system_prompt,
+            "model": model,
+            "searchEnabled": state.search_grounding,
+        });
+        let (output, refreshed) =
+            run_pi_worker_with_credential(state, &credential, &request).await?;
+        if let Some(refreshed) = refreshed {
+            if refreshed != credential {
+                credential = refreshed.clone();
+                crate::store_codex_credential(&state.db, &refreshed).await?;
+            }
         }
-        let response = state
-            .http
-            .post(&state.gemini_base_url)
-            .header("x-goog-api-key", &state.api_key)
-            .header("Api-Revision", "2026-05-20")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| AppError::Ai)?;
-        if !response.status().is_success() {
-            error!(status=%response.status(), "Gemini request failed");
-            return Err(AppError::Ai);
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
+        if !output.status.success() {
+            let code = value["code"].as_str().unwrap_or("worker");
+            error!(code, status = %output.status, "Pi worker failed");
+            return if code == "configuration" {
+                Err(AppError::AiNotConfigured)
+            } else {
+                Err(AppError::Ai)
+            };
         }
-        let value: Value = response.json().await.map_err(|_| AppError::Ai)?;
-        if let Ok(result) = parse_response(&value, state.search_grounding) {
+        if let Ok(result) = parse_pi_response(&value, state.search_grounding) {
             return Ok(result);
         }
     }
     Err(AppError::Ai)
 }
 
-pub(crate) fn parse_response(
+fn run_pi_worker(worker_path: &str, payload: &[u8]) -> std::io::Result<std::process::Output> {
+    let mut child = Command::new("node")
+        .arg(worker_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .expect("Pi worker stdin is piped")
+        .write_all(payload)?;
+    child.wait_with_output()
+}
+
+/// Runs the Pi worker with the database credential materialised as a private
+/// per-request auth.json. The Pi SDK refreshes tokens in place in that file,
+/// so the refreshed credential is read back for the caller to persist. The
+/// worker's stdout is returned along with the refresh, if any.
+async fn run_pi_worker_with_credential(
+    state: &AppState,
+    credential: &Value,
+    request: &Value,
+) -> Result<(std::process::Output, Option<Value>)> {
+    let credential_json = serde_json::to_string(credential).map_err(|_| AppError::Ai)?;
+    let temp_path =
+        std::env::temp_dir().join(format!("kindle-recipes-auth-{}.json", Uuid::new_v4()));
+    let mut request = request.clone();
+    request["authPath"] = json!(temp_path.to_string_lossy().to_string());
+    let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
+    let worker_path = state.pi_worker_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .map_err(|_| AppError::Ai)?;
+        file.write_all(format!("{{\n  \"openai-codex\": {credential_json}\n}}\n").as_bytes())
+            .map_err(|_| AppError::Ai)?;
+        let output = run_pi_worker(&worker_path, &payload);
+        let refreshed = std::fs::read_to_string(&temp_path).ok().and_then(|text| {
+            serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|value| value.get("openai-codex").cloned())
+        });
+        let _ = std::fs::remove_file(&temp_path);
+        output
+            .map(|output| (output, refreshed))
+            .map_err(|_| AppError::Ai)
+    })
+    .await
+    .map_err(|_| AppError::Ai)?
+    .map_err(|_| AppError::Ai)
+}
+
+/// Asks the Pi worker to refresh the Codex model catalogue from pi.dev and
+/// returns the current model ids (newest first). Returns an empty list when
+/// there is no Codex credential or the refresh fails; the Settings page then
+/// falls back to the built-in model list.
+pub(crate) async fn fetch_codex_models(state: &AppState) -> Result<Vec<String>> {
+    let mut credential = match crate::codex_credential(&state.db).await? {
+        Some(credential) => credential,
+        None => return Ok(Vec::new()),
+    };
+    let (output, refreshed) =
+        run_pi_worker_with_credential(state, &credential, &json!({ "command": "listModels" }))
+            .await?;
+    if let Some(refreshed) = refreshed {
+        if refreshed != credential {
+            credential = refreshed;
+            crate::store_codex_credential(&state.db, &credential).await?;
+        }
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
+    if !output.status.success() {
+        error!(status = %output.status, "Codex model list refresh failed");
+        return Ok(Vec::new());
+    }
+    Ok(value["models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+pub(crate) fn parse_pi_response(
     value: &Value,
     require_grounding: bool,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
-    let researched = value["steps"].as_array().is_some_and(|steps| {
-        steps.iter().any(|step| {
-            matches!(
-                step["type"].as_str(),
-                Some("google_search_call" | "url_context_call")
-            )
-        })
-    });
-    let mut text = String::new();
-    let mut citations = Vec::new();
-    let mut suggestions = String::new();
-    if let Some(steps) = value["steps"].as_array() {
-        for step in steps {
-            if step["type"].as_str() == Some("google_search_result") {
-                if let Some(results) = step["result"].as_array() {
-                    for result in results {
-                        if suggestions.is_empty() {
-                            suggestions = result["search_suggestions"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                        }
-                    }
-                }
-            }
-            if step["type"].as_str() != Some("model_output") {
-                continue;
-            }
-            let Some(content) = step["content"].as_array() else {
-                continue;
-            };
-            for block in content {
-                if block["type"].as_str() != Some("text") {
-                    continue;
-                }
-                text.push_str(block["text"].as_str().unwrap_or_default());
-                if let Some(annotations) = block["annotations"].as_array() {
-                    for annotation in annotations {
-                        if annotation["type"].as_str() != Some("url_citation") {
-                            continue;
-                        }
-                        let url = annotation["url"].as_str().unwrap_or_default();
-                        if !url.is_empty() {
-                            citations.push(Source {
-                                id: None,
-                                recipe_id: None,
-                                position: None,
-                                title: annotation["title"].as_str().unwrap_or_default().to_string(),
-                                url: url.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let citations = dedupe_sources(citations);
-    if require_grounding && (!researched || citations.is_empty()) {
+    let mut recipe: GeneratedRecipe =
+        serde_json::from_value(value["recipe"].clone()).map_err(|_| AppError::Ai)?;
+    let sources: Vec<Source> =
+        serde_json::from_value(value["sources"].clone()).map_err(|_| AppError::Ai)?;
+    let sources = dedupe_sources(sources);
+    if require_grounding && sources.is_empty() {
         return Err(AppError::Ai);
     }
-    let mut recipe: GeneratedRecipe = serde_json::from_str(&text).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
-    Ok((recipe, citations, suggestions))
+    Ok((recipe, sources, String::new()))
 }
 
 pub(crate) fn recipe_schema() -> Value {

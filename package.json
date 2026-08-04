@@ -1,0 +1,16 @@
+{
+  "name": "kindle-recipes-pi-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pi": "pi",
+    "test": "node --test pi/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0"
+  }
+}

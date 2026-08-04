@@ -1,0 +1,69 @@
+{% extends "base.html" %}{% block title %}Authorise Codex · Kindle Recipes{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Configuration / AI</p>
+  <h1>Authorise Codex</h1>
+  <p class="deck">Sign in with your ChatGPT Plus or Pro account so Kindle Recipes can generate recipes with Codex.</p>
+</div>
+<div class="compact-panel">
+  <div class="block" id="codex-flow-waiting">
+    <h2>1. Open the sign-in page</h2>
+    <p class="muted">Open <a href="{{ verification_uri }}" target="_blank" rel="noopener">chatgpt.com/codex/device</a> in a new tab and sign in to ChatGPT.</p>
+    <h2>2. Enter this code</h2>
+    <p class="codex-user-code">{{ user_code }}</p>
+    <p class="muted">This page checks automatically and finishes as soon as your account is connected. The code expires in {{ expires_seconds }} seconds.</p>
+  </div>
+  <div class="block" id="codex-flow-done" hidden>
+    <h2>Connected</h2>
+    <p class="muted">Your Codex account is connected. Returning to Settings…</p>
+  </div>
+  <div class="block" id="codex-flow-failed" hidden>
+    <h2>Authorisation incomplete</h2>
+    <p class="muted" id="codex-flow-failed-message"></p>
+    <p class="actions"><a class="button" href="/settings/authorise-codex">Try again</a><a class="button" href="/settings">Back to Settings</a></p>
+  </div>
+</div>
+<script>
+(function () {
+  var flowId = "{{ flow_id }}";
+  var interval = {{ interval_seconds }} * 1000;
+  if (interval < 2000) { interval = 2000; }
+  function showFailure(message) {
+    var failed = document.getElementById('codex-flow-failed');
+    var waiting = document.getElementById('codex-flow-waiting');
+    if (failed) { failed.hidden = false; }
+    if (waiting) { waiting.hidden = true; }
+    var text = document.getElementById('codex-flow-failed-message');
+    if (text && message) { text.textContent = message; }
+  }
+  function poll() {
+    var request = new XMLHttpRequest();
+    request.open('GET', '/settings/authorise-codex/status/' + encodeURIComponent(flowId), true);
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) { return; }
+      if (request.status !== 200) { window.setTimeout(poll, interval); return; }
+      var state;
+      try { state = JSON.parse(request.responseText); } catch (e) { window.setTimeout(poll, interval); return; }
+      if (state.status === 'complete') {
+        var done = document.getElementById('codex-flow-done');
+        var waiting = document.getElementById('codex-flow-waiting');
+        if (done) { done.hidden = false; }
+        if (waiting) { waiting.hidden = true; }
+        window.setTimeout(function () { window.location.href = '/settings'; }, 1500);
+        return;
+      }
+      if (state.status === 'pending' || state.status === 'slow_down') {
+        window.setTimeout(poll, interval);
+        return;
+      }
+      if (state.status === 'expired') {
+        showFailure('This sign-in code expired. Start a new authorisation to try again.');
+        return;
+      }
+      showFailure(state.message || 'Authorisation could not be completed.');
+    };
+    request.send();
+  }
+  window.setTimeout(poll, interval);
+}());
+</script>
+{% endblock %}
