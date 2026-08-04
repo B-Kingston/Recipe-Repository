@@ -3,4 +3,5 @@ data/
 deploy.sh
 *.sqlite3
 target/
+.cargo-home/
 node_modules/

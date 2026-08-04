@@ -39,5 +39,20 @@
     {% endfor %}
   </section>
 </article>
+<form class="panel form-panel top-spacer" method="post" action="/ai/drafts/{{ id }}/alter">
+  <h2>Alter this draft</h2>
+  {% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
+  <label>What should change?<textarea name="prompt" required maxlength="4000" placeholder="e.g. make it vegetarian, swap the chicken for tofu, cut the servings in half…">{{ prompt }}</textarea></label>
+  <p class="muted">Pi returns a complete replacement draft for review. This draft stays untouched until you save one.</p>
+  <p class="actions form-actions"><button class="primary">Create altered draft</button></p>
+</form>
 {% if suggestions != "" %}<div class="top-spacer">{{ suggestions }}</div>{% endif %}
+<script>
+  (function () {
+    var form = document.querySelector('form.form-panel');
+    var button = form && form.querySelector('button.primary');
+    if (!form || !button) return;
+    form.addEventListener('submit', function () { button.textContent = 'Generating'; });
+  }());
+</script>
 {% endblock %}

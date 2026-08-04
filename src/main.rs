@@ -32,8 +32,8 @@ mod chart;
 mod recipes;
 
 use ai::{
-    alter_page, alter_recipe, apply_draft, cancel_draft, draft_page, fetch_codex_models,
-    generate_page, generate_recipe,
+    alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
+    fetch_codex_models, generate_page, generate_recipe,
 };
 use recipes::{
     add_block, delete_block, delete_page, delete_recipe, home, move_block, new_recipe, recipe_page,
@@ -254,6 +254,8 @@ struct DraftTemplate {
     recipe: GeneratedRecipe,
     sources: Vec<Source>,
     suggestions: String,
+    error: String,
+    prompt: String,
 }
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -384,6 +386,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/generate", get(generate_page).post(generate_recipe))
         .route("/recipes/{id}/ai/alter", get(alter_page).post(alter_recipe))
         .route("/ai/drafts/{id}", get(draft_page))
+        .route("/ai/drafts/{id}/alter", post(alter_draft))
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
         .route("/settings", get(settings_page).post(update_settings))

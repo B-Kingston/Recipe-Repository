@@ -1,7 +1,7 @@
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
     AppError, AppState, ChartRecipe, DRAFT_HOURS, DraftTemplate, GROUNDED_RECIPE_PROMPT,
-    GeneratedRecipe, Ingredient, IngredientUse, PromptForm, RECIPE_PROMPT, Recipe, Result, Source,
+    GeneratedRecipe, Ingredient, IngredientUse, PromptForm, RECIPE_PROMPT, Result, Source,
     generate_guidance, render, required, stamp,
 };
 use axum::{
@@ -79,7 +79,7 @@ pub(crate) async fn alter_recipe(
         prompt,
         serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?
     );
-    match create_draft(&s, Some(&recipe), "alter", &full).await {
+    match create_draft(&s, Some((&recipe.id, &recipe.updated_at)), "alter", &full).await {
         Ok(draft) => Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "Alter with AI".into(),
@@ -98,17 +98,54 @@ pub(crate) async fn alter_recipe(
 pub(crate) async fn draft_page(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Html<String>> {
+) -> Result<Response> {
+    render_draft_page(&s, &id, "", "").await
+}
+
+/// Alters the recipe held in a draft, opening the result as a new draft.
+/// The alteration chain keeps pointing at the original saved recipe (if any),
+/// so applying the final draft still updates that recipe, guarded by the
+/// staleness check against the version this chain was based on.
+pub(crate) async fn alter_draft(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(f): Form<PromptForm>,
+) -> Result<Response> {
     let draft = find_draft(&s.db, &id).await?;
+    let prompt = required(&f.prompt, "Comments")?;
+    let full = format!(
+        "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
+        prompt, draft.recipe_json
+    );
+    let base = draft
+        .recipe_id
+        .as_deref()
+        .map(|recipe_id| (recipe_id, draft.base_updated_at.as_deref().unwrap_or_default()));
+    match create_draft(&s, base, "alter", &full).await {
+        Ok(new_id) => Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response()),
+        Err(e) => render_draft_page(&s, &id, &e.to_string(), &prompt).await,
+    }
+}
+
+async fn render_draft_page(
+    state: &AppState,
+    id: &str,
+    error: &str,
+    prompt: &str,
+) -> Result<Response> {
+    let draft = find_draft(&state.db, id).await?;
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
     render(DraftTemplate {
-        id,
+        id: id.to_string(),
         recipe,
         sources: serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?,
         suggestions: draft.search_suggestions,
+        error: error.to_string(),
+        prompt: prompt.to_string(),
     })
+    .map(IntoResponse::into_response)
 }
 
 pub(crate) async fn apply_draft(
@@ -237,7 +274,7 @@ pub(crate) async fn cancel_draft(
 
 async fn create_draft(
     state: &AppState,
-    base_recipe: Option<&Recipe>,
+    base: Option<(&str, &str)>,
     operation: &str,
     prompt: &str,
 ) -> Result<String> {
@@ -250,12 +287,12 @@ async fn create_draft(
         .await?;
     sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?,?)")
         .bind(&id)
-        .bind(base_recipe.map(|recipe| recipe.id.as_str()))
+        .bind(base.map(|(recipe_id, _)| recipe_id))
         .bind(operation)
         .bind(serde_json::to_string(&generated_recipe).map_err(|_| AppError::Ai)?)
         .bind(serde_json::to_string(&sources).map_err(|_| AppError::Ai)?)
         .bind(suggestions)
-        .bind(base_recipe.map(|recipe| recipe.updated_at.as_str()))
+        .bind(base.map(|(_, base_updated_at)| base_updated_at))
         .bind(now.to_rfc3339())
         .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
         .execute(&state.db)
