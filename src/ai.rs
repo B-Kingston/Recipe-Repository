@@ -18,7 +18,7 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
 };
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 pub(crate) async fn generate_page() -> Redirect {
@@ -346,15 +346,27 @@ async fn pi_recipe(
         let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
         if !output.status.success() {
             let code = value["code"].as_str().unwrap_or("worker");
-            error!(code, status = %output.status, "Pi worker failed");
-            return if code == "configuration" {
-                Err(AppError::AiNotConfigured)
-            } else {
-                Err(AppError::Ai)
-            };
+            let message = value["error"].as_str().unwrap_or("no message");
+            if code == "configuration" || attempt == 1 {
+                error!(code, message, status = %output.status, "Pi worker failed");
+                return if code == "configuration" {
+                    Err(AppError::AiNotConfigured)
+                } else {
+                    Err(AppError::Ai)
+                };
+            }
+            warn!(code, message, status = %output.status, "Pi worker failed; retrying with research guidance");
+            continue;
         }
-        if let Ok(result) = parse_pi_response(&value, state.search_grounding) {
-            return Ok(result);
+        match parse_pi_response(&value, state.search_grounding) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if attempt == 1 {
+                    error!(attempt, error = %error, "Pi worker output failed validation");
+                } else {
+                    warn!(attempt, error = %error, "Pi worker output failed validation; retrying");
+                }
+            }
         }
     }
     Err(AppError::Ai)
@@ -455,11 +467,18 @@ pub(crate) fn parse_pi_response(
     require_grounding: bool,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
     let mut recipe: GeneratedRecipe =
-        serde_json::from_value(value["recipe"].clone()).map_err(|_| AppError::Ai)?;
-    let sources: Vec<Source> =
-        serde_json::from_value(value["sources"].clone()).map_err(|_| AppError::Ai)?;
+        serde_json::from_value(value["recipe"].clone()).map_err(|parse_error| {
+            warn!(error = %parse_error, "AI response recipe failed schema deserialisation");
+            AppError::Ai
+        })?;
+    let sources: Vec<Source> = serde_json::from_value(value["sources"].clone())
+        .map_err(|parse_error| {
+            warn!(error = %parse_error, "AI response sources failed deserialisation");
+            AppError::Ai
+        })?;
     let sources = dedupe_sources(sources);
     if require_grounding && sources.is_empty() {
+        warn!("AI response carried no grounded search sources");
         return Err(AppError::Ai);
     }
     normalize_generated(&mut recipe)?;
@@ -563,6 +582,15 @@ pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
         || recipe.cook_minutes < 0
         || recipe.servings < 0
     {
+        warn!(
+            title_empty = recipe.title.trim().is_empty(),
+            ingredient_count = recipe.ingredients.len(),
+            step_count = recipe.steps.len(),
+            prep_minutes = recipe.prep_minutes,
+            cook_minutes = recipe.cook_minutes,
+            servings = recipe.servings,
+            "AI recipe failed basic content checks"
+        );
         return Err(AppError::Ai);
     }
     let mut used_ingredients = HashSet::new();
@@ -572,6 +600,7 @@ pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
             || step.chart_label.trim().is_empty()
             || step.timer_seconds < 0
         {
+            warn!(step = index, "AI recipe step failed content checks");
             return Err(AppError::Ai);
         }
         let mut local_ingredients = HashSet::new();
@@ -581,24 +610,34 @@ pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
                 || use_.amount.trim().is_empty()
                 || !local_ingredients.insert(use_.ingredient)
             {
+                warn!(step = index, ingredient = use_.ingredient, "AI recipe step ingredient use is invalid");
                 return Err(AppError::Ai);
             }
             used_ingredients.insert(use_.ingredient);
         }
         for &input in &step.input_steps {
             if input >= index || !local_inputs.insert(input) {
+                warn!(step = index, input = input, "AI recipe step input reference is invalid");
                 return Err(AppError::Ai);
             }
             consumers[input] += 1;
         }
     }
-    if used_ingredients.len() != recipe.ingredients.len()
-        || consumers
-            .iter()
-            .take(recipe.steps.len() - 1)
-            .any(|count| *count != 1)
+    if used_ingredients.len() != recipe.ingredients.len() {
+        warn!(
+            used = used_ingredients.len(),
+            total = recipe.ingredients.len(),
+            "AI recipe did not allocate every ingredient"
+        );
+        return Err(AppError::Ai);
+    }
+    if consumers
+        .iter()
+        .take(recipe.steps.len() - 1)
+        .any(|count| *count != 1)
         || consumers[recipe.steps.len() - 1] != 0
     {
+        warn!(consumers = ?consumers, "AI recipe step graph has invalid consumers");
         return Err(AppError::Ai);
     }
     Ok(())
