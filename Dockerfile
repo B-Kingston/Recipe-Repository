@@ -5,10 +5,12 @@ RUN npm ci --omit=dev
 
 FROM rust:1.88-slim AS builder
 WORKDIR /app
-COPY Cargo.toml ./
-RUN mkdir src && printf 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    mkdir src && printf 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
 COPY . .
-RUN touch src/main.rs && cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    touch src/main.rs && cargo build --release
 
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && useradd --system --uid 10001 app && mkdir /data && chown app:app /data
