@@ -1,8 +1,8 @@
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
     AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DraftTemplate, GROUNDED_RECIPE_PROMPT,
-    GeneratedRecipe, Ingredient, IngredientUse, PromptForm, RECIPE_PROMPT, Result, Source,
-    generate_guidance, render, required, stamp,
+    GeneratedRecipe, Ingredient, IngredientUse, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result,
+    Source, generate_guidance, render, required, stamp,
 };
 use axum::{
     Form,
@@ -17,6 +17,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     process::{Command, Stdio},
     sync::Arc,
+    time::Instant,
 };
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -485,6 +486,40 @@ pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Resul
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// How long a successfully fetched model catalogue stays usable before the
+/// Settings page triggers another background refresh.
+const MODEL_CATALOGUE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Returns the live Codex model catalogue when a fresh copy is cached; otherwise
+/// starts a background refresh and returns the stale cache (or an empty list on
+/// first run). The page render never waits on the Pi worker, so a slow pi.dev
+/// refresh cannot stall the Settings page. Only non-empty refreshes replace the
+/// cache, so a transient failure retries on the next visit.
+pub(crate) async fn fresh_model_catalogue(state: &Arc<AppState>, user_id: &str) -> Vec<String> {
+    let cached = (*state.model_catalogue.lock()).clone();
+    if cached
+        .as_ref()
+        .is_some_and(|catalogue| catalogue.refreshed_at.elapsed() < MODEL_CATALOGUE_TTL)
+    {
+        return cached.map(|catalogue| catalogue.models).unwrap_or_default();
+    }
+    let state = state.clone();
+    let user_id = user_id.to_string();
+    tokio::spawn(async move {
+        match fetch_codex_models(&state, &user_id).await {
+            Ok(models) if !models.is_empty() => {
+                (*state.model_catalogue.lock()).replace(ModelCatalogue {
+                    models: models.clone(),
+                    refreshed_at: Instant::now(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Codex model list refresh failed; keeping cached list"),
+        }
+    });
+    cached.map(|catalogue| catalogue.models).unwrap_or_default()
 }
 
 pub(crate) fn parse_pi_response(

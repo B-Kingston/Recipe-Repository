@@ -66,6 +66,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(None)),
     })
 }
 
