@@ -22,18 +22,18 @@
     <p class="muted">{% if search_enabled %}Enabled{% else %}Disabled{% endif %}</p>
   </div>
   <div class="block">
-    <h2>Password</h2>
-    <p class="muted">Keep the library protected with a password only you know.</p>
-    <a class="button" href="/settings/password">Change password</a>
-  </div>
-  <div class="block">
-    <h2>Authorise Codex</h2>
+    <h2>Authorise Codex <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
     <p class="muted" style="margin-bottom: 10px;">Connect your OpenAI Codex account to enable AI recipe generation.</p>
     {% if codex_authorised %}
     <p class="muted">Connected to ChatGPT Plus/Pro.</p>
     {% else %}
     <a class="button primary" href="{{ codex_auth_url }}">Authorise Codex</a>
     {% endif %}
+  </div>
+  <div class="block">
+    <h2>Password</h2>
+    <p class="muted">Set a new password. Your current password is required.</p>
+    <a class="button" href="/settings/password">Reset password</a>
   </div>
 </div>
 {% endblock %}

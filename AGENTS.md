@@ -11,7 +11,7 @@ Access control is a single-user HTTP Basic auth account: the first visit redirec
 Single-process Axum 0.8 app (crate `kindle-recipes`, edition 2024, binary-only — no `lib.rs`):
 
 - `src/main.rs` — the hub: `#[tokio::main]` bootstrap, env config, `routes()` router, `AppState`, `AppError`, shared serde types, Askama template structs, form/validation helpers, Codex device-code auth handlers, `run_node_script`.
-- `src/auth.rs` — user accounts and HTTP Basic auth: `auth_middleware` (protects every route in the `protected` router), `AuthUser` extractor, `hash_password` / `verify_password` (Argon2), `setup_page` / `setup_create`, `password_page` / `change_password`.
+- `src/auth.rs` — user accounts and HTTP Basic auth: `auth_middleware` (protects every route in the `protected` router), `AuthUser` extractor, `hash_password` / `verify_password` (Argon2), `setup_page` / `setup_create`, `reset_password_page` / `reset_password`.
 - `src/ai.rs` — Pi/Codex generation pipeline: draft create/alter/apply/cancel handlers, `pi_recipe`, `run_pi_worker(_with_credential)`, model catalogue, `recipe_schema` / `validate_generated` / `normalize_generated` / `dedupe_sources`.
 - `src/recipes.rs` — recipe CRUD handlers **and all SQL accessor helpers** (`find_recipe`, `blocks`, `step_ingredients`, `sources`, `find_draft`, `recipe_snapshot`, …).
 - `src/chart.rs` — pure cooking-flow chart builder (`build_chart`, `selected_chart_step`), no I/O.
@@ -20,7 +20,7 @@ Single-process Axum 0.8 app (crate `kindle-recipes`, edition 2024, binary-only �
 
 Data flow: HTTP request → handler (extractors `State<Arc<AppState>>`, `Path`, `Form`, `Query`) → sqlx helpers or the AI pipeline → Askama template struct → HTML. Every page is a server-rendered template in `templates/`; forms post `application/x-www-form-urlencoded` via axum `Form`.
 
-Auth flow (load-bearing): every library route sits behind `auth_middleware` (`from_fn_with_state` on the `protected` router; `/setup` and `/healthz` are outside it). No `users` row → redirect to `/setup`; missing/invalid `Authorization: Basic` → 401 with `WWW-Authenticate` challenge; valid credentials → the user id is inserted into request extensions as `AuthUser`, which handlers take as an extractor. Passwords are verified against `users.password_hash` with Argon2. `POST /settings/password` re-verifies the current password before replacing the hash; per-request verification means the new password takes effect immediately. The `users` table is the single source of truth — never a config file.
+Auth flow (load-bearing): every library route sits behind `auth_middleware` (`from_fn_with_state` on the `protected` router; `/setup` and `/healthz` are outside it). No `users` row → redirect to `/setup`; missing/invalid `Authorization: Basic` → 401 with `WWW-Authenticate` challenge; valid credentials → the user id is inserted into request extensions as `AuthUser`, which handlers take as an extractor. Passwords are verified against `users.password_hash` with Argon2. `POST /settings/password` re-verifies the current password before replacing the hash (the single password page is "Reset password" at `/settings/password`, linked under the Authorise Codex block in Settings); per-request verification means the new password takes effect immediately. The `users` table is the single source of truth — never a config file.
 
 AI flow (load-bearing): `POST /ai/generate` → `create_draft` → `spawn_blocking` runs `node pi/recipe-worker.mjs` (one JSON request on stdin, one JSON line on stdout) with a **per-request `0o600` temp `auth.json`** materialized from the DB credential; the worker's token refresh is read back and persisted via `store_codex_credential`; result lands in `ai_drafts` with `expires_at = now + 24h`; the preview page shows it and `apply_draft` persists in one transaction under a `base_updated_at` staleness guard (rejects if the recipe changed meanwhile).
 
@@ -29,7 +29,7 @@ Key invariants:
 - AI output must pass `validate_generated` (every ingredient used exactly once, `inputSteps` only reference earlier steps, …) before any draft is saved.
 - `recipes.chart_json` is AI-derived only; any manual block edit MUST call `invalidate_chart` so the viewer falls back to linear inference.
 - The Codex credential is DB-only; Pi SDK invocations MUST use `run_pi_worker_with_credential`, never a fixed-path credential file.
-- Passwords are stored only as Argon2 hashes (`users.password_hash`); `change_password` MUST verify the current password first and never log or return password material.
+- Passwords are stored only as Argon2 hashes (`users.password_hash`); `reset_password` MUST verify the current password first and never log or return password material.
 
 ## Key Directories
 
@@ -76,7 +76,7 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 - `Cargo.toml` / `Dockerfile` / `compose.yaml` / `deploy.sh` / `.env.example` — build, deploy, env contract.
 - `pi/recipe-worker.mjs` — the worker protocol contract: stdin JSON `{prompt, systemPrompt, model, searchEnabled, authPath}` or `{command: "listModels"}`; stdout `{recipe, sources}` or `{error, code}` (`code: "configuration"` → `AiNotConfigured`).
 - `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`, and `0006_users.sql` adds the `users` table for basic auth.
-- `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view. `templates/setup.html` and `templates/change_password.html` are the auth screens.
+- `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view. `templates/setup.html` and `templates/password_reset.html` are the auth screens.
 
 ## Runtime/Tooling Preferences
 

@@ -1,6 +1,6 @@
-use crate::auth::{AuthUser, change_password, hash_password, setup_create, verify_password};
+use crate::auth::{AuthUser, hash_password, reset_password, setup_create, verify_password};
 use crate::{
-    AppState, ChangePasswordForm, SetupForm, codex_credential, import_legacy_codex_auth, routes,
+    AppState, ResetPasswordForm, SetupForm, codex_credential, import_legacy_codex_auth, routes,
     stamp, store_codex_credential,
 };
 use axum::{
@@ -42,6 +42,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -318,7 +319,7 @@ async fn response_body(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
-async fn change_password_validates_current_and_updates_login() {
+async fn reset_password_requires_current_password_and_updates_login() {
     let db = database().await;
     let state = state(db.clone());
     let app = routes(state.clone());
@@ -340,13 +341,25 @@ async fn change_password_validates_current_and_updates_login() {
         id: user_id.clone(),
     };
 
+    // The page renders through the router for a signed-in user.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/settings/password",
+            Some(&basic_header("alice", "old-secret")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_body(response).await.contains("Reset password"));
+
     // Wrong current password: form re-rendered with an error, hash untouched.
-    let response = change_password(
+    let response = reset_password(
         State(state.clone()),
         user.clone(),
-        Form(ChangePasswordForm {
+        Form(ResetPasswordForm {
             current_password: "wrong".into(),
-            new_password: "new-secret".into(),
+            new_password: "reset-secret".into(),
         }),
     )
     .await
@@ -364,11 +377,11 @@ async fn change_password_validates_current_and_updates_login() {
         .unwrap();
     assert!(verify_password("old-secret", &stored));
 
-    // Blank new password: form re-rendered with an error.
-    let response = change_password(
+    // Blank new password: form re-rendered with an error, hash untouched.
+    let response = reset_password(
         State(state.clone()),
         user.clone(),
-        Form(ChangePasswordForm {
+        Form(ResetPasswordForm {
             current_password: "old-secret".into(),
             new_password: "   ".into(),
         }),
@@ -381,14 +394,20 @@ async fn change_password_validates_current_and_updates_login() {
             .await
             .contains("New password is required.")
     );
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
+        .bind(&user_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert!(verify_password("old-secret", &stored));
 
     // Correct current password: hash replaced and the redirect lands on Settings.
-    let response = change_password(
+    let response = reset_password(
         State(state.clone()),
         user.clone(),
-        Form(ChangePasswordForm {
+        Form(ResetPasswordForm {
             current_password: "old-secret".into(),
-            new_password: "new-secret".into(),
+            new_password: "reset-secret".into(),
         }),
     )
     .await
@@ -403,13 +422,13 @@ async fn change_password_validates_current_and_updates_login() {
         .fetch_one(&db)
         .await
         .unwrap();
-    assert!(verify_password("new-secret", &stored));
+    assert!(verify_password("reset-secret", &stored));
     assert!(!verify_password("old-secret", &stored));
 
-    // The router now accepts the new password and rejects the old one.
+    // The router now accepts the reset password and rejects the old one.
     let response = app
         .clone()
-        .oneshot(request("/", Some(&basic_header("alice", "new-secret"))))
+        .oneshot(request("/", Some(&basic_header("alice", "reset-secret"))))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

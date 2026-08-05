@@ -1,6 +1,6 @@
 use crate::{
-    AppError, AppState, ChangePasswordForm, ChangePasswordTemplate, Result, SetupForm,
-    SetupTemplate, render, stamp, trim,
+    AppError, AppState, ResetPasswordForm, ResetPasswordTemplate, Result, SetupForm, SetupTemplate,
+    render, stamp, trim,
 };
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::PasswordHash};
 use axum::{
@@ -121,11 +121,11 @@ pub(crate) async fn setup_create(
     }
 }
 
-pub(crate) async fn password_page(
+pub(crate) async fn reset_password_page(
     State(_state): State<Arc<AppState>>,
     _user: AuthUser,
 ) -> Result<Html<String>> {
-    render(ChangePasswordTemplate {
+    render(ResetPasswordTemplate {
         error: String::new(),
     })
 }
@@ -133,10 +133,10 @@ pub(crate) async fn password_page(
 /// Verifies the current password against the stored hash, then replaces it
 /// with the new one. Failures re-render the form with an error, mirroring
 /// `setup_create`.
-pub(crate) async fn change_password(
+pub(crate) async fn reset_password(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
-    axum::Form(form): axum::Form<ChangePasswordForm>,
+    axum::Form(form): axum::Form<ResetPasswordForm>,
 ) -> Result<Response> {
     let stored_hash: Option<String> =
         sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
@@ -147,14 +147,14 @@ pub(crate) async fn change_password(
         return Err(AppError::NotFound);
     };
     if !verify_password(&form.current_password, &stored_hash) {
-        return render(ChangePasswordTemplate {
+        return render(ResetPasswordTemplate {
             error: "Current password is incorrect.".into(),
         })
         .map(IntoResponse::into_response);
     }
     let new_password = trim(&form.new_password);
     if new_password.is_empty() {
-        return render(ChangePasswordTemplate {
+        return render(ResetPasswordTemplate {
             error: "New password is required.".into(),
         })
         .map(IntoResponse::into_response);

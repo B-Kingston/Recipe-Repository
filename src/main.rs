@@ -27,11 +27,13 @@ mod ai;
 mod auth;
 mod chart;
 mod recipes;
-use auth::{AuthUser, auth_middleware, change_password, password_page, setup_create, setup_page};
+use auth::{
+    AuthUser, auth_middleware, reset_password, reset_password_page, setup_create, setup_page,
+};
 
 use ai::{
     alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
-    fetch_codex_models, generate_page, generate_recipe,
+    fresh_model_catalogue, generate_page, generate_recipe,
 };
 use recipes::{
     add_block, delete_block, delete_page, delete_recipe, home, move_block, new_recipe, recipe_page,
@@ -68,6 +70,15 @@ struct AppState {
     auth_script_path: String,
     search_grounding: bool,
     codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>,
+    model_catalogue: Arc<Mutex<Option<ModelCatalogue>>>,
+}
+
+/// Last known Codex model catalogue, refreshed in the background so page
+/// renders never wait on a pi.dev refresh.
+#[derive(Clone)]
+struct ModelCatalogue {
+    models: Vec<String>,
+    refreshed_at: std::time::Instant,
 }
 
 /// In-flight OpenAI Codex device-code authorisation, keyed by flow id.
@@ -226,8 +237,8 @@ struct SetupTemplate {
     username: String,
 }
 #[derive(Template)]
-#[template(path = "change_password.html")]
-struct ChangePasswordTemplate {
+#[template(path = "password_reset.html")]
+struct ResetPasswordTemplate {
     error: String,
 }
 #[derive(Template)]
@@ -310,7 +321,7 @@ struct SetupForm {
     password: String,
 }
 #[derive(Deserialize)]
-struct ChangePasswordForm {
+struct ResetPasswordForm {
     current_password: String,
     new_password: String,
 }
@@ -370,6 +381,7 @@ async fn main() -> anyhowless::Result<()> {
             .unwrap_or_else(|_| "pi/codex-auth.mjs".into()),
         search_grounding: env_bool("PI_SEARCH_ENABLED", true),
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(None)),
     });
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
@@ -415,7 +427,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_page).post(update_settings))
         .route(
             "/settings/password",
-            get(password_page).post(change_password),
+            get(reset_password_page).post(reset_password),
         )
         .route("/settings/authorise-codex", get(authorise_codex_start))
         .route(
@@ -642,13 +654,7 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
         }
     };
     let model = selected_model(&s.db, &s.model).await?;
-    let fresh = match fetch_codex_models(&s, &user.id).await {
-        Ok(models) => models,
-        Err(error) => {
-            warn!(%error, "Codex model list unavailable; using built-in list");
-            Vec::new()
-        }
-    };
+    let fresh = fresh_model_catalogue(&s, &user.id).await;
     render(SettingsTemplate {
         model_options: model_options(fresh, &model),
         search_enabled: s.search_grounding,
@@ -691,13 +697,7 @@ async fn update_settings(
     Form(form): Form<SettingsForm>,
 ) -> Result<Redirect> {
     let model = form.model.trim();
-    let fresh = match fetch_codex_models(&s, &user.id).await {
-        Ok(models) => models,
-        Err(error) => {
-            warn!(%error, "Codex model list unavailable; validating against built-in list");
-            Vec::new()
-        }
-    };
+    let fresh = fresh_model_catalogue(&s, &user.id).await;
     if !model_supported(model, &fresh) {
         return Err(AppError::BadRequest(
             "Choose a supported Codex model.".into(),
