@@ -69,11 +69,6 @@
       {% endfor %}
     </ul>
   </div>
-  <form class="panel add-panel compact-panel" method="post" action="/recipes/{{ recipe.id }}/blocks">
-    <input type="hidden" name="section" value="ingredient">
-    <label>New ingredient<input name="text" required placeholder="e.g. brown onion"></label>
-    <p class="actions"><button>Add ingredient</button></p>
-  </form>
 </section>
 
 <section class="recipe-section method-section">
@@ -98,12 +93,6 @@
     {% endif %}
   </div>
   {% endfor %}
-  <form class="panel add-panel compact-panel" method="post" action="/recipes/{{ recipe.id }}/blocks">
-    <input type="hidden" name="section" value="step">
-    <label>New step<textarea name="text" required placeholder="Describe the next action…"></textarea></label>
-    <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="500 ml water"></textarea></label>
-    <p class="actions"><button>Add step</button></p>
-  </form>
 </section>
 {% else %}
 <section class="chart-view" data-chart-view data-recipe-id="{{ recipe.id }}" data-step-count="{{ chart.step_count }}">

@@ -1,3 +1,38 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300..700;1,300..700&family=Cormorant:ital,wght@0,300..700;1,300..700&display=swap');
+
+@font-face {
+  font-family: 'Google Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/google-sans-latin-ext-normal.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Google Sans';
+  font-style: italic;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/google-sans-latin-ext-italic.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Google Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/google-sans-latin-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Google Sans';
+  font-style: italic;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/static/fonts/google-sans-latin-italic.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 :root {
   --ink: #101010;
   --paper: #fdfdfb;
@@ -5,7 +40,7 @@
   --mid: #6a6a66;
   --line: 2px;
   --shadow: 5px 5px 0 var(--ink);
-  --sans: Arial, Helvetica, sans-serif;
+  --sans: 'Google Sans', Arial, Helvetica, sans-serif;
   --serif: Bookerly, Caecilia, Georgia, "Times New Roman", serif;
 }
 
@@ -18,7 +53,7 @@ body {
   background-image:
     radial-gradient(circle at 1px 1px, rgba(0,0,0,.58) .8px, transparent .9px);
   background-size: 3px 3px;
-  font: 17px/1.45 var(--serif);
+  font: 17px/1.45 var(--sans);
   -webkit-font-smoothing: none;
 }
 a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 3px; }
@@ -28,7 +63,7 @@ button, input, textarea, select { color: inherit; }
   position: relative;
   z-index: 10;
   display: flex;
-  justify-content: space-between;
+  justify-content: center;
   align-items: stretch;
   min-height: 45px;
   border-top: 1px solid #aaa;
@@ -42,18 +77,18 @@ button, input, textarea, select { color: inherit; }
   min-height: 43px;
   padding: 0 18px;
 }
-.brand { gap: 9px; font-weight: 700; text-decoration: none; border-right: 1px solid var(--ink); }
+.brand { gap: 9px; font-family: 'Cormorant', Georgia, serif; font-size: 28px; font-style: italic; font-weight: 700; text-decoration: none; }
+.brand-text { padding-bottom: 2%; }
 .brand-mark { font: 24px/1 var(--serif); transform: rotate(-9deg); }
 .top-nav {
   display: flex;
-  margin-left: auto;
 }
 .top-nav a {
   border-left: 1px solid var(--ink);
   font-weight: 700;
   text-decoration: none;
 }
-.top-nav a:hover, .top-nav a:focus, .brand:hover, .brand:focus { background: var(--ink); color: var(--paper); }
+.top-nav a:hover, .top-nav a:focus { background: var(--ink); color: var(--paper); }
 .utility-actions {
   display: flex;
   align-items: center;
@@ -67,11 +102,14 @@ button, input, textarea, select { color: inherit; }
   width: 43px;
   height: 43px;
   text-decoration: none;
-  border-radius: 4px;
 }
-.utility-action svg {
+.utility-action .settings-icon {
+  display: block;
   width: 20px;
   height: 20px;
+}
+.utility-action:hover .settings-icon, .utility-action:focus .settings-icon {
+  filter: brightness(0) invert(1);
 }
 .utility-action:hover, .utility-action:focus {
   background: var(--ink);
@@ -82,6 +120,8 @@ button, input, textarea, select { color: inherit; }
   display: flex;
   align-items: center;
   min-height: 43px;
+  border-left: 1px solid var(--ink);
+  border-right: 1px solid var(--ink);
 }
 .utility-dropdown summary {
   list-style: none;
@@ -120,7 +160,7 @@ button, input, textarea, select { color: inherit; }
   background: var(--ink);
   color: var(--paper);
 }
-.app-shell { width: 100%; margin: 0; }
+.app-shell { width: min(100%, 1160px); margin: 0 auto; }
 
 .paper {
   min-height: calc(100vh - 45px);
@@ -173,7 +213,7 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 .home-prompt { text-align: center; }
 .empty-icon { display: inline-grid; place-items: center; width: 62px; height: 62px; border: var(--line) solid var(--ink); border-radius: 50%; font-size: 30px; }
 
-.page-header { display: flex; justify-content: space-between; align-items: start; gap: 22px; padding: 8px 0 18px; border-bottom: var(--line) solid var(--ink); }
+.page-header { display: flex; width: min(100%, 780px); justify-content: space-between; align-items: start; gap: 22px; margin: 8px auto 0; padding: 0 0 18px; border-bottom: var(--line) solid var(--ink); }
 .page-header-copy { max-width: 680px; }
 .breadcrumb { margin-bottom: 8px; font: 700 12px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; }
 .deck { margin-bottom: 0; color: #333; font-size: 1.05rem; font-style: italic; }
@@ -244,7 +284,7 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 .block-index { float: left; width: 2rem; font: 700 16px/1.45 var(--sans); }
 .block-text { display: block; overflow: hidden; }
 .recipe-section { width: min(100%, 780px); margin: 30px auto 0; }
-.ingredients-section { width: min(100%, 680px); }
+.ingredients-section { width: min(100%, 780px); }
 .ingredients-box {
   margin: 12px auto 0;
   padding: 15px 22px;
@@ -287,7 +327,6 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 .compact-textarea { min-height: 4.8rem; }
 .field-help { color: var(--mid); font-size: 12px; font-weight: 400; }
 .edit-form { margin-top: .8rem; padding-top: .8rem; border-top: 1px dashed var(--ink); }
-.add-panel { margin-top: 18px; background: #eee; box-shadow: none; }
 .form-panel { max-width: 720px; margin: 26px auto; padding: 24px; box-shadow: 4px 4px 0 var(--ink); }
 .form-intro { max-width: 650px; margin: 0 auto 22px; text-align: center; }
 .form-intro .eyebrow { margin-bottom: 10px; }
@@ -297,7 +336,7 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 .prompt-help li { margin: 3px 0; }
 
 label { display: block; margin: .75rem 0 .3rem; font: 700 14px/1.25 var(--sans); }
-select { width: 100%; margin-top: 6px; padding: .65rem; border: var(--line) solid var(--ink); border-radius: 0; background: var(--paper); font: 17px/1.4 var(--serif); }
+select { width: 100%; margin-top: 6px; padding: .65rem; border: var(--line) solid var(--ink); border-radius: 0; background: var(--paper); font: 17px/1.4 var(--sans); }
 input, textarea {
   width: 100%;
   margin-top: 6px;
@@ -306,7 +345,7 @@ input, textarea {
   border-radius: 0;
   outline: none;
   background: var(--paper);
-  font: 17px/1.4 var(--serif);
+  font: 17px/1.4 var(--sans);
 }
 input:focus, textarea:focus { box-shadow: 3px 3px 0 var(--ink); }
 textarea { min-height: 7rem; resize: vertical; }
@@ -318,10 +357,10 @@ input[type=checkbox] { width: auto; box-shadow: none; }
 .sources li { margin: .4rem 0; }
 .preview { white-space: pre-wrap; }
 .top-spacer { margin-top: 1.2rem; }
+.page-header + .top-spacer { width: min(100%, 780px); margin-right: auto; margin-left: auto; }
 .muted { color: var(--mid); font-size: .9rem; }
-.draft-panel h2 { margin-top: 0; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-.view-toggle { display: flex; gap: 0; margin: 18px 0 0; }
+.view-toggle { display: flex; width: min(100%, 780px); gap: 0; margin: 18px auto 0; }
 .view-toggle .button { margin-right: -2px; box-shadow: none; }
 .chart-view { width: min(100%, 1100px); margin: 30px auto 0; }
 .chart-heading { display: flex; align-items: end; justify-content: space-between; gap: 18px; padding-bottom: 10px; border-bottom: var(--line) solid var(--ink); }
@@ -333,13 +372,13 @@ input[type=checkbox] { width: auto; box-shadow: none; }
 .chart-scroll { overflow-x: auto; padding: 12px 0 16px; border-bottom: 1px solid var(--ink); }
 .chart-table { display: grid; grid-template-columns: minmax(92px, .9fr) repeat(var(--chart-steps), minmax(93px, 1fr)); grid-template-rows: repeat(var(--chart-rows), minmax(54px, auto)); width: 100%; border-top: 2px solid #398f43; border-left: 2px solid #398f43; background: var(--paper); }
 .chart-leaf, .chart-cell { display: flex; align-items: center; min-width: 0; padding: 9px 8px; overflow-wrap: anywhere; border-right: 1px solid #398f43; border-bottom: 1px solid #398f43; color: var(--ink); background: var(--paper); font: 700 15px/1.2 var(--sans); }
-.chart-leaf { justify-content: flex-end; text-align: right; font-family: var(--serif); font-weight: 400; }
+.chart-leaf { justify-content: flex-end; text-align: right; font-family: var(--sans); font-weight: 400; }
 .chart-cell { justify-content: center; text-align: center; text-decoration: none; }
 .chart-cell:hover, .chart-cell:focus, .chart-cell.is-active { color: var(--paper); background: #246e2e; outline: none; }
 .chart-leaf.is-active { background: #dcefdc; box-shadow: inset 4px 0 #246e2e; }
 .chart-cell.is-dimmed, .chart-leaf.is-dimmed { opacity: .42; }
 .chart-detail { margin-top: 18px; padding: 17px 19px; border: var(--line) solid var(--ink); background: #f1f5ee; box-shadow: 3px 3px 0 var(--ink); }
-.chart-detail h3 { margin: 0 0 10px; font: 700 1.16rem/1.35 var(--serif); }
+.chart-detail h3 { margin: 0 0 10px; font: 700 1.16rem/1.35 var(--sans); }
 .chart-additions { margin: 9px 0; }
 .chart-additions span { display: inline-block; margin: 3px 3px 3px 0; padding: 4px 7px; border: 1px solid var(--ink); background: var(--paper); font: 700 12px/1.2 var(--sans); }
 .chart-timer { display: inline-block; margin: 8px 0 0; padding: 7px 10px; border: 1px solid var(--ink); background: var(--paper); font: 700 16px/1 var(--sans); }
@@ -349,9 +388,10 @@ input[type=checkbox] { width: auto; box-shadow: none; }
 
 @media (max-width: 760px) {
   body { background-image: none; background: var(--paper); }
-  .utility-bar { align-items: stretch; }
+  .utility-bar { align-items: stretch; justify-content: space-between; }
   .brand { padding-inline: 12px; }
   .brand span:last-child { display: none; }
+  .top-nav { margin-left: auto; }
   .top-nav a { padding-inline: 10px; font-size: 14px; }
   .paper { min-height: calc(100vh - 45px); padding: 20px 14px 30px; }
   .recipe-grid, .two-col { grid-template-columns: 1fr; }
@@ -372,7 +412,7 @@ input[type=checkbox] { width: auto; box-shadow: none; }
 
 @media print {
   body { background: white; }
-  .utility-bar, .page-actions, .add-panel, .view-toggle, .chart-view { display: none; }
+  .utility-bar, .page-actions, .view-toggle, .chart-view { display: none; }
   .print-standard { display: block; }
   .app-shell { width: 100%; margin: 0; }
   .paper { border: 0; box-shadow: none; }
