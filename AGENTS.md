@@ -2,13 +2,16 @@
 
 ## Project Overview
 
-Kindle Recipes is a deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page server-side, SQLite holds all data, and an OpenAI Codex (Pi) Node worker generates recipe drafts through the user's ChatGPT subscription. There is deliberately **no login** — deploy only on a trusted LAN or behind access control.
+Kindle Recipes is a deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page server-side, SQLite holds all data, and an OpenAI Codex (Pi) Node worker generates recipe drafts through the user's ChatGPT subscription.
+
+Access control is a single-user HTTP Basic auth account: the first visit redirects to `/setup` to create the username and password (stored as an Argon2 hash in SQLite), and every library route then requires those credentials. The signed-in user can change their password at `/settings/password` (current password required; the stored hash is replaced immediately, so the next request must use the new password). There is no user management beyond that — deploy only on a trusted LAN or behind access control.
 
 ## Architecture & Data Flow
 
 Single-process Axum 0.8 app (crate `kindle-recipes`, edition 2024, binary-only — no `lib.rs`):
 
 - `src/main.rs` — the hub: `#[tokio::main]` bootstrap, env config, `routes()` router, `AppState`, `AppError`, shared serde types, Askama template structs, form/validation helpers, Codex device-code auth handlers, `run_node_script`.
+- `src/auth.rs` — user accounts and HTTP Basic auth: `auth_middleware` (protects every route in the `protected` router), `AuthUser` extractor, `hash_password` / `verify_password` (Argon2), `setup_page` / `setup_create`, `password_page` / `change_password`.
 - `src/ai.rs` — Pi/Codex generation pipeline: draft create/alter/apply/cancel handlers, `pi_recipe`, `run_pi_worker(_with_credential)`, model catalogue, `recipe_schema` / `validate_generated` / `normalize_generated` / `dedupe_sources`.
 - `src/recipes.rs` — recipe CRUD handlers **and all SQL accessor helpers** (`find_recipe`, `blocks`, `step_ingredients`, `sources`, `find_draft`, `recipe_snapshot`, …).
 - `src/chart.rs` — pure cooking-flow chart builder (`build_chart`, `selected_chart_step`), no I/O.
@@ -17,6 +20,8 @@ Single-process Axum 0.8 app (crate `kindle-recipes`, edition 2024, binary-only �
 
 Data flow: HTTP request → handler (extractors `State<Arc<AppState>>`, `Path`, `Form`, `Query`) → sqlx helpers or the AI pipeline → Askama template struct → HTML. Every page is a server-rendered template in `templates/`; forms post `application/x-www-form-urlencoded` via axum `Form`.
 
+Auth flow (load-bearing): every library route sits behind `auth_middleware` (`from_fn_with_state` on the `protected` router; `/setup` and `/healthz` are outside it). No `users` row → redirect to `/setup`; missing/invalid `Authorization: Basic` → 401 with `WWW-Authenticate` challenge; valid credentials → the user id is inserted into request extensions as `AuthUser`, which handlers take as an extractor. Passwords are verified against `users.password_hash` with Argon2. `POST /settings/password` re-verifies the current password before replacing the hash; per-request verification means the new password takes effect immediately. The `users` table is the single source of truth — never a config file.
+
 AI flow (load-bearing): `POST /ai/generate` → `create_draft` → `spawn_blocking` runs `node pi/recipe-worker.mjs` (one JSON request on stdin, one JSON line on stdout) with a **per-request `0o600` temp `auth.json`** materialized from the DB credential; the worker's token refresh is read back and persisted via `store_codex_credential`; result lands in `ai_drafts` with `expires_at = now + 24h`; the preview page shows it and `apply_draft` persists in one transaction under a `base_updated_at` staleness guard (rejects if the recipe changed meanwhile).
 
 Key invariants:
@@ -24,12 +29,13 @@ Key invariants:
 - AI output must pass `validate_generated` (every ingredient used exactly once, `inputSteps` only reference earlier steps, …) before any draft is saved.
 - `recipes.chart_json` is AI-derived only; any manual block edit MUST call `invalidate_chart` so the viewer falls back to linear inference.
 - The Codex credential is DB-only; Pi SDK invocations MUST use `run_pi_worker_with_credential`, never a fixed-path credential file.
+- Passwords are stored only as Argon2 hashes (`users.password_hash`); `change_password` MUST verify the current password first and never log or return password material.
 
 ## Key Directories
 
 | Path | Purpose |
 |---|---|
-| `src/` | Rust binary crate: `main.rs` (bootstrap/router/shared types), `ai.rs`, `recipes.rs`, `chart.rs` |
+| `src/` | Rust binary crate: `main.rs` (bootstrap/router/shared types), `auth.rs` (setup + basic auth + password change), `ai.rs`, `recipes.rs`, `chart.rs` |
 | `src/tests/` | Rust unit-test tree (wired via `#[cfg(test)] mod tests;` in `main.rs`) |
 | `pi/` | Node ESM sidecar: `recipe-worker.mjs` (entry), `codex-auth.mjs` (device-flow CLI), `codex-native-search.mjs` (pure lib) + `*.test.mjs` |
 | `templates/` | Askama HTML templates, `base.html` parent + `{% block %}` children |
@@ -44,6 +50,7 @@ cargo test                        # Rust unit tests
 cargo fmt --check && cargo clippy -- -D warnings
 npm test                          # Node worker tests: node --test pi/*.test.mjs
 docker compose up --build         # full stack, port 3000, sqlite in recipe-data volume
+./deploy-local.sh                 # local Docker deploy: build, start detached, wait for /healthz (-f for foreground)
 ./deploy.sh [ssh-target]          # ssh → git pull --ff-only && docker compose up --build -d (default bailee@192.168.8.223)
 ```
 
@@ -64,11 +71,12 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 
 ## Important Files
 
-- `src/main.rs` — entry point; `routes()` (router table at `main.rs:419`), `AppState`, `AppError`, `anyhowless` module (startup error alias deliberately avoiding an anyhow dep).
+- `src/main.rs` — entry point; `routes()` (router table at `main.rs:396`), `AppState`, `AppError`, `anyhowless` module (startup error alias deliberately avoiding an anyhow dep).
+- `src/auth.rs` — setup page, HTTP Basic auth middleware, Argon2 hashing, password change handlers.
 - `Cargo.toml` / `Dockerfile` / `compose.yaml` / `deploy.sh` / `.env.example` — build, deploy, env contract.
 - `pi/recipe-worker.mjs` — the worker protocol contract: stdin JSON `{prompt, systemPrompt, model, searchEnabled, authPath}` or `{command: "listModels"}`; stdout `{recipe, sources}` or `{error, code}` (`code: "configuration"` → `AiNotConfigured`).
-- `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`.
-- `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view.
+- `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`, and `0006_users.sql` adds the `users` table for basic auth.
+- `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view. `templates/setup.html` and `templates/change_password.html` are the auth screens.
 
 ## Runtime/Tooling Preferences
 
@@ -80,7 +88,7 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 
 ## Testing & QA
 
-- **Rust** (`cargo test`): unit tests in `src/tests/` (`ai.rs`, `auth.rs`, `chart.rs`, `config.rs`, `recipes.rs`) plus inline `mod model_tests` in `main.rs`. Use `#[tokio::test]`; handler tests in `src/tests/recipes.rs` drive axum `State`/`Path` directly against in-memory SQLite with `sqlx::migrate!()` — reuse its `database()` / `state()` helpers. Env-var tests MUST take the static `ENV_LOCK: Mutex<()>` in `src/tests/config.rs` (and note `unsafe std::env::set_var` in edition 2024).
+- **Rust** (`cargo test`): unit tests in `src/tests/` (`ai.rs`, `auth.rs`, `chart.rs`, `config.rs`, `recipes.rs`) plus inline `mod model_tests` in `main.rs`. Use `#[tokio::test]`; handler tests in `src/tests/recipes.rs` drive axum `State`/`Path` directly against in-memory SQLite with `sqlx::migrate!()` — reuse its `database()` / `state()` helpers. `src/tests/auth.rs` covers setup, basic-auth middleware (challenge, per-user scoping), legacy Codex credential import, and the password-change flow (wrong current password, hash replacement, router accepting the new password). Env-var tests MUST take the static `ENV_LOCK: Mutex<()>` in `src/tests/config.rs` (and note `unsafe std::env::set_var` in edition 2024).
 - **Node** (`npm test`): built-in `node:test` across `pi/*.test.mjs`. Mocking is HTTP-level: swap `globalThis.fetch` (codex-auth), inject a `fetchImpl` parameter (codex-native-search), or test pure functions (recipe-worker). No test framework deps, no coverage thresholds.
 - Touch the worker protocol → run the `pi/*.test.mjs` suites; touch validation/schema → run `cargo test`.
 - Intended full validation: `docker compose up --build`, then visit `/healthz`, create a recipe, edit and reorder blocks, and test one AI preview with a real API key.

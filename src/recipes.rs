@@ -1,8 +1,8 @@
 use crate::chart::build_chart;
 use crate::{
-    AiFormTemplate, AppError, AppState, Block, BlockForm, DeleteTemplate, Draft, HomeTemplate,
-    Recipe, RecipeForm, RecipeQuery, RecipeTemplate, Result, Source, ViewBlock, ViewStep,
-    generate_guidance, number, option_number, render, required, stamp, trim,
+    AiFormTemplate, AppError, AppState, AuthUser, Block, BlockForm, DeleteTemplate, Draft,
+    HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeTemplate, Result, Source, ViewBlock,
+    ViewStep, generate_guidance, number, option_number, render, required, stamp, trim,
 };
 use axum::{
     Form,
@@ -15,9 +15,13 @@ use sqlx::SqlitePool;
 use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
-pub(crate) async fn home(State(state): State<Arc<AppState>>) -> Result<Html<String>> {
+pub(crate) async fn home(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Html<String>> {
     render(HomeTemplate {
-        recipes: sqlx::query_as("SELECT * FROM recipes ORDER BY updated_at DESC")
+        recipes: sqlx::query_as("SELECT * FROM recipes WHERE user_id=? ORDER BY updated_at DESC")
+            .bind(&user.id)
             .fetch_all(&state.db)
             .await?,
     })
@@ -38,11 +42,12 @@ pub(crate) async fn new_recipe(State(state): State<Arc<AppState>>) -> Result<Htm
 
 pub(crate) async fn recipe_page(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
     Query(query): Query<RecipeQuery>,
 ) -> Result<Html<String>> {
-    let recipe = find_recipe(&state.db, &id).await?;
-    let blocks = blocks(&state.db, &id).await?;
+    let recipe = find_recipe(&state.db, &user.id, &id).await?;
+    let blocks = blocks(&state.db, &user.id, &id).await?;
     let edit = query.edit.as_deref();
     let ingredient_blocks: Vec<Block> = blocks
         .iter()
@@ -79,7 +84,7 @@ pub(crate) async fn recipe_page(
         recipe,
         ingredients,
         steps,
-        sources: sources(&state.db, &id).await?,
+        sources: sources(&state.db, &user.id, &id).await?,
         chart,
         chart_view,
         edit_meta: query.edit_meta.is_some(),
@@ -88,17 +93,19 @@ pub(crate) async fn recipe_page(
 
 pub(crate) async fn update_recipe(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
     Form(form): Form<RecipeForm>,
 ) -> Result<Response> {
-    find_recipe(&state.db, &id).await?;
-    sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE id=?")
+    find_recipe(&state.db, &user.id, &id).await?;
+    sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE user_id=? AND id=?")
         .bind(required(&form.title, "Recipe title")?)
         .bind(trim(&form.description))
         .bind(number(&form.servings)?)
         .bind(number(&form.prep_minutes)?)
         .bind(number(&form.cook_minutes)?)
         .bind(stamp())
+        .bind(&user.id)
         .bind(&id)
         .execute(&state.db)
         .await?;
@@ -107,18 +114,21 @@ pub(crate) async fn update_recipe(
 
 pub(crate) async fn delete_page(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Html<String>> {
     render(DeleteTemplate {
-        recipe: find_recipe(&state.db, &id).await?,
+        recipe: find_recipe(&state.db, &user.id, &id).await?,
     })
 }
 
 pub(crate) async fn delete_recipe(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    let result = sqlx::query("DELETE FROM recipes WHERE id=?")
+    let result = sqlx::query("DELETE FROM recipes WHERE user_id=? AND id=?")
+        .bind(&user.id)
         .bind(id)
         .execute(&state.db)
         .await?;
@@ -130,10 +140,11 @@ pub(crate) async fn delete_recipe(
 
 pub(crate) async fn add_block(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
     Form(form): Form<BlockForm>,
 ) -> Result<Response> {
-    find_recipe(&state.db, &id).await?;
+    find_recipe(&state.db, &user.id, &id).await?;
     let section = form
         .section
         .as_deref()
@@ -177,10 +188,11 @@ pub(crate) async fn add_block(
 
 pub(crate) async fn update_block(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path((id, block_id)): Path<(String, String)>,
     Form(form): Form<BlockForm>,
 ) -> Result<Response> {
-    let block = find_block(&state.db, &id, &block_id).await?;
+    let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let text = required(&form.text, "Block text")?;
     let mut tx = state.db.begin().await?;
     sqlx::query(
@@ -217,9 +229,10 @@ pub(crate) async fn update_block(
 
 pub(crate) async fn move_block(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path((id, block_id, direction)): Path<(String, String, String)>,
 ) -> Result<Response> {
-    let block = find_block(&state.db, &id, &block_id).await?;
+    let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let delta = match direction.as_str() {
         "up" => -1,
         "down" => 1,
@@ -261,9 +274,10 @@ pub(crate) async fn move_block(
 
 pub(crate) async fn delete_block(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Path((id, block_id)): Path<(String, String)>,
 ) -> Result<Response> {
-    let block = find_block(&state.db, &id, &block_id).await?;
+    let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let mut tx = state.db.begin().await?;
     sqlx::query("DELETE FROM recipe_blocks WHERE id=?")
         .bind(&block_id)
@@ -280,30 +294,40 @@ pub(crate) async fn delete_block(
     Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
 }
 
-pub(crate) async fn find_recipe(db: &SqlitePool, id: &str) -> Result<Recipe> {
-    sqlx::query_as("SELECT * FROM recipes WHERE id=?")
+pub(crate) async fn find_recipe(db: &SqlitePool, user_id: &str, id: &str) -> Result<Recipe> {
+    sqlx::query_as("SELECT * FROM recipes WHERE user_id=? AND id=?")
+        .bind(user_id)
         .bind(id)
         .fetch_optional(db)
         .await?
         .ok_or(AppError::NotFound)
 }
 
-async fn find_block(db: &SqlitePool, recipe_id: &str, id: &str) -> Result<Block> {
-    sqlx::query_as("SELECT * FROM recipe_blocks WHERE id=? AND recipe_id=?")
-        .bind(id)
-        .bind(recipe_id)
-        .fetch_optional(db)
-        .await?
-        .ok_or(AppError::NotFound)
-}
-
-async fn blocks(db: &SqlitePool, id: &str) -> Result<Vec<Block>> {
-    Ok(
-        sqlx::query_as("SELECT * FROM recipe_blocks WHERE recipe_id=? ORDER BY section,position")
-            .bind(id)
-            .fetch_all(db)
-            .await?,
+async fn find_block(db: &SqlitePool, user_id: &str, recipe_id: &str, id: &str) -> Result<Block> {
+    sqlx::query_as(
+        "SELECT b.* FROM recipe_blocks b
+         JOIN recipes r ON r.id=b.recipe_id
+         WHERE b.id=? AND b.recipe_id=? AND r.user_id=?",
     )
+    .bind(id)
+    .bind(recipe_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)
+}
+
+async fn blocks(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Block>> {
+    Ok(sqlx::query_as(
+        "SELECT b.* FROM recipe_blocks b
+             JOIN recipes r ON r.id=b.recipe_id
+             WHERE b.recipe_id=? AND r.user_id=?
+             ORDER BY b.section,b.position",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?)
 }
 
 async fn step_ingredients(db: &SqlitePool, step_id: &str) -> Result<Vec<String>> {
@@ -353,21 +377,36 @@ async fn invalidate_chart(
     Ok(())
 }
 
-async fn sources(db: &SqlitePool, id: &str) -> Result<Vec<Source>> {
-    Ok(sqlx::query_as("SELECT id,recipe_id,position,title,url FROM recipe_sources WHERE recipe_id=? ORDER BY position").bind(id).fetch_all(db).await?)
+async fn sources(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Source>> {
+    Ok(sqlx::query_as(
+        "SELECT s.id,s.recipe_id,s.position,s.title,s.url
+         FROM recipe_sources s
+         JOIN recipes r ON r.id=s.recipe_id
+         WHERE s.recipe_id=? AND r.user_id=?
+         ORDER BY s.position",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?)
 }
 
-pub(crate) async fn find_draft(db: &SqlitePool, id: &str) -> Result<Draft> {
-    sqlx::query_as("SELECT * FROM ai_drafts WHERE id=? AND expires_at >= ?")
+pub(crate) async fn find_draft(db: &SqlitePool, user_id: &str, id: &str) -> Result<Draft> {
+    sqlx::query_as("SELECT * FROM ai_drafts WHERE id=? AND user_id=? AND expires_at >= ?")
         .bind(id)
+        .bind(user_id)
         .bind(Utc::now().to_rfc3339())
         .fetch_optional(db)
         .await?
         .ok_or(AppError::NotFound)
 }
 
-pub(crate) async fn recipe_snapshot(db: &SqlitePool, recipe: &Recipe) -> Result<Value> {
-    let blocks = blocks(db, &recipe.id).await?;
+pub(crate) async fn recipe_snapshot(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe: &Recipe,
+) -> Result<Value> {
+    let blocks = blocks(db, user_id, &recipe.id).await?;
     let mut steps = Vec::new();
     for step in blocks.iter().filter(|block| block.section == "step") {
         steps.push(json!({"text":step.text,"ingredients":step_ingredients(db,&step.id).await?}));
@@ -395,8 +434,7 @@ pub(crate) fn infer_step_ingredients(step: &str, ingredients: &[Block]) -> Vec<S
                 .text
                 .to_lowercase()
                 .split(|character: char| !character.is_alphanumeric())
-                .filter(|word| word.len() > 2)
-                .next_back()
+                .rfind(|word| word.len() > 2)
                 .unwrap_or_default()
                 .to_string();
             lower.contains(&ingredient.quantity.to_lowercase())

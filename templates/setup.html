@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f5f2">
+  <title>Set up · Recipe Repository</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="app-shell">
+    <div class="paper">
+      <div class="form-intro">
+        <p class="eyebrow">First access</p>
+        <h1>Set up Recipe Repository</h1>
+        <p class="deck">Choose a username and any password. This account will protect the recipe library.</p>
+      </div>
+      <div class="compact-panel">
+        <form method="post" action="/setup">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" required>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" required>
+          {% if !error.is_empty() %}<p class="muted">{{ error }}</p>{% endif %}
+          <p class="actions"><button class="button" type="submit">Create account</button></p>
+        </form>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

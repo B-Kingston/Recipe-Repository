@@ -1,6 +1,6 @@
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
-    AppError, AppState, ChartRecipe, DRAFT_HOURS, DraftTemplate, GROUNDED_RECIPE_PROMPT,
+    AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DraftTemplate, GROUNDED_RECIPE_PROMPT,
     GeneratedRecipe, Ingredient, IngredientUse, PromptForm, RECIPE_PROMPT, Result, Source,
     generate_guidance, render, required, stamp,
 };
@@ -27,10 +27,11 @@ pub(crate) async fn generate_page() -> Redirect {
 
 pub(crate) async fn generate_recipe(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
-    match create_draft(&s, None, "generate", &prompt).await {
+    match create_draft(&s, &user, None, "generate", &prompt).await {
         Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "New Recipe".into(),
@@ -48,9 +49,10 @@ pub(crate) async fn generate_recipe(
 
 pub(crate) async fn alter_page(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Html<String>> {
-    let recipe = find_recipe(&s.db, &id).await?;
+    let recipe = find_recipe(&s.db, &user.id, &id).await?;
     render(crate::AiFormTemplate {
         heading: "Alter with AI".into(),
         guidance: format!(
@@ -68,18 +70,27 @@ pub(crate) async fn alter_page(
 
 pub(crate) async fn alter_recipe(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
-    let recipe = find_recipe(&s.db, &id).await?;
+    let recipe = find_recipe(&s.db, &user.id, &id).await?;
     let prompt = required(&f.prompt, "Comments")?;
-    let snapshot = recipe_snapshot(&s.db, &recipe).await?;
+    let snapshot = recipe_snapshot(&s.db, &user.id, &recipe).await?;
     let full = format!(
         "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
         prompt,
         serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?
     );
-    match create_draft(&s, Some((&recipe.id, &recipe.updated_at)), "alter", &full).await {
+    match create_draft(
+        &s,
+        &user,
+        Some((&recipe.id, &recipe.updated_at)),
+        "alter",
+        &full,
+    )
+    .await
+    {
         Ok(draft) => Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "Alter with AI".into(),
@@ -97,9 +108,10 @@ pub(crate) async fn alter_recipe(
 
 pub(crate) async fn draft_page(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    render_draft_page(&s, &id, "", "").await
+    render_draft_page(&s, &user, &id, "", "").await
 }
 
 /// Alters the recipe held in a draft, opening the result as a new draft.
@@ -108,32 +120,36 @@ pub(crate) async fn draft_page(
 /// staleness check against the version this chain was based on.
 pub(crate) async fn alter_draft(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
-    let draft = find_draft(&s.db, &id).await?;
+    let draft = find_draft(&s.db, &user.id, &id).await?;
     let prompt = required(&f.prompt, "Comments")?;
     let full = format!(
         "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
         prompt, draft.recipe_json
     );
-    let base = draft
-        .recipe_id
-        .as_deref()
-        .map(|recipe_id| (recipe_id, draft.base_updated_at.as_deref().unwrap_or_default()));
-    match create_draft(&s, base, "alter", &full).await {
+    let base = draft.recipe_id.as_deref().map(|recipe_id| {
+        (
+            recipe_id,
+            draft.base_updated_at.as_deref().unwrap_or_default(),
+        )
+    });
+    match create_draft(&s, &user, base, "alter", &full).await {
         Ok(new_id) => Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response()),
-        Err(e) => render_draft_page(&s, &id, &e.to_string(), &prompt).await,
+        Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
     }
 }
 
 async fn render_draft_page(
     state: &AppState,
+    user: &AuthUser,
     id: &str,
     error: &str,
     prompt: &str,
 ) -> Result<Response> {
-    let draft = find_draft(&state.db, id).await?;
+    let draft = find_draft(&state.db, &user.id, id).await?;
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
@@ -150,9 +166,10 @@ async fn render_draft_page(
 
 pub(crate) async fn apply_draft(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    let draft = find_draft(&s.db, &id).await?;
+    let draft = find_draft(&s.db, &user.id, &id).await?;
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
@@ -164,13 +181,13 @@ pub(crate) async fn apply_draft(
     let now = stamp();
     let recipe_id = if let Some(existing) = draft.recipe_id {
         if draft.base_updated_at.as_deref()
-            != Some(&find_recipe(&s.db, &existing).await?.updated_at)
+            != Some(&find_recipe(&s.db, &user.id, &existing).await?.updated_at)
         {
             return Err(AppError::BadRequest(
                 "This recipe changed after the draft was made. Generate a new alteration.".into(),
             ));
         }
-        sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE id=?")
+        sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
             .bind(&recipe.title)
             .bind(&recipe.description)
             .bind(recipe.servings)
@@ -178,6 +195,7 @@ pub(crate) async fn apply_draft(
             .bind(recipe.cook_minutes)
             .bind(&chart_json)
             .bind(&now)
+            .bind(&user.id)
             .bind(&existing)
             .execute(&mut *tx)
             .await?;
@@ -192,7 +210,7 @@ pub(crate) async fn apply_draft(
         existing
     } else {
         let recipe_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO recipes(id,title,description,servings,prep_minutes,cook_minutes,chart_json,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO recipes(id,title,description,servings,prep_minutes,cook_minutes,chart_json,user_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(&recipe_id)
             .bind(&recipe.title)
             .bind(&recipe.description)
@@ -200,6 +218,7 @@ pub(crate) async fn apply_draft(
             .bind(recipe.prep_minutes)
             .bind(recipe.cook_minutes)
             .bind(&chart_json)
+            .bind(&user.id)
             .bind(&now)
             .bind(&now)
             .execute(&mut *tx)
@@ -253,8 +272,9 @@ pub(crate) async fn apply_draft(
             .execute(&mut *tx)
             .await?;
     }
-    sqlx::query("DELETE FROM ai_drafts WHERE id=?")
+    sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(&id)
+        .bind(&user.id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -263,10 +283,12 @@ pub(crate) async fn apply_draft(
 
 pub(crate) async fn cancel_draft(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    sqlx::query("DELETE FROM ai_drafts WHERE id=?")
+    sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(id)
+        .bind(&user.id)
         .execute(&s.db)
         .await?;
     Ok(Redirect::to("/").into_response())
@@ -274,18 +296,19 @@ pub(crate) async fn cancel_draft(
 
 async fn create_draft(
     state: &AppState,
+    user: &AuthUser,
     base: Option<(&str, &str)>,
     operation: &str,
     prompt: &str,
 ) -> Result<String> {
-    let (generated_recipe, sources, suggestions) = pi_recipe(state, prompt).await?;
+    let (generated_recipe, sources, suggestions) = pi_recipe(state, user, prompt).await?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
         .bind(now.to_rfc3339())
         .execute(&state.db)
         .await?;
-    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(base.map(|(recipe_id, _)| recipe_id))
         .bind(operation)
@@ -293,6 +316,7 @@ async fn create_draft(
         .bind(serde_json::to_string(&sources).map_err(|_| AppError::Ai)?)
         .bind(suggestions)
         .bind(base.map(|(_, base_updated_at)| base_updated_at))
+        .bind(&user.id)
         .bind(now.to_rfc3339())
         .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
         .execute(&state.db)
@@ -302,9 +326,10 @@ async fn create_draft(
 
 async fn pi_recipe(
     state: &AppState,
+    user: &AuthUser,
     prompt: &str,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
-    let mut credential = crate::codex_credential(&state.db)
+    let mut credential = crate::codex_credential(&state.db, &user.id)
         .await?
         .ok_or(AppError::AiNotConfigured)?;
     let model = crate::selected_model(&state.db, &state.model).await?;
@@ -337,11 +362,11 @@ async fn pi_recipe(
         });
         let (output, refreshed) =
             run_pi_worker_with_credential(state, &credential, &request).await?;
-        if let Some(refreshed) = refreshed {
-            if refreshed != credential {
-                credential = refreshed.clone();
-                crate::store_codex_credential(&state.db, &refreshed).await?;
-            }
+        if let Some(refreshed) = refreshed
+            && refreshed != credential
+        {
+            credential = refreshed.clone();
+            crate::store_codex_credential(&state.db, &user.id, &refreshed).await?;
         }
         let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
         if !output.status.success() {
@@ -432,19 +457,19 @@ async fn run_pi_worker_with_credential(
 /// returns the current model ids (newest first). Returns an empty list when
 /// there is no Codex credential or the refresh fails; the Settings page then
 /// falls back to the built-in model list.
-pub(crate) async fn fetch_codex_models(state: &AppState) -> Result<Vec<String>> {
-    let mut credential = match crate::codex_credential(&state.db).await? {
+pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Result<Vec<String>> {
+    let mut credential = match crate::codex_credential(&state.db, user_id).await? {
         Some(credential) => credential,
         None => return Ok(Vec::new()),
     };
     let (output, refreshed) =
         run_pi_worker_with_credential(state, &credential, &json!({ "command": "listModels" }))
             .await?;
-    if let Some(refreshed) = refreshed {
-        if refreshed != credential {
-            credential = refreshed;
-            crate::store_codex_credential(&state.db, &credential).await?;
-        }
+    if let Some(refreshed) = refreshed
+        && refreshed != credential
+    {
+        credential = refreshed;
+        crate::store_codex_credential(&state.db, user_id, &credential).await?;
     }
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
     if !output.status.success() {
@@ -471,8 +496,8 @@ pub(crate) fn parse_pi_response(
             warn!(error = %parse_error, "AI response recipe failed schema deserialisation");
             AppError::Ai
         })?;
-    let sources: Vec<Source> = serde_json::from_value(value["sources"].clone())
-        .map_err(|parse_error| {
+    let sources: Vec<Source> =
+        serde_json::from_value(value["sources"].clone()).map_err(|parse_error| {
             warn!(error = %parse_error, "AI response sources failed deserialisation");
             AppError::Ai
         })?;
@@ -610,14 +635,22 @@ pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
                 || use_.amount.trim().is_empty()
                 || !local_ingredients.insert(use_.ingredient)
             {
-                warn!(step = index, ingredient = use_.ingredient, "AI recipe step ingredient use is invalid");
+                warn!(
+                    step = index,
+                    ingredient = use_.ingredient,
+                    "AI recipe step ingredient use is invalid"
+                );
                 return Err(AppError::Ai);
             }
             used_ingredients.insert(use_.ingredient);
         }
         for &input in &step.input_steps {
             if input >= index || !local_inputs.insert(input) {
-                warn!(step = index, input = input, "AI recipe step input reference is invalid");
+                warn!(
+                    step = index,
+                    input = input,
+                    "AI recipe step input reference is invalid"
+                );
                 return Err(AppError::Ai);
             }
             consumers[input] += 1;

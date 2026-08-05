@@ -1,14 +1,13 @@
+use crate::auth::AuthUser;
 use crate::recipes::{delete_block, infer_step_ingredients, move_block};
 use crate::{AppState, Block, stamp};
 use axum::extract::{Path, State};
+use parking_lot::Mutex;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 fn ingredient(text: &str, quantity: &str, unit: &str) -> Block {
     Block {
@@ -48,12 +47,14 @@ async fn database() -> SqlitePool {
         .unwrap();
     sqlx::migrate!().run(&db).await.unwrap();
     let now = stamp();
-    sqlx::query("INSERT INTO recipes(id,title,created_at,updated_at) VALUES('r','Test',?,?)")
-        .bind(&now)
-        .bind(&now)
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO recipes(id,title,user_id,created_at,updated_at) VALUES('r','Test','u1',?,?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
     db
 }
 
@@ -74,6 +75,7 @@ async fn moving_a_block_swaps_positions_without_changing_ids() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('first','r','step',0,'First'),('second','r','step',1,'Second')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
+        AuthUser { id: "u1".into() },
         Path(("r".into(), "first".into(), "down".into())),
     )
     .await
@@ -90,9 +92,13 @@ async fn moving_a_block_swaps_positions_without_changing_ids() {
 async fn deleting_a_block_compacts_the_remaining_positions() {
     let db = database().await;
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('a','r','ingredient',0,'A'),('b','r','ingredient',1,'B'),('c','r','ingredient',2,'C')").execute(&db).await.unwrap();
-    delete_block(State(state(db.clone())), Path(("r".into(), "b".into())))
-        .await
-        .unwrap();
+    delete_block(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path(("r".into(), "b".into())),
+    )
+    .await
+    .unwrap();
     let ordered: Vec<(String, i64)> =
         sqlx::query_as("SELECT id,position FROM recipe_blocks ORDER BY position")
             .fetch_all(&db)

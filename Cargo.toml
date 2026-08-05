@@ -7,6 +7,10 @@ edition = "2024"
 askama = "0.14"
 axum = { version = "0.8", features = ["form", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
+argon2 = "0.5"
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
+parking_lot = "0.12"
 dotenvy = "0.15"
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

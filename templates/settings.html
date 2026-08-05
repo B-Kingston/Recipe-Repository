@@ -22,6 +22,11 @@
     <p class="muted">{% if search_enabled %}Enabled{% else %}Disabled{% endif %}</p>
   </div>
   <div class="block">
+    <h2>Password</h2>
+    <p class="muted">Keep the library protected with a password only you know.</p>
+    <a class="button" href="/settings/password">Change password</a>
+  </div>
+  <div class="block">
     <h2>Authorise Codex</h2>
     <p class="muted" style="margin-bottom: 10px;">Connect your OpenAI Codex account to enable AI recipe generation.</p>
     {% if codex_authorised %}

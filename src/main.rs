@@ -2,10 +2,12 @@ use askama::Template;
 use axum::{
     Router,
     extract::{Form, Path, State},
+    middleware,
     response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
 };
 use chrono::Utc;
+use parking_lot::Mutex;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,13 +16,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
-    env,
-    io::Write,
-    net::SocketAddr,
-    process::Stdio,
-    str::FromStr,
-    sync::{Arc, Mutex},
+    collections::HashMap, env, io::Write, net::SocketAddr, process::Stdio, str::FromStr, sync::Arc,
 };
 use thiserror::Error;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -28,8 +24,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod ai;
+mod auth;
 mod chart;
 mod recipes;
+use auth::{AuthUser, auth_middleware, change_password, password_page, setup_create, setup_page};
 
 use ai::{
     alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
@@ -75,6 +73,7 @@ struct AppState {
 /// In-flight OpenAI Codex device-code authorisation, keyed by flow id.
 #[derive(Clone)]
 struct CodexFlow {
+    user_id: String,
     device_auth_id: String,
     user_code: String,
     expires_at: i64,
@@ -86,6 +85,8 @@ enum AppError {
     NotFound,
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Internal(String),
     #[error("The AI service is not configured. Authorise Codex from the Settings page.")]
     AiNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
@@ -219,6 +220,17 @@ struct HomeTemplate {
     recipes: Vec<Recipe>,
 }
 #[derive(Template)]
+#[template(path = "setup.html")]
+struct SetupTemplate {
+    error: String,
+    username: String,
+}
+#[derive(Template)]
+#[template(path = "change_password.html")]
+struct ChangePasswordTemplate {
+    error: String,
+}
+#[derive(Template)]
 #[template(path = "recipe.html")]
 struct RecipeTemplate {
     recipe: Recipe,
@@ -291,6 +303,16 @@ struct RecipeForm {
     servings: String,
     prep_minutes: String,
     cook_minutes: String,
+}
+#[derive(Deserialize)]
+struct SetupForm {
+    username: String,
+    password: String,
+}
+#[derive(Deserialize)]
+struct ChangePasswordForm {
+    current_password: String,
+    new_password: String,
 }
 #[derive(Deserialize)]
 struct BlockForm {
@@ -372,9 +394,8 @@ async fn healthcheck() -> anyhowless::Result<()> {
     }
 }
 fn routes(state: Arc<AppState>) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/", get(home))
-        .route("/healthz", get(|| async { "ok" }))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
         .route("/recipes/{id}/delete", get(delete_page).post(delete_recipe))
@@ -392,12 +413,24 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
         .route("/settings", get(settings_page).post(update_settings))
+        .route(
+            "/settings/password",
+            get(password_page).post(change_password),
+        )
         .route("/settings/authorise-codex", get(authorise_codex_start))
         .route(
             "/settings/authorise-codex/status/{flow_id}",
             get(authorise_codex_status),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/setup", get(setup_page).post(setup_create))
         .nest_service("/static", ServeDir::new("static"))
+        .merge(protected)
         .with_state(state)
 }
 
@@ -542,26 +575,31 @@ const CODEX_PROVIDER: &str = "openai-codex";
 
 /// The stored Codex OAuth credential, if any. The database is the source of
 /// truth; the Pi worker only ever sees a per-request materialised auth.json.
-pub(crate) async fn codex_credential(db: &SqlitePool) -> Result<Option<Value>> {
+pub(crate) async fn codex_credential(db: &SqlitePool, user_id: &str) -> Result<Option<Value>> {
     let row: Option<(String,)> =
-        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE provider = ?")
+        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
+            .bind(user_id)
             .bind(CODEX_PROVIDER)
             .fetch_optional(db)
             .await?;
     Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
 }
-
-/// Persists (or replaces) the Codex OAuth credential.
-pub(crate) async fn store_codex_credential(db: &SqlitePool, credential: &Value) -> Result<()> {
+/// Persists (or replaces) the Codex OAuth credential for one user.
+pub(crate) async fn store_codex_credential(
+    db: &SqlitePool,
+    user_id: &str,
+    credential: &Value,
+) -> Result<()> {
     let json = serde_json::to_string(credential)
         .map_err(|_| AppError::CodexAuth("credential could not be serialised".into()))?;
     sqlx::query(
-        "INSERT INTO pi_credentials (provider, credential_json, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(provider) DO UPDATE SET
+        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id,provider) DO UPDATE SET
            credential_json = excluded.credential_json,
            updated_at = excluded.updated_at",
     )
+    .bind(user_id)
     .bind(CODEX_PROVIDER)
     .bind(json)
     .bind(stamp())
@@ -569,12 +607,11 @@ pub(crate) async fn store_codex_credential(db: &SqlitePool, credential: &Value) 
     .await?;
     Ok(())
 }
-
 /// One-time migration of a credential previously written by the Pi CLI to
-/// `<agent dir>/auth.json` into the database. Only runs when the database has
-/// no credential yet.
+/// `<agent dir>/auth.json` into the database. Only runs before the first user
+/// exists; the setup transaction claims the orphan credential for that user.
 async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
-    if codex_credential(db).await?.is_some() {
+    if auth::user_count(db).await? > 0 || codex_credential(db, "").await?.is_some() {
         return Ok(());
     }
     let agent_dir = env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| {
@@ -589,14 +626,14 @@ async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
         return Ok(());
     };
     if let Some(credential) = value.get(CODEX_PROVIDER) {
-        store_codex_credential(db, credential).await?;
+        store_codex_credential(db, "", credential).await?;
         info!("Imported existing Codex credential into the database");
     }
     Ok(())
 }
 
-async fn settings_page(State(s): State<Arc<AppState>>) -> Result<Html<String>> {
-    let codex_authorised = match codex_credential(&s.db).await {
+async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Html<String>> {
+    let codex_authorised = match codex_credential(&s.db, &user.id).await {
         Ok(Some(credential)) => credential["type"].as_str() == Some("oauth"),
         Ok(None) => false,
         Err(error) => {
@@ -605,7 +642,7 @@ async fn settings_page(State(s): State<Arc<AppState>>) -> Result<Html<String>> {
         }
     };
     let model = selected_model(&s.db, &s.model).await?;
-    let fresh = match fetch_codex_models(&s).await {
+    let fresh = match fetch_codex_models(&s, &user.id).await {
         Ok(models) => models,
         Err(error) => {
             warn!(%error, "Codex model list unavailable; using built-in list");
@@ -650,10 +687,11 @@ fn model_supported(model: &str, fresh: &[String]) -> bool {
 
 async fn update_settings(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Form(form): Form<SettingsForm>,
 ) -> Result<Redirect> {
     let model = form.model.trim();
-    let fresh = match fetch_codex_models(&s).await {
+    let fresh = match fetch_codex_models(&s, &user.id).await {
         Ok(models) => models,
         Err(error) => {
             warn!(%error, "Codex model list unavailable; validating against built-in list");
@@ -661,7 +699,9 @@ async fn update_settings(
         }
     };
     if !model_supported(model, &fresh) {
-        return Err(AppError::BadRequest("Choose a supported Codex model.".into()));
+        return Err(AppError::BadRequest(
+            "Choose a supported Codex model.".into(),
+        ));
     }
     sqlx::query(
         "INSERT INTO app_settings (key, value, updated_at) VALUES ('model', ?, ?)
@@ -694,12 +734,14 @@ pub(crate) async fn selected_model(db: &SqlitePool, fallback: &str) -> Result<St
         sqlx::query_as("SELECT value FROM app_settings WHERE key = 'model'")
             .fetch_optional(db)
             .await?;
-    Ok(model.map(|(model,)| model).unwrap_or_else(|| fallback.into()))
+    Ok(model
+        .map(|(model,)| model)
+        .unwrap_or_else(|| fallback.into()))
 }
 
 /// Starts an OpenAI Codex device-code flow and shows the code to enter at
 /// chatgpt.com/codex/device. The rendered page polls the status route below.
-async fn authorise_codex_start(State(s): State<Arc<AppState>>) -> Result<Response> {
+async fn authorise_codex_start(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
     let output = run_node_script(&s.auth_script_path, "start", b"")
         .map_err(|_| AppError::CodexAuth("could not start the authorisation flow".into()))?;
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
@@ -724,9 +766,10 @@ async fn authorise_codex_start(State(s): State<Arc<AppState>>) -> Result<Respons
         .max(60);
     let expires_at = Utc::now().timestamp() + expires_seconds;
     let flow_id = Uuid::new_v4().to_string();
-    s.codex_flows.lock().unwrap().insert(
+    s.codex_flows.lock().insert(
         flow_id.clone(),
         CodexFlow {
+            user_id: user.id.clone(),
             device_auth_id: device_auth_id.to_string(),
             user_code: user_code.to_string(),
             expires_at,
@@ -750,14 +793,18 @@ async fn authorise_codex_start(State(s): State<Arc<AppState>>) -> Result<Respons
 /// the flow is dropped.
 async fn authorise_codex_status(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(flow_id): Path<String>,
 ) -> Result<Json<Value>> {
-    let flow = s.codex_flows.lock().unwrap().get(&flow_id).cloned();
+    let flow = s.codex_flows.lock().get(&flow_id).cloned();
     let Some(flow) = flow else {
         return Ok(Json(json!({ "status": "unknown" })));
     };
+    if flow.user_id != user.id {
+        return Ok(Json(json!({ "status": "unknown" })));
+    }
     if Utc::now().timestamp() > flow.expires_at {
-        s.codex_flows.lock().unwrap().remove(&flow_id);
+        s.codex_flows.lock().remove(&flow_id);
         return Ok(Json(json!({ "status": "expired" })));
     }
     let payload = json!({
@@ -775,9 +822,9 @@ async fn authorise_codex_status(
         value["status"] = json!("failed");
     }
     if value["status"].as_str() == Some("complete") {
-        s.codex_flows.lock().unwrap().remove(&flow_id);
+        s.codex_flows.lock().remove(&flow_id);
         if let Some(credential) = value.get("credential").cloned() {
-            store_codex_credential(&s.db, &credential).await?;
+            store_codex_credential(&s.db, &user.id, &credential).await?;
         }
     }
     if let Some(object) = value.as_object_mut() {
