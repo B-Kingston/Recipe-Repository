@@ -29,6 +29,7 @@ Key invariants:
 - AI output must pass `validate_generated` (every ingredient used exactly once, `inputSteps` only reference earlier steps, …) before any draft is saved.
 - `recipes.chart_json` is AI-derived only; any manual block edit MUST call `invalidate_chart` so the viewer falls back to linear inference.
 - The Codex credential is DB-only; Pi SDK invocations MUST use `run_pi_worker_with_credential`, never a fixed-path credential file.
+- LLM call logging: every generation logs the full request (provider, model, attempt, prompt, system prompt) and the full response (recipe + sources JSON, elapsed ms) at `info` level, and the worker's stderr is forwarded into the app log, so `docker compose logs` shows the whole call. Only selected fields are logged — `apiKey`/`authPath` never appear.
 - Passwords are stored only as Argon2 hashes (`users.password_hash`); `reset_password` MUST verify the current password first and never log or return password material.
 
 ## Key Directories
@@ -74,7 +75,7 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 - `src/main.rs` — entry point; `routes()` (router table at `main.rs:396`), `AppState`, `AppError`, `anyhowless` module (startup error alias deliberately avoiding an anyhow dep).
 - `src/auth.rs` — setup page, HTTP Basic auth middleware, Argon2 hashing, password change handlers.
 - `Cargo.toml` / `Dockerfile` / `compose.yaml` / `deploy.sh` / `.env.example` — build, deploy, env contract.
-- `pi/recipe-worker.mjs` — the worker protocol contract: stdin JSON `{prompt, systemPrompt, model, searchEnabled, authPath}` or `{command: "listModels"}`; stdout `{recipe, sources}` or `{error, code}` (`code: "configuration"` → `AiNotConfigured`).
+- `pi/recipe-worker.mjs` — the worker protocol contract: stdin JSON `{prompt, systemPrompt, model, reasoningEffort, searchEnabled, authPath}` or `{command: "listModels"}`; stdout `{recipe, sources}` or `{error, code}` (`code: "configuration"` → `AiNotConfigured`). `reasoningEffort` is `low|medium|high`, default `low`.
 - `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`, and `0006_users.sql` adds the `users` table for basic auth.
 - `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view. `templates/setup.html` and `templates/password_reset.html` are the auth screens.
 

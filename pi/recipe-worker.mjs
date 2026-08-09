@@ -10,7 +10,23 @@ import { createNativeSearchObserver, nativeSearchPayload } from "./codex-native-
 
 const PROVIDER = "openai-codex";
 
-class WorkerError extends Error {
+const REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+
+/** Coerces a request's reasoningEffort to one of the supported values.
+ *  Missing or blank means the host default ("low"); anything else is
+ *  rejected so a mistyped setting fails loudly instead of silently
+ *  running at a different effort than the user chose. */
+export function normalizeEffort(value) {
+  if (value === undefined || value === null) return "low";
+  const effort = String(value).trim().toLowerCase();
+  if (effort === "") return "low";
+  if (!REASONING_EFFORTS.has(effort)) {
+    throw new WorkerError("input", `Invalid reasoningEffort: ${value}`);
+  }
+  return effort;
+}
+
+export class WorkerError extends Error {
   constructor(code, message) {
     super(message);
     this.code = code;
@@ -103,6 +119,35 @@ function sourceList(value, seenSources) {
   });
 }
 
+/**
+ * Grounds the model's claimed sources against the citations the search
+ * surfaced. Exact URL membership is enforced whenever citations exist, so a
+ * claim that matches nothing is dropped as unverifiable. The Responses API
+ * only attaches url_citation annotations when the model emits inline citation
+ * markers, which the JSON-only instruction set does not trigger; the search
+ * runs and informs the recipe, but the API returns zero citations to verify
+ * against. In that case (`acceptUnverifiable`) the claimed http(s) URLs are
+ * accepted as-is — the model was prompted to cite only URLs from the search
+ * results — so grounded generation still works.
+ */
+export function verifiedSources(claimed, citations, acceptUnverifiable) {
+  const verified = sourceList(claimed, citations);
+  if (verified.length > 0 || citations.size > 0 || !acceptUnverifiable) return verified;
+  const urls = new Set();
+  const fallback = [];
+  for (const source of Array.isArray(claimed) ? claimed : []) {
+    if (!source || typeof source.url !== "string") continue;
+    const url = source.url.trim();
+    if (!/^https?:\/\//.test(url) || urls.has(url)) continue;
+    urls.add(url);
+    fallback.push({
+      title: typeof source.title === "string" && source.title.trim() ? source.title.trim() : url,
+      url,
+    });
+  }
+  return fallback;
+}
+
 export function recipePrompt(systemPrompt, searchEnabled) {
   const output = `Return only one JSON object with this shape:\n{
   "recipe": { ...the supplied recipe schema... },
@@ -123,6 +168,93 @@ export function completionContext(request, searchEnabled) {
     messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
     tools: [],
   };
+}
+
+const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
+
+function openaiCredentials(request) {
+  const apiBaseUrl = typeof request.apiBaseUrl === "string" && request.apiBaseUrl.trim()
+    ? request.apiBaseUrl.trim() : null;
+  const apiKey = typeof request.apiKey === "string" && request.apiKey.trim()
+    ? request.apiKey.trim() : null;
+  if (!apiBaseUrl || !apiKey) {
+    throw new WorkerError("worker", "Missing apiBaseUrl or apiKey for the OpenAI API request.");
+  }
+  return { apiBaseUrl, apiKey };
+}
+
+/** POST {base}/responses; returns the parsed JSON body. Throws WorkerError on
+ *  transport failure or non-2xx (error body truncated to 300 chars; never
+ *  includes the key). */
+export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
+  const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OPENAI_RESPONSE_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        input: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt },
+        ],
+        ...(searchEnabled ? { tools: [{ type: "web_search" }], tool_choice: "required" } : {}),
+        reasoning: { effort: reasoningEffort },
+        text: { verbosity: "low" },
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new WorkerError(
+        "worker",
+        `OpenAI API returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`,
+      );
+    }
+    return await response.json();
+  } catch (error) {
+    if (error instanceof WorkerError) throw error;
+    throw new WorkerError("worker", `OpenAI API request failed: ${error instanceof Error ? error.message : "unknown error"}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Reduces a Responses API body to what the worker needs.
+ *  citations is a Map<url, title> built from url_citation annotations. */
+export function parseResponsesOutput(data) {
+  const output = Array.isArray(data?.output) ? data.output : [];
+  let searched = false;
+  let refused = false;
+  const citations = new Map();
+  const texts = [];
+  for (const item of output) {
+    if (item?.type === "web_search_call") {
+      const action = item.action;
+      const actionType = typeof action === "string" ? action : action?.type;
+      if (actionType === "search") searched = true;
+    } else if (item?.type === "message") {
+      for (const part of item.content ?? []) {
+        if (part?.type === "refusal") refused = true;
+        if (part?.type === "output_text") texts.push(part.text ?? "");
+        for (const annotation of part?.annotations ?? []) {
+          // Documented shape: the annotation itself carries url/title
+          // ({type:"url_citation", url, title}); the nested url_citation
+          // object is accepted defensively for shape variants.
+          const citation = annotation?.url_citation ?? annotation;
+          if (citation && typeof citation.url === "string" && citation.url) {
+            citations.set(citation.url, typeof citation.title === "string" ? citation.title : "");
+          }
+        }
+      }
+    }
+  }
+  return { text: texts.join(""), searched, refused, citations };
 }
 
 /**
@@ -163,6 +295,30 @@ async function main() {
   const modelId = typeof request.model === "string" && request.model.trim()
     ? request.model.trim()
     : "gpt-5.4-mini";
+  const reasoningEffort = normalizeEffort(request.reasoningEffort);
+  if (request.provider === "openai") {
+    const { apiBaseUrl, apiKey } = openaiCredentials(request);
+    const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
+    const data = await openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, request.prompt, searchEnabled, reasoningEffort);
+    if (data.status && data.status !== "completed") {
+      throw new WorkerError("worker", `OpenAI response incomplete: ${data.incomplete_details?.reason ?? "unknown reason"}`);
+    }
+    const { text, searched, refused, citations } = parseResponsesOutput(data);
+    if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
+    if (searchEnabled && !searched) {
+      throw new WorkerError("output", "OpenAI returned a recipe without running web search.");
+    }
+    const result = extractJson(text);
+    if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
+      throw new WorkerError("output", "Pi did not return a recipe object.");
+    }
+    const sources = verifiedSources(result.sources, citations, true);
+    if (searchEnabled && sources.length === 0) {
+      throw new WorkerError("output", "OpenAI did not use any valid web-search sources.");
+    }
+    outputJson({ recipe: result.recipe, sources });
+    return;
+  }
   await mkdir(agentDir, { recursive: true });
 
   // The host supplies a per-request auth.json (its database-backed credential)
@@ -191,7 +347,7 @@ async function main() {
     model,
     context,
     {
-      reasoningEffort: "low",
+      reasoningEffort,
       textVerbosity: "low",
       transport: "sse",
       maxRetries: 1,

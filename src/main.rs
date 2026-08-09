@@ -42,6 +42,11 @@ use recipes::{
 
 const DRAFT_HOURS: i64 = 24;
 const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_REASONING_EFFORT: &str = "low";
+/// Reasoning efforts offered for the model, matching the worker protocol.
+const REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
 /// Built-in fallback for the Settings model list, used only when the live
 /// pi.dev catalogue cannot be fetched. Ordered newest first.
 const MODEL_OPTIONS: &[&str] = &[
@@ -98,7 +103,9 @@ enum AppError {
     BadRequest(String),
     #[error("{0}")]
     Internal(String),
-    #[error("The AI service is not configured. Authorise Codex from the Settings page.")]
+    #[error(
+        "The AI service is not configured. Authorise Codex or configure an OpenAI API key from the Settings page."
+    )]
     AiNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
     Ai,
@@ -285,12 +292,15 @@ struct DraftTemplate {
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTemplate {
-    model_options: Vec<ModelOption>,
+    model_options: Vec<SelectOption>,
+    effort_options: Vec<SelectOption>,
     search_enabled: bool,
     codex_authorised: bool,
     codex_auth_url: String,
+    openai_mode: bool,
+    openai_base_url: String,
 }
-struct ModelOption {
+struct SelectOption {
     value: String,
     selected: bool,
 }
@@ -340,7 +350,16 @@ struct PromptForm {
 }
 #[derive(Deserialize)]
 struct SettingsForm {
-    model: String,
+    #[serde(default)]
+    model: String, // Codex-only; the OpenAI mode is pinned to DEFAULT_OPENAI_MODEL
+    #[serde(default)]
+    reasoning_effort: String,
+    #[serde(default)]
+    use_openai_api: Option<String>, // checkbox present when checked
+    #[serde(default)]
+    openai_base_url: String,
+    #[serde(default)]
+    openai_api_key: String,
 }
 #[derive(Deserialize)]
 struct RecipeQuery {
@@ -584,6 +603,7 @@ fn generate_guidance(search_grounding: bool) -> &'static str {
 }
 
 const CODEX_PROVIDER: &str = "openai-codex";
+const OPENAI_API_PROVIDER: &str = "openai-compatible";
 
 /// The stored Codex OAuth credential, if any. The database is the source of
 /// truth; the Pi worker only ever sees a per-request materialised auth.json.
@@ -619,6 +639,68 @@ pub(crate) async fn store_codex_credential(
     .await?;
     Ok(())
 }
+
+/// The active AI provider: "openai" (OpenAI API) or "pi" (Codex).
+/// Stored globally in app_settings like the model; the single-user app keeps
+/// this app-wide. Anything other than exactly "openai" resolves to "pi".
+pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
+            .fetch_optional(db)
+            .await?;
+    Ok(row
+        .map(|(value,)| value)
+        .filter(|value| value == "openai")
+        .unwrap_or_else(|| "pi".into()))
+}
+
+/// The stored OpenAI API config for one user: (base URL, API key).
+pub(crate) async fn openai_api_config(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
+            .bind(user_id)
+            .bind(OPENAI_API_PROVIDER)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(json,)| {
+        let value: Value = serde_json::from_str(&json).ok()?;
+        Some((
+            value.get("baseUrl")?.as_str()?.to_string(),
+            value.get("apiKey")?.as_str()?.to_string(),
+        ))
+    }))
+}
+
+/// Upserts the OpenAI API config; same SQL shape as store_codex_credential,
+/// with provider OPENAI_API_PROVIDER and
+/// credential_json = json!({"baseUrl": base_url, "apiKey": api_key}).
+pub(crate) async fn store_openai_api_config(
+    db: &SqlitePool,
+    user_id: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<()> {
+    let json = serde_json::to_string(&json!({ "baseUrl": base_url, "apiKey": api_key }))
+        .map_err(|_| AppError::Internal("OpenAI API config could not be serialised".into()))?;
+    sqlx::query(
+        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id,provider) DO UPDATE SET
+           credential_json = excluded.credential_json,
+           updated_at = excluded.updated_at",
+    )
+    .bind(user_id)
+    .bind(OPENAI_API_PROVIDER)
+    .bind(json)
+    .bind(stamp())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// One-time migration of a credential previously written by the Pi CLI to
 /// `<agent dir>/auth.json` into the database. Only runs before the first user
 /// exists; the setup transaction claims the orphan credential for that user.
@@ -653,13 +735,29 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
             false
         }
     };
-    let model = selected_model(&s.db, &s.model).await?;
-    let fresh = fresh_model_catalogue(&s, &user.id).await;
+    let openai_mode = crate::ai_provider(&s.db).await? == "openai";
+    let openai_base_url = crate::openai_api_config(&s.db, &user.id)
+        .await?
+        .map(|(url, _)| url)
+        .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.into());
+    // The model list is Codex-only: the OpenAI mode is pinned to
+    // DEFAULT_OPENAI_MODEL, so no catalogue refresh is ever triggered for it.
+    let (model, fresh) = if openai_mode {
+        (String::new(), Vec::new())
+    } else {
+        (
+            selected_model(&s.db, &s.model).await?,
+            fresh_model_catalogue(&s, &user.id).await,
+        )
+    };
     render(SettingsTemplate {
         model_options: model_options(fresh, &model),
+        effort_options: effort_options(&selected_effort(&s.db, DEFAULT_REASONING_EFFORT).await?),
         search_enabled: s.search_grounding,
         codex_authorised,
         codex_auth_url: "/settings/authorise-codex".into(),
+        openai_mode,
+        openai_base_url,
     })
 }
 
@@ -667,7 +765,7 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
 /// worker when available, otherwise the built-in fallback list. The current
 /// selection is always included (marked selected) so saving never silently
 /// changes the model.
-fn model_options(fresh: Vec<String>, current: &str) -> Vec<ModelOption> {
+fn model_options(fresh: Vec<String>, current: &str) -> Vec<SelectOption> {
     let mut values = if fresh.is_empty() {
         MODEL_OPTIONS.iter().map(|model| (*model).into()).collect()
     } else {
@@ -678,9 +776,21 @@ fn model_options(fresh: Vec<String>, current: &str) -> Vec<ModelOption> {
     }
     values
         .into_iter()
-        .map(|value| ModelOption {
+        .map(|value| SelectOption {
             selected: value == current,
             value,
+        })
+        .collect()
+}
+
+/// Effort options for the Settings select: a fixed low/medium/high set (the
+/// worker protocol knows no other values), with the current choice selected.
+fn effort_options(current: &str) -> Vec<SelectOption> {
+    REASONING_EFFORTS
+        .iter()
+        .map(|value| SelectOption {
+            selected: *value == current,
+            value: (*value).into(),
         })
         .collect()
 }
@@ -696,18 +806,80 @@ async fn update_settings(
     user: AuthUser,
     Form(form): Form<SettingsForm>,
 ) -> Result<Redirect> {
-    let model = form.model.trim();
-    let fresh = fresh_model_catalogue(&s, &user.id).await;
-    if !model_supported(model, &fresh) {
+    let want_openai = form.use_openai_api.is_some();
+    // The effort applies to both providers, so it is saved regardless of mode.
+    let effort = trim(&form.reasoning_effort);
+    let effort = if effort.is_empty() {
+        DEFAULT_REASONING_EFFORT.to_string()
+    } else {
+        effort
+    };
+    if !REASONING_EFFORTS.contains(&effort.as_str()) {
         return Err(AppError::BadRequest(
-            "Choose a supported Codex model.".into(),
+            "Choose a supported reasoning effort.".into(),
         ));
     }
     sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ('model', ?, ?)
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('reasoning_effort', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
-    .bind(model)
+    .bind(effort)
+    .bind(stamp())
+    .execute(&s.db)
+    .await?;
+    if !want_openai {
+        let model = trim(&form.model);
+        if model.is_empty() {
+            return Err(AppError::BadRequest("Choose a model.".into()));
+        }
+        let fresh = fresh_model_catalogue(&s, &user.id).await;
+        if !model_supported(&model, &fresh) {
+            return Err(AppError::BadRequest(
+                "Choose a supported Codex model.".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('model', ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .bind(&model)
+        .bind(stamp())
+        .execute(&s.db)
+        .await?;
+    }
+    if want_openai {
+        let stored = crate::openai_api_config(&s.db, &user.id).await?;
+        let base_url = trim(&form.openai_base_url);
+        let base_url = if base_url.is_empty() {
+            stored
+                .as_ref()
+                .map(|(url, _)| url.clone())
+                .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.into())
+        } else {
+            base_url
+        };
+        let api_key = trim(&form.openai_api_key);
+        let api_key = if api_key.is_empty() {
+            stored
+                .as_ref()
+                .map(|(_, key)| key.clone())
+                .ok_or_else(|| AppError::BadRequest("Enter the API key.".into()))?
+        } else {
+            api_key
+        };
+        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+            return Err(AppError::BadRequest(
+                "API base URL must start with http:// or https://.".into(),
+            ));
+        }
+        let base_url = base_url.trim_end_matches('/').to_string();
+        crate::store_openai_api_config(&s.db, &user.id, &base_url, &api_key).await?;
+    }
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(if want_openai { "openai" } else { "pi" })
     .bind(stamp())
     .execute(&s.db)
     .await?;
@@ -736,6 +908,16 @@ pub(crate) async fn selected_model(db: &SqlitePool, fallback: &str) -> Result<St
             .await?;
     Ok(model
         .map(|(model,)| model)
+        .unwrap_or_else(|| fallback.into()))
+}
+
+pub(crate) async fn selected_effort(db: &SqlitePool, fallback: &str) -> Result<String> {
+    let effort: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'reasoning_effort'")
+            .fetch_optional(db)
+            .await?;
+    Ok(effort
+        .map(|(effort,)| effort)
         .unwrap_or_else(|| fallback.into()))
 }
 
@@ -835,9 +1017,9 @@ async fn authorise_codex_status(
 
 #[cfg(test)]
 mod model_tests {
-    use super::{MODEL_OPTIONS, ModelOption, model_options, model_supported};
+    use super::{MODEL_OPTIONS, SelectOption, effort_options, model_options, model_supported};
 
-    fn values(options: &[ModelOption]) -> Vec<&str> {
+    fn values(options: &[SelectOption]) -> Vec<&str> {
         options.iter().map(|option| option.value.as_str()).collect()
     }
 
@@ -872,6 +1054,20 @@ mod model_tests {
     fn empty_fresh_list_falls_back_to_builtin() {
         let options = model_options(Vec::new(), "gpt-5.4-mini");
         assert_eq!(values(&options), MODEL_OPTIONS);
+    }
+
+    #[test]
+    fn effort_options_offer_all_three_with_current_selected() {
+        let options = effort_options("medium");
+        assert_eq!(values(&options), vec!["low", "medium", "high"]);
+        assert!(!options[0].selected && options[1].selected && !options[2].selected);
+        // An unknown stored value never marks an option selected; the worker
+        // defaults such requests to low.
+        assert!(
+            effort_options("extreme")
+                .iter()
+                .all(|option| !option.selected)
+        );
     }
 }
 

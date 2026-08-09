@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub(crate) async fn generate_page() -> Redirect {
@@ -330,10 +330,14 @@ async fn pi_recipe(
     user: &AuthUser,
     prompt: &str,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+    if crate::ai_provider(&state.db).await? == "openai" {
+        return openai_recipe(state, user, prompt).await;
+    }
     let mut credential = crate::codex_credential(&state.db, &user.id)
         .await?
         .ok_or(AppError::AiNotConfigured)?;
     let model = crate::selected_model(&state.db, &state.model).await?;
+    let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
     for attempt in 0..2 {
         let input = if attempt == 0 {
             prompt.to_string()
@@ -355,14 +359,27 @@ async fn pi_recipe(
             },
             recipe_schema()
         );
+        info!(
+            provider = "codex",
+            model = %model,
+            reasoning_effort = %effort,
+            search_enabled = state.search_grounding,
+            attempt,
+            prompt = %input,
+            system_prompt = %system_prompt,
+            "LLM request"
+        );
+        let started = Instant::now();
         let request = json!({
             "prompt": input,
             "systemPrompt": system_prompt,
             "model": model,
+            "reasoningEffort": effort,
             "searchEnabled": state.search_grounding,
         });
         let (output, refreshed) =
             run_pi_worker_with_credential(state, &credential, &request).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         if let Some(refreshed) = refreshed
             && refreshed != credential
         {
@@ -374,16 +391,25 @@ async fn pi_recipe(
             let code = value["code"].as_str().unwrap_or("worker");
             let message = value["error"].as_str().unwrap_or("no message");
             if code == "configuration" || attempt == 1 {
-                error!(code, message, status = %output.status, "Pi worker failed");
+                error!(code, message, status = %output.status, elapsed_ms, "Pi worker failed");
                 return if code == "configuration" {
                     Err(AppError::AiNotConfigured)
                 } else {
                     Err(AppError::Ai)
                 };
             }
-            warn!(code, message, status = %output.status, "Pi worker failed; retrying with research guidance");
+            warn!(code, message, status = %output.status, elapsed_ms, "Pi worker failed; retrying with research guidance");
             continue;
         }
+        info!(
+            provider = "codex",
+            model = %model,
+            reasoning_effort = %effort,
+            attempt,
+            elapsed_ms,
+            response = %value,
+            "LLM response"
+        );
         match parse_pi_response(&value, state.search_grounding) {
             Ok(result) => return Ok(result),
             Err(error) => {
@@ -398,19 +424,128 @@ async fn pi_recipe(
     Err(AppError::Ai)
 }
 
+/// Generates through the OpenAI API Responses path (worker provider "openai"):
+/// web_search tool when grounding is enabled, model pinned to gpt-5.6-luna,
+/// same two-attempt retry contract as the Codex branch (attempt 1 re-prompted
+/// with research guidance) but without credential refresh — the API key never
+/// round-trips back from the worker.
+async fn openai_recipe(
+    state: &AppState,
+    user: &AuthUser,
+    prompt: &str,
+) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+    let Some((base_url, api_key)) = crate::openai_api_config(&state.db, &user.id).await? else {
+        return Err(AppError::AiNotConfigured);
+    };
+    let model = crate::DEFAULT_OPENAI_MODEL;
+    let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
+    for attempt in 0..2 {
+        let input = if attempt == 0 {
+            prompt.to_string()
+        } else if state.search_grounding {
+            format!(
+                "{prompt}\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
+            )
+        } else {
+            format!(
+                "{prompt}\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
+            )
+        };
+        let system_prompt = format!(
+            "{}\n\nRecipe JSON schema:\n{}",
+            if state.search_grounding {
+                GROUNDED_RECIPE_PROMPT
+            } else {
+                RECIPE_PROMPT
+            },
+            recipe_schema()
+        );
+        info!(
+            provider = "openai",
+            model = %model,
+            reasoning_effort = %effort,
+            search_enabled = state.search_grounding,
+            attempt,
+            prompt = %input,
+            system_prompt = %system_prompt,
+            "LLM request"
+        );
+        let started = Instant::now();
+        let request = json!({
+            "provider": "openai",
+            "apiBaseUrl": base_url,
+            "apiKey": api_key,
+            "prompt": input,
+            "systemPrompt": system_prompt,
+            "model": model,
+            "reasoningEffort": effort,
+            "searchEnabled": state.search_grounding,
+        });
+        let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
+        let worker_path = state.pi_worker_path.clone();
+        let output = tokio::task::spawn_blocking(move || run_pi_worker(&worker_path, &payload))
+            .await
+            .map_err(|_| AppError::Ai)?
+            .map_err(|_| AppError::Ai)?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
+        if !output.status.success() {
+            let code = value["code"].as_str().unwrap_or("worker");
+            let message = value["error"].as_str().unwrap_or("no message");
+            if code == "configuration" || attempt == 1 {
+                error!(code, message, status = %output.status, elapsed_ms, "OpenAI worker failed");
+                return if code == "configuration" {
+                    Err(AppError::AiNotConfigured)
+                } else {
+                    Err(AppError::Ai)
+                };
+            }
+            warn!(code, message, status = %output.status, elapsed_ms, "OpenAI worker failed; retrying with research guidance");
+            continue;
+        }
+        info!(
+            provider = "openai",
+            model = %model,
+            reasoning_effort = %effort,
+            attempt,
+            elapsed_ms,
+            response = %value,
+            "LLM response"
+        );
+        match parse_pi_response(&value, state.search_grounding) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if attempt == 1 {
+                    error!(attempt, error = %error, "OpenAI worker output failed validation");
+                } else {
+                    warn!(attempt, error = %error, "OpenAI worker output failed validation; retrying");
+                }
+            }
+        }
+    }
+    Err(AppError::Ai)
+}
+
 fn run_pi_worker(worker_path: &str, payload: &[u8]) -> std::io::Result<std::process::Output> {
     let mut child = Command::new("node")
         .arg(worker_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     child
         .stdin
         .as_mut()
         .expect("Pi worker stdin is piped")
         .write_all(payload)?;
-    child.wait_with_output()
+    let output = child.wait_with_output()?;
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            info!(line, "Pi worker");
+        }
+    }
+    Ok(output)
 }
 
 /// Runs the Pi worker with the database credential materialised as a private

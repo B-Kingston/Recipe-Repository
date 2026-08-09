@@ -3,3 +3,4 @@ mod auth;
 mod chart;
 mod config;
 mod recipes;
+mod settings;

@@ -5,16 +5,32 @@
 </div>
 <div class="compact-panel">
   <div class="block">
-    <h2>AI Model</h2>
+    <h2>AI Provider</h2>
     <form method="post" action="/settings">
+      <label class="toggle-row"><input type="checkbox" name="use_openai_api"{% if openai_mode %} checked{% endif %}> Use the OpenAI API instead of Codex</label>
+      {% if openai_mode %}
+      <p class="muted">Uses the gpt-5.6-luna model with native web search.</p>
+      {% else %}
       <label for="model">Codex model</label>
       <select id="model" name="model">
         {% for option in model_options %}
         <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
         {% endfor %}
       </select>
-      <p class="muted">Used for new recipes and AI alterations.</p>
-      <button class="primary" type="submit">Save model</button>
+      {% endif %}
+      <label for="reasoning_effort">Reasoning effort</label>
+      <select id="reasoning_effort" name="reasoning_effort">
+        {% for option in effort_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+        {% endfor %}
+      </select>
+      <p class="muted">Higher effort thinks longer for more careful recipes.</p>
+      <label for="openai_base_url">API base URL</label>
+      <input type="url" id="openai_base_url" name="openai_base_url" value="{{ openai_base_url }}">
+      <label for="openai_api_key">API key</label>
+      <input type="password" id="openai_api_key" name="openai_api_key" placeholder="sk-… (blank keeps the stored key)" autocomplete="off">
+      <p class="muted">Codex uses your ChatGPT subscription. The OpenAI API uses your key at the base URL (default https://api.openai.com/v1) with native web search on the gpt-5.6-luna model.</p>
+      <button class="primary" type="submit">Save settings</button>
     </form>
   </div>
   <div class="block">
