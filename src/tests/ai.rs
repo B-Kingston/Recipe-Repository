@@ -121,10 +121,11 @@ fn pi_response_extracts_recipe_and_search_sources() {
         "recipe": recipe(),
         "sources": [{"title":"Toast","url":"https://example.com/toast"}]
     });
-    let (parsed, sources, suggestions) = parse_pi_response(&response, true).unwrap();
+    let (parsed, sources, suggestions, critique) = parse_pi_response(&response, true).unwrap();
     assert_eq!(parsed.title, "Toast");
     assert_eq!(sources.len(), 1);
     assert!(suggestions.is_empty());
+    assert!(critique.is_none());
 }
 
 #[test]
@@ -136,7 +137,49 @@ fn grounded_pi_response_requires_search_sources() {
 #[test]
 fn ungrounded_pi_response_accepts_no_sources() {
     let response = json!({"recipe": recipe(), "sources": []});
-    let (_, sources, suggestions) = parse_pi_response(&response, false).unwrap();
+    let (_, sources, suggestions, critique) = parse_pi_response(&response, false).unwrap();
     assert!(sources.is_empty());
     assert!(suggestions.is_empty());
+    assert!(critique.is_none());
+}
+
+#[test]
+fn pi_response_parses_optional_critique() {
+    let with_critique = json!({
+        "recipe": recipe(),
+        "sources": [],
+        "critique": {
+            "total": 4,
+            "resolved": 3,
+            "unresolved": ["pomegranate molasses"],
+            "pairCount": 3,
+            "coherencePercentile": 41.3,
+            "weakestPairs": [{"a": "tomato", "b": "saffron", "percentile": 13.7}],
+            "weakestIngredient": {"name": "saffron", "meanPercentile": 11.9},
+            "added": ["tofu"],
+            "removed": ["chicken"]
+        }
+    });
+    let (_, _, _, critique) = parse_pi_response(&with_critique, false).unwrap();
+    let critique = critique.expect("critique must parse");
+    assert_eq!(critique.total, 4);
+    assert_eq!(critique.pair_count, 3);
+    assert_eq!(critique.coherence_percentile, 41.3);
+    assert_eq!(critique.weakest_pairs.len(), 1);
+    assert_eq!(critique.weakest_pairs[0].a, "tomato");
+    assert_eq!(
+        critique.weakest_ingredient.as_ref().unwrap().name,
+        "saffron"
+    );
+    assert_eq!(critique.added, vec!["tofu"]);
+    assert_eq!(critique.removed, vec!["chicken"]);
+
+    let without_critique = json!({"recipe": recipe(), "sources": []});
+    let (_, _, _, critique) = parse_pi_response(&without_critique, false).unwrap();
+    assert!(critique.is_none());
+
+    // A malformed critique is dropped with a warning, never failing the recipe.
+    let malformed = json!({"recipe": recipe(), "sources": [], "critique": "garbage"});
+    let (_, _, _, critique) = parse_pi_response(&malformed, false).unwrap();
+    assert!(critique.is_none());
 }

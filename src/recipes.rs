@@ -37,6 +37,7 @@ pub(crate) async fn new_recipe(State(state): State<Arc<AppState>>) -> Result<Htm
         cancel_url: "/".into(),
         error: String::new(),
         prompt: String::new(),
+        pairwise_critique: false,
     })
 }
 

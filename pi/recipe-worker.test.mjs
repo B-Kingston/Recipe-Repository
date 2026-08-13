@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WorkerError, catalogModelIds, normalizeEffort, openaiResponse, parseResponsesOutput, verifiedSources } from "./recipe-worker.mjs";
+import { WorkerError, catalogModelIds, critiquePass, normalizeEffort, openaiChat, openaiResponse, parseResponsesOutput, verifiedSources } from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -243,4 +243,129 @@ test("verifiedSources rejects unverifiable claims when the fallback is disabled"
     false,
   );
   assert.deepEqual(sources, []);
+});
+
+test("openaiChat posts multi-message input with no tools", async () => {
+  let capturedUrl;
+  let capturedInit;
+  const fetchImpl = async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return { ok: true, json: async () => ({ status: "completed" }) };
+  };
+  const messages = [
+    { role: "user", content: "prompt", timestamp: Date.now() },
+    { role: "assistant", content: "turn one", timestamp: Date.now() },
+    { role: "user", content: "critique", timestamp: Date.now() },
+  ];
+  const body = await openaiChat("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", messages, "high", fetchImpl);
+  assert.equal(capturedUrl, "https://api.openai.com/v1/responses");
+  assert.deepEqual(capturedInit.headers.Authorization, "Bearer sk-test");
+  const sent = JSON.parse(capturedInit.body);
+  assert.equal(sent.model, "gpt-5.6-luna");
+  // The Responses API rejects unknown fields (e.g. `timestamp`) on input
+  // items; only role/content may be sent.
+  assert.deepEqual(sent.input, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "prompt" },
+    { role: "assistant", content: "turn one" },
+    { role: "user", content: "critique" },
+  ]);
+  assert.ok(!("tools" in sent));
+  assert.ok(!("tool_choice" in sent));
+  assert.deepEqual(sent.reasoning, { effort: "high" });
+  assert.deepEqual(body, { status: "completed" });
+});
+
+test("critiquePass returns the revised recipe with the diff when the revision is valid", async () => {
+  const turn1 = { ingredients: [{ name: "chicken" }, { name: "rice" }] };
+  const messages = [];
+  const pass = await critiquePass({
+    prompt: "make it vegan",
+    turn1Text: "turn one text",
+    turn1Recipe: turn1,
+    systemPrompt: "sys",
+    log: () => {},
+    callModel: async (msgs) => {
+      messages.push(...msgs);
+      return JSON.stringify({ recipe: { ingredients: [{ name: "Tofu" }, { name: "rice" }] } });
+    },
+  });
+  assert.equal(pass.critique.total, 2);
+  assert.equal(pass.critique.resolved, 2);
+  assert.equal(pass.critique.pairCount, 1);
+  assert.deepEqual(pass.critique.added, ["Tofu"]);
+  assert.deepEqual(pass.critique.removed, ["chicken"]);
+  assert.deepEqual(pass.recipe.ingredients, [{ name: "Tofu" }, { name: "rice" }]);
+  assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user"]);
+  assert.equal(messages[0].content, "make it vegan");
+  assert.equal(messages[1].content, "turn one text");
+  assert.ok(messages[2].content.includes("Scored 2 of 2 ingredients (1 pairs)"));
+});
+
+test("critiquePass falls back to the turn-1 recipe on a garbage revision", async () => {
+  const turn1 = { ingredients: [{ name: "chicken" }, { name: "rice" }] };
+  const pass = await critiquePass({
+    prompt: "p",
+    turn1Text: "t",
+    turn1Recipe: turn1,
+    systemPrompt: "s",
+    log: () => {},
+    callModel: async () => "not json at all",
+  });
+  assert.deepEqual(pass.recipe, turn1);
+  assert.equal(pass.critique, null);
+});
+
+test("critiquePass falls back to the turn-1 recipe when the model call returns null", async () => {
+  const turn1 = { ingredients: [{ name: "chicken" }, { name: "rice" }] };
+  const pass = await critiquePass({
+    prompt: "p",
+    turn1Text: "t",
+    turn1Recipe: turn1,
+    systemPrompt: "s",
+    log: () => {},
+    callModel: async () => null,
+  });
+  assert.deepEqual(pass.recipe, turn1);
+  assert.equal(pass.critique, null);
+});
+
+test("critiquePass skips when fewer than two ingredients resolve", async () => {
+  const turn1 = { ingredients: [{ name: "only one unresolvable ingredient" }] };
+  let called = false;
+  const pass = await critiquePass({
+    prompt: "p",
+    turn1Text: "t",
+    turn1Recipe: turn1,
+    systemPrompt: "s",
+    log: () => {},
+    callModel: async () => {
+      called = true;
+      return "{}";
+    },
+  });
+  assert.deepEqual(pass.recipe, turn1);
+  assert.equal(pass.critique, null);
+  assert.equal(called, false);
+});
+
+test("critiquePass emits the critique and the revision result on stderr", async () => {
+  const logged = [];
+  await critiquePass({
+    prompt: "p",
+    turn1Text: "t",
+    turn1Recipe: { ingredients: [{ name: "chicken" }, { name: "rice" }] },
+    systemPrompt: "s",
+    log: (line) => logged.push(line),
+    callModel: async () => JSON.stringify({ recipe: { ingredients: [{ name: "Tofu" }, { name: "rice" }] } }),
+  });
+  assert.equal(logged.length, 2);
+  const critiqueLine = JSON.parse(logged[0]);
+  assert.equal(critiqueLine.event, "pairwise_critique");
+  assert.ok(critiqueLine.turn2Message.includes("same schema as your draft above"));
+  const resultLine = JSON.parse(logged[1]);
+  assert.equal(resultLine.event, "pairwise_critique_result");
+  assert.deepEqual(resultLine.added, ["Tofu"]);
+  assert.deepEqual(resultLine.removed, ["chicken"]);
 });

@@ -1,8 +1,8 @@
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
-    AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DraftTemplate, GROUNDED_RECIPE_PROMPT,
-    GeneratedRecipe, Ingredient, IngredientUse, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result,
-    Source, generate_guidance, render, required, stamp,
+    AppError, AppState, AuthUser, ChartRecipe, Critique, DRAFT_HOURS, DraftTemplate,
+    GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient, IngredientUse, ModelCatalogue, PromptForm,
+    RECIPE_PROMPT, Result, Source, generate_guidance, render, required, stamp,
 };
 use axum::{
     Form,
@@ -32,7 +32,8 @@ pub(crate) async fn generate_recipe(
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
-    match create_draft(&s, &user, None, "generate", &prompt).await {
+    let pairwise_critique = f.pairwise_critique.is_some();
+    match create_draft(&s, &user, None, "generate", &prompt, pairwise_critique).await {
         Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "New Recipe".into(),
@@ -43,6 +44,7 @@ pub(crate) async fn generate_recipe(
             cancel_url: "/".into(),
             error: e.to_string(),
             prompt,
+            pairwise_critique,
         })
         .map(IntoResponse::into_response),
     }
@@ -66,6 +68,7 @@ pub(crate) async fn alter_page(
         cancel_url: format!("/recipes/{id}"),
         error: String::new(),
         prompt: String::new(),
+        pairwise_critique: false,
     })
 }
 
@@ -77,6 +80,7 @@ pub(crate) async fn alter_recipe(
 ) -> Result<Response> {
     let recipe = find_recipe(&s.db, &user.id, &id).await?;
     let prompt = required(&f.prompt, "Comments")?;
+    let pairwise_critique = f.pairwise_critique.is_some();
     let snapshot = recipe_snapshot(&s.db, &user.id, &recipe).await?;
     let full = format!(
         "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
@@ -89,6 +93,7 @@ pub(crate) async fn alter_recipe(
         Some((&recipe.id, &recipe.updated_at)),
         "alter",
         &full,
+        pairwise_critique,
     )
     .await
     {
@@ -102,6 +107,7 @@ pub(crate) async fn alter_recipe(
             cancel_url: format!("/recipes/{id}"),
             error: e.to_string(),
             prompt,
+            pairwise_critique,
         })
         .map(IntoResponse::into_response),
     }
@@ -112,7 +118,7 @@ pub(crate) async fn draft_page(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    render_draft_page(&s, &user, &id, "", "").await
+    render_draft_page(&s, &user, &id, "", "", false).await
 }
 
 /// Alters the recipe held in a draft, opening the result as a new draft.
@@ -137,9 +143,12 @@ pub(crate) async fn alter_draft(
             draft.base_updated_at.as_deref().unwrap_or_default(),
         )
     });
-    match create_draft(&s, &user, base, "alter", &full).await {
+    let pairwise_critique = f.pairwise_critique.is_some();
+    match create_draft(&s, &user, base, "alter", &full, pairwise_critique).await {
         Ok(new_id) => Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response()),
-        Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
+        Err(e) => {
+            render_draft_page(&s, &user, &id, &e.to_string(), &prompt, pairwise_critique).await
+        }
     }
 }
 
@@ -149,11 +158,17 @@ async fn render_draft_page(
     id: &str,
     error: &str,
     prompt: &str,
+    pairwise_critique: bool,
 ) -> Result<Response> {
     let draft = find_draft(&state.db, &user.id, id).await?;
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
+    let critique = if draft.critique_json.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str(&draft.critique_json).map_err(|_| AppError::Ai)?)
+    };
     render(DraftTemplate {
         id: id.to_string(),
         recipe,
@@ -161,6 +176,8 @@ async fn render_draft_page(
         suggestions: draft.search_suggestions,
         error: error.to_string(),
         prompt: prompt.to_string(),
+        pairwise_critique,
+        critique,
     })
     .map(IntoResponse::into_response)
 }
@@ -301,15 +318,21 @@ async fn create_draft(
     base: Option<(&str, &str)>,
     operation: &str,
     prompt: &str,
+    pairwise_critique: bool,
 ) -> Result<String> {
-    let (generated_recipe, sources, suggestions) = pi_recipe(state, user, prompt).await?;
+    let (generated_recipe, sources, suggestions, critique) =
+        pi_recipe(state, user, prompt, pairwise_critique).await?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
         .bind(now.to_rfc3339())
         .execute(&state.db)
         .await?;
-    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at)VALUES(?,?,?,?,?,?,?,?,?,?)")
+    let critique_json = match &critique {
+        Some(c) => serde_json::to_string(c).map_err(|_| AppError::Ai)?,
+        None => String::new(),
+    };
+    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at,critique_json)VALUES(?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(base.map(|(recipe_id, _)| recipe_id))
         .bind(operation)
@@ -320,6 +343,7 @@ async fn create_draft(
         .bind(&user.id)
         .bind(now.to_rfc3339())
         .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
+        .bind(critique_json)
         .execute(&state.db)
         .await?;
     Ok(id)
@@ -329,9 +353,10 @@ async fn pi_recipe(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+    pairwise_critique: bool,
+) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
     if crate::ai_provider(&state.db).await? == "openai" {
-        return openai_recipe(state, user, prompt).await;
+        return openai_recipe(state, user, prompt, pairwise_critique).await;
     }
     let mut credential = crate::codex_credential(&state.db, &user.id)
         .await?
@@ -376,6 +401,7 @@ async fn pi_recipe(
             "model": model,
             "reasoningEffort": effort,
             "searchEnabled": state.search_grounding,
+            "pairwiseCritique": pairwise_critique,
         });
         let (output, refreshed) =
             run_pi_worker_with_credential(state, &credential, &request).await?;
@@ -433,7 +459,8 @@ async fn openai_recipe(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+    pairwise_critique: bool,
+) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
     let Some((base_url, api_key)) = crate::openai_api_config(&state.db, &user.id).await? else {
         return Err(AppError::AiNotConfigured);
     };
@@ -480,6 +507,7 @@ async fn openai_recipe(
             "model": model,
             "reasoningEffort": effort,
             "searchEnabled": state.search_grounding,
+            "pairwiseCritique": pairwise_critique,
         });
         let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
         let worker_path = state.pi_worker_path.clone();
@@ -660,7 +688,7 @@ pub(crate) async fn fresh_model_catalogue(state: &Arc<AppState>, user_id: &str) 
 pub(crate) fn parse_pi_response(
     value: &Value,
     require_grounding: bool,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
     let mut recipe: GeneratedRecipe =
         serde_json::from_value(value["recipe"].clone()).map_err(|parse_error| {
             warn!(error = %parse_error, "AI response recipe failed schema deserialisation");
@@ -676,8 +704,20 @@ pub(crate) fn parse_pi_response(
         warn!("AI response carried no grounded search sources");
         return Err(AppError::Ai);
     }
+    // The critique is auxiliary review material; a malformed one is dropped
+    // with a warning rather than failing an otherwise valid recipe.
+    let critique = match value.get("critique") {
+        None | Some(Value::Null) => None,
+        Some(value) => match serde_json::from_value::<Critique>(value.clone()) {
+            Ok(critique) => Some(critique),
+            Err(parse_error) => {
+                warn!(error = %parse_error, "AI response critique failed deserialisation; dropping it");
+                None
+            }
+        },
+    };
     normalize_generated(&mut recipe)?;
-    Ok((recipe, sources, String::new()))
+    Ok((recipe, sources, String::new(), critique))
 }
 
 pub(crate) fn recipe_schema() -> Value {

@@ -7,6 +7,7 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { createNativeSearchObserver, nativeSearchPayload } from "./codex-native-search.mjs";
+import { loadEpicure, pairwiseCritique, critiqueMessage, ingredientDiff } from "./epicure-scores.mjs";
 
 const PROVIDER = "openai-codex";
 
@@ -185,8 +186,9 @@ function openaiCredentials(request) {
 
 /** POST {base}/responses; returns the parsed JSON body. Throws WorkerError on
  *  transport failure or non-2xx (error body truncated to 300 chars; never
- *  includes the key). */
-export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
+ *  includes the key). Shared by the one-shot generation call and the
+ *  multi-message critique-revision call. */
+async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
   const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), OPENAI_RESPONSE_TIMEOUT_MS);
@@ -197,16 +199,7 @@ export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, 
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model: modelId,
-        input: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: prompt },
-        ],
-        ...(searchEnabled ? { tools: [{ type: "web_search" }], tool_choice: "required" } : {}),
-        reasoning: { effort: reasoningEffort },
-        text: { verbosity: "low" },
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -223,6 +216,37 @@ export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, 
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
+  return postResponses(apiBaseUrl, apiKey, {
+    model: modelId,
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt },
+    ],
+    ...(searchEnabled ? { tools: [{ type: "web_search" }], tool_choice: "required" } : {}),
+    reasoning: { effort: reasoningEffort },
+    text: { verbosity: "low" },
+  }, fetchImpl);
+}
+
+/** Multi-message Responses API call for the critique-revision turn: system
+ *  prompt plus arbitrary role messages, no tools (revision is never
+ *  web-searched). Returns the parsed JSON body with the same error mapping as
+ *  openaiResponse. Input items are reduced to role/content: the critique pass
+ *  stamps its messages with `timestamp` for the pi SDK path, and the Responses
+ *  API rejects unknown fields on input items (HTTP 400). */
+export async function openaiChat(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", fetchImpl = fetch) {
+  return postResponses(apiBaseUrl, apiKey, {
+    model: modelId,
+    input: [
+      { role: "system", content: systemPrompt },
+      ...messages.map(({ role, content }) => ({ role, content })),
+    ],
+    reasoning: { effort: reasoningEffort },
+    text: { verbosity: "low" },
+  }, fetchImpl);
 }
 
 /** Reduces a Responses API body to what the worker needs.
@@ -255,6 +279,57 @@ export function parseResponsesOutput(data) {
     }
   }
   return { text: texts.join(""), searched, refused, citations };
+}
+
+/**
+ * Two-turn critique pass: scores the turn-1 recipe's ingredient pairings with
+ * the bundled epicure model, sends the compressed critique to the model on a
+ * second turn (no web search), and returns the revision. Fully fail-soft —
+ * any data, call, or parse failure returns the turn-1 recipe with
+ * critique: null, so the pass can never break generation.
+ * @returns {Promise<{recipe: object, critique: object|null}>}
+ */
+export async function critiquePass({ prompt, turn1Text, turn1Recipe, systemPrompt, callModel, log = console.error }) {
+  try {
+    const data = loadEpicure();
+    const critique = pairwiseCritique(turn1Recipe, data);
+    if (!critique) {
+      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "fewer than two matched ingredients" }));
+      return { recipe: turn1Recipe, critique: null };
+    }
+    const message = critiqueMessage(critique);
+    log(JSON.stringify({ event: "pairwise_critique", ...critique, turn2Message: message }));
+    const text = await callModel([
+      { role: "user", content: prompt, timestamp: Date.now() },
+      { role: "assistant", content: turn1Text, timestamp: Date.now() },
+      { role: "user", content: message, timestamp: Date.now() },
+    ]);
+    if (text === null) {
+      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision call failed or was refused" }));
+      return { recipe: turn1Recipe, critique: null };
+    }
+    let revised;
+    try {
+      revised = extractJson(text);
+    } catch {
+      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision response was not valid JSON" }));
+      return { recipe: turn1Recipe, critique: null };
+    }
+    if (!revised || typeof revised !== "object" || !revised.recipe || typeof revised.recipe !== "object") {
+      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision response lacked a recipe object" }));
+      return { recipe: turn1Recipe, critique: null };
+    }
+    const diff = ingredientDiff(turn1Recipe, revised.recipe);
+    log(JSON.stringify({ event: "pairwise_critique_result", ...diff }));
+    return { recipe: revised.recipe, critique: { ...critique, ...diff } };
+  } catch (error) {
+    log(JSON.stringify({
+      event: "pairwise_critique",
+      skipped: true,
+      reason: error instanceof Error ? error.message : "unknown error",
+    }));
+    return { recipe: turn1Recipe, critique: null };
+  }
 }
 
 /**
@@ -316,7 +391,26 @@ async function main() {
     if (searchEnabled && sources.length === 0) {
       throw new WorkerError("output", "OpenAI did not use any valid web-search sources.");
     }
-    outputJson({ recipe: result.recipe, sources });
+    const pass = request.pairwiseCritique === true
+      ? await critiquePass({
+          prompt: request.prompt,
+          turn1Text: text,
+          turn1Recipe: result.recipe,
+          systemPrompt: request.systemPrompt,
+          callModel: async (messages) => {
+            try {
+              const revisionData = await openaiChat(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort);
+              const { text: revisionText, refused: revisionRefused } = parseResponsesOutput(revisionData);
+              return revisionRefused ? null : revisionText;
+            } catch {
+              return null;
+            }
+          },
+        })
+      : { recipe: result.recipe, critique: null };
+    outputJson(pass.critique
+      ? { recipe: pass.recipe, sources, critique: pass.critique }
+      : { recipe: pass.recipe, sources });
     return;
   }
   await mkdir(agentDir, { recursive: true });
@@ -365,7 +459,8 @@ async function main() {
     throw new WorkerError("output", "Codex returned a recipe without running native web search.");
   }
 
-  const result = extractJson(assistantText(response));
+  const turn1Text = assistantText(response);
+  const result = extractJson(turn1Text);
   if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
     throw new WorkerError("output", "Pi did not return a recipe object.");
   }
@@ -373,7 +468,26 @@ async function main() {
   if (searchEnabled && sources.length === 0) {
     throw new WorkerError("output", "Pi did not use any valid web-search sources.");
   }
-  outputJson({ recipe: result.recipe, sources });
+  const pass = request.pairwiseCritique === true
+    ? await critiquePass({
+        prompt: request.prompt,
+        turn1Text,
+        turn1Recipe: result.recipe,
+        systemPrompt: request.systemPrompt,
+        callModel: async (messages) => {
+          const revision = await modelRuntime.complete(model, {
+            systemPrompt: recipePrompt(request.systemPrompt, false),
+            messages,
+            tools: [],
+          }, { reasoningEffort, textVerbosity: "low", transport: "sse", maxRetries: 1 });
+          if (revision.stopReason === "error" || revision.stopReason === "aborted") return null;
+          return assistantText(revision);
+        },
+      })
+    : { recipe: result.recipe, critique: null };
+  outputJson(pass.critique
+    ? { recipe: pass.recipe, sources, critique: pass.critique }
+    : { recipe: pass.recipe, sources });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

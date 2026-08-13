@@ -1,0 +1,1 @@
+ALTER TABLE ai_drafts ADD COLUMN critique_json TEXT NOT NULL DEFAULT '';

@@ -278,6 +278,7 @@ struct AiFormTemplate {
     cancel_url: String,
     error: String,
     prompt: String,
+    pairwise_critique: bool,
 }
 #[derive(Template)]
 #[template(path = "draft.html")]
@@ -288,6 +289,8 @@ struct DraftTemplate {
     suggestions: String,
     error: String,
     prompt: String,
+    pairwise_critique: bool,
+    critique: Option<Critique>,
 }
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -347,6 +350,8 @@ struct BlockForm {
 #[derive(Deserialize)]
 struct PromptForm {
     prompt: String,
+    #[serde(default)]
+    pairwise_critique: Option<String>, // checkbox present when checked
 }
 #[derive(Deserialize)]
 struct SettingsForm {
@@ -505,6 +510,41 @@ struct GeneratedRecipe {
     ingredients: Vec<Ingredient>,
     steps: Vec<GeneratedStep>,
 }
+/// Result of the opt-in pairwise flavour-critique pass, produced by the
+/// worker from the bundled epicure ingredient model and stored on the draft
+/// row so the draft page can show what the model was told and what changed.
+/// Wire field names match the worker's stdout `critique` object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Critique {
+    total: usize,
+    resolved: usize,
+    #[serde(default)]
+    unresolved: Vec<String>,
+    #[serde(rename = "pairCount")]
+    pair_count: usize,
+    #[serde(rename = "coherencePercentile")]
+    coherence_percentile: f64,
+    #[serde(rename = "weakestPairs", default)]
+    weakest_pairs: Vec<CritiquePair>,
+    #[serde(rename = "weakestIngredient", default)]
+    weakest_ingredient: Option<CritiqueIngredient>,
+    #[serde(default)]
+    added: Vec<String>,
+    #[serde(default)]
+    removed: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CritiquePair {
+    a: String,
+    b: String,
+    percentile: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CritiqueIngredient {
+    name: String,
+    #[serde(rename = "meanPercentile")]
+    mean_percentile: f64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChartRecipe {
     version: u8,
@@ -541,6 +581,7 @@ struct Draft {
     sources_json: String,
     search_suggestions: String,
     base_updated_at: Option<String>,
+    critique_json: String,
 }
 
 #[derive(Clone)]
