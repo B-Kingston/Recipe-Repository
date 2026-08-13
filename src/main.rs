@@ -297,7 +297,6 @@ struct DraftTemplate {
 struct SettingsTemplate {
     model_options: Vec<SelectOption>,
     effort_options: Vec<SelectOption>,
-    search_enabled: bool,
     codex_authorised: bool,
     codex_auth_url: String,
     openai_mode: bool,
@@ -683,7 +682,7 @@ pub(crate) async fn store_codex_credential(
 
 /// The active AI provider: "openai" (OpenAI API) or "pi" (Codex).
 /// Stored globally in app_settings like the model; the single-user app keeps
-/// this app-wide. Anything other than exactly "openai" resolves to "pi".
+/// this app-wide. Anything other than exactly "pi" resolves to "openai".
 pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
@@ -691,8 +690,8 @@ pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
             .await?;
     Ok(row
         .map(|(value,)| value)
-        .filter(|value| value == "openai")
-        .unwrap_or_else(|| "pi".into()))
+        .filter(|value| value == "pi")
+        .unwrap_or_else(|| "openai".into()))
 }
 
 /// The stored OpenAI API config for one user: (base URL, API key).
@@ -794,7 +793,6 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
     render(SettingsTemplate {
         model_options: model_options(fresh, &model),
         effort_options: effort_options(&selected_effort(&s.db, DEFAULT_REASONING_EFFORT).await?),
-        search_enabled: s.search_grounding,
         codex_authorised,
         codex_auth_url: "/settings/authorise-codex".into(),
         openai_mode,

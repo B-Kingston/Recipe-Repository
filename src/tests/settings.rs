@@ -50,9 +50,9 @@ async fn save(
 }
 
 #[tokio::test]
-async fn ai_provider_defaults_to_pi() {
+async fn ai_provider_defaults_to_openai() {
     let db = database().await;
-    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+    assert_eq!(ai_provider(&db).await.unwrap(), "openai");
 }
 
 #[tokio::test]

@@ -34,10 +34,6 @@
     </form>
   </div>
   <div class="block">
-    <h2>Web Search</h2>
-    <p class="muted">{% if search_enabled %}Enabled{% else %}Disabled{% endif %}</p>
-  </div>
-  <div class="block">
     <h2>Authorise Codex <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
     <p class="muted" style="margin-bottom: 10px;">Connect your OpenAI Codex account to enable AI recipe generation.</p>
     {% if codex_authorised %}
