@@ -84,7 +84,7 @@ pub(crate) async fn create_user(db: &SqlitePool, username: &str, password: &str)
         .bind(stamp())
         .execute(&mut *tx)
         .await?;
-    for table in ["recipes", "ai_drafts", "pi_credentials"] {
+    for table in ["recipes", "ai_drafts", "pi_credentials", "ai_endpoints"] {
         let query = format!("UPDATE {table} SET user_id=? WHERE user_id='' ");
         sqlx::query(&query).bind(&user_id).execute(&mut *tx).await?;
     }

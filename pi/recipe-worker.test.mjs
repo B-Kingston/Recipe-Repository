@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WorkerError, catalogModelIds, critiquePass, normalizeEffort, openaiChat, openaiResponse, parseResponsesOutput, verifiedSources } from "./recipe-worker.mjs";
+import { WorkerError, anthropicMessages, anthropicUrl, catalogModelIds, critiquePass, normalizeEffort, openaiChat, openaiResponse, parseAnthropicOutput, parseResponsesOutput, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -111,6 +111,121 @@ test("openaiResponse sends the chosen reasoning effort", async () => {
   await openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", false, "high", fetchImpl);
   const sent = JSON.parse(capturedInit.body);
   assert.deepEqual(sent.reasoning, { effort: "high" });
+});
+
+test("anthropicUrl maps base URLs to the Messages endpoint", () => {
+  assert.equal(anthropicUrl("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+  assert.equal(anthropicUrl("https://api.anthropic.com/"), "https://api.anthropic.com/v1/messages");
+  assert.equal(anthropicUrl("https://api.anthropic.com/v1"), "https://api.anthropic.com/v1/messages");
+  assert.equal(anthropicUrl("https://proxy.example.com/anthropic/v1/"), "https://proxy.example.com/anthropic/v1/messages");
+});
+
+test("anthropicMessages posts to /v1/messages with x-api-key auth", async () => {
+  let capturedUrl;
+  let capturedInit;
+  const fetchImpl = async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return { ok: true, json: async () => ({ type: "message", content: [] }) };
+  };
+  const body = await anthropicMessages(
+    "https://api.anthropic.com",
+    "sk-ant-test",
+    "claude-sonnet-4-5",
+    "sys",
+    [{ role: "user", content: "prompt" }],
+    "medium",
+    true,
+    fetchImpl,
+  );
+  assert.equal(capturedUrl, "https://api.anthropic.com/v1/messages");
+  assert.equal(capturedInit.method, "POST");
+  assert.equal(capturedInit.headers["Content-Type"], "application/json");
+  assert.equal(capturedInit.headers["x-api-key"], "sk-ant-test");
+  assert.equal(capturedInit.headers["anthropic-version"], "2023-06-01");
+  const sent = JSON.parse(capturedInit.body);
+  assert.equal(sent.model, "claude-sonnet-4-5");
+  assert.equal(sent.system, "sys");
+  assert.deepEqual(sent.messages, [{ role: "user", content: "prompt" }]);
+  assert.deepEqual(sent.tools, [{ type: "web_search_20250305" }]);
+  assert.deepEqual(body, { type: "message", content: [] });
+});
+
+test("anthropicMessages scales the thinking budget with effort and covers it in max_tokens", async () => {
+  let capturedInit;
+  const fetchImpl = async (url, init) => {
+    capturedInit = init;
+    return { ok: true, json: async () => ({}) };
+  };
+  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "low", false, fetchImpl);
+  let sent = JSON.parse(capturedInit.body);
+  assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 1024 });
+  assert.equal(sent.max_tokens, 1024 + 8192);
+  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "high", false, fetchImpl);
+  sent = JSON.parse(capturedInit.body);
+  assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 8192 });
+  assert.equal(sent.max_tokens, 8192 + 8192);
+  assert.ok(!("tools" in sent));
+});
+
+test("thinkingBudget defaults unknown or blank efforts to low", () => {
+  assert.equal(thinkingBudget(undefined), 1024);
+  assert.equal(thinkingBudget(""), 1024);
+  assert.equal(thinkingBudget("medium"), 4096);
+  assert.equal(thinkingBudget("high"), 8192);
+});
+
+test("anthropicMessages maps a non-2xx response to a WorkerError", async () => {
+  const fetchImpl = async () => ({ ok: false, status: 401, text: async () => "bad key" });
+  await assert.rejects(
+    anthropicMessages("https://api.anthropic.com", "sk-ant-test", "m", "s", [{ role: "user", content: "p" }], "low", false, fetchImpl),
+    (error) => {
+      assert.ok(error instanceof WorkerError);
+      assert.equal(error.code, "worker");
+      assert.ok(error.message.includes("HTTP 401"));
+      return true;
+    },
+  );
+});
+
+test("parseAnthropicOutput extracts text and web-search citations", () => {
+  const { text, searched, refused, citations } = parseAnthropicOutput({
+    stop_reason: "end_turn",
+    content: [
+      { type: "text", text: "Here is the recipe " },
+      { type: "text", text: "and more." },
+      {
+        type: "web_search_tool_result",
+        tool_use_id: "toolu_1",
+        content: [
+          { type: "text", text: "search summary" },
+          {
+            type: "search_result",
+            title: "Sourdough basics",
+            source: { type: "url", url: "https://example.com/sourdough" },
+          },
+          {
+            type: "search_result",
+            url: "https://example.org/old-shape",
+            title: "Legacy shape",
+          },
+        ],
+      },
+    ],
+  });
+  assert.equal(text, "Here is the recipe and more.");
+  assert.equal(searched, true);
+  assert.equal(refused, false);
+  assert.equal(citations.get("https://example.com/sourdough"), "Sourdough basics");
+  assert.equal(citations.get("https://example.org/old-shape"), "Legacy shape");
+});
+
+test("parseAnthropicOutput flags refusals and missing searches", () => {
+  const refused = parseAnthropicOutput({ stop_reason: "refusal", content: [] });
+  assert.equal(refused.refused, true);
+  const noSearch = parseAnthropicOutput({ stop_reason: "end_turn", content: [{ type: "text", text: "hi" }] });
+  assert.equal(noSearch.searched, false);
+  assert.equal(noSearch.citations.size, 0);
 });
 
 test("normalizeEffort defaults missing or blank to low", () => {

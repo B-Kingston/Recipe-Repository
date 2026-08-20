@@ -43,7 +43,7 @@ use recipes::{
 const DRAFT_HOURS: i64 = 24;
 const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
 const DEFAULT_REASONING_EFFORT: &str = "low";
 /// Reasoning efforts offered for the model, matching the worker protocol.
 const REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
@@ -95,6 +95,19 @@ struct CodexFlow {
     expires_at: i64,
 }
 
+/// A registered AI endpoint (OpenAI-spec or Anthropic-spec) with its API key,
+/// as stored in ai_endpoints. Shared into the AI pipeline; the key is sent to
+/// the worker per request and never rendered into templates.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct Endpoint {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) spec: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    pub(crate) model: String,
+}
+
 #[derive(Debug, Error)]
 enum AppError {
     #[error("That page was not found.")]
@@ -104,7 +117,7 @@ enum AppError {
     #[error("{0}")]
     Internal(String),
     #[error(
-        "The AI service is not configured. Authorise Codex or configure an OpenAI API key from the Settings page."
+        "The AI service is not configured. Authorise Codex or add an API endpoint from the Settings page."
     )]
     AiNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
@@ -299,11 +312,23 @@ struct SettingsTemplate {
     effort_options: Vec<SelectOption>,
     codex_authorised: bool,
     codex_auth_url: String,
-    openai_mode: bool,
-    openai_base_url: String,
+    codex_selected: bool,
+    has_endpoints: bool,
+    endpoints: Vec<EndpointRow>,
 }
 struct SelectOption {
     value: String,
+    selected: bool,
+}
+/// One saved AI endpoint as shown in Settings: spec, base URL, masked key,
+/// and model. The raw key never reaches the template.
+struct EndpointRow {
+    id: String,
+    name: String,
+    spec: String,
+    base_url: String,
+    key_masked: String,
+    model: String,
     selected: bool,
 }
 #[derive(Template)]
@@ -355,15 +380,20 @@ struct PromptForm {
 #[derive(Deserialize)]
 struct SettingsForm {
     #[serde(default)]
-    model: String, // Codex-only; the OpenAI mode is pinned to DEFAULT_OPENAI_MODEL
+    model: String, // Codex-only; endpoint models are stored per endpoint
     #[serde(default)]
     reasoning_effort: String,
     #[serde(default)]
-    use_openai_api: Option<String>, // checkbox present when checked
+    provider: String, // "pi" (Codex) or an ai_endpoints row id
+}
+#[derive(Deserialize)]
+struct EndpointForm {
+    name: String,
+    spec: String,
+    base_url: String,
+    api_key: String,
     #[serde(default)]
-    openai_base_url: String,
-    #[serde(default)]
-    openai_api_key: String,
+    model: String,
 }
 #[derive(Deserialize)]
 struct RecipeQuery {
@@ -395,6 +425,7 @@ async fn main() -> anyhowless::Result<()> {
     import_legacy_codex_auth(&db).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     set_default_model(&db, &configured_model).await?;
+    reconcile_ai_provider(&db).await?;
     let state = Arc::new(AppState {
         db,
         model: configured_model,
@@ -448,6 +479,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
         .route("/settings", get(settings_page).post(update_settings))
+        .route("/settings/endpoints", post(add_endpoint))
+        .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route(
             "/settings/password",
             get(reset_password_page).post(reset_password),
@@ -643,7 +676,8 @@ fn generate_guidance(search_grounding: bool) -> &'static str {
 }
 
 const CODEX_PROVIDER: &str = "openai-codex";
-const OPENAI_API_PROVIDER: &str = "openai-compatible";
+const OPENAI_SPEC: &str = "openai";
+const ANTHROPIC_SPEC: &str = "anthropic";
 
 /// The stored Codex OAuth credential, if any. The database is the source of
 /// truth; the Pi worker only ever sees a per-request materialised auth.json.
@@ -680,64 +714,134 @@ pub(crate) async fn store_codex_credential(
     Ok(())
 }
 
-/// The active AI provider: "openai" (OpenAI API) or "pi" (Codex).
-/// Stored globally in app_settings like the model; the single-user app keeps
-/// this app-wide. Anything other than exactly "pi" resolves to "openai".
+/// The active AI provider: "pi" (Codex) or an ai_endpoints row id.
+/// Stored app-wide like the model; reconcile_ai_provider keeps the value
+/// valid at startup and the endpoint handlers keep it valid at runtime.
+/// Anything absent resolves to "pi".
 pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
             .fetch_optional(db)
             .await?;
-    Ok(row
-        .map(|(value,)| value)
-        .filter(|value| value == "pi")
-        .unwrap_or_else(|| "openai".into()))
+    Ok(row.map(|(value,)| value).unwrap_or_else(|| "pi".into()))
 }
 
-/// The stored OpenAI API config for one user: (base URL, API key).
-pub(crate) async fn openai_api_config(
-    db: &SqlitePool,
-    user_id: &str,
-) -> Result<Option<(String, String)>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
-            .bind(user_id)
-            .bind(OPENAI_API_PROVIDER)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.and_then(|(json,)| {
-        let value: Value = serde_json::from_str(&json).ok()?;
-        Some((
-            value.get("baseUrl")?.as_str()?.to_string(),
-            value.get("apiKey")?.as_str()?.to_string(),
-        ))
-    }))
-}
-
-/// Upserts the OpenAI API config; same SQL shape as store_codex_credential,
-/// with provider OPENAI_API_PROVIDER and
-/// credential_json = json!({"baseUrl": base_url, "apiKey": api_key}).
-pub(crate) async fn store_openai_api_config(
-    db: &SqlitePool,
-    user_id: &str,
-    base_url: &str,
-    api_key: &str,
-) -> Result<()> {
-    let json = serde_json::to_string(&json!({ "baseUrl": base_url, "apiKey": api_key }))
-        .map_err(|_| AppError::Internal("OpenAI API config could not be serialised".into()))?;
-    sqlx::query(
-        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id,provider) DO UPDATE SET
-           credential_json = excluded.credential_json,
-           updated_at = excluded.updated_at",
+/// All registered AI endpoints for one user, oldest first.
+pub(crate) async fn list_endpoints(db: &SqlitePool, user_id: &str) -> Result<Vec<Endpoint>> {
+    Ok(sqlx::query_as(
+        "SELECT id,name,spec,base_url,api_key,model FROM ai_endpoints WHERE user_id=? ORDER BY created_at",
     )
     .bind(user_id)
-    .bind(OPENAI_API_PROVIDER)
-    .bind(json)
+    .fetch_all(db)
+    .await?)
+}
+
+/// One registered AI endpoint for one user, if it exists.
+pub(crate) async fn find_endpoint(
+    db: &SqlitePool,
+    user_id: &str,
+    id: &str,
+) -> Result<Option<Endpoint>> {
+    Ok(sqlx::query_as(
+        "SELECT id,name,spec,base_url,api_key,model FROM ai_endpoints WHERE user_id=? AND id=?",
+    )
+    .bind(user_id)
+    .bind(id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Registers a new AI endpoint for one user; returns its id.
+pub(crate) async fn insert_endpoint(
+    db: &SqlitePool,
+    user_id: &str,
+    name: &str,
+    spec: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = stamp();
+    sqlx::query("INSERT INTO ai_endpoints(id,user_id,name,spec,base_url,api_key,model,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?)")
+        .bind(&id)
+        .bind(user_id)
+        .bind(name)
+        .bind(spec)
+        .bind(base_url)
+        .bind(api_key)
+        .bind(model)
+        .bind(&now)
+        .bind(&now)
+        .execute(db)
+        .await?;
+    Ok(id)
+}
+
+pub(crate) async fn remove_endpoint(db: &SqlitePool, user_id: &str, id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM ai_endpoints WHERE user_id=? AND id=?")
+        .bind(user_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// The tail of a stored API key, for display only; the full key is never
+/// rendered into a template. Keys shorter than 8 characters show no tail at
+/// all, so a short key can never leak in full.
+fn mask_key(key: &str) -> String {
+    const MASK: &str = "••••";
+    if key.chars().count() < 8 {
+        return MASK.into();
+    }
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{MASK}{tail}")
+}
+
+/// Heals a stale ai_provider setting at startup: the pre-endpoint "openai"
+/// value or a deleted endpoint id resolves to the first registered endpoint,
+/// falling back to Codex ("pi"). Missing settings are left alone (the read
+/// path defaults to "pi").
+async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
+            .fetch_optional(db)
+            .await?;
+    let Some((current,)) = row else { return Ok(()) };
+    if current == "pi" {
+        return Ok(());
+    }
+    let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? LIMIT 1")
+        .bind(&current)
+        .fetch_optional(db)
+        .await?;
+    if live.is_some() {
+        return Ok(());
+    }
+    let first: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM ai_endpoints ORDER BY created_at LIMIT 1")
+            .fetch_optional(db)
+            .await?;
+    let value = first.map(|(id,)| id).unwrap_or_else(|| "pi".into());
+    sqlx::query(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(&value)
     .bind(stamp())
     .execute(db)
     .await?;
+    if value != current {
+        info!(from = %current, to = %value, "Reconciled stale AI provider setting");
+    }
     Ok(())
 }
 
@@ -775,28 +879,40 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
             false
         }
     };
-    let openai_mode = crate::ai_provider(&s.db).await? == "openai";
-    let openai_base_url = crate::openai_api_config(&s.db, &user.id)
+    let provider = crate::ai_provider(&s.db).await?;
+    let codex_selected = provider == "pi";
+    let endpoints = crate::list_endpoints(&s.db, &user.id)
         .await?
-        .map(|(url, _)| url)
-        .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.into());
-    // The model list is Codex-only: the OpenAI mode is pinned to
-    // DEFAULT_OPENAI_MODEL, so no catalogue refresh is ever triggered for it.
-    let (model, fresh) = if openai_mode {
-        (String::new(), Vec::new())
-    } else {
+        .into_iter()
+        .map(|endpoint| EndpointRow {
+            selected: endpoint.id == provider,
+            key_masked: mask_key(&endpoint.api_key),
+            id: endpoint.id,
+            name: endpoint.name,
+            spec: endpoint.spec,
+            base_url: endpoint.base_url,
+            model: endpoint.model,
+        })
+        .collect::<Vec<_>>();
+    let has_endpoints = !endpoints.is_empty();
+    // The model list is Codex-only: endpoint models are stored per endpoint,
+    // so no catalogue refresh is ever triggered for them.
+    let (model, fresh) = if codex_selected {
         (
             selected_model(&s.db, &s.model).await?,
             fresh_model_catalogue(&s, &user.id).await,
         )
+    } else {
+        (String::new(), Vec::new())
     };
     render(SettingsTemplate {
         model_options: model_options(fresh, &model),
         effort_options: effort_options(&selected_effort(&s.db, DEFAULT_REASONING_EFFORT).await?),
         codex_authorised,
         codex_auth_url: "/settings/authorise-codex".into(),
-        openai_mode,
-        openai_base_url,
+        codex_selected,
+        has_endpoints,
+        endpoints,
     })
 }
 
@@ -845,8 +961,8 @@ async fn update_settings(
     user: AuthUser,
     Form(form): Form<SettingsForm>,
 ) -> Result<Redirect> {
-    let want_openai = form.use_openai_api.is_some();
-    // The effort applies to both providers, so it is saved regardless of mode.
+    let provider = trim(&form.provider);
+    // The effort applies to all providers, so it is saved regardless of mode.
     let effort = trim(&form.reasoning_effort);
     let effort = if effort.is_empty() {
         DEFAULT_REASONING_EFFORT.to_string()
@@ -866,7 +982,7 @@ async fn update_settings(
     .bind(stamp())
     .execute(&s.db)
     .await?;
-    if !want_openai {
+    if provider == "pi" {
         let model = trim(&form.model);
         if model.is_empty() {
             return Err(AppError::BadRequest("Choose a model.".into()));
@@ -885,43 +1001,72 @@ async fn update_settings(
         .bind(stamp())
         .execute(&s.db)
         .await?;
-    }
-    if want_openai {
-        let stored = crate::openai_api_config(&s.db, &user.id).await?;
-        let base_url = trim(&form.openai_base_url);
-        let base_url = if base_url.is_empty() {
-            stored
-                .as_ref()
-                .map(|(url, _)| url.clone())
-                .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.into())
-        } else {
-            base_url
-        };
-        let api_key = trim(&form.openai_api_key);
-        let api_key = if api_key.is_empty() {
-            stored
-                .as_ref()
-                .map(|(_, key)| key.clone())
-                .ok_or_else(|| AppError::BadRequest("Enter the API key.".into()))?
-        } else {
-            api_key
-        };
-        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+    } else {
+        let endpoint = crate::find_endpoint(&s.db, &user.id, &provider)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("Choose a saved API endpoint.".into()))?;
+        if endpoint.spec != OPENAI_SPEC && endpoint.spec != ANTHROPIC_SPEC {
             return Err(AppError::BadRequest(
-                "API base URL must start with http:// or https://.".into(),
+                "The saved endpoint has an unknown API spec.".into(),
             ));
         }
-        let base_url = base_url.trim_end_matches('/').to_string();
-        crate::store_openai_api_config(&s.db, &user.id, &base_url, &api_key).await?;
     }
     sqlx::query(
         "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
-    .bind(if want_openai { "openai" } else { "pi" })
+    .bind(&provider)
     .bind(stamp())
     .execute(&s.db)
     .await?;
+    Ok(Redirect::to("/settings"))
+}
+
+/// Registers a new AI endpoint (OpenAI-spec or Anthropic-spec) with its API
+/// key. The key is stored in the database, never in a config file, and only
+/// its masked tail is ever rendered back to the page.
+async fn add_endpoint(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<EndpointForm>,
+) -> Result<Redirect> {
+    let name = required(&form.name, "Endpoint name")?;
+    let spec = required(&form.spec, "API spec")?;
+    if spec != OPENAI_SPEC && spec != ANTHROPIC_SPEC {
+        return Err(AppError::BadRequest(
+            "API spec must be openai or anthropic.".into(),
+        ));
+    }
+    let base_url = required(&form.base_url, "API base URL")?;
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err(AppError::BadRequest(
+            "API base URL must start with http:// or https://.".into(),
+        ));
+    }
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let api_key = required(&form.api_key, "API key")?;
+    let model = trim(&form.model);
+    crate::insert_endpoint(&s.db, &user.id, &name, &spec, &base_url, &api_key, &model).await?;
+    Ok(Redirect::to("/settings"))
+}
+
+/// Removes a saved endpoint. If it was the active provider, generation falls
+/// back to Codex ("pi") so the setting never dangles.
+async fn delete_endpoint(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Redirect> {
+    crate::remove_endpoint(&s.db, &user.id, &id).await?;
+    if crate::ai_provider(&s.db).await? == id {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', 'pi', ?)
+             ON CONFLICT(key) DO UPDATE SET value = 'pi', updated_at = excluded.updated_at",
+        )
+        .bind(stamp())
+        .execute(&s.db)
+        .await?;
+    }
     Ok(Redirect::to("/settings"))
 }
 

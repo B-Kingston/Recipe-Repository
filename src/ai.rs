@@ -355,8 +355,12 @@ async fn pi_recipe(
     prompt: &str,
     pairwise_critique: bool,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
-    if crate::ai_provider(&state.db).await? == "openai" {
-        return openai_recipe(state, user, prompt, pairwise_critique).await;
+    let provider = crate::ai_provider(&state.db).await?;
+    if provider != "pi" {
+        let endpoint = crate::find_endpoint(&state.db, &user.id, &provider)
+            .await?
+            .ok_or(AppError::AiNotConfigured)?;
+        return endpoint_recipe(state, &endpoint, prompt, pairwise_critique).await;
     }
     let mut credential = crate::codex_credential(&state.db, &user.id)
         .await?
@@ -450,21 +454,25 @@ async fn pi_recipe(
     Err(AppError::Ai)
 }
 
-/// Generates through the OpenAI API Responses path (worker provider "openai"):
-/// web_search tool when grounding is enabled, model pinned to gpt-5.6-luna,
-/// same two-attempt retry contract as the Codex branch (attempt 1 re-prompted
-/// with research guidance) but without credential refresh — the API key never
-/// round-trips back from the worker.
-async fn openai_recipe(
+/// Generates through a registered API endpoint (OpenAI-spec or Anthropic-spec):
+/// native web search when grounding is enabled, model from the endpoint or the
+/// spec default, same two-attempt retry contract as the Codex branch (attempt 1
+/// re-prompted with research guidance) but without credential refresh — the API
+/// key never round-trips back from the worker.
+async fn endpoint_recipe(
     state: &AppState,
-    user: &AuthUser,
+    endpoint: &crate::Endpoint,
     prompt: &str,
     pairwise_critique: bool,
 ) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
-    let Some((base_url, api_key)) = crate::openai_api_config(&state.db, &user.id).await? else {
-        return Err(AppError::AiNotConfigured);
+    let model = if endpoint.model.trim().is_empty() {
+        match endpoint.spec.as_str() {
+            crate::ANTHROPIC_SPEC => crate::DEFAULT_ANTHROPIC_MODEL.to_string(),
+            _ => crate::DEFAULT_OPENAI_MODEL.to_string(),
+        }
+    } else {
+        endpoint.model.clone()
     };
-    let model = crate::DEFAULT_OPENAI_MODEL;
     let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
     for attempt in 0..2 {
         let input = if attempt == 0 {
@@ -488,7 +496,7 @@ async fn openai_recipe(
             recipe_schema()
         );
         info!(
-            provider = "openai",
+            provider = %endpoint.spec,
             model = %model,
             reasoning_effort = %effort,
             search_enabled = state.search_grounding,
@@ -499,9 +507,9 @@ async fn openai_recipe(
         );
         let started = Instant::now();
         let request = json!({
-            "provider": "openai",
-            "apiBaseUrl": base_url,
-            "apiKey": api_key,
+            "provider": endpoint.spec,
+            "apiBaseUrl": endpoint.base_url,
+            "apiKey": endpoint.api_key,
             "prompt": input,
             "systemPrompt": system_prompt,
             "model": model,
@@ -521,18 +529,18 @@ async fn openai_recipe(
             let code = value["code"].as_str().unwrap_or("worker");
             let message = value["error"].as_str().unwrap_or("no message");
             if code == "configuration" || attempt == 1 {
-                error!(code, message, status = %output.status, elapsed_ms, "OpenAI worker failed");
+                error!(code, message, status = %output.status, elapsed_ms, "Endpoint worker failed");
                 return if code == "configuration" {
                     Err(AppError::AiNotConfigured)
                 } else {
                     Err(AppError::Ai)
                 };
             }
-            warn!(code, message, status = %output.status, elapsed_ms, "OpenAI worker failed; retrying with research guidance");
+            warn!(code, message, status = %output.status, elapsed_ms, "Endpoint worker failed; retrying with research guidance");
             continue;
         }
         info!(
-            provider = "openai",
+            provider = %endpoint.spec,
             model = %model,
             reasoning_effort = %effort,
             attempt,
@@ -544,9 +552,9 @@ async fn openai_recipe(
             Ok(result) => return Ok(result),
             Err(error) => {
                 if attempt == 1 {
-                    error!(attempt, error = %error, "OpenAI worker output failed validation");
+                    error!(attempt, error = %error, "Endpoint worker output failed validation");
                 } else {
-                    warn!(attempt, error = %error, "OpenAI worker output failed validation; retrying");
+                    warn!(attempt, error = %error, "Endpoint worker output failed validation; retrying");
                 }
             }
         }

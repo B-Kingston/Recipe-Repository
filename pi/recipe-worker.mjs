@@ -173,23 +173,21 @@ export function completionContext(request, searchEnabled) {
 
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
 
-function openaiCredentials(request) {
+function apiCredentials(request) {
   const apiBaseUrl = typeof request.apiBaseUrl === "string" && request.apiBaseUrl.trim()
     ? request.apiBaseUrl.trim() : null;
   const apiKey = typeof request.apiKey === "string" && request.apiKey.trim()
     ? request.apiKey.trim() : null;
   if (!apiBaseUrl || !apiKey) {
-    throw new WorkerError("worker", "Missing apiBaseUrl or apiKey for the OpenAI API request.");
+    throw new WorkerError("worker", "Missing apiBaseUrl or apiKey for the API request.");
   }
   return { apiBaseUrl, apiKey };
 }
 
-/** POST {base}/responses; returns the parsed JSON body. Throws WorkerError on
- *  transport failure or non-2xx (error body truncated to 300 chars; never
- *  includes the key). Shared by the one-shot generation call and the
- *  multi-message critique-revision call. */
-async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
-  const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
+/** POST JSON and return the parsed body. Throws WorkerError on transport
+ *  failure or non-2xx (error body truncated to 300 chars; never includes the
+ *  key). Shared by the Responses API path and the Messages API path. */
+async function fetchJson(url, headers, body, fetchImpl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), OPENAI_RESPONSE_TIMEOUT_MS);
   try {
@@ -197,7 +195,7 @@ async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        ...headers,
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -206,16 +204,22 @@ async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
       const detail = await response.text().catch(() => "");
       throw new WorkerError(
         "worker",
-        `OpenAI API returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`,
+        `API returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`,
       );
     }
     return await response.json();
   } catch (error) {
     if (error instanceof WorkerError) throw error;
-    throw new WorkerError("worker", `OpenAI API request failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    throw new WorkerError("worker", `API request failed: ${error instanceof Error ? error.message : "unknown error"}`);
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** POST {base}/responses; returns the parsed JSON body. */
+async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
+  const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
+  return fetchJson(url, { Authorization: `Bearer ${apiKey}` }, body, fetchImpl);
 }
 
 export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
@@ -279,6 +283,71 @@ export function parseResponsesOutput(data) {
     }
   }
   return { text: texts.join(""), searched, refused, citations };
+}
+
+const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20250305";
+/** Thinking budget tokens per reasoning effort; max_tokens must exceed it. */
+const ANTHROPIC_THINKING_BUDGETS = { low: 1024, medium: 4096, high: 8192 };
+/** Output headroom added to the thinking budget for max_tokens. */
+const ANTHROPIC_OUTPUT_HEADROOM = 8192;
+
+export function thinkingBudget(reasoningEffort) {
+  return ANTHROPIC_THINKING_BUDGETS[normalizeEffort(reasoningEffort)] ?? ANTHROPIC_THINKING_BUDGETS.low;
+}
+
+/** The Messages API path for a stored base URL: append /v1/messages, unless
+ *  the base already ends in /v1, then append /messages. */
+export function anthropicUrl(baseUrl) {
+  const base = baseUrl.replace(/\/+$/, "");
+  return /\/v1$/i.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+}
+
+/** POST {base}/v1/messages with x-api-key auth. Extended thinking is always
+ *  enabled with an effort-scaled budget; the web_search tool is attached when
+ *  search is enabled. max_tokens covers the budget plus output headroom.
+ *  Returns the parsed JSON body with the same error mapping as openaiResponse. */
+export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", searchEnabled = false, fetchImpl = fetch) {
+  const budget = thinkingBudget(reasoningEffort);
+  const body = {
+    model: modelId,
+    max_tokens: budget + ANTHROPIC_OUTPUT_HEADROOM,
+    system: systemPrompt,
+    messages,
+    thinking: { type: "enabled", budget_tokens: budget },
+    ...(searchEnabled ? { tools: [{ type: ANTHROPIC_WEB_SEARCH_TOOL }] } : {}),
+  };
+  return fetchJson(anthropicUrl(apiBaseUrl), {
+    "x-api-key": apiKey,
+    "anthropic-version": ANTHROPIC_VERSION,
+  }, body, fetchImpl);
+}
+
+/** Reduces a Messages API body to what the worker needs. Web search results
+ *  arrive as content blocks of type web_search_tool_result, each holding
+ *  search_result items with source.url / title; those become the citations
+ *  the claimed sources are verified against. */
+export function parseAnthropicOutput(data) {
+  const content = Array.isArray(data?.content) ? data.content : [];
+  let searched = false;
+  const citations = new Map();
+  const texts = [];
+  for (const block of content) {
+    if (block?.type === "text") {
+      if (typeof block.text === "string") texts.push(block.text);
+    } else if (block?.type === "web_search_tool_result") {
+      searched = true;
+      for (const item of Array.isArray(block.content) ? block.content : []) {
+        if (item?.type !== "search_result") continue;
+        const source = item.source;
+        const url = source && source.type === "url" && typeof source.url === "string"
+          ? source.url
+          : typeof item.url === "string" ? item.url : "";
+        if (url) citations.set(url, typeof item.title === "string" && item.title ? item.title : "");
+      }
+    }
+  }
+  return { text: texts.join(""), searched, refused: data?.stop_reason === "refusal", citations };
 }
 
 /**
@@ -372,7 +441,7 @@ async function main() {
     : "gpt-5.4-mini";
   const reasoningEffort = normalizeEffort(request.reasoningEffort);
   if (request.provider === "openai") {
-    const { apiBaseUrl, apiKey } = openaiCredentials(request);
+    const { apiBaseUrl, apiKey } = apiCredentials(request);
     const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
     const data = await openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, request.prompt, searchEnabled, reasoningEffort);
     if (data.status && data.status !== "completed") {
@@ -401,6 +470,64 @@ async function main() {
             try {
               const revisionData = await openaiChat(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort);
               const { text: revisionText, refused: revisionRefused } = parseResponsesOutput(revisionData);
+              return revisionRefused ? null : revisionText;
+            } catch {
+              return null;
+            }
+          },
+        })
+      : { recipe: result.recipe, critique: null };
+    outputJson(pass.critique
+      ? { recipe: pass.recipe, sources, critique: pass.critique }
+      : { recipe: pass.recipe, sources });
+    return;
+  }
+  if (request.provider === "anthropic") {
+    const { apiBaseUrl, apiKey } = apiCredentials(request);
+    const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
+    const data = await anthropicMessages(
+      apiBaseUrl,
+      apiKey,
+      modelId,
+      systemPrompt,
+      [{ role: "user", content: request.prompt }],
+      reasoningEffort,
+      searchEnabled,
+    );
+    if (data.stop_reason === "max_tokens") {
+      throw new WorkerError("worker", "Anthropic response was truncated by max_tokens.");
+    }
+    const { text, searched, refused, citations } = parseAnthropicOutput(data);
+    if (refused) throw new WorkerError("worker", "Anthropic refused the request.");
+    if (searchEnabled && !searched) {
+      throw new WorkerError("output", "Anthropic returned a recipe without running web search.");
+    }
+    const result = extractJson(text);
+    if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
+      throw new WorkerError("output", "Pi did not return a recipe object.");
+    }
+    const sources = verifiedSources(result.sources, citations, true);
+    if (searchEnabled && sources.length === 0) {
+      throw new WorkerError("output", "Anthropic did not use any valid web-search sources.");
+    }
+    const pass = request.pairwiseCritique === true
+      ? await critiquePass({
+          prompt: request.prompt,
+          turn1Text: text,
+          turn1Recipe: result.recipe,
+          systemPrompt: request.systemPrompt,
+          callModel: async (messages) => {
+            try {
+              const revisionData = await anthropicMessages(
+                apiBaseUrl,
+                apiKey,
+                modelId,
+                systemPrompt,
+                messages.map(({ role, content }) => ({ role, content })),
+                reasoningEffort,
+                false,
+              );
+              const { text: revisionText, refused: revisionRefused } = parseAnthropicOutput(revisionData);
               return revisionRefused ? null : revisionText;
             } catch {
               return null;

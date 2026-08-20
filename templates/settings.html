@@ -7,10 +7,14 @@
   <div class="block">
     <h2>AI Provider</h2>
     <form method="post" action="/settings">
-      <label class="toggle-row"><input type="checkbox" name="use_openai_api"{% if openai_mode %} checked{% endif %}> Use the OpenAI API instead of Codex</label>
-      {% if openai_mode %}
-      <p class="muted">Uses the gpt-5.6-luna model with native web search.</p>
-      {% else %}
+      <fieldset>
+        <legend class="muted">Active provider</legend>
+        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}> Codex <span class="muted">(ChatGPT subscription)</span></label>
+        {% for endpoint in endpoints %}
+        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}> {{ endpoint.name }} <span class="muted">({{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }})</span></label>
+        {% endfor %}
+      </fieldset>
+      {% if codex_selected %}
       <label for="model">Codex model</label>
       <select id="model" name="model">
         {% for option in model_options %}
@@ -25,13 +29,43 @@
         {% endfor %}
       </select>
       <p class="muted">Higher effort thinks longer for more careful recipes.</p>
-      <label for="openai_base_url">API base URL</label>
-      <input type="url" id="openai_base_url" name="openai_base_url" value="{{ openai_base_url }}">
-      <label for="openai_api_key">API key</label>
-      <input type="password" id="openai_api_key" name="openai_api_key" placeholder="sk-… (blank keeps the stored key)" autocomplete="off">
-      <p class="muted">Codex uses your ChatGPT subscription. The OpenAI API uses your key at the base URL (default https://api.openai.com/v1) with native web search on the gpt-5.6-luna model.</p>
       <button class="primary" type="submit">Save settings</button>
     </form>
+  </div>
+  <div class="block">
+    <h2>API endpoints</h2>
+    <p class="muted" style="margin-bottom: 10px;">Register OpenAI-spec or Anthropic-spec endpoints with their API keys, then switch between them above.</p>
+    <form method="post" action="/settings/endpoints">
+      <label for="endpoint_name">Name</label>
+      <input type="text" id="endpoint_name" name="name" placeholder="Claude, Local server, …">
+      <label for="endpoint_spec">API spec</label>
+      <select id="endpoint_spec" name="spec">
+        <option value="openai">OpenAI spec</option>
+        <option value="anthropic">Anthropic spec</option>
+      </select>
+      <label for="endpoint_base_url">Base URL</label>
+      <input type="url" id="endpoint_base_url" name="base_url" placeholder="https://api.anthropic.com">
+      <label for="endpoint_model">Model <span class="muted">(optional — blank uses the spec default)</span></label>
+      <input type="text" id="endpoint_model" name="model" placeholder="claude-sonnet-4-5 or gpt-5.6-luna">
+      <label for="endpoint_api_key">API key</label>
+      <input type="password" id="endpoint_api_key" name="api_key" autocomplete="off">
+      <button class="primary" type="submit">Save endpoint</button>
+    </form>
+    {% if has_endpoints %}
+    <ul class="endpoint-list">
+      {% for endpoint in endpoints %}
+      <li class="endpoint-row{% if endpoint.selected %} endpoint-row--active{% endif %}">
+        <div class="endpoint-detail">
+          <strong>{{ endpoint.name }}</strong>{% if endpoint.selected %} <span class="codex-status codex-status--connected">Active</span>{% endif %}
+          <p class="muted">{{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }}</p>
+        </div>
+        <form method="post" action="/settings/endpoints/{{ endpoint.id }}/delete">
+          <button class="button compact" type="submit">Delete</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
   </div>
   <div class="block">
     <h2>Authorise Codex <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>

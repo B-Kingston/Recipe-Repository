@@ -128,6 +128,30 @@ button, input, textarea, select { color: inherit; }
 .codex-status--missing {
   background: #f7e6e3;
 }
+.endpoint-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+.endpoint-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid var(--ink);
+  background: var(--paper);
+}
+.endpoint-row--active {
+  box-shadow: 2px 2px 0 #aaa;
+}
+.endpoint-detail {
+  min-width: 0;
+}
+.endpoint-detail .muted {
+  margin: 2px 0 0;
+}
 .app-shell { width: min(100%, 1160px); margin: 0 auto; }
 
 .paper {
