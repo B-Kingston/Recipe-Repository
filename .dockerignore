@@ -3,4 +3,7 @@
 target
 data
 .env
+.venv
+bench
 node_modules
+**/__pycache__

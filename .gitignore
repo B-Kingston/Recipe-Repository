@@ -1,5 +1,7 @@
 .env
+.venv/
 data/
+bench/ocr/data/
 deploy.sh
 *.sqlite3
 target/

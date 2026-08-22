@@ -46,13 +46,12 @@ Key invariants:
 
 ## Development Commands
 
+All development, benchmarking, experimentation, dependency/package installation, builds, and testing MUST run inside Docker. Do not run Rust, Node, Cargo, npm, benchmark, or packaging/install commands directly on the host machine. Use the project Docker/Compose environment (or an equivalent disposable development container) so the local machine is not modified by toolchains, caches, dependencies, or generated artifacts.
+
 ```sh
-cargo build / cargo run          # local Rust build (needs DATABASE_URL default sqlite:recipes.sqlite3)
-cargo test                        # Rust unit tests
-cargo fmt --check && cargo clippy -- -D warnings
-npm test                          # Node worker tests: node --test pi/*.test.mjs
 docker compose up --build         # full stack, port 3000, sqlite in recipe-data volume
 ./deploy-local.sh                 # local Docker deploy: build, start detached, wait for /healthz (-f for foreground)
+docker compose run --rm <service> <command>  # run build, test, fmt, clippy, benchmarks, or installs in a container
 ./deploy.sh [ssh-target]          # ssh → git pull --ff-only && docker compose up --build -d (default bailee@192.168.8.223)
 ```
 

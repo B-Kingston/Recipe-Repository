@@ -43,6 +43,12 @@ async function readRequest() {
       throw new Error("invalid request");
     }
     if (request.command === "listModels") return request;
+    if (request.command === "cleanMedia") {
+      if (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string") {
+        throw new Error("missing cleaner prompt or systemPrompt");
+      }
+      return request;
+    }
     if (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string") {
       throw new Error("missing prompt or systemPrompt");
     }
@@ -172,6 +178,7 @@ export function completionContext(request, searchEnabled) {
 }
 
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
+const OPENROUTER_CLEANER_TIMEOUT_MS = 180_000;
 
 function apiCredentials(request) {
   const apiBaseUrl = typeof request.apiBaseUrl === "string" && request.apiBaseUrl.trim()
@@ -187,9 +194,9 @@ function apiCredentials(request) {
 /** POST JSON and return the parsed body. Throws WorkerError on transport
  *  failure or non-2xx (error body truncated to 300 chars; never includes the
  *  key). Shared by the Responses API path and the Messages API path. */
-async function fetchJson(url, headers, body, fetchImpl) {
+async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), OPENAI_RESPONSE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(url, {
       method: "POST",
@@ -220,6 +227,134 @@ async function fetchJson(url, headers, body, fetchImpl) {
 async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
   const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
   return fetchJson(url, { Authorization: `Bearer ${apiKey}` }, body, fetchImpl);
+}
+
+/** OpenRouter's OpenAI-compatible chat-completions request used only for
+ * reducing noisy local video evidence before the final recipe generation. */
+export async function openrouterChatCompletion(
+  apiBaseUrl,
+  apiKey,
+  modelId,
+  systemPrompt,
+  prompt,
+  fetchImpl = fetch,
+  options = {},
+) {
+  const url = `${apiBaseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  const referer = process.env.OPENROUTER_HTTP_REFERER?.trim();
+  const title = process.env.OPENROUTER_APP_TITLE?.trim();
+  if (referer) headers["HTTP-Referer"] = referer;
+  if (title) headers["X-Title"] = title;
+  const body = {
+    model: modelId,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt },
+    ],
+    // Default keeps the historical cleaner behaviour. Callers may disable
+    // reasoning (the free Gemma cleaner wastes most of its token budget on
+    // chain-of-thought for a simple extraction task) or tune temperature/
+    // max_tokens for cheaper, faster, more deterministic cleaning. A caller
+    // may also pass reasoning: null to OMIT the field entirely for providers
+    // that reject the flag on certain models.
+    reasoning: options.reasoning !== undefined ? options.reasoning : { enabled: true },
+    stream: false,
+    max_tokens: options.maxTokens ?? 2048,
+  };
+  if (body.reasoning === null) delete body.reasoning;
+  if (typeof options.temperature === "number") body.temperature = options.temperature;
+  return fetchJson(url, headers, body, fetchImpl, OPENROUTER_CLEANER_TIMEOUT_MS);
+}
+
+function cleanerMessageText(data) {
+  const message = data?.choices?.[0]?.message;
+  if (!message || message.refusal) {
+    throw new WorkerError("output", "OpenRouter refused the media-cleaner request.");
+  }
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("");
+  }
+  throw new WorkerError("output", "OpenRouter returned no media-cleaner text.");
+}
+
+function cleanerScalar(value, max = 800) {
+  if (typeof value !== "string") return "";
+  return value.replaceAll("\u0000", " ").trim().slice(0, max);
+}
+
+function cleanerList(value) {
+  const values = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  return values
+    .flatMap((item) => {
+      if (typeof item === "string") return [item];
+      if (!item || typeof item !== "object") return [];
+      const direct = item.text ?? item.step ?? item.instruction ?? item.fact;
+      if (direct) return [direct];
+      const name = item.name ?? item.ingredient ?? "";
+      const amount = item.amount ?? item.quantity ?? "";
+      const unit = item.unit ?? "";
+      return [
+        [amount, unit, name].filter((part) => typeof part === "string" && part.trim()).join(" "),
+      ];
+    })
+    .map((item) => cleanerScalar(item))
+    .filter(Boolean)
+    .slice(0, 80);
+}
+
+/** Converts the model's constrained JSON into a small, known-field-only text
+ * block. Unknown response fields and prose are discarded rather than passed
+ * through to the final recipe model. */
+export function formatRecipeEvidence(value) {
+  const root = value?.recipeEvidence && typeof value.recipeEvidence === "object"
+    ? value.recipeEvidence
+    : value;
+  if (!root || typeof root !== "object" || Array.isArray(root)) {
+    throw new WorkerError("output", "OpenRouter returned an invalid media-cleaner object.");
+  }
+  const title = cleanerScalar(root.title);
+  const servings = cleanerScalar(root.servings);
+  const ingredients = cleanerList(root.ingredients);
+  const steps = cleanerList(root.steps);
+  const timings = cleanerList(root.timings);
+  const notes = cleanerList(root.relevant_notes ?? root.relevantNotes);
+  if (ingredients.length === 0 && steps.length === 0) {
+    throw new WorkerError("output", "OpenRouter found no recipe facts in the video evidence.");
+  }
+  const lines = [];
+  if (title) lines.push(`Dish: ${title}`);
+  if (servings) lines.push(`Servings: ${servings}`);
+  if (ingredients.length > 0) {
+    lines.push("Ingredients:");
+    lines.push(...ingredients.map((item) => `- ${item}`));
+  }
+  if (steps.length > 0) {
+    lines.push("Method:");
+    lines.push(...steps.map((item, index) => `${index + 1}. ${item}`));
+  }
+  if (timings.length > 0) {
+    lines.push("Timings and temperatures:");
+    lines.push(...timings.map((item) => `- ${item}`));
+  }
+  if (notes.length > 0) {
+    lines.push("Relevant recipe notes:");
+    lines.push(...notes.map((item) => `- ${item}`));
+  }
+  const text = lines.join("\n").trim();
+  if (text.length > 24_000) {
+    throw new WorkerError("output", "OpenRouter returned too much media-cleaner text.");
+  }
+  return text;
+}
+
+export function parseOpenRouterCleaner(data) {
+  const text = cleanerMessageText(data);
+  return formatRecipeEvidence(extractJson(text));
 }
 
 export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
@@ -428,10 +563,45 @@ async function listModels(request) {
   outputJson({ models: catalogModelIds(modelRuntime.getModels(PROVIDER)) });
 }
 
+async function cleanMedia(request) {
+  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+  if (!apiKey) {
+    throw new WorkerError("configuration", "OPENROUTER_API_KEY is not configured.");
+  }
+  const apiBaseUrl = process.env.OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
+  const modelId = typeof request.model === "string" && request.model.trim()
+    ? request.model.trim()
+    : process.env.OPENROUTER_CLEANER_MODEL?.trim() || "google/gemma-4-26b-a4b-it:free";
+  // Optional tuning knobs forwarded from the host (ai.rs). When omitted the
+  // worker's openrouterChatCompletion keeps the historical defaults.
+  const options = {
+    reasoning: typeof request.reasoning === "object" && request.reasoning ? request.reasoning : undefined,
+    maxTokens: typeof request.maxTokens === "number" ? request.maxTokens : undefined,
+    temperature: typeof request.temperature === "number" ? request.temperature : undefined,
+  };
+  for (const key of Object.keys(options)) {
+    if (options[key] === undefined) delete options[key];
+  }
+  const data = await openrouterChatCompletion(
+    apiBaseUrl,
+    apiKey,
+    modelId,
+    request.systemPrompt,
+    request.prompt,
+    undefined,
+    options,
+  );
+  outputJson({ cleanedText: parseOpenRouterCleaner(data), model: modelId });
+}
+
 async function main() {
   const request = await readRequest();
   if (request.command === "listModels") {
     await listModels(request);
+    return;
+  }
+  if (request.command === "cleanMedia") {
+    await cleanMedia(request);
     return;
   }
   const agentDir = process.env.PI_CODING_AGENT_DIR || getAgentDir();

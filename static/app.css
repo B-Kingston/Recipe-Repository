@@ -176,6 +176,7 @@ h3 { font: 700 1rem/1.2 var(--sans); }
   border-bottom: var(--line) solid var(--ink);
 }
 .section-heading h1 { margin: 0; }
+.section-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .eyebrow { margin-bottom: 5px; font: 700 11px/1 var(--sans); letter-spacing: .13em; text-transform: uppercase; }
 
 .recipe-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding-top: 18px; }
@@ -336,6 +337,16 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 }
 .critique-added { color: #1b5e20; border-color: #1b5e20; }
 .critique-removed { color: #8b1a1a; border-color: #8b1a1a; text-decoration: line-through; }
+.evidence-panel { width: min(100%, 780px); margin: 24px auto 18px; padding: 17px 20px; background: #f1f5ee; }
+.evidence-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.evidence-heading h2 { margin: 0; }
+.evidence-heading a { font-size: 13px; font-weight: 700; }
+.evidence-panel details { margin-top: 9px; border-top: 1px solid var(--ink); padding-top: 8px; }
+.evidence-panel summary { cursor: pointer; font-weight: 700; }
+.evidence-text { margin: 8px 0 2px; max-height: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .9rem; }
+.evidence-ocr { margin: 8px 0 2px; padding-left: 1.2rem; font-size: .9rem; }
+.evidence-ocr li { margin: 4px 0; }
+.evidence-warning { margin: 12px 0 0; padding-top: 9px; border-top: 1px dashed var(--ink); color: #714b00; font-size: .86rem; }
 .edit-form { margin-top: .8rem; padding-top: .8rem; border-top: 1px dashed var(--ink); }
 .form-panel { max-width: 720px; margin: 26px auto; padding: 24px; box-shadow: 4px 4px 0 var(--ink); }
 .form-intro { max-width: 650px; margin: 0 auto 22px; text-align: center; }
@@ -402,7 +413,8 @@ input[type=checkbox] { width: auto; box-shadow: none; }
   .brand { padding-inline: 12px; }
   .brand span:last-child { display: none; }
   .top-nav { margin-left: auto; }
-  .top-nav a { padding-inline: 10px; font-size: 14px; }
+  .top-nav a { padding-inline: 8px; font-size: 13px; }
+  .section-actions { justify-content: flex-end; }
   .paper { min-height: calc(100vh - 45px); padding: 20px 14px 30px; }
   .recipe-grid, .two-col { grid-template-columns: 1fr; }
   .page-header { display: block; }

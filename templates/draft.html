@@ -37,6 +37,19 @@
 </section>
 {% when None %}
 {% endmatch %}
+{% match evidence %}
+{% when Some with (evidence) %}
+<section class="panel evidence-panel">
+  <div class="evidence-heading"><h2>Evidence combined from video</h2><a href="{{ evidence.source_url }}" target="_blank" rel="noopener noreferrer">Open original post</a></div>
+  <p class="muted">Local audio and OCR were combined with the post caption, then reduced to recipe-only facts by the OpenRouter cleaner before this draft was generated{% if evidence.duration_seconds.is_some() %} from the first {{ evidence.duration_seconds.unwrap() }} seconds{% endif %}.</p>
+  {% if evidence.cleaned_recipe_text != "" %}<details class="cleaned-evidence" open><summary>Recipe-only evidence sent to the final model</summary><p class="evidence-text">{{ evidence.cleaned_recipe_text }}</p></details>{% endif %}
+  {% if evidence.description != "" %}<details><summary>Raw post description (cleaner input only)</summary><p class="evidence-text">{{ evidence.description }}</p></details>{% endif %}
+  {% if evidence.audio_transcript != "" %}<details><summary>Raw audio transcript (cleaner input only)</summary><p class="evidence-text">{{ evidence.audio_transcript }}</p></details>{% endif %}
+  {% if evidence.ocr.len() > 0 %}<details><summary>{{ evidence.ocr.len() }} raw OCR capture{% if evidence.ocr.len() != 1 %}s{% endif %} (cleaner input only)</summary><ul class="evidence-ocr">{% for item in evidence.ocr %}<li><span class="muted">~{{ item.timestamp_seconds }}s</span> {{ item.text }}</li>{% endfor %}</ul></details>{% endif %}
+  {% if evidence.warnings.len() > 0 %}<p class="evidence-warning"><strong>Extraction notes:</strong> {% for warning in evidence.warnings %}{{ warning }}{% if !loop.last %} {% endif %}{% endfor %}</p>{% endif %}
+</section>
+{% when None %}
+{% endmatch %}
 <p class="muted top-spacer">Review this researched draft before adding it to your library.</p>
 <article class="draft-panel">
   <section class="recipe-section ingredients-section">

@@ -1,7 +1,7 @@
 use askama::Template;
 use axum::{
     Router,
-    extract::{Form, Path, State},
+    extract::{DefaultBodyLimit, Form, Path, State},
     middleware,
     response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
@@ -16,7 +16,13 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap, env, io::Write, net::SocketAddr, process::Stdio, str::FromStr, sync::Arc,
+    collections::HashMap,
+    env,
+    io::{Read, Write},
+    net::SocketAddr,
+    process::Stdio,
+    str::FromStr,
+    sync::Arc,
 };
 use thiserror::Error;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -26,6 +32,7 @@ use uuid::Uuid;
 mod ai;
 mod auth;
 mod chart;
+mod media;
 mod recipes;
 use auth::{
     AuthUser, auth_middleware, reset_password, reset_password_page, setup_create, setup_page,
@@ -33,8 +40,9 @@ use auth::{
 
 use ai::{
     alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
-    fresh_model_catalogue, generate_page, generate_recipe,
+    fresh_model_catalogue, generate_page, generate_recipe, import_page, import_recipe,
 };
+use media::MediaEvidence;
 use recipes::{
     add_block, delete_block, delete_page, delete_recipe, home, move_block, new_recipe, recipe_page,
     update_block, update_recipe,
@@ -120,6 +128,10 @@ enum AppError {
         "The AI service is not configured. Authorise Codex or add an API endpoint from the Settings page."
     )]
     AiNotConfigured,
+    #[error(
+        "The video recipe cleaner is not configured. Set OPENROUTER_API_KEY before importing a video."
+    )]
+    MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
     Ai,
     #[error("Codex authorisation failed: {0}")]
@@ -294,12 +306,20 @@ struct AiFormTemplate {
     pairwise_critique: bool,
 }
 #[derive(Template)]
+#[template(path = "media_import.html")]
+struct MediaImportTemplate {
+    error: String,
+    url: String,
+    notes: String,
+}
+#[derive(Template)]
 #[template(path = "draft.html")]
 struct DraftTemplate {
     id: String,
     recipe: GeneratedRecipe,
     sources: Vec<Source>,
     suggestions: String,
+    evidence: Option<MediaEvidence>,
     error: String,
     prompt: String,
     pairwise_critique: bool,
@@ -378,6 +398,12 @@ struct PromptForm {
     pairwise_critique: Option<String>, // checkbox present when checked
 }
 #[derive(Deserialize)]
+struct MediaImportForm {
+    url: String,
+    #[serde(default)]
+    notes: String,
+}
+#[derive(Deserialize)]
 struct SettingsForm {
     #[serde(default)]
     model: String, // Codex-only; endpoint models are stored per endpoint
@@ -406,8 +432,31 @@ struct RecipeQuery {
 #[tokio::main]
 async fn main() -> anyhowless::Result<()> {
     dotenvy::dotenv().ok();
-    if env::args().any(|arg| arg == "--healthcheck") {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--healthcheck") {
         return healthcheck().await;
+    }
+    if let Some(index) = args
+        .iter()
+        .position(|arg| arg == "--extract-media-evidence")
+    {
+        let url = args.get(index + 1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--extract-media-evidence requires a social-media URL",
+            )
+        })?;
+        let evidence = media::extract_social_evidence(url).await?;
+        println!("{}", serde_json::to_string_pretty(&evidence)?);
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--clean-ocr") {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let value: Value = serde_json::from_str(&input)?;
+        let snippets = media::clean_ocr_batch(&value, 0.5);
+        println!("{}", serde_json::to_string_pretty(&snippets)?);
+        return Ok(());
     }
     tracing_subscriber::fmt()
         .with_env_filter(env::var("RUST_LOG").unwrap_or_else(|_| "kindle_recipes=info".into()))
@@ -426,6 +475,14 @@ async fn main() -> anyhowless::Result<()> {
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     set_default_model(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
+    let removed_expired_drafts = sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
+        .bind(Utc::now().to_rfc3339())
+        .execute(&db)
+        .await?
+        .rows_affected();
+    if removed_expired_drafts > 0 {
+        info!(removed_expired_drafts, "Removed expired AI drafts");
+    }
     let state = Arc::new(AppState {
         db,
         model: configured_model,
@@ -473,6 +530,12 @@ fn routes(state: Arc<AppState>) -> Router {
         )
         .route("/recipes/{id}/blocks/{block_id}/delete", post(delete_block))
         .route("/ai/generate", get(generate_page).post(generate_recipe))
+        .route(
+            "/ai/import",
+            get(import_page)
+                .post(import_recipe)
+                .layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route("/recipes/{id}/ai/alter", get(alter_page).post(alter_recipe))
         .route("/ai/drafts/{id}", get(draft_page))
         .route("/ai/drafts/{id}/alter", post(alter_draft))
@@ -614,6 +677,7 @@ struct Draft {
     search_suggestions: String,
     base_updated_at: Option<String>,
     critique_json: String,
+    evidence_json: String,
 }
 
 #[derive(Clone)]

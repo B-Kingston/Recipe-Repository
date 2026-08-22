@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WorkerError, anthropicMessages, anthropicUrl, catalogModelIds, critiquePass, normalizeEffort, openaiChat, openaiResponse, parseAnthropicOutput, parseResponsesOutput, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
+import { WorkerError, anthropicMessages, anthropicUrl, catalogModelIds, critiquePass, formatRecipeEvidence, normalizeEffort, openaiChat, openaiResponse, openrouterChatCompletion, parseAnthropicOutput, parseOpenRouterCleaner, parseResponsesOutput, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -111,6 +111,78 @@ test("openaiResponse sends the chosen reasoning effort", async () => {
   await openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", false, "high", fetchImpl);
   const sent = JSON.parse(capturedInit.body);
   assert.deepEqual(sent.reasoning, { effort: "high" });
+});
+
+test("openrouterChatCompletion uses the requested chat-completions model and reasoning", async () => {
+  let capturedUrl;
+  let capturedInit;
+  const fetchImpl = async (url, init) => {
+    capturedUrl = url;
+    capturedInit = init;
+    return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
+  };
+  await openrouterChatCompletion("https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free", "sys", "raw evidence", fetchImpl);
+  assert.equal(capturedUrl, "https://openrouter.ai/api/v1/chat/completions");
+  assert.equal(capturedInit.headers.Authorization, "Bearer or-test");
+  const sent = JSON.parse(capturedInit.body);
+  assert.equal(sent.model, "google/gemma-4-26b-a4b-it:free");
+  assert.deepEqual(sent.messages, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "raw evidence" },
+  ]);
+  assert.deepEqual(sent.reasoning, { enabled: true });
+  assert.equal(sent.stream, false);
+  assert.equal(sent.max_tokens, 2048);
+  assert.ok(!("temperature" in sent));
+});
+
+test("openrouterChatCompletion honours reasoning/maxTokens/temperature options and omits reasoning when null", async () => {
+  let capturedInit;
+  const fetchImpl = async (_url, init) => {
+    capturedInit = init;
+    return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
+  };
+  // Off + tuned max_tokens and a deterministic temperature.
+  await openrouterChatCompletion(
+    "https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free",
+    "sys", "raw evidence", fetchImpl,
+    { reasoning: { enabled: false }, maxTokens: 1024, temperature: 0 },
+  );
+  let sent = JSON.parse(capturedInit.body);
+  assert.deepEqual(sent.reasoning, { enabled: false });
+  assert.equal(sent.max_tokens, 1024);
+  assert.equal(sent.temperature, 0);
+  // null reasoning means the field is omitted entirely (some models reject it).
+  await openrouterChatCompletion(
+    "https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free",
+    "sys", "raw evidence", fetchImpl, { reasoning: null },
+  );
+  sent = JSON.parse(capturedInit.body);
+  assert.ok(!("reasoning" in sent), "null reasoning should omit the field");
+  assert.equal(sent.max_tokens, 2048, "unset maxTokens keeps the default");
+});
+
+test("parseOpenRouterCleaner keeps recipe fields and discards cleaner prose and unknown fields", () => {
+  const cleaned = parseOpenRouterCleaner({
+    choices: [{ message: { content: "```json\n" + JSON.stringify({
+      title: "Chilli tofu",
+      ingredients: [{ quantity: "200", unit: "g", name: "tofu" }, "1 tbsp oil"],
+      steps: ["Crisp the tofu"],
+      timings: ["Fry for 5 minutes"],
+      relevant_notes: ["Serve hot"],
+      rambling: "Follow me for more recipes",
+    }) + "\n```" } }],
+  });
+  assert.equal(cleaned, "Dish: Chilli tofu\nIngredients:\n- 200 g tofu\n- 1 tbsp oil\nMethod:\n1. Crisp the tofu\nTimings and temperatures:\n- Fry for 5 minutes\nRelevant recipe notes:\n- Serve hot");
+  assert.ok(!cleaned.includes("Follow me"));
+});
+
+test("formatRecipeEvidence rejects cleaner output without ingredients or steps", () => {
+  assert.throws(() => formatRecipeEvidence({ title: "A story", relevant_notes: ["Like and follow"] }), (error) => {
+    assert.ok(error instanceof WorkerError);
+    assert.equal(error.code, "output");
+    return true;
+  });
 });
 
 test("anthropicUrl maps base URLs to the Messages endpoint", () => {
