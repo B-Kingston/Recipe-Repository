@@ -27,6 +27,8 @@ The Docker image includes the local video-analysis runtime. `MEDIA_WHISPER_MODEL
 
 The social importer is intentionally single-URL and best-effort: Meta may require login, block datacenter IPs, or change its page format. Public Facebook Reels are less reliable to download than Instagram posts. The UI reports missing local audio/OCR tools or cleaner configuration instead of silently sending raw social chatter to the final model. To keep the local process bounded, it analyzes at most the first five minutes, downloads at most a 60 MiB media file, limits the temporary workdir, and runs one import at a time.
 
+To debug the reel pipeline itself, open **Settings → Media extraction debugger**. It runs the same extractor on up to five URLs (one per line), streams each phase live — post description capture, audio transcription, per-frame OCR — and finishes with a review page showing every OCR frame thumbnail next to its raw engine reading, the cleaner's verdict for that reading, the caption chains that became evidence cards, and the full description/audio captures.
+
 ## Deployment note
 
 This first release deliberately has no login. Only expose it on a trusted LAN or behind a VPN/reverse proxy with access control. Do not place it directly on the public internet.

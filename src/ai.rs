@@ -1,29 +1,37 @@
 use crate::media::{
-    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaEvidence,
-    canonical_social_url, cleaner_prompt, extract_social_evidence,
-    recipe_prompt as media_recipe_prompt,
+    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaDebug,
+    MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence,
+    extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
-    AppError, AppState, AuthUser, ChartRecipe, Critique, DRAFT_HOURS, DraftTemplate,
-    GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient, IngredientUse, MediaImportForm,
-    MediaImportTemplate, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source,
-    generate_guidance, render, required, stamp, trim,
+    AppError, AppState, AuthUser, ChartRecipe, Critique, DRAFT_HOURS, DebugUrlView, DraftTemplate,
+    GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView,
+    MediaDebugCardView, MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate,
+    MediaDebugTemplate, MediaImportForm, MediaImportTemplate, ModelCatalogue, PromptForm,
+    RECIPE_PROMPT, Result, Source, generate_guidance, render, required, stamp, trim,
 };
 use axum::{
     Form,
-    extract::{Path, State},
-    response::{Html, IntoResponse, Redirect, Response},
+    extract::{Path, Query, State},
+    http::header,
+    response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use chrono::{Duration, Utc};
+use parking_lot::Mutex;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
-    env,
+    collections::{HashMap, HashSet},
+    env, fs,
     io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::PathBuf,
     process::{Command, Stdio},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::Semaphore;
@@ -1289,4 +1297,532 @@ pub(crate) fn dedupe_sources(sources: Vec<Source>) -> Vec<Source> {
                 && seen.insert(source.url.clone())
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Media extraction debugger (Settings → Media extraction debugger)
+//
+// A single-user tool for watching the Instagram/Facebook reel pipeline run:
+// one or more URLs are extracted through the production path while phase
+// events (page metadata, download, audio transcript, per-frame OCR captures)
+// stream into an in-memory run record. The run page polls a JSON events
+// endpoint so results appear live, then keeps every capture — description,
+// audio, OCR frames with raw vs cleaned readings — on one page for review.
+// Runs are ephemeral: memory only, frames in a temp directory that is removed
+// when the run is evicted.
+// ---------------------------------------------------------------------------
+
+/// Social URLs extracted per debugger run. The local extractor holds one
+/// global media slot, so URLs in a run (and any concurrent video import) are
+/// processed sequentially regardless of this cap.
+pub(crate) const MAX_DEBUG_URLS: usize = 5;
+/// Runs kept at once; starting another evicts the oldest.
+pub(crate) const DEBUG_RUN_LIMIT: usize = 4;
+const DEBUG_RUN_TTL_SECONDS: u64 = 2 * 60 * 60;
+/// Upper bound on buffered events per run before the oldest are dropped.
+const DEBUG_HISTORY_CAP: usize = 4000;
+
+/// One URL's accumulated review state inside a debugger run, kept in sync by
+/// the same events the browser receives so the server-rendered snapshot and
+/// the live view always agree.
+#[derive(Default)]
+pub(crate) struct DebugUrlState {
+    pub(crate) source_url: String,
+    pub(crate) status: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) duration_seconds: Option<u64>,
+    pub(crate) transcript: String,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) captures: Vec<DebugCaptureRow>,
+    pub(crate) cards: Vec<DebugCardRow>,
+    pub(crate) error_message: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct DebugCaptureRow {
+    pub(crate) seconds: u64,
+    /// Retained frame file name; empty when the copy failed.
+    pub(crate) image: String,
+    pub(crate) raw: String,
+    pub(crate) cleaned: Option<String>,
+    pub(crate) card: Option<usize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DebugCardRow {
+    pub(crate) seconds: u64,
+    pub(crate) text: String,
+    pub(crate) kept: bool,
+}
+
+/// An in-flight (or recently finished) debugger run. Cloned freely; all
+/// fields are shared.
+#[derive(Clone)]
+pub(crate) struct MediaDebugRun {
+    pub(crate) created: Instant,
+    pub(crate) dir: PathBuf,
+    pub(crate) urls: Arc<Vec<Arc<Mutex<DebugUrlState>>>>,
+    pub(crate) history: Arc<Mutex<Vec<Value>>>,
+    pub(crate) pending: Arc<AtomicUsize>,
+}
+
+pub(crate) type DebugRunMap = Arc<Mutex<HashMap<String, MediaDebugRun>>>;
+
+impl MediaDebugRun {
+    fn new(urls: &[String], dir: PathBuf) -> Self {
+        Self {
+            created: Instant::now(),
+            dir,
+            urls: Arc::new(
+                urls.iter()
+                    .map(|url| {
+                        Arc::new(Mutex::new(DebugUrlState {
+                            source_url: url.clone(),
+                            status: "queued".into(),
+                            ..DebugUrlState::default()
+                        }))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            history: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(AtomicUsize::new(urls.len())),
+        }
+    }
+
+    fn record_event(&self, event: Value) {
+        {
+            let mut history = self.history.lock();
+            history.push(event.clone());
+            if history.len() > DEBUG_HISTORY_CAP {
+                let overflow = history.len() - DEBUG_HISTORY_CAP;
+                history.drain(0..overflow);
+            }
+        }
+        absorb_event(&self.urls, &event);
+    }
+
+    fn finished(&self) -> bool {
+        self.pending.load(Ordering::SeqCst) == 0
+    }
+}
+
+pub(crate) fn valid_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id.len() <= 64
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+}
+
+/// Only retained OCR thumbnails may be served: `f0007.jpg` style names, so a
+/// crafted path can never escape the run directory.
+pub(crate) fn valid_frame_file(file: &str) -> bool {
+    let bytes = file.as_bytes();
+    bytes.len() == 9
+        && bytes[0] == b'f'
+        && bytes[1..5].iter().all(u8::is_ascii_digit)
+        && &file[5..] == ".jpg"
+}
+
+pub(crate) fn find_run(runs: &DebugRunMap, run_id: &str) -> Result<MediaDebugRun> {
+    if !valid_run_id(run_id) {
+        return Err(AppError::NotFound);
+    }
+    runs.lock().get(run_id).cloned().ok_or(AppError::NotFound)
+}
+
+/// Splits the debugger textarea into validated canonical URLs plus per-line
+/// error messages, enforcing [`MAX_DEBUG_URLS`].
+pub(crate) fn parse_debug_urls(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut urls = Vec::new();
+    let mut errors = Vec::new();
+    for (index, line) in raw.lines().map(str::trim).enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let line_number = index + 1;
+        if urls.len() >= MAX_DEBUG_URLS {
+            errors.push(format!(
+                "Line {line_number}: a run extracts at most {MAX_DEBUG_URLS} URLs."
+            ));
+            break;
+        }
+        match canonical_social_url(line) {
+            Ok(url) => urls.push(url),
+            Err(error) => errors.push(format!("Line {line_number}: {error}")),
+        }
+    }
+    (urls, errors)
+}
+
+/// Applies a streamed event to the matching URL state so reloads and no-JS
+/// polling see the same picture as the live event feed.
+pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
+    let Some(index) = event.get("url").and_then(Value::as_u64).map(|i| i as usize) else {
+        return;
+    };
+    let Some(cell) = urls.get(index) else {
+        return;
+    };
+    let mut state = cell.lock();
+    match event.get("kind").and_then(Value::as_str) {
+        Some("description") => {
+            state.title = event
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            state.description = event
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            state.duration_seconds = event.get("durationSeconds").and_then(Value::as_u64);
+        }
+        Some("audio") => {
+            state.transcript = event
+                .get("transcript")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        Some("warning") => {
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !message.is_empty() && state.warnings.last() != Some(&message) {
+                state.warnings.push(message);
+            }
+        }
+        Some("ocr-captures") => {
+            state.captures = event
+                .get("captures")
+                .and_then(Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|capture| {
+                            Some(DebugCaptureRow {
+                                seconds: capture.get("seconds")?.as_u64()?,
+                                image: capture
+                                    .get("image")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                raw: capture
+                                    .get("raw")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                cleaned: capture
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                card: capture
+                                    .get("card")
+                                    .and_then(Value::as_u64)
+                                    .map(|c| c as usize),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            state.cards = event
+                .get("cards")
+                .and_then(Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|card| {
+                            Some(DebugCardRow {
+                                seconds: card.get("seconds")?.as_u64()?,
+                                text: card
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                kept: card.get("kept").and_then(Value::as_bool).unwrap_or(false),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        Some("error") => {
+            state.status = "failed".into();
+            state.error_message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        _ => {}
+    }
+}
+
+/// Removes expired debugger runs and enforces the run limit, deleting each
+/// evicted run's retained frames from disk.
+pub(crate) fn prune_debug_runs(runs: &DebugRunMap) {
+    let mut runs = runs.lock();
+    let now = Instant::now();
+    let expired: Vec<String> = runs
+        .iter()
+        .filter(|(_, run)| now.duration_since(run.created).as_secs() > DEBUG_RUN_TTL_SECONDS)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in expired {
+        if let Some(run) = runs.remove(&id) {
+            let _ = fs::remove_dir_all(&run.dir);
+        }
+    }
+    while runs.len() >= DEBUG_RUN_LIMIT {
+        let oldest = runs
+            .iter()
+            .min_by_key(|(_, run)| run.created)
+            .map(|(id, _)| id.clone());
+        let Some(id) = oldest else {
+            break;
+        };
+        if let Some(run) = runs.remove(&id) {
+            let _ = fs::remove_dir_all(&run.dir);
+        }
+    }
+}
+
+pub(crate) async fn media_debug_page(State(s): State<Arc<AppState>>) -> Result<Html<String>> {
+    prune_debug_runs(&s.media_debug_runs);
+    debug_page_response(&s.media_debug_runs, String::new(), String::new())
+}
+
+fn debug_page_response(
+    runs: &DebugRunMap,
+    error: String,
+    urls_value: String,
+) -> Result<Html<String>> {
+    let snapshot = runs.lock();
+    let mut rows: Vec<(Instant, MediaDebugRunRow)> = snapshot
+        .iter()
+        .map(|(id, run)| {
+            (
+                run.created,
+                MediaDebugRunRow {
+                    id: id.clone(),
+                    url_count: run.urls.len(),
+                    finished: run.finished(),
+                    age_minutes: (Instant::now().duration_since(run.created).as_secs() / 60) as i64,
+                },
+            )
+        })
+        .collect();
+    drop(snapshot);
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    render(MediaDebugTemplate {
+        error,
+        urls_value,
+        runs: rows.into_iter().map(|(_, row)| row).collect(),
+    })
+}
+
+pub(crate) async fn media_debug_start(
+    State(s): State<Arc<AppState>>,
+    Form(form): Form<MediaDebugForm>,
+) -> Result<Response> {
+    prune_debug_runs(&s.media_debug_runs);
+    let (urls, errors) = parse_debug_urls(&form.urls);
+    let mut error = errors.join(" ");
+    if urls.is_empty() && error.is_empty() {
+        error = "Paste at least one Facebook or Instagram URL.".into();
+    }
+    if !error.is_empty() || urls.is_empty() {
+        return debug_page_response(&s.media_debug_runs, error, form.urls)
+            .map(IntoResponse::into_response);
+    }
+    let run_id = Uuid::new_v4().to_string();
+    let dir = env::temp_dir().join(format!("kindle-recipes-media-debug-{run_id}"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir.join("frames"))
+        .map_err(|error| {
+            AppError::Internal(format!("Could not create the debug directory: {error}"))
+        })?;
+    for index in 0..urls.len() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("frames").join(index.to_string()))
+            .map_err(|error| {
+                AppError::Internal(format!("Could not create the debug directory: {error}"))
+            })?;
+    }
+    let run = MediaDebugRun::new(&urls, dir);
+    s.media_debug_runs
+        .lock()
+        .insert(run_id.clone(), run.clone());
+    tokio::spawn(async move {
+        for (index, url) in urls.into_iter().enumerate() {
+            {
+                let mut state = run.urls[index].lock();
+                state.status = "extracting".into();
+            }
+            run.record_event(json!({
+                "url": index,
+                "kind": "status",
+                "state": "extracting",
+            }));
+            // The production extractor serialises on one global media slot,
+            // so queued URLs simply wait here while earlier ones stream.
+            let emitter: Arc<dyn Fn(Value) + Send + Sync> = {
+                let sink = run.clone();
+                Arc::new(move |event| sink.record_event(event))
+            };
+            let debug = Arc::new(MediaDebug::new(
+                index,
+                run.dir.join("frames").join(index.to_string()),
+                emitter,
+            ));
+            match extract_social_evidence_debug(&url, debug).await {
+                Ok(evidence) => {
+                    run.record_event(json!({
+                        "url": index,
+                        "kind": "result",
+                        "ok": true,
+                        "title": evidence.title,
+                        "descriptionChars": evidence.description.chars().count(),
+                        "audioChars": evidence.audio_transcript.chars().count(),
+                        "ocrCount": evidence.ocr.len(),
+                    }));
+                    let mut state = run.urls[index].lock();
+                    state.status = "done".into();
+                    state.title = evidence.title;
+                    state.description = evidence.description;
+                    state.duration_seconds = evidence.duration_seconds;
+                    state.transcript = evidence.audio_transcript;
+                    for message in &evidence.warnings {
+                        if state.warnings.last() != Some(message) {
+                            state.warnings.push(message.clone());
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%url, %error, "Media debugger extraction failed");
+                    run.record_event(json!({
+                        "url": index,
+                        "kind": "error",
+                        "message": error.to_string(),
+                    }));
+                    run.urls[index].lock().status = "failed".into();
+                }
+            }
+            run.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        run.record_event(json!({ "kind": "run-done" }));
+    });
+    Ok(Redirect::to(&format!("/settings/media-debug/{run_id}")).into_response())
+}
+
+pub(crate) async fn media_debug_run_page(
+    State(s): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Result<Html<String>> {
+    let run = find_run(&s.media_debug_runs, &run_id)?;
+    let finished = run.finished();
+    let mut views = Vec::with_capacity(run.urls.len());
+    for (index, cell) in run.urls.iter().enumerate() {
+        let state = cell.lock();
+        views.push(DebugUrlView {
+            source_url: state.source_url.clone(),
+            status: state.status.clone(),
+            title: state.title.clone(),
+            description: state.description.clone(),
+            duration_seconds: state.duration_seconds,
+            transcript: state.transcript.clone(),
+            warnings: state.warnings.clone(),
+            error_message: state.error_message.clone(),
+            captures: state
+                .captures
+                .iter()
+                .map(|capture| MediaDebugCaptureView {
+                    seconds: capture.seconds,
+                    image_url: if capture.image.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "/settings/media-debug/{run_id}/frames/{index}/{}",
+                            capture.image
+                        ))
+                    },
+                    raw: capture.raw.clone(),
+                    cleaned: capture.cleaned.clone(),
+                    card: capture.card,
+                })
+                .collect(),
+            cards: state
+                .cards
+                .iter()
+                .map(|card| MediaDebugCardView {
+                    seconds: card.seconds,
+                    text: card.text.clone(),
+                    kept: card.kept,
+                })
+                .collect(),
+        });
+    }
+    render(MediaDebugRunTemplate {
+        run_id,
+        finished,
+        urls: views,
+    })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DebugEventsQuery {
+    #[serde(default)]
+    pub(crate) since: usize,
+}
+
+pub(crate) async fn media_debug_events(
+    State(s): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Query(query): Query<DebugEventsQuery>,
+) -> Result<Json<Value>> {
+    let run = find_run(&s.media_debug_runs, &run_id)?;
+    let history = run.history.lock();
+    let start = query.since.min(history.len());
+    let events = history[start..].to_vec();
+    let next = history.len();
+    drop(history);
+    Ok(Json(json!({
+        "events": events,
+        "done": run.finished(),
+        "next": next,
+    })))
+}
+
+pub(crate) async fn media_debug_frame(
+    State(s): State<Arc<AppState>>,
+    Path((run_id, url_index, file)): Path<(String, usize, String)>,
+) -> Result<Response> {
+    let run = find_run(&s.media_debug_runs, &run_id)?;
+    if !valid_frame_file(&file) {
+        return Err(AppError::NotFound);
+    }
+    let bytes = fs::read(
+        run.dir
+            .join("frames")
+            .join(url_index.to_string())
+            .join(file),
+    )
+    .map_err(|_| AppError::NotFound)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response())
 }

@@ -1,0 +1,32 @@
+{% extends "base.html" %}{% block title %}Media extraction debugger · Kindle Recipes{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Settings / Media debugger</p>
+  <h1>Media extraction debugger</h1>
+  <p class="deck">Run the Instagram/Facebook reel analysis pipeline on one or more public URLs and watch each phase report live: the page description capture, the local Whisper audio transcription, and every OCR frame with its raw reading next to what the cleaner kept.</p>
+</div>
+{% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
+<form class="panel form-panel media-debug-form" method="post" action="/settings/media-debug">
+  <label for="debug-urls">Facebook or Instagram URLs <span class="muted">(one per line, up to 5)</span><textarea id="debug-urls" name="urls" rows="6" required placeholder="https://www.instagram.com/reel/&#10;https://www.facebook.com/reel/...">{{ urls_value }}</textarea></label>
+  <p class="field-help">Extraction shares the single local media slot with video imports, so URLs in a run are processed one after another. Results stream into a run page you can leave open and revisit.</p>
+  <p class="actions form-actions"><a class="button" href="/settings">Back to settings</a><button class="primary" type="submit">Run extraction</button></p>
+</form>
+{% if !runs.is_empty() %}
+<div class="compact-panel">
+  <div class="block">
+    <h2>Recent runs</h2>
+    <ul class="endpoint-list">
+      {% for run in runs %}
+      <li class="endpoint-row">
+        <div class="endpoint-detail">
+          <strong><a href="/settings/media-debug/{{ run.id }}">{{ run.id }}</a></strong>
+          <p class="muted">{{ run.url_count }} URL{% if run.url_count != 1 %}s{% endif %} &middot; {{ run.age_minutes }} min ago &middot;
+            {% if run.finished %}finished{% else %}<span class="codex-status codex-status--connected">running</span>{% endif %}</p>
+        </div>
+        <a class="button compact" href="/settings/media-debug/{{ run.id }}">Open</a>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

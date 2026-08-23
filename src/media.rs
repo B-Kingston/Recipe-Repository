@@ -1,7 +1,7 @@
 use crate::{AppError, Result, Source};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::os::unix::process::CommandExt;
 use std::{
     collections::HashMap,
@@ -84,6 +84,83 @@ pub(crate) struct MediaEvidence {
 pub(crate) struct OcrSnippet {
     pub(crate) timestamp_seconds: u64,
     pub(crate) text: String,
+}
+
+/// Optional observation hook used by the Settings media-extraction debugger.
+/// When one is supplied, the extraction pipeline reports every phase boundary
+/// (page metadata, download, audio transcription, OCR planning and per-frame
+/// captures) through `emit`, and retains copies of the frames that were fed
+/// to the OCR engine so they can be reviewed next to the readings. Production
+/// imports pass `None` and behave exactly as before.
+pub(crate) struct MediaDebug {
+    url_index: usize,
+    frames_dir: PathBuf,
+    started: Instant,
+    emit: Arc<dyn Fn(Value) + Send + Sync>,
+}
+
+impl MediaDebug {
+    pub(crate) fn new(
+        url_index: usize,
+        frames_dir: PathBuf,
+        emit: Arc<dyn Fn(Value) + Send + Sync>,
+    ) -> Self {
+        Self {
+            url_index,
+            frames_dir,
+            started: Instant::now(),
+            emit,
+        }
+    }
+
+    fn event(&self, kind: &str, payload: Value) {
+        let mut envelope = json!({
+            "url": self.url_index,
+            "elapsedMs": self.started.elapsed().as_millis() as u64,
+            "kind": kind,
+        });
+        if let (Some(target), Value::Object(extra)) = (envelope.as_object_mut(), payload) {
+            for (key, value) in extra {
+                target.insert(key, value);
+            }
+        }
+        (self.emit)(envelope);
+    }
+
+    /// Copies every frame selected for OCR into the retained debugger
+    /// directory so the review page can show the pixels each reading came
+    /// from. Returns one file name per job slot; an empty string means the
+    /// copy failed and no thumbnail is shown for that slot.
+    fn retain_frames(&self, jobs: &[OcrFrame], warnings: &mut Vec<String>) -> Vec<String> {
+        let mut names = Vec::with_capacity(jobs.len());
+        for (slot, job) in jobs.iter().enumerate() {
+            let name = format!("f{slot:04}.jpg");
+            match fs::copy(&job.path, self.frames_dir.join(&name)) {
+                Ok(_) => names.push(name),
+                Err(error) => {
+                    warn!(
+                        path = %job.path.display(),
+                        %error,
+                        "Could not retain an OCR frame for the debugger"
+                    );
+                    warnings.push(format!("An OCR frame could not be retained: {error}"));
+                    names.push(String::new());
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Emits every warning appended since the previous checkpoint so the debugger
+/// stream matches what production would record in the evidence.
+fn flush_new_warnings(warnings: &[String], seen: &mut usize, debug: Option<&MediaDebug>) {
+    if let Some(debug) = debug {
+        for message in warnings[*seen..].iter() {
+            debug.event("warning", json!({ "message": message }));
+        }
+    }
+    *seen = warnings.len();
 }
 
 impl MediaEvidence {
@@ -193,6 +270,22 @@ pub(crate) fn canonical_social_url(raw: &str) -> Result<String> {
 /// command-line media tools in a blocking worker. A description-only result is
 /// still useful when a platform blocks the video download.
 pub(crate) async fn extract_social_evidence(raw: &str) -> Result<MediaEvidence> {
+    extract_social_evidence_inner(raw, None).await
+}
+
+/// Same pipeline as [`extract_social_evidence`], but reporting progress and
+/// retaining OCR frames for the debugger page.
+pub(crate) async fn extract_social_evidence_debug(
+    raw: &str,
+    debug: Arc<MediaDebug>,
+) -> Result<MediaEvidence> {
+    extract_social_evidence_inner(raw, Some(debug)).await
+}
+
+async fn extract_social_evidence_inner(
+    raw: &str,
+    debug: Option<Arc<MediaDebug>>,
+) -> Result<MediaEvidence> {
     let source_url = canonical_social_url(raw)?;
     // A single media import keeps several browser tabs from multiplying page
     // fetches, yt-dlp downloads, Whisper model memory, and OCR processes. The
@@ -210,7 +303,7 @@ pub(crate) async fn extract_social_evidence(raw: &str) -> Result<MediaEvidence> 
         // the handler future, a running extractor must still reserve the one
         // global media slot until its child processes and cleanup finish.
         let _permit = permit;
-        extract_with_local_tools(source_url, page)
+        extract_with_local_tools(source_url, page, debug.as_deref())
     })
     .await
     .map_err(|_| AppError::Internal("The local media extractor stopped unexpectedly.".into()))?
@@ -394,7 +487,11 @@ async fn fetch_page_metadata(url: &str) -> PageMetadata {
     }
 }
 
-fn extract_with_local_tools(source_url: String, page: PageMetadata) -> Result<MediaEvidence> {
+fn extract_with_local_tools(
+    source_url: String,
+    page: PageMetadata,
+    debug: Option<&MediaDebug>,
+) -> Result<MediaEvidence> {
     cleanup_stale_workdirs();
     let workdir = env::temp_dir().join(format!("kindle-recipes-media-{}", Uuid::new_v4()));
     fs::DirBuilder::new()
@@ -407,7 +504,7 @@ fn extract_with_local_tools(source_url: String, page: PageMetadata) -> Result<Me
             ))
         })?;
     let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-    let result = extract_in_directory(&source_url, page, &workdir, deadline);
+    let result = extract_in_directory(&source_url, page, &workdir, deadline, debug);
     if let Err(error) = fs::remove_dir_all(&workdir) {
         warn!(
             path = %workdir.display(),
@@ -447,9 +544,11 @@ fn extract_in_directory(
     page: PageMetadata,
     workdir: &Path,
     deadline: Instant,
+    debug: Option<&MediaDebug>,
 ) -> Result<MediaEvidence> {
     let ytdlp = env_path("MEDIA_YTDLP_PATH", "yt-dlp");
     let mut warnings = Vec::new();
+    let mut seen_warnings = 0usize;
     let mut title = page.title;
     let mut description = page.description;
     let mut duration_seconds = None;
@@ -494,6 +593,17 @@ fn extract_in_directory(
         },
         Err(error) => warnings.push(format!("Video metadata lookup failed: {error}")),
     }
+    flush_new_warnings(&warnings, &mut seen_warnings, debug);
+    if let Some(debug) = debug {
+        debug.event(
+            "description",
+            json!({
+                "title": title,
+                "description": description,
+                "durationSeconds": duration_seconds,
+            }),
+        );
+    }
 
     if let Some(duration) = duration_seconds
         && duration > MAX_MEDIA_SECONDS
@@ -504,6 +614,10 @@ fn extract_in_directory(
     }
 
     let video_path = download_video(&ytdlp, source_url, workdir, &mut warnings, deadline);
+    flush_new_warnings(&warnings, &mut seen_warnings, debug);
+    if let Some(debug) = debug {
+        debug.event("download", json!({ "ok": video_path.is_some() }));
+    }
     let mut audio_transcript = String::new();
     let mut ocr = Vec::new();
     if let Some(video_path) = video_path {
@@ -512,10 +626,20 @@ fn extract_in_directory(
             extract_audio_and_frames(&video_path, workdir, frame_rate, &mut warnings, deadline);
         if let Some(audio_path) = audio {
             audio_transcript = transcribe_audio(&audio_path, &mut warnings, deadline);
+            if let Some(debug) = debug {
+                debug.event(
+                    "audio",
+                    json!({
+                        "chars": audio_transcript.len(),
+                        "transcript": audio_transcript,
+                    }),
+                );
+            }
         }
         if let Some(sample) = frames {
-            ocr = read_video_text(&sample, frame_rate, &mut warnings, deadline);
+            ocr = read_video_text(&sample, frame_rate, &mut warnings, deadline, debug);
         }
+        flush_new_warnings(&warnings, &mut seen_warnings, debug);
     }
 
     if title.trim().is_empty() {
@@ -832,7 +956,7 @@ pub(crate) fn clean_ocr_batch(value: &Value, default_step_seconds: f64) -> Vec<O
             readings.push(Some(text));
         }
     }
-    collapse_ocr_readings(&jobs, readings)
+    collapse_ocr_readings(&jobs, readings).snippets
 }
 
 fn read_video_text(
@@ -840,18 +964,27 @@ fn read_video_text(
     frame_rate: f64,
     warnings: &mut Vec<String>,
     deadline: Instant,
+    debug: Option<&MediaDebug>,
 ) -> Vec<OcrSnippet> {
     let jobs = plan_ocr_jobs(sample, frame_rate, &ocr_plan_options(), warnings);
     if jobs.is_empty() {
         return Vec::new();
     }
+    if let Some(debug) = debug {
+        debug.event("ocr-plan", json!({ "planned": jobs.len() }));
+    }
+    let retained = debug
+        .map(|debug| debug.retain_frames(&jobs, warnings))
+        .unwrap_or_default();
     match env_path("MEDIA_OCR_ENGINE", "paddle")
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "paddle" | "paddleocr" => read_video_text_paddle(&jobs, warnings, deadline),
-        "tesseract" => read_video_text_tesseract(&jobs, warnings, deadline),
+        "paddle" | "paddleocr" => {
+            read_video_text_paddle(&jobs, &retained, warnings, deadline, debug)
+        }
+        "tesseract" => read_video_text_tesseract(&jobs, &retained, warnings, deadline, debug),
         engine => {
             warnings.push(format!(
                 "Unsupported MEDIA_OCR_ENGINE={engine:?}; use paddle or tesseract."
@@ -1130,10 +1263,67 @@ fn legacy_uniform_jobs(frames: Vec<PathBuf>, interval: usize, frame_rate: f64) -
 /// Runs one PaddleOCR process for the complete sampled frame set. The Python
 /// helper constructs PP-OCRv6 once and feeds the screenshots as a batch; no
 /// model or Python process is created for an individual frame.
+/// One engine reading of a sampled frame: exactly what the OCR engine
+/// returned (`raw`) next to what the cleaner let through (`cleaned`).
+#[derive(Debug, Clone)]
+struct SlotCapture {
+    raw: String,
+    cleaned: Option<String>,
+}
+
+/// Shared tail of both OCR engines: collapse the cleaned readings into
+/// caption chains, then report every frame capture and chain to the debugger.
+fn finish_ocr(
+    jobs: &[OcrFrame],
+    retained: &[String],
+    slots: Vec<Option<SlotCapture>>,
+    debug: Option<&MediaDebug>,
+) -> Vec<OcrSnippet> {
+    let mut readings = Vec::with_capacity(slots.len());
+    for capture in &slots {
+        readings.push(capture.as_ref().and_then(|c| c.cleaned.clone()));
+    }
+    let outcome = collapse_ocr_readings(jobs, readings);
+    if let Some(debug) = debug {
+        let captures = jobs
+            .iter()
+            .enumerate()
+            .map(|(slot, job)| {
+                json!({
+                    "slot": slot,
+                    "seconds": job.seconds.round().max(0.0) as u64,
+                    "image": retained.get(slot).filter(|name| !name.is_empty()),
+                    "raw": slots[slot].as_ref().map(|c| c.raw.clone()).unwrap_or_default(),
+                    "text": slots[slot].as_ref().and_then(|c| c.cleaned.clone()),
+                    "card": outcome.card_of_slot.get(slot).copied().flatten(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let cards = outcome
+            .cards
+            .iter()
+            .map(|card| {
+                json!({
+                    "seconds": card.seconds,
+                    "kept": card.kept,
+                    "text": card.text,
+                })
+            })
+            .collect::<Vec<_>>();
+        debug.event(
+            "ocr-captures",
+            json!({ "captures": captures, "cards": cards }),
+        );
+    }
+    outcome.snippets
+}
+
 fn read_video_text_paddle(
     sampled: &[OcrFrame],
+    retained: &[String],
     warnings: &mut Vec<String>,
     deadline: Instant,
+    debug: Option<&MediaDebug>,
 ) -> Vec<OcrSnippet> {
     if sampled.is_empty() {
         return Vec::new();
@@ -1196,25 +1386,33 @@ fn read_video_text_paddle(
             sampled.len()
         ));
     }
-    let mut readings = vec![None::<String>; sampled.len()];
+    // Keep the raw engine output next to the cleaned reading so the debugger
+    // can show what the engine actually saw before the noise filter decided.
+    let mut slots: Vec<Option<SlotCapture>> = vec![None; sampled.len()];
     for (slot, frame) in frame_results.iter().enumerate().take(sampled.len()) {
-        if let Some(text) = frame
-            .get("text")
-            .and_then(Value::as_str)
-            .and_then(clean_ocr_reading)
-        {
-            readings[slot] = Some(text);
+        let Some(raw) = frame.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if raw.trim().is_empty() {
+            continue;
         }
+        let cleaned = clean_ocr_reading(raw);
+        slots[slot] = Some(SlotCapture {
+            raw: raw.to_string(),
+            cleaned,
+        });
     }
-    collapse_ocr_readings(sampled, readings)
+    finish_ocr(sampled, retained, slots, debug)
 }
 
 /// Retains the old Tesseract path as a reproducible baseline for the OCR
 /// benchmark and as a fallback for machines that cannot use PaddleOCR.
 fn read_video_text_tesseract(
     sampled: &[OcrFrame],
+    retained: &[String],
     warnings: &mut Vec<String>,
     deadline: Instant,
+    debug: Option<&MediaDebug>,
 ) -> Vec<OcrSnippet> {
     let tesseract = env_path("MEDIA_TESSERACT_PATH", "tesseract");
     let language = env_path("MEDIA_TESSERACT_LANG", "eng");
@@ -1222,7 +1420,7 @@ fn read_video_text_tesseract(
     // Run up to OCR_MAX_WORKERS Tesseract processes concurrently. PaddleOCR
     // does not use this path: it receives all sampled frames in one batched
     // Python invocation above.
-    let readings = std::sync::Mutex::new(vec![None::<String>; sampled.len()]);
+    let slots = std::sync::Mutex::new(vec![None::<SlotCapture>; sampled.len()]);
     let failures = std::sync::Mutex::new(Vec::new());
     let next_job = std::sync::atomic::AtomicUsize::new(0);
     let workers = sampled
@@ -1256,10 +1454,12 @@ fn read_video_text_tesseract(
                     ];
                     match run_tool(&tesseract, &args, timeout, 16 * 1024) {
                         Ok(output) => {
-                            if let Some(text) =
-                                clean_ocr_reading(&parse_tesseract_tsv(&output.stdout))
-                            {
-                                readings.lock().unwrap()[slot] = Some(text);
+                            let raw = parse_tesseract_tsv(&output.stdout);
+                            if !raw.trim().is_empty() {
+                                slots.lock().unwrap()[slot] = Some(SlotCapture {
+                                    raw: raw.clone(),
+                                    cleaned: clean_ocr_reading(&raw),
+                                });
                             }
                         }
                         Err(error) => failures.lock().unwrap().push(error.to_string()),
@@ -1282,19 +1482,23 @@ fn read_video_text_tesseract(
             _ => {}
         }
     }
-    let readings = readings
+    let slots = slots
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    collapse_ocr_readings(sampled, readings)
+    finish_ocr(sampled, retained, slots, debug)
 }
 
 // A recipe caption stays on screen for many consecutive samples, and each
 // sample reads slightly differently. Chain readings whose word sets overlap
 // enough and emit only the longest (most complete) reading per chain.
-fn collapse_ocr_readings(jobs: &[OcrFrame], mut readings: Vec<Option<String>>) -> Vec<OcrSnippet> {
+fn collapse_ocr_readings(jobs: &[OcrFrame], mut readings: Vec<Option<String>>) -> CollapseOutcome {
     let mut snippets = Vec::new();
     let mut total_chars = 0usize;
     let mut card: Option<CaptionChain> = None;
+    // Index (in `cards`) of the chain currently being built.
+    let mut current_card = usize::MAX;
+    let mut cards: Vec<CardTrace> = Vec::new();
+    let mut card_of_slot: Vec<Option<usize>> = vec![None; jobs.len()];
     for (slot, job) in jobs.iter().enumerate() {
         if snippets.len() >= OCR_MAX_SNIPPETS || total_chars >= OCR_MAX_CHARS {
             break;
@@ -1307,27 +1511,82 @@ fn collapse_ocr_readings(jobs: &[OcrFrame], mut readings: Vec<Option<String>>) -
         // Planned jobs carry the exact on-screen second from the ffmpeg
         // timeline (or the grid fallback), so no index math happens here.
         let seconds = job.seconds.round().max(0.0) as u64;
-        match &mut card {
+        let extends = match &mut card {
             Some(state) => {
                 let shared = words.intersection(&state.best_words).count();
                 let smaller = words.len().min(state.best_words.len()).max(1);
-                if shared * 100 >= smaller * 55 {
-                    if text.chars().count() > state.best_text.chars().count() {
-                        state.best_text = text.clone();
-                        state.best_words = words;
-                    }
-                    state.chain_len += 1;
-                    state.members.push(text);
-                } else {
-                    push_card(&mut card, &mut snippets, &mut total_chars);
-                    card = Some(CaptionChain::new(seconds, text, words));
-                }
+                shared * 100 >= smaller * 55
             }
-            None => card = Some(CaptionChain::new(seconds, text, words)),
+            None => false,
+        };
+        if extends {
+            let state = card.as_mut().expect("chain exists when extending");
+            if text.chars().count() > state.best_text.chars().count() {
+                state.best_text = text.clone();
+                state.best_words = words;
+            }
+            state.chain_len += 1;
+            state.members.push(text);
+            card_of_slot[slot] = Some(current_card);
+        } else {
+            if card.is_some() {
+                let (snippet, fallback) = emit_card(&mut card, &mut snippets, &mut total_chars);
+                let trace = &mut cards[current_card];
+                trace.snippet = snippet;
+                trace.kept = snippet.is_some();
+                trace.text = match snippet {
+                    Some(index) => snippets[index].text.clone(),
+                    None => fallback,
+                };
+            }
+            current_card = cards.len();
+            cards.push(CardTrace {
+                seconds,
+                text: String::new(),
+                snippet: None,
+                kept: false,
+            });
+            card = Some(CaptionChain::new(seconds, text, words));
+            card_of_slot[slot] = Some(current_card);
         }
     }
-    push_card(&mut card, &mut snippets, &mut total_chars);
-    snippets
+    let (snippet, fallback) = emit_card(&mut card, &mut snippets, &mut total_chars);
+    if current_card != usize::MAX {
+        let trace = &mut cards[current_card];
+        trace.snippet = snippet;
+        trace.kept = snippet.is_some();
+        trace.text = match snippet {
+            Some(index) => snippets[index].text.clone(),
+            None => fallback,
+        };
+    }
+    CollapseOutcome {
+        snippets,
+        card_of_slot,
+        cards,
+    }
+}
+
+/// Outcome of collapsing per-frame OCR readings into caption chains. Besides
+/// the evidence snippets this carries everything the debugger needs to map
+/// individual frame captures onto the card they corroborated.
+struct CollapseOutcome {
+    snippets: Vec<OcrSnippet>,
+    /// Per sampled-frame slot, which chain the reading joined.
+    card_of_slot: Vec<Option<usize>>,
+    /// One trace per chain in creation order; `kept` marks chains whose best
+    /// reading became an evidence snippet.
+    cards: Vec<CardTrace>,
+}
+
+/// One caption-chain: consecutive corroborating samples of the same card.
+struct CardTrace {
+    seconds: u64,
+    /// The final reviewed text: the emitted snippet when kept, otherwise the
+    /// chain's best raw reading so a dropped card can still be inspected.
+    text: String,
+    snippet: Option<usize>,
+    kept: bool,
 }
 
 /// One caption-chain: consecutive corroborating samples of the same card.
@@ -1393,25 +1652,30 @@ fn consolidate_chain(best: &str, members: &[String]) -> String {
     }
 }
 
-/// Emits the pending caption-chain reading and resets the chain. A chain of
-/// exactly one uncorroborated sample is only emitted when it reads as real
+/// Emits the pending caption-chain reading and resets the chain. Returns the
+/// snippet index when the chain's best reading became evidence, plus the
+/// chain's best raw reading so a dropped card can still be reviewed. A chain
+/// of exactly one uncorroborated sample is only emitted when it reads as real
 /// text on its own; isolated noise never becomes a snippet.
-fn push_card(
+fn emit_card(
     card: &mut Option<CaptionChain>,
     snippets: &mut Vec<OcrSnippet>,
     total_chars: &mut usize,
-) {
-    if let Some(state) = card.take() {
-        if state.chain_len == 1 && !standalone_reading_is_strong(&state.best_text) {
-            return;
-        }
-        let text = consolidate_chain(&state.best_text, &state.members);
-        *total_chars += text.len();
-        snippets.push(OcrSnippet {
-            timestamp_seconds: state.seconds,
-            text,
-        });
+) -> (Option<usize>, String) {
+    let Some(state) = card.take() else {
+        return (None, String::new());
+    };
+    let best = state.best_text.clone();
+    if state.chain_len == 1 && !standalone_reading_is_strong(&best) {
+        return (None, best);
     }
+    let text = consolidate_chain(&state.best_text, &state.members);
+    *total_chars += text.len();
+    snippets.push(OcrSnippet {
+        timestamp_seconds: state.seconds,
+        text,
+    });
+    (Some(snippets.len() - 1), best)
 }
 
 fn remaining_timeout(deadline: Instant, maximum: Duration) -> Option<Duration> {
@@ -2919,7 +3183,7 @@ mod tests {
             Some("cup flour pinch salt".to_string()),
             Some("Serve the rice".to_string()),
         ];
-        let snippets = collapse_ocr_readings(&jobs, readings);
+        let snippets = collapse_ocr_readings(&jobs, readings).snippets;
         // Three readings -> two chains: a corroborated pair plus one strong
         // single sample.
         assert_eq!(snippets.len(), 2);
@@ -2945,7 +3209,7 @@ mod tests {
             },
         ];
         let readings = vec![Some("72 Ss an".to_string()), Some("viii 41".to_string())];
-        let snippets = collapse_ocr_readings(&jobs, readings);
+        let snippets = collapse_ocr_readings(&jobs, readings).snippets;
         assert!(snippets.is_empty());
     }
 
@@ -3045,14 +3309,18 @@ mod tests {
             priority: 0,
         }];
         let readings = vec![clean_ocr_reading("loviaas 2L: uus")];
-        assert!(collapse_ocr_readings(&jobs, readings).is_empty());
+        assert!(collapse_ocr_readings(&jobs, readings).snippets.is_empty());
 
         let fragment = vec![OcrFrame {
             seconds: 28.0,
             path: PathBuf::from("fragment.jpg"),
             priority: 0,
         }];
-        assert!(collapse_ocr_readings(&fragment, vec![Some("Place".into())]).is_empty());
+        assert!(
+            collapse_ocr_readings(&fragment, vec![Some("Place".into())])
+                .snippets
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3073,7 +3341,7 @@ mod tests {
                 readings.push(Some(cleaned));
             }
         }
-        let snippets = collapse_ocr_readings(&jobs, readings);
+        let snippets = collapse_ocr_readings(&jobs, readings).snippets;
         // One snippet per two-second caption window, timestamped at its
         // start, with every noise token gone: no timers, no watermark
         // digits, no one-off misread fragments.
@@ -3129,7 +3397,7 @@ mod tests {
                 None => rejected += 1,
             }
         }
-        let snippets = collapse_ocr_readings(&jobs, readings);
+        let snippets = collapse_ocr_readings(&jobs, readings).snippets;
         // Fresh download of the DZNQT3Pt3Ja fixture through the full
         // production path: no digit soup, no timers, no fragment salad - every
         // emitted snippet is readable recipe text.

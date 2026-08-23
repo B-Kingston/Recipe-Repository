@@ -39,8 +39,10 @@ use auth::{
 };
 
 use ai::{
-    alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
+    DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
     fresh_model_catalogue, generate_page, generate_recipe, import_page, import_recipe,
+    media_debug_events, media_debug_frame, media_debug_page, media_debug_run_page,
+    media_debug_start,
 };
 use media::MediaEvidence;
 use recipes::{
@@ -84,6 +86,7 @@ struct AppState {
     search_grounding: bool,
     codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>,
     model_catalogue: Arc<Mutex<Option<ModelCatalogue>>>,
+    media_debug_runs: DebugRunMap,
 }
 
 /// Last known Codex model catalogue, refreshed in the background so page
@@ -360,6 +363,57 @@ struct CodexAuthoriseTemplate {
     interval_seconds: u64,
     expires_seconds: i64,
 }
+#[derive(Template)]
+#[template(path = "media_debug.html")]
+struct MediaDebugTemplate {
+    error: String,
+    urls_value: String,
+    runs: Vec<MediaDebugRunRow>,
+}
+/// One recent debugger run as listed on the launcher page.
+pub(crate) struct MediaDebugRunRow {
+    pub(crate) id: String,
+    pub(crate) url_count: usize,
+    pub(crate) finished: bool,
+    pub(crate) age_minutes: i64,
+}
+#[derive(Template)]
+#[template(path = "media_debug_run.html")]
+struct MediaDebugRunTemplate {
+    run_id: String,
+    finished: bool,
+    urls: Vec<DebugUrlView>,
+}
+#[derive(Deserialize)]
+struct MediaDebugForm {
+    urls: String,
+}
+/// One URL's full three-phase review snapshot for the run page: description
+/// captures, audio analysis, and OCR captures with their retained frames.
+pub(crate) struct DebugUrlView {
+    pub(crate) source_url: String,
+    pub(crate) status: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) duration_seconds: Option<u64>,
+    pub(crate) transcript: String,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) error_message: String,
+    pub(crate) captures: Vec<MediaDebugCaptureView>,
+    pub(crate) cards: Vec<MediaDebugCardView>,
+}
+pub(crate) struct MediaDebugCaptureView {
+    pub(crate) seconds: u64,
+    pub(crate) image_url: Option<String>,
+    pub(crate) raw: String,
+    pub(crate) cleaned: Option<String>,
+    pub(crate) card: Option<usize>,
+}
+pub(crate) struct MediaDebugCardView {
+    pub(crate) seconds: u64,
+    pub(crate) text: String,
+    pub(crate) kept: bool,
+}
 fn render(t: impl Template) -> Result<Html<String>> {
     Ok(Html(t.render()?))
 }
@@ -493,6 +547,7 @@ async fn main() -> anyhowless::Result<()> {
         search_grounding: env_bool("PI_SEARCH_ENABLED", true),
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
+        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
     });
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
@@ -552,6 +607,19 @@ fn routes(state: Arc<AppState>) -> Router {
         .route(
             "/settings/authorise-codex/status/{flow_id}",
             get(authorise_codex_status),
+        )
+        .route(
+            "/settings/media-debug",
+            get(media_debug_page).post(media_debug_start),
+        )
+        .route("/settings/media-debug/{run_id}", get(media_debug_run_page))
+        .route(
+            "/settings/media-debug/{run_id}/events",
+            get(media_debug_events),
+        )
+        .route(
+            "/settings/media-debug/{run_id}/frames/{url_index}/{file}",
+            get(media_debug_frame),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

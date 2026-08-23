@@ -67,6 +67,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
+        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

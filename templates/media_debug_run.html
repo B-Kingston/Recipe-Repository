@@ -1,0 +1,59 @@
+{% extends "base.html" %}{% block title %}Debug run · Kindle Recipes{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Settings / Media debugger</p>
+  <h1>Extraction run</h1>
+  <p class="deck">
+    {% if finished %}All URLs finished. Review the three capture phases below.{% else %}Running &mdash; this page refreshes itself until the run finishes. Results appear as each phase reports.{% endif %}
+    <span class="muted">Run {{ run_id }}</span>
+  </p>
+  <p class="actions"><a class="button compact" href="/settings/media-debug">New run</a> <a class="button compact" href="/settings">Settings</a></p>
+</div>
+<div class="media-debug-run" data-debug-root data-debug-finished="{% if finished %}1{% else %}0{% endif %}" data-events-url="/settings/media-debug/{{ run_id }}/events" data-frames-base="/settings/media-debug/{{ run_id }}/frames">
+  {% if !finished %}<p class="actions"><a class="button compact" href="/settings/media-debug/{{ run_id }}">Refresh now</a> <span class="muted">With JavaScript on, results stream in automatically.</span></p>{% endif %}
+  <div data-debug-output>
+    {% for url in urls %}
+    <section class="block debug-url-card">
+      <h2 class="debug-url-title"><span class="codex-status{% if url.status == "done" %} codex-status--connected{% endif %}{% if url.status == "failed" %} codex-status--missing{% endif %} debug-status">{{ url.status }}</span> {{ url.source_url }}</h2>
+      {% if url.error_message != "" %}<p class="error">{{ url.error_message }}</p>{% endif %}
+      {% if url.status == "queued" || url.status == "extracting" %}<p class="muted">Waiting for the local media slot&hellip;</p>{% endif %}
+      {% if url.warnings.len() > 0 %}
+      <ul class="debug-warnings">{% for warning in url.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+      {% endif %}
+      {% if url.title != "" || url.description != "" %}
+      <h3>Description captures</h3>
+      {% match url.duration_seconds %}{% when Some with (duration) %}<p class="muted">Duration: {{ duration }}s</p>{% when None %}{% endmatch %}
+      {% if url.title != "" %}<p><strong>{{ url.title }}</strong></p>{% endif %}
+      {% if url.description != "" %}<p class="debug-description">{{ url.description }}</p>{% endif %}
+      {% endif %}
+      {% if url.transcript != "" %}
+      <h3>Audio analysis captures</h3>
+      <div class="debug-mono">{{ url.transcript }}</div>
+      {% endif %}
+      {% if url.captures.len() > 0 %}
+      <h3>OCR captures <span class="muted">({{ url.captures.len() }} frames)</span></h3>
+      <table class="debug-captures">
+        <thead><tr><th>Frame</th><th>t</th><th>Recognised text (kept)</th><th>Raw engine reading</th><th>Card</th></tr></thead>
+        <tbody>
+          {% for capture in url.captures %}
+          <tr>
+            <td class="debug-thumb">{% match capture.image_url %}{% when Some with (src) %}<a href="{{ src }}" target="_blank"><img src="{{ src }}" alt="frame at {{ capture.seconds }}s" loading="lazy"></a>{% when None %}<span class="muted">&mdash;</span>{% endmatch %}</td>
+            <td class="debug-seconds">{{ capture.seconds }}s</td>
+            <td class="debug-clean">{% match capture.cleaned %}{% when Some with (text) %}{{ text }}{% when None %}<span class="debug-dropped">dropped by cleaner</span>{% endmatch %}</td>
+            <td class="debug-mono debug-raw">{{ capture.raw }}</td>
+            <td>{% match capture.card %}{% when Some with (card) %}<span class="debug-cardref">#{{ card + 1 }}</span>{% when None %}<span class="muted">&mdash;</span>{% endmatch %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <h3>On-screen text cards</h3>
+      <ol class="debug-final-list">
+        {% for card in url.cards %}
+        <li class="{% if !card.kept %}debug-dropped{% endif %}">[{{ card.seconds }}s] {{ card.text }}{% if !card.kept %} <span class="muted">(not sent to the draft)</span>{% endif %}</li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}
