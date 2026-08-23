@@ -55,6 +55,8 @@ const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
 const DEFAULT_REASONING_EFFORT: &str = "low";
+pub(crate) const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+const AI_GATEWAY_PROVIDER: &str = "vercel-ai-gateway";
 /// Reasoning efforts offered for the model, matching the worker protocol.
 const REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
 /// Built-in fallback for the Settings model list, used only when the live
@@ -132,7 +134,7 @@ enum AppError {
     )]
     AiNotConfigured,
     #[error(
-        "The video recipe cleaner is not configured. Set AI_GATEWAY_API_KEY before importing a video."
+        "The video recipe cleaner is not configured. Add Vercel AI Gateway credentials in Settings before importing a video."
     )]
     MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
@@ -341,6 +343,9 @@ struct SettingsTemplate {
     codex_selected: bool,
     has_endpoints: bool,
     endpoints: Vec<EndpointRow>,
+    gateway_configured: bool,
+    gateway_key_masked: String,
+    gateway_base_url: String,
 }
 struct SelectOption {
     value: String,
@@ -487,6 +492,19 @@ struct EndpointForm {
     model: String,
 }
 #[derive(Deserialize)]
+struct AiGatewayForm {
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct AiGatewayCredential {
+    #[serde(rename = "apiKey")]
+    pub(crate) api_key: String,
+    #[serde(rename = "baseUrl")]
+    pub(crate) base_url: String,
+}
+#[derive(Deserialize)]
 struct RecipeQuery {
     edit: Option<String>,
     edit_meta: Option<String>,
@@ -608,6 +626,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
         .route("/settings", get(settings_page).post(update_settings))
+        .route("/settings/vercel-gateway", post(update_ai_gateway))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route(
@@ -857,6 +876,44 @@ pub(crate) async fn store_codex_credential(
     Ok(())
 }
 
+/// Reads the per-user Vercel AI Gateway credential used only by the media
+/// cleaner. Invalid legacy rows are treated as unconfigured.
+pub(crate) async fn ai_gateway_credential(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<AiGatewayCredential>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
+            .bind(user_id)
+            .bind(AI_GATEWAY_PROVIDER)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
+}
+
+async fn store_ai_gateway_credential(
+    db: &SqlitePool,
+    user_id: &str,
+    credential: &AiGatewayCredential,
+) -> Result<()> {
+    let json = serde_json::to_string(credential)
+        .map_err(|_| AppError::Internal("Gateway credential could not be serialised.".into()))?;
+    sqlx::query(
+        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id,provider) DO UPDATE SET
+           credential_json = excluded.credential_json,
+           updated_at = excluded.updated_at",
+    )
+    .bind(user_id)
+    .bind(AI_GATEWAY_PROVIDER)
+    .bind(json)
+    .bind(stamp())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// The active AI provider: "pi" (Codex) or an ai_endpoints row id.
 /// Stored app-wide like the model; reconcile_ai_provider keeps the value
 /// valid at startup and the endpoint handlers keep it valid at runtime.
@@ -1038,6 +1095,16 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
         })
         .collect::<Vec<_>>();
     let has_endpoints = !endpoints.is_empty();
+    let gateway = ai_gateway_credential(&s.db, &user.id).await?;
+    let gateway_configured = gateway.is_some();
+    let gateway_key_masked = gateway
+        .as_ref()
+        .map(|credential| mask_key(&credential.api_key))
+        .unwrap_or_default();
+    let gateway_base_url = gateway
+        .as_ref()
+        .map(|credential| credential.base_url.clone())
+        .unwrap_or_else(|| AI_GATEWAY_DEFAULT_BASE_URL.into());
     // The model list is Codex-only: endpoint models are stored per endpoint,
     // so no catalogue refresh is ever triggered for them.
     let (model, fresh) = if codex_selected {
@@ -1056,6 +1123,9 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
         codex_selected,
         has_endpoints,
         endpoints,
+        gateway_configured,
+        gateway_key_masked,
+        gateway_base_url,
     })
 }
 
@@ -1162,6 +1232,35 @@ async fn update_settings(
     .bind(stamp())
     .execute(&s.db)
     .await?;
+    Ok(Redirect::to("/settings"))
+}
+
+/// Saves the Vercel AI Gateway credential for video evidence cleaning. A
+/// blank key preserves the existing key, so editing the URL never requires
+/// exposing the secret back to the browser.
+async fn update_ai_gateway(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<AiGatewayForm>,
+) -> Result<Redirect> {
+    let base_url = required(&form.base_url, "Gateway base URL")?;
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+        return Err(AppError::BadRequest(
+            "Gateway base URL must start with http:// or https://.".into(),
+        ));
+    }
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let api_key = trim(&form.api_key);
+    let api_key = if api_key.is_empty() {
+        ai_gateway_credential(&s.db, &user.id)
+            .await?
+            .map(|credential| credential.api_key)
+            .ok_or_else(|| AppError::BadRequest("Enter a Vercel AI Gateway API key.".into()))?
+    } else {
+        api_key
+    };
+    store_ai_gateway_credential(&s.db, &user.id, &AiGatewayCredential { api_key, base_url })
+        .await?;
     Ok(Redirect::to("/settings"))
 }
 

@@ -68,6 +68,17 @@
     {% endif %}
   </div>
   <div class="block">
+    <h2>Vercel AI Gateway <span class="codex-status{% if gateway_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if gateway_configured %}&#10003; Configured{% else %}Not configured{% endif %}</span></h2>
+    <p class="muted" style="margin-bottom: 10px;">Used to clean caption, transcript, and OCR evidence before a video recipe is generated.</p>
+    <form method="post" action="/settings/vercel-gateway">
+      <label for="gateway_base_url">Base URL</label>
+      <input type="url" id="gateway_base_url" name="base_url" value="{{ gateway_base_url }}" required>
+      <label for="gateway_api_key">API key{% if gateway_configured %} <span class="muted">(current key {{ gateway_key_masked }} · leave blank to keep it)</span>{% endif %}</label>
+      <input type="password" id="gateway_api_key" name="api_key" autocomplete="off"{% if !gateway_configured %} required{% endif %}>
+      <button class="primary" type="submit">Save gateway</button>
+    </form>
+  </div>
+  <div class="block">
     <h2>Authorise Codex <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
     <p class="muted" style="margin-bottom: 10px;">Connect your OpenAI Codex account to enable AI recipe generation.</p>
     {% if codex_authorised %}

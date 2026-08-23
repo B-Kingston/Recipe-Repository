@@ -49,7 +49,7 @@ The intended complete validation command is:
 docker compose up --build
 ```
 
-Then set `AI_GATEWAY_API_KEY`, visit `/healthz`, create a recipe, paste a public video URL into **From Video**, wait for local extraction/model warm-up and the cleaner pass, and review the cleaned evidence panel before saving. The example URLs can be tried directly:
+Then save your Vercel AI Gateway API key in **Settings**, visit `/healthz`, create a recipe, paste a public video URL into **From Video**, wait for local extraction/model warm-up and the cleaner pass, and review the cleaned evidence panel before saving. The example URLs can be tried directly:
 
 - `https://www.facebook.com/reel/2921942621481069`
 - `https://www.instagram.com/p/DZNQT3Pt3Ja/`

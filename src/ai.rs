@@ -165,7 +165,7 @@ pub(crate) async fn import_recipe(
             ));
         }
     };
-    if let Err(error) = ensure_media_cleaner_configured() {
+    if let Err(error) = ensure_media_cleaner_configured(&s, &user.id).await {
         return Ok(render_import_error(
             error.to_string(),
             &raw_url,
@@ -198,7 +198,7 @@ pub(crate) async fn import_recipe(
             ));
         }
     };
-    let evidence = match clean_media_evidence(&s, &extracted).await {
+    let evidence = match clean_media_evidence(&s, &user.id, &extracted).await {
         Ok(evidence) => evidence,
         Err(error) => {
             return Ok(render_import_error(
@@ -276,23 +276,26 @@ Return exactly one JSON object with these keys and no others: {"title":"string",
 
 static MEDIA_IMPORT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn ensure_media_cleaner_configured() -> Result<()> {
-    if env::var("AI_GATEWAY_API_KEY")
-        .ok()
-        .is_some_and(|key| !key.trim().is_empty())
-    {
-        Ok(())
-    } else {
-        Err(AppError::MediaCleanerNotConfigured)
-    }
+async fn ensure_media_cleaner_configured(
+    state: &AppState,
+    user_id: &str,
+) -> Result<crate::AiGatewayCredential> {
+    crate::ai_gateway_credential(&state.db, user_id)
+        .await?
+        .filter(|credential| !credential.api_key.trim().is_empty())
+        .ok_or(AppError::MediaCleanerNotConfigured)
 }
 
 /// Runs the recipe-only Vercel AI Gateway pass after local extraction. The
-/// worker receives the API key from its inherited environment, never from a
-/// prompt, process argument, or SQLite row. Raw local channels are sent only
-/// to this filtering pass; the returned bounded text is the sole video
-/// evidence later included in the final recipe prompt.
-async fn clean_media_evidence(state: &AppState, evidence: &MediaEvidence) -> Result<MediaEvidence> {
+/// worker receives the database credential in its private environment. Raw
+/// local channels are sent only to this filtering pass; the returned bounded
+/// text is the sole video evidence later included in the final recipe prompt.
+async fn clean_media_evidence(
+    state: &AppState,
+    user_id: &str,
+    evidence: &MediaEvidence,
+) -> Result<MediaEvidence> {
+    let gateway = ensure_media_cleaner_configured(state, user_id).await?;
     let model = env::var("AI_GATEWAY_CLEANER_MODEL")
         .ok()
         .filter(|model| !model.trim().is_empty())
@@ -341,7 +344,8 @@ async fn clean_media_evidence(state: &AppState, evidence: &MediaEvidence) -> Res
         let out = tokio::task::spawn_blocking({
             let worker_path = worker_path.clone();
             let payload = payload.clone();
-            move || run_pi_worker_for_cleaner(&worker_path, &payload)
+            let gateway = gateway.clone();
+            move || run_pi_worker_for_cleaner(&worker_path, &payload, &gateway)
         })
         .await
         .map_err(|_| AppError::Ai)?
@@ -971,32 +975,40 @@ async fn endpoint_recipe(
 }
 
 fn run_pi_worker(worker_path: &str, payload: &[u8]) -> std::io::Result<std::process::Output> {
-    run_pi_worker_with_gateway_key(worker_path, payload, false)
+    let mut command = pi_worker_command(worker_path);
+    // Only a cleaner worker may receive the gateway credential.
+    command
+        .env_remove("AI_GATEWAY_API_KEY")
+        .env_remove("AI_GATEWAY_BASE_URL");
+    run_pi_worker_command(command, payload)
 }
 
 fn run_pi_worker_for_cleaner(
     worker_path: &str,
     payload: &[u8],
+    gateway: &crate::AiGatewayCredential,
 ) -> std::io::Result<std::process::Output> {
-    run_pi_worker_with_gateway_key(worker_path, payload, true)
+    let mut command = pi_worker_command(worker_path);
+    command
+        .env("AI_GATEWAY_API_KEY", &gateway.api_key)
+        .env("AI_GATEWAY_BASE_URL", &gateway.base_url);
+    run_pi_worker_command(command, payload)
 }
 
-fn run_pi_worker_with_gateway_key(
-    worker_path: &str,
-    payload: &[u8],
-    allow_gateway_key: bool,
-) -> std::io::Result<std::process::Output> {
+fn pi_worker_command(worker_path: &str) -> Command {
     let mut command = Command::new("node");
     command
         .arg(worker_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if !allow_gateway_key {
-        // The cleaner is the only worker allowed to see this secret. Codex,
-        // endpoint, and model-catalogue workers do not need it.
-        command.env_remove("AI_GATEWAY_API_KEY");
-    }
+    command
+}
+
+fn run_pi_worker_command(
+    mut command: Command,
+    payload: &[u8],
+) -> std::io::Result<std::process::Output> {
     let mut child = command.spawn()?;
     child
         .stdin
@@ -1678,6 +1690,7 @@ fn debug_page_response(
 
 pub(crate) async fn media_debug_start(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Form(form): Form<MediaDebugForm>,
 ) -> Result<Response> {
     prune_debug_runs(&s.media_debug_runs);
@@ -1741,7 +1754,7 @@ pub(crate) async fn media_debug_start(
                         "kind": "status",
                         "state": "cleaning",
                     }));
-                    match clean_media_evidence(&s, &extracted).await {
+                    match clean_media_evidence(&s, &user.id, &extracted).await {
                         Ok(evidence) => {
                             run.record_event(json!({
                                 "url": index,

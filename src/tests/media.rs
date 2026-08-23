@@ -2,6 +2,7 @@ use crate::ai::{
     DebugRunMap, DebugUrlState, MAX_DEBUG_URLS, MediaDebugRun, absorb_event, find_run,
     media_debug_frame, media_debug_start, parse_debug_urls, valid_frame_file, valid_run_id,
 };
+use crate::auth::AuthUser;
 use crate::{AppError, AppState, MediaDebugForm};
 use axum::extract::{Form, Path, State};
 use parking_lot::Mutex;
@@ -173,6 +174,7 @@ async fn starting_a_run_with_only_invalid_urls_rerenders_with_errors() {
     let runs = DebugRunMap::default();
     let response = media_debug_start(
         State(state(database().await, runs.clone())),
+        AuthUser { id: "u1".into() },
         Form(MediaDebugForm {
             urls: "not a url at all".into(),
         }),

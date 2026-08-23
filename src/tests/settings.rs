@@ -1,8 +1,9 @@
 use crate::auth::AuthUser;
 use crate::{
-    AppError, AppState, EndpointForm, SettingsForm, add_endpoint, ai_provider, delete_endpoint,
-    find_endpoint, insert_endpoint, list_endpoints, mask_key, reconcile_ai_provider,
-    remove_endpoint, selected_effort, selected_model, stamp, update_settings,
+    AiGatewayForm, AppError, AppState, EndpointForm, SettingsForm, add_endpoint,
+    ai_gateway_credential, ai_provider, delete_endpoint, find_endpoint, insert_endpoint,
+    list_endpoints, mask_key, reconcile_ai_provider, remove_endpoint, selected_effort,
+    selected_model, stamp, update_ai_gateway, update_settings,
 };
 use axum::extract::{Form, Path, State};
 use parking_lot::Mutex;
@@ -75,6 +76,71 @@ async fn set_provider(db: &SqlitePool, value: &str) {
     .execute(db)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn gateway_credentials_are_saved_per_user() {
+    let db = database().await;
+    let _ = update_ai_gateway(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Form(AiGatewayForm {
+            base_url: "https://ai-gateway.vercel.sh/v1/".into(),
+            api_key: "vg-secret-abcdefgh".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let credential = ai_gateway_credential(&db, "u1").await.unwrap().unwrap();
+    assert_eq!(credential.api_key, "vg-secret-abcdefgh");
+    assert_eq!(credential.base_url, "https://ai-gateway.vercel.sh/v1");
+    assert!(ai_gateway_credential(&db, "u2").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn blank_gateway_key_preserves_the_saved_secret() {
+    let db = database().await;
+    for (base_url, api_key) in [
+        ("https://first.example/v1", "vg-secret"),
+        ("https://second.example/v1", ""),
+    ] {
+        let _ = update_ai_gateway(
+            State(state(db.clone())),
+            AuthUser { id: "u1".into() },
+            Form(AiGatewayForm {
+                base_url: base_url.into(),
+                api_key: api_key.into(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let credential = ai_gateway_credential(&db, "u1").await.unwrap().unwrap();
+    assert_eq!(credential.api_key, "vg-secret");
+    assert_eq!(credential.base_url, "https://second.example/v1");
+}
+
+#[tokio::test]
+async fn gateway_requires_a_key_and_valid_url() {
+    let db = database().await;
+    for form in [
+        AiGatewayForm {
+            base_url: "https://ai-gateway.vercel.sh/v1".into(),
+            api_key: String::new(),
+        },
+        AiGatewayForm {
+            base_url: "ai-gateway.vercel.sh/v1".into(),
+            api_key: "vg-secret".into(),
+        },
+    ] {
+        let result = update_ai_gateway(
+            State(state(db.clone())),
+            AuthUser { id: "u1".into() },
+            Form(form),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+    }
 }
 
 #[tokio::test]
