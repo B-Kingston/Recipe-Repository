@@ -1,10 +1,12 @@
 use crate::ai::{
-    DebugRunMap, DebugUrlState, MAX_DEBUG_URLS, MediaDebugRun, absorb_event, find_run,
-    media_debug_frame, media_debug_start, parse_debug_urls, valid_frame_file, valid_run_id,
+    DebugEventsQuery, DebugRunMap, DebugUrlState, MAX_DEBUG_URLS, MediaDebugRun, MediaRunPurpose,
+    absorb_event, find_run, import_events, media_debug_frame, media_debug_start, parse_debug_urls,
+    valid_frame_file, valid_run_id,
 };
 use crate::auth::AuthUser;
+use crate::media::MediaChannels;
 use crate::{AppError, AppState, MediaDebugForm};
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use parking_lot::Mutex;
 use sqlx::{
     SqlitePool,
@@ -46,9 +48,13 @@ fn empty_run(dir: PathBuf) -> MediaDebugRun {
     MediaDebugRun {
         created: std::time::Instant::now(),
         dir,
-        urls: Arc::new(Vec::new()),
+        urls: Arc::new(vec![Arc::new(Mutex::new(DebugUrlState::default()))]),
         history: Arc::new(Mutex::new(Vec::new())),
         pending: Arc::new(AtomicUsize::new(0)),
+        owner_id: "u1".into(),
+        purpose: MediaRunPurpose::Debug,
+        channels: MediaChannels::default(),
+        draft_id: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -183,6 +189,42 @@ async fn starting_a_run_with_only_invalid_urls_rerenders_with_errors() {
     .unwrap();
     assert_eq!(response.status(), 200);
     assert!(runs.lock().is_empty());
+}
+
+#[tokio::test]
+async fn import_event_feeds_are_scoped_to_the_run_owner() {
+    let runs = DebugRunMap::default();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let dir = std::env::temp_dir().join(format!("kindle-recipes-import-test-{run_id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut run = empty_run(dir.clone());
+    run.purpose = MediaRunPurpose::Import;
+    run.owner_id = "u1".into();
+    run.history.lock().push(serde_json::json!({
+        "url": 0, "kind": "status", "state": "extracting"
+    }));
+    runs.lock().insert(run_id.clone(), run);
+    let app = state(database().await, runs);
+
+    let payload = import_events(
+        State(app.clone()),
+        AuthUser { id: "u1".into() },
+        Path(run_id.clone()),
+        Query(DebugEventsQuery { since: 0 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(payload.0["events"][0]["state"], "extracting");
+
+    let foreign = import_events(
+        State(app),
+        AuthUser { id: "u2".into() },
+        Path(run_id),
+        Query(DebugEventsQuery { since: 0 }),
+    )
+    .await;
+    assert!(matches!(foreign, Err(AppError::NotFound)));
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

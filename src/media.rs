@@ -115,12 +115,11 @@ impl MediaChannels {
     }
 }
 
-/// Optional observation hook used by the Settings media-extraction debugger.
-/// When one is supplied, the extraction pipeline reports every phase boundary
-/// (page metadata, download, audio transcription, OCR planning and per-frame
-/// captures) through `emit`, and retains copies of the frames that were fed
-/// to the OCR engine so they can be reviewed next to the readings. Production
-/// imports pass `None` and behave exactly as before.
+/// Optional observation hook used by the From Video progress page and the
+/// Settings media-extraction debugger. When supplied, the extraction pipeline
+/// reports every phase boundary (page metadata, download, audio transcription,
+/// OCR planning and per-frame captures) through `emit`, and retains copies of
+/// OCR input frames so raw readings can be reviewed next to their pixels.
 pub(crate) struct MediaDebug {
     url_index: usize,
     frames_dir: PathBuf,
@@ -327,12 +326,23 @@ async fn extract_social_evidence_inner(
     let semaphore = MEDIA_JOB_LIMIT
         .get_or_init(|| Arc::new(Semaphore::new(1)))
         .clone();
+    if let Some(observer) = debug.as_deref() {
+        observer.event("phase", json!({ "phase": "worker", "state": "waiting" }));
+    }
     let permit = semaphore
         .acquire_owned()
         .await
         .map_err(|_| AppError::Internal("The local media extractor is unavailable.".into()))?;
     // The caption fetch is a separate HTTP round trip; skip it entirely when
     // the importer disabled the description channel.
+    if channels.description
+        && let Some(observer) = debug.as_deref()
+    {
+        observer.event(
+            "phase",
+            json!({ "phase": "description", "state": "running" }),
+        );
+    }
     let page = if channels.description {
         fetch_page_metadata(&source_url).await
     } else {
@@ -647,6 +657,7 @@ fn extract_in_directory(
                 "durationSeconds": duration_seconds,
             }),
         );
+        debug.event("phase", json!({ "phase": "description", "state": "done" }));
     }
 
     if let Some(duration) = duration_seconds
@@ -659,6 +670,11 @@ fn extract_in_directory(
 
     // Nothing needs the video file itself when both local channels are off:
     // a description-only import must not spend the download budget.
+    if (channels.audio || channels.ocr)
+        && let Some(debug) = debug
+    {
+        debug.event("phase", json!({ "phase": "download", "state": "running" }));
+    }
     let video_path = if channels.audio || channels.ocr {
         download_video(&ytdlp, source_url, workdir, &mut warnings, deadline)
     } else {
@@ -667,11 +683,26 @@ fn extract_in_directory(
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
     if let Some(debug) = debug {
         debug.event("download", json!({ "ok": video_path.is_some() }));
+        debug.event("phase", json!({ "phase": "download", "state": "done" }));
     }
     let mut audio_transcript = String::new();
     let mut ocr = Vec::new();
     if let Some(video_path) = video_path {
         let frame_rate = video_frame_rate(&video_path);
+        if let Some(debug) = debug {
+            if channels.audio {
+                debug.event(
+                    "phase",
+                    json!({ "phase": "audio", "state": "preparing audio" }),
+                );
+            }
+            if channels.ocr {
+                debug.event(
+                    "phase",
+                    json!({ "phase": "ocr", "state": "sampling frames" }),
+                );
+            }
+        }
         let (audio, frames) = extract_audio_and_frames(
             &video_path,
             workdir,
@@ -680,8 +711,13 @@ fn extract_in_directory(
             &mut warnings,
             deadline,
         );
-        if let Some(audio_path) = audio {
-            audio_transcript = transcribe_audio(&audio_path, &mut warnings, deadline);
+        if channels.audio {
+            if let Some(debug) = debug {
+                debug.event("phase", json!({ "phase": "audio", "state": "running" }));
+            }
+            if let Some(audio_path) = audio {
+                audio_transcript = transcribe_audio(&audio_path, &mut warnings, deadline);
+            }
             if let Some(debug) = debug {
                 debug.event(
                     "audio",
@@ -690,12 +726,30 @@ fn extract_in_directory(
                         "transcript": audio_transcript,
                     }),
                 );
+                debug.event("phase", json!({ "phase": "audio", "state": "done" }));
             }
         }
-        if let Some(sample) = frames {
-            ocr = read_video_text(&sample, frame_rate, &mut warnings, deadline, debug);
+        if channels.ocr {
+            if let Some(debug) = debug {
+                debug.event("phase", json!({ "phase": "ocr", "state": "running" }));
+            }
+            if let Some(sample) = frames {
+                ocr = read_video_text(&sample, frame_rate, &mut warnings, deadline, debug);
+            }
+            if let Some(debug) = debug {
+                debug.event("phase", json!({ "phase": "ocr", "state": "done" }));
+            }
         }
         flush_new_warnings(&warnings, &mut seen_warnings, debug);
+    } else if let Some(debug) = debug {
+        if channels.audio {
+            debug.event("audio", json!({ "chars": 0, "transcript": "" }));
+            debug.event("phase", json!({ "phase": "audio", "state": "done" }));
+        }
+        if channels.ocr {
+            debug.event("ocr-captures", json!({ "captures": [], "cards": [] }));
+            debug.event("phase", json!({ "phase": "ocr", "state": "done" }));
+        }
     }
 
     if title.trim().is_empty() {
@@ -723,6 +777,7 @@ fn extract_in_directory(
                 .into(),
         );
     }
+    flush_new_warnings(&warnings, &mut seen_warnings, debug);
     info!(
         source_url,
         ocr_engine = "paddle",

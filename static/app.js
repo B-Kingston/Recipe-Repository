@@ -243,3 +243,143 @@
 
   poll();
 }());
+
+/* From Video import: replay the bounded run feed, then poll for new events.
+ * The background job survives navigation and each raw channel is replaced
+ * atomically when its backend stage reports, avoiding partial or unsafe HTML. */
+(function () {
+  var root = document.querySelector('[data-import-root]');
+  if (!root || root.getAttribute('data-import-finished') === '1') return;
+  var eventsUrl = root.getAttribute('data-events-url');
+  var framesBase = root.getAttribute('data-frames-base');
+  var status = root.querySelector('[data-import-status]');
+  var errorBox = root.querySelector('[data-import-error]');
+  var warnings = root.querySelector('[data-import-warnings]');
+  var ready = root.querySelector('[data-import-ready]');
+  var draftLink = root.querySelector('[data-import-draft]');
+  var since = 0;
+  var stopped = false;
+  var replayed = false;
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+  function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+  function stage(name) { return root.querySelector('[data-import-stage="' + name + '"]'); }
+  function enabled(name) { var box = stage(name); return !box || box.getAttribute('data-stage-enabled') !== '0'; }
+  function stageStatus(name, value) {
+    var box = stage(name);
+    var badge = box && box.querySelector('[data-stage-status]');
+    if (badge && enabled(name)) badge.textContent = value;
+  }
+  function setRaw(holder, text, emptyText) {
+    clear(holder);
+    holder.appendChild(text ? el('div', 'debug-mono', text) : el('p', 'muted', emptyText));
+  }
+  function setDescription(event) {
+    if (!enabled('description')) return;
+    var holder = root.querySelector('[data-import-description]');
+    clear(holder);
+    if (event.durationSeconds !== undefined && event.durationSeconds !== null) holder.appendChild(el('p', 'muted', 'Duration: ' + event.durationSeconds + 's'));
+    if (event.title) holder.appendChild(el('p', null, '')).appendChild(el('strong', null, event.title));
+    if (event.description) holder.appendChild(el('div', 'debug-mono', event.description));
+    if (!event.title && !event.description) holder.appendChild(el('p', 'muted', 'No caption or description was found.'));
+    stageStatus('description', 'done');
+  }
+  function setAudio(event) {
+    if (!enabled('audio')) return;
+    setRaw(root.querySelector('[data-import-audio]'), event.transcript || '', 'No spoken transcript was found.');
+    stageStatus('audio', 'done');
+  }
+  function setOcr(event) {
+    if (!enabled('ocr')) return;
+    var holder = root.querySelector('[data-import-ocr]');
+    var captures = event.captures || [];
+    clear(holder);
+    if (!captures.length) {
+      holder.appendChild(el('p', 'muted', 'No readable on-screen text was found.'));
+      stageStatus('ocr', 'done');
+      return;
+    }
+    var table = document.createElement('table');
+    table.className = 'debug-captures';
+    var head = table.createTHead().insertRow();
+    ['Frame', 't', 'Recognised text', 'Raw engine reading'].forEach(function (label) { head.appendChild(document.createElement('th')).appendChild(document.createTextNode(label)); });
+    var body = document.createElement('tbody');
+    table.appendChild(body);
+    captures.forEach(function (capture) {
+      var row = body.insertRow(-1);
+      var thumb = row.insertCell(-1);
+      thumb.className = 'debug-thumb';
+      if (capture.image) {
+        var link = document.createElement('a');
+        var image = document.createElement('img');
+        link.href = framesBase + '/0/' + capture.image;
+        link.target = '_blank';
+        image.src = link.href;
+        image.alt = 'frame at ' + capture.seconds + 's';
+        image.loading = 'lazy';
+        link.appendChild(image);
+        thumb.appendChild(link);
+      } else thumb.textContent = '\u2014';
+      row.insertCell(-1).textContent = capture.seconds + 's';
+      var clean = row.insertCell(-1);
+      if (capture.text !== undefined && capture.text !== null) clean.textContent = capture.text;
+      else clean.appendChild(el('span', 'debug-dropped', 'not kept'));
+      var raw = row.insertCell(-1);
+      raw.className = 'debug-mono debug-raw';
+      raw.textContent = capture.raw || '';
+    });
+    holder.appendChild(table);
+    stageStatus('ocr', 'done');
+  }
+  function apply(event) {
+    if (event.kind === 'status') status.textContent = event.state || 'working';
+    else if (event.kind === 'phase') stageStatus(event.phase, event.state || 'working');
+    else if (event.kind === 'description') setDescription(event);
+    else if (event.kind === 'audio') setAudio(event);
+    else if (event.kind === 'ocr-plan') stageStatus('ocr', 'reading ' + event.planned + ' frames');
+    else if (event.kind === 'ocr-captures') setOcr(event);
+    else if (event.kind === 'cleaned') {
+      setRaw(root.querySelector('[data-import-cleaner]'), event.text || '', 'The cleaner returned no recipe facts.');
+      stageStatus('cleaner', 'done');
+    } else if (event.kind === 'warning' && event.message) warnings.appendChild(el('li', null, event.message));
+    else if (event.kind === 'result') {
+      status.textContent = 'ready';
+      status.className = 'codex-status codex-status--connected import-overall-status';
+      stageStatus('draft', 'done');
+      if (event.draftUrl) draftLink.href = event.draftUrl;
+      ready.hidden = false;
+      var copy = root.querySelector('[data-import-draft-copy]');
+      if (copy) copy.textContent = 'Ready for your review.';
+    } else if (event.kind === 'error') {
+      status.textContent = 'failed';
+      status.className = 'codex-status codex-status--missing import-overall-status';
+      errorBox.textContent = event.message || 'The video import failed.';
+      errorBox.hidden = false;
+    }
+  }
+  function poll() {
+    if (stopped) return;
+    var request = new XMLHttpRequest();
+    request.open('GET', eventsUrl + '?since=' + since, true);
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      if (request.status >= 200 && request.status < 300) {
+        try {
+          var payload = JSON.parse(request.responseText);
+          if (!replayed) { clear(warnings); replayed = true; }
+          (payload.events || []).forEach(apply);
+          since = payload.next || since;
+          if (payload.done) { stopped = true; return; }
+        } catch (ignored) { /* retry below */ }
+        window.setTimeout(poll, 900);
+      } else window.setTimeout(poll, 3500);
+    };
+    request.send();
+  }
+  poll();
+}());

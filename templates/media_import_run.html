@@ -1,0 +1,57 @@
+{% extends "base.html" %}{% block title %}Importing video · Kindle Recipes{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Cookbook / Video import</p>
+  <h1>{% if finished %}{% match draft_url %}{% when Some with (_) %}Your video draft is ready{% when None %}Video import stopped{% endmatch %}{% else %}Reading the recipe video{% endif %}</h1>
+  <p class="deck">Results appear below as the caption, local Whisper, OCR, cleaner, and recipe generator finish. Expand each source to see the raw evidence being used.</p>
+</div>
+<div class="media-import-progress" data-import-root data-import-finished="{% if finished %}1{% else %}0{% endif %}" data-events-url="/ai/import/{{ run_id }}/events" data-frames-base="/ai/import/{{ run_id }}/frames">
+  <section class="panel import-overall" aria-live="polite">
+    <p><strong>Status:</strong> <span class="codex-status import-overall-status" data-import-status>{{ evidence.status }}</span></p>
+    <p class="muted import-source-url">{{ evidence.source_url }}</p>
+    <p class="error" data-import-error{% if evidence.error_message == "" %} hidden{% endif %}>{{ evidence.error_message }}</p>
+    <ul class="debug-warnings" data-import-warnings>{% for warning in evidence.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+    <p class="actions import-ready" data-import-ready{% match draft_url %}{% when Some with (_) %}{% when None %} hidden{% endmatch %}>
+      {% match draft_url %}{% when Some with (url) %}<a class="button primary" data-import-draft href="{{ url }}">Review recipe draft</a>{% when None %}<a class="button primary" data-import-draft href="#">Review recipe draft</a>{% endmatch %}
+      <span class="muted">The raw evidence stays on this page until the run expires.</span>
+    </p>
+  </section>
+
+  <div class="import-stage-grid">
+    <details class="panel import-stage" data-import-stage="description" data-stage-enabled="{% if use_description %}1{% else %}0{% endif %}"{% if use_description %} open{% endif %}>
+      <summary><span>1</span> Caption / description <em data-stage-status>{% if use_description %}{% if evidence.title != "" || evidence.description != "" %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
+      <div data-import-description>
+        {% match evidence.duration_seconds %}{% when Some with (duration) %}<p class="muted">Duration: {{ duration }}s</p>{% when None %}{% endmatch %}
+        {% if evidence.title != "" %}<p><strong>{{ evidence.title }}</strong></p>{% endif %}
+        {% if evidence.description != "" %}<div class="debug-mono">{{ evidence.description }}</div>{% else %}<p class="muted">{% if use_description %}Waiting for the post metadata…{% else %}This source was not selected.{% endif %}</p>{% endif %}
+      </div>
+    </details>
+
+    <details class="panel import-stage" data-import-stage="audio" data-stage-enabled="{% if use_audio %}1{% else %}0{% endif %}"{% if use_audio %} open{% endif %}>
+      <summary><span>2</span> Spoken audio <em data-stage-status>{% if use_audio %}{% if evidence.transcript != "" %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
+      <div data-import-audio>{% if evidence.transcript != "" %}<div class="debug-mono">{{ evidence.transcript }}</div>{% else %}<p class="muted">{% if use_audio %}Waiting for local Whisper…{% else %}This source was not selected.{% endif %}</p>{% endif %}</div>
+    </details>
+
+    <details class="panel import-stage" data-import-stage="ocr" data-stage-enabled="{% if use_ocr %}1{% else %}0{% endif %}"{% if use_ocr %} open{% endif %}>
+      <summary><span>3</span> On-screen OCR <em data-stage-status>{% if use_ocr %}{% if evidence.captures.len() > 0 %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
+      <div data-import-ocr>
+        {% if evidence.captures.len() > 0 %}
+        <table class="debug-captures"><thead><tr><th>Frame</th><th>t</th><th>Recognised text</th><th>Raw engine reading</th></tr></thead><tbody>
+          {% for capture in evidence.captures %}<tr><td class="debug-thumb">{% match capture.image_url %}{% when Some with (src) %}<a href="{{ src }}" target="_blank"><img src="{{ src }}" alt="frame at {{ capture.seconds }}s" loading="lazy"></a>{% when None %}&mdash;{% endmatch %}</td><td>{{ capture.seconds }}s</td><td>{% match capture.cleaned %}{% when Some with (text) %}{{ text }}{% when None %}<span class="debug-dropped">not kept</span>{% endmatch %}</td><td class="debug-mono debug-raw">{{ capture.raw }}</td></tr>{% endfor %}
+        </tbody></table>
+        {% else %}<p class="muted">{% if use_ocr %}Waiting for sampled frames and PaddleOCR…{% else %}This source was not selected.{% endif %}</p>{% endif %}
+      </div>
+    </details>
+
+    <details class="panel import-stage" data-import-stage="cleaner">
+      <summary><span>4</span> Recipe evidence cleaner <em data-stage-status>{% if evidence.cleaned_recipe_text != "" %}done{% else %}waiting{% endif %}</em></summary>
+      <div data-import-cleaner>{% if evidence.cleaned_recipe_text != "" %}<div class="debug-mono">{{ evidence.cleaned_recipe_text }}</div>{% else %}<p class="muted">Starts after the selected raw sources finish.</p>{% endif %}</div>
+    </details>
+
+    <details class="panel import-stage" data-import-stage="draft">
+      <summary><span>5</span> Recipe draft <em data-stage-status>{% match draft_url %}{% when Some with (_) %}done{% when None %}waiting{% endmatch %}</em></summary>
+      <p class="muted" data-import-draft-copy>{% match draft_url %}{% when Some with (_) %}Ready for your review.{% when None %}Starts after the cleaner has reduced the raw evidence to recipe facts.{% endmatch %}</p>
+    </details>
+  </div>
+  <p class="actions"><a class="button" href="/ai/import">Import another video</a>{% if !finished %}<a class="button" href="/ai/import/{{ run_id }}">Refresh now</a>{% endif %}</p>
+</div>
+{% endblock %}

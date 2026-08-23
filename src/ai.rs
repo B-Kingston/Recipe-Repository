@@ -1,15 +1,16 @@
 use crate::media::{
     MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaChannels,
-    MediaDebug, MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence,
-    extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
+    MediaDebug, MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence_debug,
+    recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
     AppError, AppState, AuthUser, ChartRecipe, Critique, DRAFT_HOURS, DebugUrlView, DraftTemplate,
     GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView,
     MediaDebugCardView, MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate,
-    MediaDebugTemplate, MediaImportForm, MediaImportTemplate, ModelCatalogue, PromptForm,
-    RECIPE_PROMPT, Result, Source, generate_guidance, render, required, stamp, trim,
+    MediaDebugTemplate, MediaImportForm, MediaImportRunTemplate, MediaImportTemplate,
+    ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source, generate_guidance, render, required,
+    stamp, trim,
 };
 use axum::{
     Form,
@@ -181,60 +182,136 @@ pub(crate) async fn import_recipe(
             channels,
         ));
     }
-    let _import_permit = MEDIA_IMPORT_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(1)))
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| AppError::Internal("The media importer is unavailable.".into()))?;
-    let extracted = match extract_social_evidence(&source_url, channels).await {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return Ok(render_import_error(
-                error.to_string(),
-                &raw_url,
-                &notes,
-                channels,
-            ));
-        }
-    };
-    let evidence = match clean_media_evidence(&s, &user.id, &extracted).await {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return Ok(render_import_error(
-                error.to_string(),
-                &raw_url,
-                &notes,
-                channels,
-            ));
-        }
-    };
-    let source = evidence.source();
-    let evidence_json = serde_json::to_string(&evidence).map_err(|_| AppError::Ai)?;
-    let prompt = media_recipe_prompt(&evidence, &notes);
-    match create_draft(
-        &s,
-        &user,
-        None,
-        "generate",
-        &prompt,
-        false,
-        DraftProvenance {
-            attribution: Some(&source),
-            evidence_json: Some(&evidence_json),
-            search_enabled: Some(false),
-        },
-    )
-    .await
-    {
-        Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
-        Err(error) => Ok(render_import_error(
-            error.to_string(),
+    prune_debug_runs(&s.media_debug_runs);
+    if s.media_debug_runs.lock().len() >= DEBUG_RUN_LIMIT {
+        return Ok(render_import_error(
+            "There are already several media jobs running. Wait for one to finish and try again.",
             &raw_url,
             &notes,
             channels,
-        )),
+        ));
     }
+    let run_id = Uuid::new_v4().to_string();
+    let dir = env::temp_dir().join(format!("kindle-recipes-media-import-{run_id}"));
+    let frames_dir = dir.join("frames").join("0");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&frames_dir)
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "Could not create the import progress directory: {error}"
+            ))
+        })?;
+    let run = MediaDebugRun::new(
+        std::slice::from_ref(&source_url),
+        dir,
+        user.id.clone(),
+        MediaRunPurpose::Import,
+        channels,
+    );
+    s.media_debug_runs
+        .lock()
+        .insert(run_id.clone(), run.clone());
+
+    tokio::spawn(run_media_import(
+        s, user, run, source_url, notes, channels, frames_dir,
+    ));
+    Ok(Redirect::to(&format!("/ai/import/{run_id}")).into_response())
+}
+
+async fn run_media_import(
+    state: Arc<AppState>,
+    user: AuthUser,
+    run: MediaDebugRun,
+    source_url: String,
+    notes: String,
+    channels: MediaChannels,
+    frames_dir: PathBuf,
+) {
+    let outcome: Result<String> = async {
+        run.record_event(json!({
+            "url": 0,
+            "kind": "status",
+            "state": "waiting for the media worker",
+        }));
+        let _import_permit = MEDIA_IMPORT_LIMIT
+            .get_or_init(|| Arc::new(Semaphore::new(1)))
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::Internal("The media importer is unavailable.".into()))?;
+        run.record_event(json!({ "url": 0, "kind": "status", "state": "extracting" }));
+        let emitter: Arc<dyn Fn(Value) + Send + Sync> = {
+            let sink = run.clone();
+            Arc::new(move |event| sink.record_event(event))
+        };
+        let observer = Arc::new(MediaDebug::new(0, frames_dir, emitter));
+        let extracted = extract_social_evidence_debug(&source_url, channels, observer).await?;
+
+        run.record_event(json!({ "url": 0, "kind": "status", "state": "cleaning evidence" }));
+        run.record_event(json!({
+            "url": 0,
+            "kind": "phase",
+            "phase": "cleaner",
+            "state": "running",
+        }));
+        let evidence = clean_media_evidence(&state, &user.id, &extracted).await?;
+        run.record_event(json!({
+            "url": 0,
+            "kind": "cleaned",
+            "text": evidence.cleaned_recipe_text.clone(),
+        }));
+        run.record_event(json!({
+            "url": 0,
+            "kind": "phase",
+            "phase": "draft",
+            "state": "running",
+        }));
+        run.record_event(json!({ "url": 0, "kind": "status", "state": "preparing draft" }));
+        let source = evidence.source();
+        let evidence_json = serde_json::to_string(&evidence).map_err(|_| AppError::Ai)?;
+        let prompt = media_recipe_prompt(&evidence, &notes);
+        let id = create_draft(
+            &state,
+            &user,
+            None,
+            "generate",
+            &prompt,
+            false,
+            DraftProvenance {
+                attribution: Some(&source),
+                evidence_json: Some(&evidence_json),
+                search_enabled: Some(false),
+            },
+        )
+        .await?;
+        Ok(id)
+    }
+    .await;
+
+    match outcome {
+        Ok(id) => {
+            *run.draft_id.lock() = Some(id.clone());
+            run.record_event(json!({
+                "url": 0,
+                "kind": "result",
+                "ok": true,
+                "draftUrl": format!("/ai/drafts/{id}"),
+            }));
+            run.urls[0].lock().status = "ready".into();
+        }
+        Err(error) => {
+            warn!(%source_url, %error, "Video import failed");
+            run.record_event(json!({
+                "url": 0,
+                "kind": "error",
+                "message": error.to_string(),
+            }));
+        }
+    }
+    run.pending.store(0, Ordering::SeqCst);
+    run.record_event(json!({ "kind": "run-done" }));
 }
 
 async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
@@ -1347,16 +1424,13 @@ pub(crate) fn dedupe_sources(sources: Vec<Source>) -> Vec<Source> {
 }
 
 // ---------------------------------------------------------------------------
-// Media extraction debugger (Settings → Media extraction debugger)
+// Media extraction runs
 //
-// A single-user tool for watching the Instagram/Facebook reel pipeline run:
-// one or more URLs are extracted through the production path while phase
-// events (page metadata, download, audio transcript, per-frame OCR captures)
-// stream into an in-memory run record. The run page polls a JSON events
-// endpoint so results appear live, then keeps every capture — description,
-// audio, OCR frames with raw vs cleaned readings — on one page for review.
-// Runs are ephemeral: memory only, frames in a temp directory that is removed
-// when the run is evicted.
+// Both the user-facing From Video importer and the Settings debugger run in
+// the background. Phase events (page metadata, download, audio transcript,
+// per-frame OCR captures) stream into an in-memory record that their pages
+// poll with a replay cursor. Runs are ephemeral: memory only, frames in a temp
+// directory that is removed when the run is evicted.
 // ---------------------------------------------------------------------------
 
 /// Social URLs extracted per debugger run. The local extractor holds one
@@ -1404,8 +1478,15 @@ pub(crate) struct DebugCardRow {
     pub(crate) kept: bool,
 }
 
-/// An in-flight (or recently finished) debugger run. Cloned freely; all
-/// fields are shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaRunPurpose {
+    Import,
+    Debug,
+}
+
+/// An in-flight (or recently finished) extraction run. Cloned freely; all
+/// mutable fields are shared. `owner_id` is checked on every production run
+/// read so a guessed UUID cannot expose raw transcript or OCR evidence.
 #[derive(Clone)]
 pub(crate) struct MediaDebugRun {
     pub(crate) created: Instant,
@@ -1413,12 +1494,22 @@ pub(crate) struct MediaDebugRun {
     pub(crate) urls: Arc<Vec<Arc<Mutex<DebugUrlState>>>>,
     pub(crate) history: Arc<Mutex<Vec<Value>>>,
     pub(crate) pending: Arc<AtomicUsize>,
+    pub(crate) owner_id: String,
+    pub(crate) purpose: MediaRunPurpose,
+    pub(crate) channels: MediaChannels,
+    pub(crate) draft_id: Arc<Mutex<Option<String>>>,
 }
 
 pub(crate) type DebugRunMap = Arc<Mutex<HashMap<String, MediaDebugRun>>>;
 
 impl MediaDebugRun {
-    fn new(urls: &[String], dir: PathBuf) -> Self {
+    fn new(
+        urls: &[String],
+        dir: PathBuf,
+        owner_id: String,
+        purpose: MediaRunPurpose,
+        channels: MediaChannels,
+    ) -> Self {
         Self {
             created: Instant::now(),
             dir,
@@ -1435,6 +1526,10 @@ impl MediaDebugRun {
             ),
             history: Arc::new(Mutex::new(Vec::new())),
             pending: Arc::new(AtomicUsize::new(urls.len())),
+            owner_id,
+            purpose,
+            channels,
+            draft_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1478,6 +1573,14 @@ pub(crate) fn find_run(runs: &DebugRunMap, run_id: &str) -> Result<MediaDebugRun
         return Err(AppError::NotFound);
     }
     runs.lock().get(run_id).cloned().ok_or(AppError::NotFound)
+}
+
+fn find_import_run(runs: &DebugRunMap, run_id: &str, user_id: &str) -> Result<MediaDebugRun> {
+    let run = find_run(runs, run_id)?;
+    if run.purpose != MediaRunPurpose::Import || run.owner_id != user_id {
+        return Err(AppError::NotFound);
+    }
+    Ok(run)
 }
 
 /// Splits the debugger textarea into validated canonical URLs plus per-line
@@ -1641,8 +1744,12 @@ pub(crate) fn prune_debug_runs(runs: &DebugRunMap) {
         }
     }
     while runs.len() >= DEBUG_RUN_LIMIT {
+        // Never evict a live import just because another browser tab starts a
+        // job. Completed runs are disposable; if every slot is active the
+        // start handlers reject the new request instead.
         let oldest = runs
             .iter()
+            .filter(|(_, run)| run.finished())
             .min_by_key(|(_, run)| run.created)
             .map(|(id, _)| id.clone());
         let Some(id) = oldest else {
@@ -1696,6 +1803,9 @@ pub(crate) async fn media_debug_start(
     prune_debug_runs(&s.media_debug_runs);
     let (urls, errors) = parse_debug_urls(&form.urls);
     let mut error = errors.join(" ");
+    if s.media_debug_runs.lock().len() >= DEBUG_RUN_LIMIT {
+        error = "There are already several media jobs running. Wait for one to finish.".into();
+    }
     if urls.is_empty() && error.is_empty() {
         error = "Paste at least one Facebook or Instagram URL.".into();
     }
@@ -1721,7 +1831,13 @@ pub(crate) async fn media_debug_start(
                 AppError::Internal(format!("Could not create the debug directory: {error}"))
             })?;
     }
-    let run = MediaDebugRun::new(&urls, dir);
+    let run = MediaDebugRun::new(
+        &urls,
+        dir,
+        user.id.clone(),
+        MediaRunPurpose::Debug,
+        MediaChannels::default(),
+    );
     s.media_debug_runs
         .lock()
         .insert(run_id.clone(), run.clone());
@@ -1810,54 +1926,87 @@ pub(crate) async fn media_debug_start(
     Ok(Redirect::to(&format!("/settings/media-debug/{run_id}")).into_response())
 }
 
+fn debug_url_view(state: &DebugUrlState, frames_base: &str, url_index: usize) -> DebugUrlView {
+    DebugUrlView {
+        source_url: state.source_url.clone(),
+        status: state.status.clone(),
+        title: state.title.clone(),
+        description: state.description.clone(),
+        duration_seconds: state.duration_seconds,
+        transcript: state.transcript.clone(),
+        cleaned_recipe_text: state.cleaned_recipe_text.clone(),
+        warnings: state.warnings.clone(),
+        error_message: state.error_message.clone(),
+        captures: state
+            .captures
+            .iter()
+            .map(|capture| MediaDebugCaptureView {
+                seconds: capture.seconds,
+                image_url: if capture.image.is_empty() {
+                    None
+                } else {
+                    Some(format!("{frames_base}/{url_index}/{}", capture.image))
+                },
+                raw: capture.raw.clone(),
+                cleaned: capture.cleaned.clone(),
+                card: capture.card,
+            })
+            .collect(),
+        cards: state
+            .cards
+            .iter()
+            .map(|card| MediaDebugCardView {
+                seconds: card.seconds,
+                text: card.text.clone(),
+                kept: card.kept,
+            })
+            .collect(),
+    }
+}
+
+pub(crate) async fn import_run_page(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(run_id): Path<String>,
+) -> Result<Html<String>> {
+    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    let evidence = debug_url_view(
+        &run.urls[0].lock(),
+        &format!("/ai/import/{run_id}/frames"),
+        0,
+    );
+    let draft_url = run
+        .draft_id
+        .lock()
+        .as_ref()
+        .map(|id| format!("/ai/drafts/{id}"));
+    render(MediaImportRunTemplate {
+        run_id,
+        finished: run.finished(),
+        draft_url,
+        use_description: run.channels.description,
+        use_audio: run.channels.audio,
+        use_ocr: run.channels.ocr,
+        evidence,
+    })
+}
+
 pub(crate) async fn media_debug_run_page(
     State(s): State<Arc<AppState>>,
     Path(run_id): Path<String>,
 ) -> Result<Html<String>> {
     let run = find_run(&s.media_debug_runs, &run_id)?;
-    let finished = run.finished();
-    let mut views = Vec::with_capacity(run.urls.len());
-    for (index, cell) in run.urls.iter().enumerate() {
-        let state = cell.lock();
-        views.push(DebugUrlView {
-            source_url: state.source_url.clone(),
-            status: state.status.clone(),
-            title: state.title.clone(),
-            description: state.description.clone(),
-            duration_seconds: state.duration_seconds,
-            transcript: state.transcript.clone(),
-            cleaned_recipe_text: state.cleaned_recipe_text.clone(),
-            warnings: state.warnings.clone(),
-            error_message: state.error_message.clone(),
-            captures: state
-                .captures
-                .iter()
-                .map(|capture| MediaDebugCaptureView {
-                    seconds: capture.seconds,
-                    image_url: if capture.image.is_empty() {
-                        None
-                    } else {
-                        Some(format!(
-                            "/settings/media-debug/{run_id}/frames/{index}/{}",
-                            capture.image
-                        ))
-                    },
-                    raw: capture.raw.clone(),
-                    cleaned: capture.cleaned.clone(),
-                    card: capture.card,
-                })
-                .collect(),
-            cards: state
-                .cards
-                .iter()
-                .map(|card| MediaDebugCardView {
-                    seconds: card.seconds,
-                    text: card.text.clone(),
-                    kept: card.kept,
-                })
-                .collect(),
-        });
+    if run.purpose != MediaRunPurpose::Debug {
+        return Err(AppError::NotFound);
     }
+    let finished = run.finished();
+    let frames_base = format!("/settings/media-debug/{run_id}/frames");
+    let views = run
+        .urls
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| debug_url_view(&cell.lock(), &frames_base, index))
+        .collect();
     render(MediaDebugRunTemplate {
         run_id,
         finished,
@@ -1871,30 +2020,43 @@ pub(crate) struct DebugEventsQuery {
     pub(crate) since: usize,
 }
 
+fn run_events(run: MediaDebugRun, since: usize) -> Json<Value> {
+    let history = run.history.lock();
+    let start = since.min(history.len());
+    let events = history[start..].to_vec();
+    let next = history.len();
+    drop(history);
+    Json(json!({
+        "events": events,
+        "done": run.finished(),
+        "next": next,
+    }))
+}
+
+pub(crate) async fn import_events(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(run_id): Path<String>,
+    Query(query): Query<DebugEventsQuery>,
+) -> Result<Json<Value>> {
+    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    Ok(run_events(run, query.since))
+}
+
 pub(crate) async fn media_debug_events(
     State(s): State<Arc<AppState>>,
     Path(run_id): Path<String>,
     Query(query): Query<DebugEventsQuery>,
 ) -> Result<Json<Value>> {
     let run = find_run(&s.media_debug_runs, &run_id)?;
-    let history = run.history.lock();
-    let start = query.since.min(history.len());
-    let events = history[start..].to_vec();
-    let next = history.len();
-    drop(history);
-    Ok(Json(json!({
-        "events": events,
-        "done": run.finished(),
-        "next": next,
-    })))
+    if run.purpose != MediaRunPurpose::Debug {
+        return Err(AppError::NotFound);
+    }
+    Ok(run_events(run, query.since))
 }
 
-pub(crate) async fn media_debug_frame(
-    State(s): State<Arc<AppState>>,
-    Path((run_id, url_index, file)): Path<(String, usize, String)>,
-) -> Result<Response> {
-    let run = find_run(&s.media_debug_runs, &run_id)?;
-    if !valid_frame_file(&file) {
+fn run_frame(run: &MediaDebugRun, url_index: usize, file: &str) -> Result<Response> {
+    if !valid_frame_file(file) || url_index >= run.urls.len() {
         return Err(AppError::NotFound);
     }
     let bytes = fs::read(
@@ -1912,4 +2074,24 @@ pub(crate) async fn media_debug_frame(
         bytes,
     )
         .into_response())
+}
+
+pub(crate) async fn import_frame(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((run_id, url_index, file)): Path<(String, usize, String)>,
+) -> Result<Response> {
+    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    run_frame(&run, url_index, &file)
+}
+
+pub(crate) async fn media_debug_frame(
+    State(s): State<Arc<AppState>>,
+    Path((run_id, url_index, file)): Path<(String, usize, String)>,
+) -> Result<Response> {
+    let run = find_run(&s.media_debug_runs, &run_id)?;
+    if run.purpose != MediaRunPurpose::Debug {
+        return Err(AppError::NotFound);
+    }
+    run_frame(&run, url_index, &file)
 }

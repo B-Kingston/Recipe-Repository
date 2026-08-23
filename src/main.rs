@@ -40,9 +40,9 @@ use auth::{
 
 use ai::{
     DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
-    fresh_model_catalogue, generate_page, generate_recipe, import_page, import_recipe,
-    media_debug_events, media_debug_frame, media_debug_page, media_debug_run_page,
-    media_debug_start,
+    fresh_model_catalogue, generate_page, generate_recipe, import_events, import_frame,
+    import_page, import_recipe, import_run_page, media_debug_events, media_debug_frame,
+    media_debug_page, media_debug_run_page, media_debug_start,
 };
 use media::MediaEvidence;
 use recipes::{
@@ -319,6 +319,17 @@ struct MediaImportTemplate {
     use_description: bool,
     use_audio: bool,
     use_ocr: bool,
+}
+#[derive(Template)]
+#[template(path = "media_import_run.html")]
+struct MediaImportRunTemplate {
+    run_id: String,
+    finished: bool,
+    draft_url: Option<String>,
+    use_description: bool,
+    use_audio: bool,
+    use_ocr: bool,
+    evidence: DebugUrlView,
 }
 #[derive(Template)]
 #[template(path = "draft.html")]
@@ -619,6 +630,12 @@ fn routes(state: Arc<AppState>) -> Router {
             get(import_page)
                 .post(import_recipe)
                 .layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route("/ai/import/{run_id}", get(import_run_page))
+        .route("/ai/import/{run_id}/events", get(import_events))
+        .route(
+            "/ai/import/{run_id}/frames/{url_index}/{file}",
+            get(import_frame),
         )
         .route("/recipes/{id}/ai/alter", get(alter_page).post(alter_recipe))
         .route("/ai/drafts/{id}", get(draft_page))

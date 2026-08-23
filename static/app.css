@@ -445,6 +445,24 @@ input[type=checkbox] { width: auto; box-shadow: none; }
   .paper { border: 0; box-shadow: none; }
 }
 
+/* Live From Video import */
+.media-import-progress { width: min(100%, 980px); margin: 0 auto; }
+.import-overall { margin-bottom: 18px; padding: 16px 18px; }
+.import-overall p { margin-bottom: 8px; }
+.import-overall-status { margin-left: 4px; text-transform: none; }
+.import-source-url { overflow-wrap: anywhere; }
+.import-ready { align-items: center; margin-bottom: 0; }
+.import-stage-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.import-stage { margin: 0; padding: 0; overflow: hidden; }
+.import-stage summary { display: flex; align-items: center; gap: 9px; padding: 13px 15px; cursor: pointer; font-weight: 700; list-style: none; }
+.import-stage summary::-webkit-details-marker { display: none; }
+.import-stage summary > span { display: inline-grid; place-items: center; flex: 0 0 28px; width: 28px; height: 28px; border: 1px solid var(--ink); }
+.import-stage summary > em { margin-left: auto; color: var(--mid); font: 700 11px/1.2 var(--sans); letter-spacing: .05em; text-transform: uppercase; }
+.import-stage[open] summary { border-bottom: 1px solid var(--wash); }
+.import-stage > div, .import-stage > p { margin: 0; padding: 14px 16px; }
+.import-stage .debug-captures { margin: 0; }
+.import-stage .debug-mono { max-height: 22rem; overflow: auto; }
+
 /* Media extraction debugger */
 .media-debug-form textarea { font-family: monospace; }
 .debug-url-card { margin-top: 14px; }
