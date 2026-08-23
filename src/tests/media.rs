@@ -128,6 +128,14 @@ fn absorbed_events_build_the_review_state() {
     );
     absorb_event(
         &states,
+        &serde_json::json!({
+            "url": 0,
+            "kind": "cleaned",
+            "text": "Dish: Crispy rice\nIngredients:\n- 1 cup rice"
+        }),
+    );
+    absorb_event(
+        &states,
         &serde_json::json!({"url": 0, "kind": "ocr-captures", "captures": [
             {"slot": 0, "seconds": 3, "image": "f0000.jpg", "raw": "cup flour", "text": "cup flour", "card": 0},
             {"slot": 1, "seconds": 4, "image": "", "raw": "72 Ss an", "text": null, "card": null}
@@ -140,6 +148,10 @@ fn absorbed_events_build_the_review_state() {
     assert_eq!(state.description, "A reel caption");
     assert_eq!(state.duration_seconds, Some(42));
     assert_eq!(state.transcript, "hello");
+    assert_eq!(
+        state.cleaned_recipe_text,
+        "Dish: Crispy rice\nIngredients:\n- 1 cup rice"
+    );
     assert_eq!(state.warnings.len(), 1);
     assert_eq!(state.captures.len(), 2);
     assert_eq!(state.captures[0].cleaned.as_deref(), Some("cup flour"));

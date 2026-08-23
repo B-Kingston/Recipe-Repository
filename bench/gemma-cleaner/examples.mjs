@@ -6,7 +6,7 @@
 // codeflow". So we fabricate realistic raw evidence that mimics what Whisper
 // and Tesseract actually return for these cooking reels: spoken numbers as
 // words, social filler ("like and subscribe", "link in bio"), hashtags, and
-// on-screen ingredient amounts. The cleaner (Gemma 4 via OpenRouter) is then
+// on-screen ingredient amounts. The cleaner (Laguna via Vercel AI Gateway) is then
 // run for real against this evidence.
 
 export const EXAMPLES = [

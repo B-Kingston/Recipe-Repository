@@ -41,7 +41,7 @@
 {% when Some with (evidence) %}
 <section class="panel evidence-panel">
   <div class="evidence-heading"><h2>Evidence combined from video</h2><a href="{{ evidence.source_url }}" target="_blank" rel="noopener noreferrer">Open original post</a></div>
-  <p class="muted">Local audio and OCR were combined with the post caption, then reduced to recipe-only facts by the OpenRouter cleaner before this draft was generated{% if evidence.duration_seconds.is_some() %} from the first {{ evidence.duration_seconds.unwrap() }} seconds{% endif %}.</p>
+  <p class="muted">Local audio and OCR were combined with the post caption, then reduced to recipe-only facts by the AI Gateway cleaner before this draft was generated{% if evidence.duration_seconds.is_some() %} from the first {{ evidence.duration_seconds.unwrap() }} seconds{% endif %}.</p>
   {% if evidence.cleaned_recipe_text != "" %}<details class="cleaned-evidence" open><summary>Recipe-only evidence sent to the final model</summary><p class="evidence-text">{{ evidence.cleaned_recipe_text }}</p></details>{% endif %}
   {% if evidence.description != "" %}<details><summary>Raw post description (cleaner input only)</summary><p class="evidence-text">{{ evidence.description }}</p></details>{% endif %}
   {% if evidence.audio_transcript != "" %}<details><summary>Raw audio transcript (cleaner input only)</summary><p class="evidence-text">{{ evidence.audio_transcript }}</p></details>{% endif %}

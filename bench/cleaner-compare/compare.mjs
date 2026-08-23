@@ -3,7 +3,7 @@
 // Each invocation:
 //   1. deletes the previous benchmark output directory;
 //   2. runs the production Rust media extractor from the supplied reel URL;
-//   3. sends that fresh description/audio/OCR evidence to OpenRouter;
+//   3. sends that fresh description/audio/OCR evidence to Vercel AI Gateway;
 //   4. saves the evidence first and Laguna's cleanup below it.
 //
 // Usage:
@@ -26,8 +26,8 @@ import { promisify } from "node:util";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  openrouterChatCompletion,
-  parseOpenRouterCleaner,
+  aiGatewayChatCompletion,
+  parseAiGatewayCleaner,
 } from "../../pi/recipe-worker.mjs";
 import { IMPROVED_SYSTEM_PROMPT } from "../gemma-cleaner/cleaner_prompt.mjs";
 
@@ -59,15 +59,15 @@ function loadEnv(path) {
 
 loadEnv(join(REPO_ROOT, ".env"));
 
-const KEY = process.env.OPENROUTER_API_KEY || "";
-const BASE = process.env.OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
-const MODEL_A = process.env.MODEL_A?.trim() || "google/gemma-4-26b-a4b-it:free";
-const MODEL_B = process.env.MODEL_B?.trim() || "poolside/laguna-s-2.1:free";
-const OPTIONS = { reasoning: { enabled: false }, maxTokens: 2048 };
+const KEY = process.env.AI_GATEWAY_API_KEY || "";
+const BASE = process.env.AI_GATEWAY_BASE_URL?.trim() || "https://ai-gateway.vercel.sh/v1";
+const MODEL_A = process.env.MODEL_A?.trim() || "openai/gpt-5.4-mini";
+const MODEL_B = process.env.MODEL_B?.trim() || "poolside/laguna-s-2.1-free";
+const OPTIONS = { reasoning: { effort: "none" }, maxTokens: 2048 };
 const SOURCE_URL = parseSourceUrl(process.argv.slice(2));
 
 if (!KEY) {
-  console.error("OPENROUTER_API_KEY not set in .env");
+  console.error("AI_GATEWAY_API_KEY not set in .env");
   process.exit(1);
 }
 
@@ -112,8 +112,8 @@ function cleanerResult(result) {
   return {
     model_requested: result.model,
     model_returned: result.modelReturned,
-    raw_openrouter_response: parseJsonText(result.rawText),
-    raw_openrouter_text: result.rawText,
+    raw_gateway_response: parseJsonText(result.rawText),
+    raw_gateway_text: result.rawText,
     cleaned_recipe_text: result.cleaned,
     score: result.score,
     error: result.error,
@@ -245,7 +245,7 @@ async function runOne(model, evidence, attempt = 0) {
   let cleaned;
   let error;
   try {
-    data = await openrouterChatCompletion(
+    data = await aiGatewayChatCompletion(
       BASE,
       KEY,
       model,
@@ -255,7 +255,7 @@ async function runOne(model, evidence, attempt = 0) {
       OPTIONS,
     );
     rawText = data?.choices?.[0]?.message?.content ?? "";
-    cleaned = parseOpenRouterCleaner(data);
+    cleaned = parseAiGatewayCleaner(data);
   } catch (caught) {
     const message = caught?.code ? `${caught.code}: ${caught.message}` : String(caught);
     if (attempt === 0 && !message.startsWith("configuration")) {
@@ -323,7 +323,7 @@ function renderReport({ runId, extractedAt, evidence, results }) {
     lines.push(`> ERROR: ${laguna?.error ?? "not run"}\n`);
   } else {
     lines.push(`*${laguna.latencyMs}ms · ${laguna.totalTokens} tokens · under 180s: ${laguna.underTimeout}*\n`);
-    lines.push("### Raw OpenRouter response\n");
+    lines.push("### Raw AI Gateway response\n");
     lines.push("```json");
     lines.push(laguna.rawText);
     lines.push("```\n");

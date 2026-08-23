@@ -178,7 +178,7 @@ export function completionContext(request, searchEnabled) {
 }
 
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
-const OPENROUTER_CLEANER_TIMEOUT_MS = 180_000;
+const AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000;
 
 function apiCredentials(request) {
   const apiBaseUrl = typeof request.apiBaseUrl === "string" && request.apiBaseUrl.trim()
@@ -229,9 +229,9 @@ async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
   return fetchJson(url, { Authorization: `Bearer ${apiKey}` }, body, fetchImpl);
 }
 
-/** OpenRouter's OpenAI-compatible chat-completions request used only for
- * reducing noisy local video evidence before the final recipe generation. */
-export async function openrouterChatCompletion(
+/** Vercel AI Gateway's OpenAI-compatible chat-completions request used only
+ * for reducing noisy local video evidence before final recipe generation. */
+export async function aiGatewayChatCompletion(
   apiBaseUrl,
   apiKey,
   modelId,
@@ -242,35 +242,27 @@ export async function openrouterChatCompletion(
 ) {
   const url = `${apiBaseUrl.replace(/\/+$/, "")}/chat/completions`;
   const headers = { Authorization: `Bearer ${apiKey}` };
-  const referer = process.env.OPENROUTER_HTTP_REFERER?.trim();
-  const title = process.env.OPENROUTER_APP_TITLE?.trim();
-  if (referer) headers["HTTP-Referer"] = referer;
-  if (title) headers["X-Title"] = title;
   const body = {
     model: modelId,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: prompt },
     ],
-    // Default keeps the historical cleaner behaviour. Callers may disable
-    // reasoning (the free Gemma cleaner wastes most of its token budget on
-    // chain-of-thought for a simple extraction task) or tune temperature/
-    // max_tokens for cheaper, faster, more deterministic cleaning. A caller
-    // may also pass reasoning: null to OMIT the field entirely for providers
-    // that reject the flag on certain models.
-    reasoning: options.reasoning !== undefined ? options.reasoning : { enabled: true },
+    // Reasoning is off by default for this extraction task. The caller may
+    // select a Gateway-supported effort or omit the field for compatibility.
+    reasoning: options.reasoning !== undefined ? options.reasoning : { effort: "none" },
     stream: false,
     max_tokens: options.maxTokens ?? 2048,
   };
   if (body.reasoning === null) delete body.reasoning;
   if (typeof options.temperature === "number") body.temperature = options.temperature;
-  return fetchJson(url, headers, body, fetchImpl, OPENROUTER_CLEANER_TIMEOUT_MS);
+  return fetchJson(url, headers, body, fetchImpl, AI_GATEWAY_CLEANER_TIMEOUT_MS);
 }
 
 function cleanerMessageText(data) {
   const message = data?.choices?.[0]?.message;
   if (!message || message.refusal) {
-    throw new WorkerError("output", "OpenRouter refused the media-cleaner request.");
+    throw new WorkerError("output", "AI Gateway refused the media-cleaner request.");
   }
   if (typeof message.content === "string") return message.content;
   if (Array.isArray(message.content)) {
@@ -279,7 +271,7 @@ function cleanerMessageText(data) {
       .map((part) => part.text)
       .join("");
   }
-  throw new WorkerError("output", "OpenRouter returned no media-cleaner text.");
+  throw new WorkerError("output", "AI Gateway returned no media-cleaner text.");
 }
 
 function cleanerScalar(value, max = 800) {
@@ -315,7 +307,7 @@ export function formatRecipeEvidence(value) {
     ? value.recipeEvidence
     : value;
   if (!root || typeof root !== "object" || Array.isArray(root)) {
-    throw new WorkerError("output", "OpenRouter returned an invalid media-cleaner object.");
+    throw new WorkerError("output", "AI Gateway returned an invalid media-cleaner object.");
   }
   const title = cleanerScalar(root.title);
   const servings = cleanerScalar(root.servings);
@@ -324,7 +316,7 @@ export function formatRecipeEvidence(value) {
   const timings = cleanerList(root.timings);
   const notes = cleanerList(root.relevant_notes ?? root.relevantNotes);
   if (ingredients.length === 0 && steps.length === 0) {
-    throw new WorkerError("output", "OpenRouter found no recipe facts in the video evidence.");
+    throw new WorkerError("output", "AI Gateway found no recipe facts in the video evidence.");
   }
   const lines = [];
   if (title) lines.push(`Dish: ${title}`);
@@ -347,12 +339,12 @@ export function formatRecipeEvidence(value) {
   }
   const text = lines.join("\n").trim();
   if (text.length > 24_000) {
-    throw new WorkerError("output", "OpenRouter returned too much media-cleaner text.");
+    throw new WorkerError("output", "AI Gateway returned too much media-cleaner text.");
   }
   return text;
 }
 
-export function parseOpenRouterCleaner(data) {
+export function parseAiGatewayCleaner(data) {
   const text = cleanerMessageText(data);
   return formatRecipeEvidence(extractJson(text));
 }
@@ -564,16 +556,15 @@ async function listModels(request) {
 }
 
 async function cleanMedia(request) {
-  const apiKey = process.env.OPENROUTER_API_KEY?.trim();
+  const apiKey = process.env.AI_GATEWAY_API_KEY?.trim();
   if (!apiKey) {
-    throw new WorkerError("configuration", "OPENROUTER_API_KEY is not configured.");
+    throw new WorkerError("configuration", "AI_GATEWAY_API_KEY is not configured.");
   }
-  const apiBaseUrl = process.env.OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
+  const apiBaseUrl = process.env.AI_GATEWAY_BASE_URL?.trim() || "https://ai-gateway.vercel.sh/v1";
   const modelId = typeof request.model === "string" && request.model.trim()
     ? request.model.trim()
-    : process.env.OPENROUTER_CLEANER_MODEL?.trim() || "google/gemma-4-26b-a4b-it:free";
-  // Optional tuning knobs forwarded from the host (ai.rs). When omitted the
-  // worker's openrouterChatCompletion keeps the historical defaults.
+    : process.env.AI_GATEWAY_CLEANER_MODEL?.trim() || "poolside/laguna-s-2.1-free";
+  // Optional tuning knobs forwarded from the host (ai.rs).
   const options = {
     reasoning: typeof request.reasoning === "object" && request.reasoning ? request.reasoning : undefined,
     maxTokens: typeof request.maxTokens === "number" ? request.maxTokens : undefined,
@@ -582,7 +573,7 @@ async function cleanMedia(request) {
   for (const key of Object.keys(options)) {
     if (options[key] === undefined) delete options[key];
   }
-  const data = await openrouterChatCompletion(
+  const data = await aiGatewayChatCompletion(
     apiBaseUrl,
     apiKey,
     modelId,
@@ -591,7 +582,7 @@ async function cleanMedia(request) {
     undefined,
     options,
   );
-  outputJson({ cleanedText: parseOpenRouterCleaner(data), model: modelId });
+  outputJson({ cleanedText: parseAiGatewayCleaner(data), model: modelId });
 }
 
 async function main() {

@@ -73,7 +73,7 @@ pub(crate) struct MediaEvidence {
     pub(crate) audio_transcript: String,
     pub(crate) ocr: Vec<OcrSnippet>,
     pub(crate) warnings: Vec<String>,
-    /// Recipe-only text produced by the OpenRouter cleaner. The raw local
+    /// Recipe-only text produced by the Vercel AI Gateway cleaner. The raw local
     /// channels remain available for review, but this is the only video text
     /// that `recipe_prompt` is allowed to send to the final recipe model.
     #[serde(default)]
@@ -1729,10 +1729,10 @@ fn run_tool(
     // own helpers. Put the whole subprocess tree in a private process group so
     // a timeout does not leave descendants writing into the temp directory.
     command.process_group(0);
-    // Local media tools do not need the OpenRouter secret. Do not expose it to
+    // Local media tools do not need the AI Gateway secret. Do not expose it to
     // yt-dlp, ffmpeg, Python/Whisper, or Tesseract even though they inherit the
     // app environment by default.
-    command.env_remove("OPENROUTER_API_KEY");
+    command.env_remove("AI_GATEWAY_API_KEY");
     let mut child = command
         .args(args)
         .stdout(Stdio::piped())

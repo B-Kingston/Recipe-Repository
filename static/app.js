@@ -50,7 +50,8 @@
 }());
 
 /* Media extraction debugger: polls the run's JSON event feed and appends
- * phase results (description, audio, OCR captures) as they arrive. The page
+ * phase results (description, audio, OCR captures, and the Laguna cleaner
+ * output) as they arrive. The page
  * also renders a server-side snapshot; this enhancement only takes over when
  * the snapshot is still empty, so the two never fight over the DOM. */
 (function () {
@@ -87,7 +88,8 @@
     var phases = {
       description: el('div', 'debug-phase'),
       audio: el('div', 'debug-phase'),
-      ocr: el('div', 'debug-phase')
+      ocr: el('div', 'debug-phase'),
+      cleaner: el('div', 'debug-phase')
     };
     article.appendChild(phases.description);
     article.appendChild(phases.audio);
@@ -113,6 +115,13 @@
     while (box.firstChild) box.removeChild(box.firstChild);
     box.appendChild(el('h3', null, 'Audio analysis captures'));
     box.appendChild(el('div', 'debug-mono', data.transcript || '[no transcript]'));
+  }
+
+  function setCleaner(card, data) {
+    var box = card.phases.cleaner;
+    while (box.firstChild) box.removeChild(box.firstChild);
+    box.appendChild(el('h3', null, 'Laguna recipe cleaner output'));
+    box.appendChild(el('div', 'debug-mono', data.text || '[no cleaned recipe output]'));
   }
 
   function buildOcrSkeleton(box) {
@@ -191,6 +200,8 @@
       setDescription(card, event);
     } else if (kind === 'audio') {
       setAudio(card, event);
+    } else if (kind === 'cleaned') {
+      setCleaner(card, event);
     } else if (kind === 'warning') {
       if (event.message) card.warnings.appendChild(el('li', null, event.message));
     } else if (kind === 'ocr-captures') {

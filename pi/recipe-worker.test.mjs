@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WorkerError, anthropicMessages, anthropicUrl, catalogModelIds, critiquePass, formatRecipeEvidence, normalizeEffort, openaiChat, openaiResponse, openrouterChatCompletion, parseAnthropicOutput, parseOpenRouterCleaner, parseResponsesOutput, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
+import { WorkerError, aiGatewayChatCompletion, anthropicMessages, anthropicUrl, catalogModelIds, critiquePass, formatRecipeEvidence, normalizeEffort, openaiChat, openaiResponse, parseAiGatewayCleaner, parseAnthropicOutput, parseResponsesOutput, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -113,7 +113,7 @@ test("openaiResponse sends the chosen reasoning effort", async () => {
   assert.deepEqual(sent.reasoning, { effort: "high" });
 });
 
-test("openrouterChatCompletion uses the requested chat-completions model and reasoning", async () => {
+test("aiGatewayChatCompletion uses the requested chat-completions model and reasoning", async () => {
   let capturedUrl;
   let capturedInit;
   const fetchImpl = async (url, init) => {
@@ -121,40 +121,40 @@ test("openrouterChatCompletion uses the requested chat-completions model and rea
     capturedInit = init;
     return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
   };
-  await openrouterChatCompletion("https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free", "sys", "raw evidence", fetchImpl);
-  assert.equal(capturedUrl, "https://openrouter.ai/api/v1/chat/completions");
-  assert.equal(capturedInit.headers.Authorization, "Bearer or-test");
+  await aiGatewayChatCompletion("https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free", "sys", "raw evidence", fetchImpl);
+  assert.equal(capturedUrl, "https://ai-gateway.vercel.sh/v1/chat/completions");
+  assert.equal(capturedInit.headers.Authorization, "Bearer vg-test");
   const sent = JSON.parse(capturedInit.body);
-  assert.equal(sent.model, "google/gemma-4-26b-a4b-it:free");
+  assert.equal(sent.model, "poolside/laguna-s-2.1-free");
   assert.deepEqual(sent.messages, [
     { role: "system", content: "sys" },
     { role: "user", content: "raw evidence" },
   ]);
-  assert.deepEqual(sent.reasoning, { enabled: true });
+  assert.deepEqual(sent.reasoning, { effort: "none" });
   assert.equal(sent.stream, false);
   assert.equal(sent.max_tokens, 2048);
   assert.ok(!("temperature" in sent));
 });
 
-test("openrouterChatCompletion honours reasoning/maxTokens/temperature options and omits reasoning when null", async () => {
+test("aiGatewayChatCompletion honours reasoning/maxTokens/temperature options and omits reasoning when null", async () => {
   let capturedInit;
   const fetchImpl = async (_url, init) => {
     capturedInit = init;
     return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
   };
   // Off + tuned max_tokens and a deterministic temperature.
-  await openrouterChatCompletion(
-    "https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free",
+  await aiGatewayChatCompletion(
+    "https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free",
     "sys", "raw evidence", fetchImpl,
-    { reasoning: { enabled: false }, maxTokens: 1024, temperature: 0 },
+    { reasoning: { effort: "none" }, maxTokens: 1024, temperature: 0 },
   );
   let sent = JSON.parse(capturedInit.body);
-  assert.deepEqual(sent.reasoning, { enabled: false });
+  assert.deepEqual(sent.reasoning, { effort: "none" });
   assert.equal(sent.max_tokens, 1024);
   assert.equal(sent.temperature, 0);
   // null reasoning means the field is omitted entirely (some models reject it).
-  await openrouterChatCompletion(
-    "https://openrouter.ai/api/v1/", "or-test", "google/gemma-4-26b-a4b-it:free",
+  await aiGatewayChatCompletion(
+    "https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free",
     "sys", "raw evidence", fetchImpl, { reasoning: null },
   );
   sent = JSON.parse(capturedInit.body);
@@ -162,8 +162,8 @@ test("openrouterChatCompletion honours reasoning/maxTokens/temperature options a
   assert.equal(sent.max_tokens, 2048, "unset maxTokens keeps the default");
 });
 
-test("parseOpenRouterCleaner keeps recipe fields and discards cleaner prose and unknown fields", () => {
-  const cleaned = parseOpenRouterCleaner({
+test("parseAiGatewayCleaner keeps recipe fields and discards cleaner prose and unknown fields", () => {
+  const cleaned = parseAiGatewayCleaner({
     choices: [{ message: { content: "```json\n" + JSON.stringify({
       title: "Chilli tofu",
       ingredients: [{ quantity: "200", unit: "g", name: "tofu" }, "1 tbsp oil"],

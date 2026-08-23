@@ -2,7 +2,7 @@
 <div class="form-intro">
   <p class="eyebrow">Cookbook / Video import</p>
   <h1>Import a recipe video</h1>
-  <p class="deck">Paste a public Facebook Reel or Instagram post/reel. The server downloads a temporary copy, transcribes its audio with local Whisper, reads on-screen text with local OCR, and sends the combined evidence through a recipe-only OpenRouter cleaner before preparing a draft.</p>
+  <p class="deck">Paste a public Facebook Reel or Instagram post/reel. The server downloads a temporary copy, transcribes its audio with local Whisper, reads on-screen text with local OCR, and sends the combined evidence through a recipe-only Vercel AI Gateway cleaner before preparing a draft.</p>
 </div>
 {% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
 <form class="panel form-panel media-import-panel" method="post" action="/ai/import">
@@ -15,7 +15,7 @@
       <li>The post caption or description</li>
       <li>Spoken instructions and quantities from local Whisper transcription</li>
       <li>Ingredient cards and other on-screen text from local Tesseract OCR</li>
-      <li>A recipe-only OpenRouter pass that removes social chatter before final generation</li>
+      <li>A recipe-only AI Gateway pass that removes social chatter before final generation</li>
     </ul>
     <p class="muted">The video is temporary and deleted after extraction. The raw channels go only to the cleaner; you review the complete recipe before saving it.</p>
   </div>

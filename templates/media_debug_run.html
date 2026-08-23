@@ -3,7 +3,7 @@
   <p class="eyebrow">Settings / Media debugger</p>
   <h1>Extraction run</h1>
   <p class="deck">
-    {% if finished %}All URLs finished. Review the three capture phases below.{% else %}Running &mdash; this page refreshes itself until the run finishes. Results appear as each phase reports.{% endif %}
+    {% if finished %}All URLs finished. Review the extraction phases and Laguna cleaner output below.{% else %}Running &mdash; this page refreshes itself until the run finishes. Results appear as each phase reports.{% endif %}
     <span class="muted">Run {{ run_id }}</span>
   </p>
   <p class="actions"><a class="button compact" href="/settings/media-debug">New run</a> <a class="button compact" href="/settings">Settings</a></p>
@@ -51,6 +51,10 @@
         <li class="{% if !card.kept %}debug-dropped{% endif %}">[{{ card.seconds }}s] {{ card.text }}{% if !card.kept %} <span class="muted">(not sent to the draft)</span>{% endif %}</li>
         {% endfor %}
       </ol>
+      {% endif %}
+      {% if url.cleaned_recipe_text != "" %}
+      <h3>Laguna recipe cleaner output</h3>
+      <div class="debug-mono">{{ url.cleaned_recipe_text }}</div>
       {% endif %}
     </section>
     {% endfor %}

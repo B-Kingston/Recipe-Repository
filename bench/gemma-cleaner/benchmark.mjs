@@ -1,13 +1,13 @@
-// Benchmark + before/after evaluation for the Gemma 4 OpenRouter media
+// Benchmark + before/after evaluation for the Laguna Vercel AI Gateway media
 // cleaner (the text-cleaning step used by "From Video" imports).
 //
 // Pipeline mocked here:
 //   extract_social_evidence()  -> MediaEvidence (title/desc/transcript/ocr)
 //   [mocked: yt-dlp/ffmpeg/whisper/tesseract not installed]
 //   cleaner_prompt(evidence)   -> user prompt  (ported 1:1 from src/media.rs)
-//   cleanMedia() / openrouterChatCompletion()  -> REAL Gemma 4 call via the
-//                                                 actual worker code
-//   parseOpenRouterCleaner()   -> cleaned_recipe_text
+//   cleanMedia() / aiGatewayChatCompletion()  -> REAL Laguna call via the
+//                                                  actual worker code
+//   parseAiGatewayCleaner()   -> cleaned_recipe_text
 //
 // We exercise the real worker path for the LLM call, vary the cleaner
 // configuration, and measure: latency, prompt/completion/total tokens,
@@ -16,8 +16,8 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import {
-  openrouterChatCompletion,
-  parseOpenRouterCleaner,
+  aiGatewayChatCompletion,
+  parseAiGatewayCleaner,
 } from "../../pi/recipe-worker.mjs";
 import { cleanerPrompt, PRODUCTION_SYSTEM_PROMPT, IMPROVED_SYSTEM_PROMPT } from "./cleaner_prompt.mjs";
 import { EXAMPLES } from "./examples.mjs";
@@ -36,35 +36,35 @@ function loadEnv(path) {
 }
 loadEnv(".env");
 
-const KEY = process.env.OPENROUTER_API_KEY || "";
-const BASE = process.env.OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
+const KEY = process.env.AI_GATEWAY_API_KEY || "";
+const BASE = process.env.AI_GATEWAY_BASE_URL?.trim() || "https://ai-gateway.vercel.sh/v1";
 const MODEL =
-  process.env.OPENROUTER_CLEANER_MODEL?.trim() || "google/gemma-4-26b-a4b-it:free";
+  process.env.AI_GATEWAY_CLEANER_MODEL?.trim() || "poolside/laguna-s-2.1-free";
 
 if (!KEY) {
-  console.error("OPENROUTER_API_KEY not set in .env");
+  console.error("AI_GATEWAY_API_KEY not set in .env");
   process.exit(1);
 }
 
-// Variant definitions. `reasoning` -> {enabled:bool} | null(omit).
+// Variant definitions. `reasoning` -> {effort:string} | null(omit).
 const VARIANTS = [
   {
     id: "baseline",
-    label: "Baseline (production: reasoning ON, 2048 tok)",
+    label: "Baseline (low reasoning, 2048 tok)",
     systemPrompt: PRODUCTION_SYSTEM_PROMPT,
-    options: { reasoning: { enabled: true }, maxTokens: 2048 },
+    options: { reasoning: { effort: "low" }, maxTokens: 2048 },
   },
   {
     id: "reasoning_off",
     label: "Reasoning OFF (production prompt)",
     systemPrompt: PRODUCTION_SYSTEM_PROMPT,
-    options: { reasoning: { enabled: false }, maxTokens: 2048 },
+    options: { reasoning: { effort: "none" }, maxTokens: 2048 },
   },
   {
     id: "improved",
     label: "Improved prompt + reasoning OFF + temp 0",
     systemPrompt: IMPROVED_SYSTEM_PROMPT,
-    options: { reasoning: { enabled: false }, maxTokens: 2048, temperature: 0 },
+    options: { reasoning: { effort: "none" }, maxTokens: 2048, temperature: 0 },
   },
 ];
 
@@ -119,11 +119,10 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// The production worker hardcodes OPENROUTER_CLEANER_TIMEOUT_MS = 180_000 and
-// the baseline (reasoning ON) exceeds it on the free tier. To still capture a
-// baseline *quality* data point we sample it here with an extended timeout,
-// and the report flags that production would have aborted at 180s.
-async function directOpenRouter(prompt, systemPrompt, timeoutMs) {
+// The production worker hardcodes AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000.
+// To capture the low-reasoning quality data point with a generous ceiling,
+// sample it here with an extended timeout.
+async function directAiGateway(prompt, systemPrompt, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -132,8 +131,6 @@ async function directOpenRouter(prompt, systemPrompt, timeoutMs) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${KEY}`,
-        "HTTP-Referer": process.env.OPENROUTER_HTTP_REFERER?.trim() || "",
-        "X-Title": process.env.OPENROUTER_APP_TITLE?.trim() || "",
       },
       body: JSON.stringify({
         model: MODEL,
@@ -141,7 +138,7 @@ async function directOpenRouter(prompt, systemPrompt, timeoutMs) {
           { role: "system", content: systemPrompt },
           { role: "user", content: prompt },
         ],
-        reasoning: { enabled: true },
+        reasoning: { effort: "low" },
         stream: false,
         max_tokens: 2048,
       }),
@@ -158,9 +155,9 @@ async function directOpenRouter(prompt, systemPrompt, timeoutMs) {
 async function callVariant(variant, prompt) {
   if (variant.id === "baseline") {
     // Sampled with an extended timeout (production would abort at 180s).
-    return directOpenRouter(prompt, variant.systemPrompt, 540_000);
+    return directAiGateway(prompt, variant.systemPrompt, 540_000);
   }
-  return openrouterChatCompletion(
+  return aiGatewayChatCompletion(
     BASE, KEY, MODEL, variant.systemPrompt, prompt, undefined, variant.options,
   );
 }
@@ -173,7 +170,7 @@ async function runOne(variant, example, attempt = 0) {
   try {
     data = await callVariant(variant, prompt);
     rawText = data?.choices?.[0]?.message?.content ?? "";
-    cleaned = parseOpenRouterCleaner(data); // real worker parse + format
+    cleaned = parseAiGatewayCleaner(data); // real worker parse + format
   } catch (e) {
     const msg = e?.code ? `${e.code}: ${e.message}` : String(e);
     // Retry once on transient free-tier glitches (e.g. empty/non-JSON body).
@@ -232,15 +229,13 @@ async function main() {
   writeFileSync("bench/gemma-cleaner/out/results.json", JSON.stringify(results, null, 2));
 
   // ---- human report ------------------------------------------------------
-  out.push("# Gemma 4 Media-Cleaner Benchmark\n");
+  out.push("# Laguna Media-Cleaner Benchmark\n");
   out.push(`Model: \`${MODEL}\`  |  Date: ${new Date().toISOString()}\n`);
 
   out.push(
-    "\n> Note: the production worker hardcodes `OPENROUTER_CLEANER_TIMEOUT_MS = 180_000`. " +
-    "The `baseline` (reasoning ON) variant exceeds that on the free tier and would " +
-    "abort the import; its numbers below were sampled with an extended timeout purely " +
-    "to compare *quality*. `reasoning_off` uses the production prompt but disables " +
-    "reasoning, isolating the speed/cost win.\n",
+    "\n> Note: the production worker hardcodes `AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000`. " +
+    "The low-reasoning baseline is sampled with an extended timeout, while " +
+    "`reasoning_off` uses the production-shaped prompt with reasoning disabled.\n",
   );
 
   // Metrics summary table.

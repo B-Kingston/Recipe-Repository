@@ -15,15 +15,13 @@ const FILLER = [
 const fillerCount = (t) => FILLER.reduce((n, f) => (t.toLowerCase().includes(f) ? n + 1 : n), 0);
 
 const out = [];
-out.push("# Gemma 4 Media-Cleaner Benchmark\n");
-const model = results[0]?.model || "google/gemma-4-26b-a4b-it:free";
+out.push("# Laguna Media-Cleaner Benchmark\n");
+const model = results[0]?.model || "poolside/laguna-s-2.1-free";
 out.push(`Model: \`${model}\`  |  Date: ${new Date().toISOString()}\n`);
 out.push(
-  "\n> Note: the production worker hardcodes `OPENROUTER_CLEANER_TIMEOUT_MS = 180_000`. " +
-  "The `baseline` (reasoning ON) variant exceeds that on the free tier and would " +
-  "abort the import; its numbers below were sampled with an extended timeout purely " +
-  "to compare *quality*. `reasoning_off` uses the production-shaped prompt but " +
-  "disables reasoning, isolating the speed/cost win.\n",
+  "\n> Note: the production worker hardcodes `AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000`. " +
+  "The low-reasoning baseline is sampled with an extended timeout, while " +
+  "`reasoning_off` uses the production-shaped prompt with reasoning disabled.\n",
 );
 
 out.push("\n## Throughput & cost (per example)\n");

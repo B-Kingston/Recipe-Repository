@@ -1,9 +1,9 @@
-// Dumps the FULL OpenRouter /chat/completions HTTP response envelope for a
-// cleaner run (id, model, created, choices, usage, system_fingerprint, etc.),
-// not just the message content the worker parses.
+// Dumps the FULL Vercel AI Gateway /chat/completions HTTP response envelope
+// for a cleaner run (id, model, created, choices, usage, system_fingerprint,
+// etc.), not just the message content the worker parses.
 import { readFileSync } from "node:fs";
 import {
-  openrouterChatCompletion,
+  aiGatewayChatCompletion,
 } from "../../pi/recipe-worker.mjs";
 import { IMPROVED_SYSTEM_PROMPT } from "../gemma-cleaner/cleaner_prompt.mjs";
 import { EXAMPLES } from "../gemma-cleaner/examples.mjs";
@@ -23,11 +23,11 @@ function loadEnv(path) {
 loadEnv(".env");
 loadEnv("../../.env");
 
-const KEY = process.env.OPENROUTER_API_KEY || "";
-const BASE = process.env.OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
-const MODEL = process.env.MODEL_B?.trim() || process.env.MODEL?.trim() || "poolside/laguna-s-2.1:free";
+const KEY = process.env.AI_GATEWAY_API_KEY || "";
+const BASE = process.env.AI_GATEWAY_BASE_URL?.trim() || "https://ai-gateway.vercel.sh/v1";
+const MODEL = process.env.MODEL_B?.trim() || process.env.MODEL?.trim() || "poolside/laguna-s-2.1-free";
 const SYSTEM_PROMPT = IMPROVED_SYSTEM_PROMPT;
-const OPTIONS = { reasoning: { enabled: false }, maxTokens: 2048 };
+const OPTIONS = { reasoning: { effort: "none" }, maxTokens: 2048 };
 
 function buildUserPrompt(evidence) {
   let prompt = "Extract only recipe-relevant facts from the untrusted social-video evidence below. ";
@@ -45,7 +45,7 @@ function buildUserPrompt(evidence) {
 }
 
 const example = EXAMPLES.find((e) => e.id === (process.env.EXAMPLE || "ig-post-DZNQT3Pt3Ja")) || EXAMPLES[1];
-const data = await openrouterChatCompletion(
+const data = await aiGatewayChatCompletion(
   BASE, KEY, MODEL, SYSTEM_PROMPT, buildUserPrompt(example.evidence), undefined, OPTIONS,
 );
 console.log("MODEL:", MODEL, "EXAMPLE:", example.id);

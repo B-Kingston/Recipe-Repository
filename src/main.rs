@@ -132,7 +132,7 @@ enum AppError {
     )]
     AiNotConfigured,
     #[error(
-        "The video recipe cleaner is not configured. Set OPENROUTER_API_KEY before importing a video."
+        "The video recipe cleaner is not configured. Set AI_GATEWAY_API_KEY before importing a video."
     )]
     MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
@@ -397,6 +397,7 @@ pub(crate) struct DebugUrlView {
     pub(crate) description: String,
     pub(crate) duration_seconds: Option<u64>,
     pub(crate) transcript: String,
+    pub(crate) cleaned_recipe_text: String,
     pub(crate) warnings: Vec<String>,
     pub(crate) error_message: String,
     pub(crate) captures: Vec<MediaDebugCaptureView>,

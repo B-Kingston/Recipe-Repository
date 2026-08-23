@@ -1,5 +1,5 @@
 // Faithful port of the Rust `cleaner_prompt(evidence)` builder in src/media.rs
-// plus the production OpenRouter cleaner system prompt from src/ai.rs.
+// plus the production Vercel AI Gateway cleaner system prompt from src/ai.rs.
 // Keeping these identical to the production source lets the benchmark exercise
 // the EXACT prompt the live app would send before any improvement is applied.
 
