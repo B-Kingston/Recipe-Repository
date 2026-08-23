@@ -57,8 +57,33 @@ def _box_sort_key(box: object, fallback: int) -> tuple[float, float, int]:
         return (float(fallback), float(fallback), fallback)
 
 
+def _text_matches_language(text: str, lang: str) -> bool:
+    """Reject confident-looking output in a script the selected model cannot read.
+
+    PP-OCR can occasionally interpret food texture as repeated CJK glyphs even
+    when the explicit English recognizer is loaded. Confidence alone cannot
+    remove that failure because the recognizer is highly certain. Keep CJK for
+    the language families that support it and reject CJK-majority lines for
+    the normal English/Arabic recipe configurations.
+    """
+    letters = [character for character in text if character.isalpha()]
+    if not letters:
+        return True
+    cjk = sum(
+        "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+        for character in letters
+    )
+    language = lang.strip().lower()
+    supports_cjk = language in {"ch", "zh"} or language.startswith(
+        ("chinese", "japan", "korean")
+    )
+    return supports_cjk or cjk * 2 <= len(letters)
+
+
 def _paddle_frame_reading(
-    result: object, score_threshold: float
+    result: object, score_threshold: float, lang: str
 ) -> dict[str, object]:
     payload = _paddle_result_payload(result)
     texts = payload.get("rec_texts") or []
@@ -73,10 +98,10 @@ def _paddle_frame_reading(
             score = float(scores[index])
         except (IndexError, TypeError, ValueError):
             score = 0.0
-        if score < score_threshold:
+        if score < score_threshold or not _text_matches_language(text, lang):
             continue
-        # Match the production Tesseract noise guard: a lone short token is
-        # usually background texture, while a quantity remains useful when it
+        # A lone short token is usually background texture, while a quantity
+        # remains useful when it
         # is attached to the ingredient line that contains it.
         if len(text.split()) < 2 and sum(character.isalnum() for character in text) < 5:
             continue
@@ -93,8 +118,6 @@ def _paddle_frame_reading(
 
 def ocr_frames(
     frame_paths: list[Path],
-    ocr_version: str,
-    model_size: str,
     lang: str,
     batch_size: int,
     score_threshold: float,
@@ -114,29 +137,16 @@ def ocr_frames(
             "PaddleOCR is not installed; install paddlepaddle==3.2.0 and paddleocr"
         ) from error
 
-    model_size = model_size.strip().lower()
-    if model_size not in {"medium", "small", "tiny"}:
-        raise RuntimeError("--model-size must be medium, small, or tiny")
-
-    # PaddleOCR owns exactly one detector/recognizer pair for this invocation.
-    # The pipeline config makes the detector consume screenshots in batches;
-    # text_recognition_batch_size also batches the recognition predictor's
-    # crops. `predict_iter` streams completed frame results without retaining
-    # the image tensors for the whole video. The medium model is the normal
-    # `ocr_version=PP-OCRv6` selection; the smaller explicit PP-OCRv6 models
-    # make the CPU speed/quality trade-off configurable for video imports.
+    # PaddleOCR owns exactly one small detector/recognizer pair for this
+    # invocation. The pipeline config batches both screenshots and recognition
+    # crops; `predict_iter` streams results without retaining tensors for the
+    # whole video. Benchmarks established small as the production accuracy/
+    # speed point, so alternative model sizes are intentionally not exposed.
     pipeline_config = load_pipeline_config("OCR")
     pipeline_config["batch_size"] = batch_size
-    model_args: dict[str, object]
-    if model_size == "medium":
-        model_args = {"ocr_version": ocr_version, "lang": lang}
-    else:
-        model_args = {
-            "text_detection_model_name": f"PP-OCRv6_{model_size}_det",
-            "text_recognition_model_name": f"PP-OCRv6_{model_size}_rec",
-        }
     ocr = PaddleOCR(
-        **model_args,
+        text_detection_model_name="PP-OCRv6_small_det",
+        text_recognition_model_name="PP-OCRv6_small_rec",
         device=os.environ.get("MEDIA_OCR_DEVICE", "cpu"),
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
@@ -145,15 +155,17 @@ def ocr_frames(
         paddlex_config=pipeline_config,
     )
     results = ocr.predict_iter([str(path) for path in frame_paths])
-    readings = [_paddle_frame_reading(result, score_threshold) for result in results]
+    readings = [
+        _paddle_frame_reading(result, score_threshold, lang) for result in results
+    ]
     if len(readings) != len(frame_paths):
         raise RuntimeError(
             f"PaddleOCR returned {len(readings)} frame results for {len(frame_paths)} inputs"
         )
     return {
         "engine": "paddleocr",
-        "model": f"PP-OCRv6_{model_size}",
-        "model_size": model_size,
+        "model": "PP-OCRv6_small",
+        "model_size": "small",
         "lang": lang,
         "batch_size": batch_size,
         "frames": readings,
@@ -226,15 +238,6 @@ def main() -> None:
 
     ocr_parser = subparsers.add_parser("ocr")
     ocr_parser.add_argument(
-        "--ocr-version",
-        default=os.environ.get("MEDIA_OCR_VERSION", "PP-OCRv6"),
-    )
-    ocr_parser.add_argument(
-        "--model-size",
-        default=os.environ.get("MEDIA_OCR_MODEL_SIZE", "small"),
-        choices=["medium", "small", "tiny"],
-    )
-    ocr_parser.add_argument(
         "--lang", default=os.environ.get("MEDIA_OCR_LANG", "en")
     )
     ocr_parser.add_argument(
@@ -262,8 +265,6 @@ def main() -> None:
             json.dumps(
                 ocr_frames(
                     args.frames,
-                    args.ocr_version,
-                    args.model_size,
                     args.lang,
                     max(1, args.batch_size),
                     args.score_threshold,

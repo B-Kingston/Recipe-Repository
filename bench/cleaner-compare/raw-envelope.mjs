@@ -39,7 +39,7 @@ function buildUserPrompt(evidence) {
   prompt += "POST TITLE (untrusted):\n" + (evidence.title.trim() === "" ? "[none]" : evidence.title.trim());
   prompt += "\n\nPOST DESCRIPTION (untrusted):\n" + (evidence.description.trim() === "" ? "[none]" : evidence.description.trim());
   prompt += "\n\nSPOKEN AUDIO TRANSCRIPT (untrusted Whisper output):\n" + (evidence.audio_transcript.trim() === "" ? "[none]" : evidence.audio_transcript.trim());
-  prompt += "\n\nON-SCREEN OCR (untrusted Tesseract output):\n";
+  prompt += "\n\nON-SCREEN OCR (untrusted PaddleOCR output):\n";
   prompt += evidence.ocr.length === 0 ? "[none]" : evidence.ocr.map((o) => `[${o.timestamp_seconds}s] ${o.text}`).join("\n");
   return prompt;
 }

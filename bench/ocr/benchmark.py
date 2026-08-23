@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""Compare production Tesseract OCR with batched PP-OCRv6 on one frame set.
+"""Benchmark production PP-OCRv6-small on one frame set.
 
-The two engines receive the same screenshots selected by src/media.rs:
-frequent ffmpeg samples, uniformly thinned to at most 160 frames. PaddleOCR is
-run once for the complete set, while Tesseract uses the same four-worker
-per-frame baseline as production.
+The screenshots are selected by src/media.rs and uniformly thinned to at most
+160 frames. PaddleOCR small is run once for the complete set.
 
 Example (inside the media Docker image):
     /opt/media-venv/bin/python bench/ocr/benchmark.py \
@@ -17,20 +15,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 OCR_MAX_FRAME_JOBS = 160
-OCR_MAX_WORKERS = 4
 
 
-def selected_frames(frames_dir: Path, maximum: int) -> list[Path]:
+def selected_frames(frames_dir: Path, maximum: int) -> tuple[list[Path], list[int]]:
     frames = sorted(
         path
         for path in frames_dir.iterdir()
@@ -38,8 +33,17 @@ def selected_frames(frames_dir: Path, maximum: int) -> list[Path]:
     )
     if not frames:
         raise RuntimeError(f"no .jpg frames found in {frames_dir}")
-    stride = max(1, math.ceil(len(frames) / maximum))
-    return frames[::stride]
+    if len(frames) <= maximum:
+        return frames, list(range(len(frames)))
+    if maximum == 1:
+        return [frames[0]], [0]
+    # Pick exactly N positions across the full timeline. A ceil stride can
+    # throw away almost half the data (161 inputs became 81 at a cap of 160).
+    indexes = [
+        round(step * (len(frames) - 1) / (maximum - 1))
+        for step in range(maximum)
+    ]
+    return [frames[index] for index in indexes], indexes
 
 
 def run_checked(
@@ -64,67 +68,8 @@ def run_checked(
     return completed.stdout
 
 
-def looks_like_token(value: str) -> bool:
-    alphanumeric = sum(character.isalnum() for character in value)
-    if alphanumeric < 2 or alphanumeric * 2 < len(value):
-        return False
-    latin = any(character.isascii() and character.isalpha() for character in value)
-    arabic = any("\u0600" <= character <= "\u06ff" for character in value)
-    return not (latin and arabic)
-
-
-def parse_tesseract_tsv(raw: bytes) -> str:
-    lines: list[tuple[tuple[str, str, str], list[str]]] = []
-    for row in raw.decode("utf-8", errors="replace").splitlines()[1:]:
-        fields = row.split("\t")
-        if len(fields) < 12 or fields[0] != "5":
-            continue
-        try:
-            confidence = float(fields[10])
-        except ValueError:
-            confidence = 0.0
-        word = fields[11].strip()
-        if confidence < 60.0 or not looks_like_token(word):
-            continue
-        key = (fields[2], fields[3], fields[4])
-        if lines and lines[-1][0] == key:
-            lines[-1][1].append(word)
-        else:
-            lines.append((key, [word]))
-    output: list[str] = []
-    for _, words in lines:
-        if len(words) < 2 and sum(character.isalnum() for character in words[0]) < 5:
-            continue
-        output.extend(words)
-    return " ".join(output)
-
-
-def tesseract_one(path: Path) -> str:
-    raw = run_checked(
-        [
-            os.environ.get("MEDIA_TESSERACT_PATH", "tesseract"),
-            str(path),
-            "stdout",
-            "--psm",
-            "6",
-            "-l",
-            os.environ.get("MEDIA_TESSERACT_LANG", "eng"),
-            "tsv",
-        ]
-    )
-    return " ".join(parse_tesseract_tsv(raw).split())
-
-
-def run_tesseract(frames: list[Path]) -> tuple[float, list[str]]:
-    started = time.perf_counter()
-    workers = max(1, min(OCR_MAX_WORKERS, os.cpu_count() or 1, len(frames)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        readings = list(pool.map(tesseract_one, frames))
-    return (time.perf_counter() - started) * 1000.0, readings
-
-
 def run_paddle(
-    frames: list[Path], model_size: str, batch_size: int
+    frames: list[Path], batch_size: int
 ) -> tuple[float, dict[str, object]]:
     python = os.environ.get("MEDIA_PYTHON", sys.executable)
     script = Path(__file__).resolve().parents[2] / "pi" / "local-media.py"
@@ -132,10 +77,6 @@ def run_paddle(
         python,
         str(script),
         "ocr",
-        "--ocr-version",
-        os.environ.get("MEDIA_OCR_VERSION", "PP-OCRv6"),
-        "--model-size",
-        model_size,
         "--lang",
         os.environ.get("MEDIA_OCR_LANG", "en"),
         "--batch-size",
@@ -247,7 +188,15 @@ def main() -> None:
     parser.add_argument("--expected-file", type=Path)
     parser.add_argument("--max-frames", type=int, default=OCR_MAX_FRAME_JOBS)
     parser.add_argument(
-        "--model-size", choices=["medium", "small", "tiny"], default="small"
+        "--frame-step-seconds",
+        type=float,
+        default=0.5,
+        help="seconds between source frames before benchmark thinning",
+    )
+    parser.add_argument(
+        "--timestamps-file",
+        type=Path,
+        help="optional JSON array of source seconds, one per input JPEG",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
@@ -257,14 +206,26 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if args.max_frames < 1 or args.batch_size < 1:
-        raise RuntimeError("--max-frames and --batch-size must be positive")
+    if args.max_frames < 1 or args.batch_size < 1 or args.frame_step_seconds <= 0:
+        raise RuntimeError("frame step, --max-frames, and --batch-size must be positive")
 
-    frames = selected_frames(args.frames_dir, min(args.max_frames, OCR_MAX_FRAME_JOBS))
-    reference = args.expected_file.read_text(encoding="utf-8") if args.expected_file else ""
-    paddle_ms, paddle_result = run_paddle(
-        frames, args.model_size, args.batch_size
+    frames, source_indexes = selected_frames(
+        args.frames_dir, min(args.max_frames, OCR_MAX_FRAME_JOBS)
     )
+    if args.timestamps_file:
+        all_seconds = json.loads(args.timestamps_file.read_text(encoding="utf-8"))
+        if not isinstance(all_seconds, list) or not all(
+            isinstance(value, (int, float)) and value >= 0 for value in all_seconds
+        ):
+            raise RuntimeError("--timestamps-file must contain a JSON array of nonnegative seconds")
+        total_inputs = max(source_indexes) + 1 if source_indexes else 0
+        if len(all_seconds) < total_inputs:
+            raise RuntimeError("--timestamps-file has fewer entries than the input frame set")
+        frame_seconds = [float(all_seconds[index]) for index in source_indexes]
+    else:
+        frame_seconds = [index * args.frame_step_seconds for index in source_indexes]
+    reference = args.expected_file.read_text(encoding="utf-8") if args.expected_file else ""
+    paddle_ms, paddle_result = run_paddle(frames, args.batch_size)
     paddle_readings = [
         str(frame.get("text", ""))
         for frame in paddle_result.get("frames", [])
@@ -274,39 +235,32 @@ def main() -> None:
         raise RuntimeError(
             f"PaddleOCR returned {len(paddle_readings)} readings for {len(frames)} frames"
         )
-    tesseract_ms, tesseract_readings = run_tesseract(frames)
+    # The engine preserves input order but does not know the source timeline.
+    # Attach real pre-thinning timestamps before invoking production cleanup.
+    for frame, seconds in zip(paddle_result.get("frames", []), frame_seconds):
+        if isinstance(frame, dict):
+            frame["seconds"] = seconds
     paddle_snippets = clean_with_production(args.app_path, paddle_result)
-    tesseract_envelope = {
-        "frames": [
-            {"text": text, "seconds": index * 0.5}
-            for index, text in enumerate(tesseract_readings)
-        ]
-    }
-    tesseract_snippets = clean_with_production(args.app_path, tesseract_envelope)
     report = {
         "frames_dir": str(args.frames_dir),
         "frame_count": len(frames),
-        "model_size": args.model_size,
+        "frame_step_seconds": None if args.timestamps_file else args.frame_step_seconds,
+        "timestamps_file": str(args.timestamps_file) if args.timestamps_file else None,
+        "frame_seconds": frame_seconds,
+        "model_size": "small",
         "batch_size": args.batch_size,
         "reference_file": str(args.expected_file) if args.expected_file else None,
         "production_cleaner": args.app_path,
         "paddleocr": engine_summary(
-            "PP-OCRv6",
+            "PP-OCRv6-small",
             paddle_ms,
             paddle_readings,
             reference,
             paddle_snippets,
             {
-                "model": paddle_result.get("model", "PP-OCRv6"),
+                "model": paddle_result.get("model", "PP-OCRv6_small"),
                 "lang": paddle_result.get("lang", os.environ.get("MEDIA_OCR_LANG", "en")),
             },
-        ),
-        "tesseract": engine_summary(
-            "Tesseract",
-            tesseract_ms,
-            tesseract_readings,
-            reference,
-            tesseract_snippets,
         ),
     }
     encoded = json.dumps(report, ensure_ascii=False, indent=2) + "\n"

@@ -28,28 +28,29 @@ const DESCRIPTION_MAX_CHARS: usize = 20_000;
 const TRANSCRIPT_MAX_CHARS: usize = 24_000;
 const OCR_MAX_CHARS: usize = 60_000;
 const OCR_MAX_SNIPPETS: usize = 400;
-/// Upper bound on Tesseract invocations per extraction. Adaptive sampling
+/// Upper bound on PaddleOCR frame jobs per extraction. Adaptive sampling
 /// must not translate dense change coverage one-to-one into OCR jobs: beyond
 /// this many planned jobs the quietest filler samples are thinned evenly over
 /// the video so the stage stays well within the media deadline.
 const OCR_MAX_FRAME_JOBS: usize = 160;
-/// Tesseract processes run concurrently during OCR.
-const OCR_MAX_WORKERS: usize = 4;
-/// Cadence, in samples per second of video, at which frames are extracted as
-/// OCR candidates. The adaptive planner scans at this rate while on-screen
-/// text is changing and falls back to `OCR_QUIET_HZ` while a card holds
-/// still, so the effective OCR rate follows the rate at which the text
-/// itself changes instead of burning inference on static screens.
-const OCR_SCAN_HZ_DEFAULT: f64 = 2.0;
+/// Cadence at which frames are extracted as cheap OCR candidates. Keep this
+/// higher than the inference cadence: a short card must exist in the candidate
+/// timeline before the adaptive planner can preserve its transition.
+const OCR_SCAN_HZ_DEFAULT: f64 = 4.0;
+/// Maximum OCR inference cadence during sustained motion. Transition onsets
+/// are always retained, while filler frames are limited to this rate so the
+/// higher candidate cadence does not double normal CPU inference time.
+const OCR_ACTIVE_HZ_DEFAULT: f64 = 2.0;
 /// OCR cadence while the change signal says the screen is holding still.
-const OCR_QUIET_HZ_DEFAULT: f64 = 0.4;
+const OCR_QUIET_HZ_DEFAULT: f64 = 0.5;
 /// Per-sample luma-change score (ffmpeg signalstats YDIF) above which a
-/// sample is treated as rapid text change and scanned at the full rate.
-const OCR_YDIF_ACTIVE_THRESHOLD: f64 = 6.0;
+/// sample is treated as a transition. The former value of 6 only detected
+/// large scene motion and could miss a small text overlay appearing.
+const OCR_YDIF_ACTIVE_THRESHOLD: f64 = 1.0;
 /// Per-sample luma-change score below which the screen counts as calm. A
 /// burst only ends after this is held for `OCR_QUIET_CONFIRM_SAMPLES`
 /// consecutive samples, so flicker inside an active span does not flap.
-const OCR_YDIF_QUIET_THRESHOLD: f64 = 1.5;
+const OCR_YDIF_QUIET_THRESHOLD: f64 = 0.25;
 const OCR_QUIET_CONFIRM_SAMPLES: usize = 3;
 /// Width of each sampled screenshot before OCR. This preserves small overlay
 /// text while keeping PP-OCRv6 CPU inference inside the media deadline.
@@ -724,8 +725,8 @@ fn extract_in_directory(
     }
     info!(
         source_url,
-        ocr_engine = %env_path("MEDIA_OCR_ENGINE", "paddle"),
-        ocr_model_size = %env_path("MEDIA_OCR_MODEL_SIZE", "small"),
+        ocr_engine = "paddle",
+        ocr_model_size = "small",
         description_enabled = channels.description,
         audio_enabled = channels.audio,
         ocr_enabled = channels.ocr,
@@ -877,8 +878,8 @@ fn extract_audio_and_frames(
         "-vf".into(),
         format!(
             // Keep the screenshots frequent, but resize them before the
-            // detector. Grayscale plus a mild unsharp mask gives both the
-            // PaddleOCR and Tesseract paths higher-contrast text edges while
+            // detector. Grayscale plus a mild unsharp mask gives PaddleOCR
+            // higher-contrast text edges while
             // keeping CPU inference inside the media deadline. The change
             // probe runs while frames still carry their original timestamps,
             // so reported seconds stay true wall-clock positions;
@@ -1047,22 +1048,7 @@ fn read_video_text(
     let retained = debug
         .map(|debug| debug.retain_frames(&jobs, warnings))
         .unwrap_or_default();
-    match env_path("MEDIA_OCR_ENGINE", "paddle")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "paddle" | "paddleocr" => {
-            read_video_text_paddle(&jobs, &retained, warnings, deadline, debug)
-        }
-        "tesseract" => read_video_text_tesseract(&jobs, &retained, warnings, deadline, debug),
-        engine => {
-            warnings.push(format!(
-                "Unsupported MEDIA_OCR_ENGINE={engine:?}; use paddle or tesseract."
-            ));
-            Vec::new()
-        }
-    }
+    read_video_text_paddle(&jobs, &retained, warnings, deadline, debug)
 }
 
 /// One frame selected for OCR, with the wall-clock second it appeared on and
@@ -1099,6 +1085,7 @@ struct FrameSample {
 struct OcrPlanOptions {
     adaptive: bool,
     scan_hz: f64,
+    active_hz: f64,
     quiet_hz: f64,
     ydif_active: f64,
     ydif_quiet: f64,
@@ -1108,6 +1095,7 @@ fn ocr_plan_options() -> OcrPlanOptions {
     OcrPlanOptions {
         adaptive: env_flag("MEDIA_OCR_ADAPTIVE", true),
         scan_hz: env_bounded_f64("MEDIA_OCR_SCAN_HZ", OCR_SCAN_HZ_DEFAULT, 0.5, 8.0),
+        active_hz: env_bounded_f64("MEDIA_OCR_ACTIVE_HZ", OCR_ACTIVE_HZ_DEFAULT, 0.5, 8.0),
         quiet_hz: env_bounded_f64("MEDIA_OCR_QUIET_HZ", OCR_QUIET_HZ_DEFAULT, 0.05, 4.0),
         ydif_active: env_bounded_f64(
             "MEDIA_OCR_YDIF_ACTIVE",
@@ -1185,11 +1173,11 @@ fn list_ocr_frames(frames_dir: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf
     frames
 }
 
-/// Plans which extracted frames are worth an OCR pass. While the change
-/// signal reports rapid on-screen movement every candidate is kept (the scan
-/// cadence follows the text's own churn rate); once a card holds still the
-/// cadence decays to sparse sentinels so a static screen is re-read only
-/// rarely. The global job budget is enforced last by dropping filler
+/// Plans which extracted frames are worth an OCR pass. Every transition onset
+/// is retained, sustained movement is limited to the active inference cadence,
+/// and a card that holds still decays to sparse sentinels. This separates the
+/// higher candidate cadence needed for short-card recall from expensive OCR
+/// inference. The global job budget is enforced last by dropping filler
 /// samples evenly over time, never the onset of a burst.
 fn plan_ocr_jobs(
     sample: &FrameSample,
@@ -1206,12 +1194,15 @@ fn plan_ocr_jobs(
     }
     if sample.signals.len() < frames.len() {
         warnings.push(
-            "The OCR change timeline ended before the frames did; later frames were skipped."
+            "The OCR change timeline ended before the frames did; later frames use the uniform fallback."
                 .into(),
         );
     }
     let count = frames.len().min(sample.signals.len());
-    let quiet_stride = ((options.scan_hz / options.quiet_hz).round() as usize).max(1);
+    let active_stride =
+        ((options.scan_hz / options.active_hz.min(options.scan_hz)).round() as usize).max(1);
+    let quiet_stride =
+        ((options.scan_hz / options.quiet_hz.min(options.scan_hz)).round() as usize).max(1);
     let mut jobs: Vec<OcrFrame> = Vec::with_capacity(count);
     let mut mode_active = false;
     let mut calm_run = 0usize;
@@ -1234,7 +1225,15 @@ fn plan_ocr_jobs(
             }
         }
         since_last_kept = since_last_kept.saturating_add(1);
-        let keep = mode_active || since_last_kept >= quiet_stride;
+        // A transition is never cadence-gated: this is the candidate most
+        // likely to contain a newly appeared short card. Sustained motion is
+        // sampled at active_hz, while calm spans use sparse sentinels.
+        let stride = if mode_active {
+            active_stride
+        } else {
+            quiet_stride
+        };
+        let keep = became_active || jobs.is_empty() || since_last_kept >= stride;
         if !keep {
             continue;
         }
@@ -1250,6 +1249,17 @@ fn plan_ocr_jobs(
             seconds: signal.seconds,
             path: frames[index].clone(),
             priority,
+        });
+    }
+    // Metadata output can be truncated independently of JPEG extraction. Do
+    // not turn that observability failure into lost OCR coverage: retain the
+    // unmatched tail on the quiet cadence and let the normal global cap thin
+    // it evenly if necessary.
+    for index in (count..frames.len()).step_by(quiet_stride) {
+        jobs.push(OcrFrame {
+            seconds: (index * sample.interval) as f64 / frame_rate.max(1.0),
+            path: frames[index].clone(),
+            priority: 1,
         });
     }
     let planned = enforce_job_cap(jobs);
@@ -1401,8 +1411,6 @@ fn read_video_text_paddle(
     }
     let python = env_path("MEDIA_PYTHON", "python3");
     let script = env::var("MEDIA_OCR_SCRIPT").unwrap_or_else(|_| "pi/local-media.py".into());
-    let ocr_version = env_path("MEDIA_OCR_VERSION", "PP-OCRv6");
-    let model_size = env_path("MEDIA_OCR_MODEL_SIZE", "small");
     let lang = env_path("MEDIA_OCR_LANG", "en");
     let batch_size = env::var("MEDIA_OCR_BATCH_SIZE")
         .ok()
@@ -1412,10 +1420,6 @@ fn read_video_text_paddle(
     let mut args = vec![
         script,
         "ocr".into(),
-        "--ocr-version".into(),
-        ocr_version,
-        "--model-size".into(),
-        model_size,
         "--lang".into(),
         lang,
         "--batch-size".into(),
@@ -1473,89 +1477,6 @@ fn read_video_text_paddle(
             cleaned,
         });
     }
-    finish_ocr(sampled, retained, slots, debug)
-}
-
-/// Retains the old Tesseract path as a reproducible baseline for the OCR
-/// benchmark and as a fallback for machines that cannot use PaddleOCR.
-fn read_video_text_tesseract(
-    sampled: &[OcrFrame],
-    retained: &[String],
-    warnings: &mut Vec<String>,
-    deadline: Instant,
-    debug: Option<&MediaDebug>,
-) -> Vec<OcrSnippet> {
-    let tesseract = env_path("MEDIA_TESSERACT_PATH", "tesseract");
-    let language = env_path("MEDIA_TESSERACT_LANG", "eng");
-
-    // Run up to OCR_MAX_WORKERS Tesseract processes concurrently. PaddleOCR
-    // does not use this path: it receives all sampled frames in one batched
-    // Python invocation above.
-    let slots = std::sync::Mutex::new(vec![None::<SlotCapture>; sampled.len()]);
-    let failures = std::sync::Mutex::new(Vec::new());
-    let next_job = std::sync::atomic::AtomicUsize::new(0);
-    let workers = sampled
-        .len()
-        .min(
-            thread::available_parallelism()
-                .map_or(1, |count| count.get())
-                .min(OCR_MAX_WORKERS),
-        )
-        .max(1);
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let slot = next_job.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if slot >= sampled.len() {
-                        return;
-                    }
-                    let Some(timeout) = remaining_timeout(deadline, Duration::from_secs(15)) else {
-                        next_job.store(sampled.len(), std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    };
-                    let args = vec![
-                        sampled[slot].path.to_string_lossy().to_string(),
-                        "stdout".into(),
-                        "--psm".into(),
-                        "6".into(),
-                        "-l".into(),
-                        language.clone(),
-                        "tsv".into(),
-                    ];
-                    match run_tool(&tesseract, &args, timeout, 16 * 1024) {
-                        Ok(output) => {
-                            let raw = parse_tesseract_tsv(&output.stdout);
-                            if !raw.trim().is_empty() {
-                                slots.lock().unwrap()[slot] = Some(SlotCapture {
-                                    raw: raw.clone(),
-                                    cleaned: clean_ocr_reading(&raw),
-                                });
-                            }
-                        }
-                        Err(error) => failures.lock().unwrap().push(error.to_string()),
-                    }
-                }
-            });
-        }
-    });
-    if let Ok(failures) = failures.lock() {
-        let unavailable = failures.first().cloned();
-        match unavailable {
-            Some(message) if failures.len() == sampled.len() => {
-                warnings.push(format!("Local OCR was unavailable: {message}"))
-            }
-            Some(_) if !failures.is_empty() => warnings.push(format!(
-                "Some frames could not be read by local OCR: {} of {} failed",
-                failures.len(),
-                sampled.len()
-            )),
-            _ => {}
-        }
-    }
-    let slots = slots
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     finish_ocr(sampled, retained, slots, debug)
 }
 
@@ -1801,7 +1722,7 @@ fn run_tool(
     // a timeout does not leave descendants writing into the temp directory.
     command.process_group(0);
     // Local media tools do not need the AI Gateway secret. Do not expose it to
-    // yt-dlp, ffmpeg, Python/Whisper, or Tesseract even though they inherit the
+    // yt-dlp, ffmpeg, Whisper, or PaddleOCR even though they inherit the
     // app environment by default.
     command.env_remove("AI_GATEWAY_API_KEY");
     let mut child = command
@@ -1819,8 +1740,8 @@ fn run_tool(
         .take()
         .ok_or_else(|| format!("{program} stderr was not piped"))?;
     // Drain both pipes while the process runs. Waiting for the child before
-    // reading output can deadlock yt-dlp or tesseract once their pipe buffer
-    // fills, especially when a metadata response contains many formats.
+    // reading output can deadlock yt-dlp or another media tool once its pipe
+    // buffer fills, especially when metadata contains many formats.
     let stdout_thread = thread::spawn(move || drain_output(stdout, max_output_bytes));
     let stderr_thread = thread::spawn(move || drain_output(stderr, max_output_bytes));
     let started = Instant::now();
@@ -1993,49 +1914,6 @@ fn bounded_text(value: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &value[..end])
-}
-
-fn parse_tesseract_tsv(bytes: &[u8]) -> String {
-    // Tesseract emits one row per word; rows sharing a (block, paragraph,
-    // line) triple form one visual line. Recipe captions are contiguous
-    // lines, while background-texture misreads scatter lone words across the
-    // frame, so only lines with enough surviving words are kept.
-    const KEEP_SINGLE_WORD_ALNUM: usize = 5;
-    type TesseractLine<'a> = (&'a str, &'a str, &'a str);
-    let mut lines: Vec<(TesseractLine, Vec<&str>)> = Vec::new();
-    let content = String::from_utf8_lossy(bytes);
-    for row in content.lines().skip(1) {
-        let fields = row.split('\t').collect::<Vec<_>>();
-        // Tesseract's word rows are level 5; confidence is deliberately used
-        // here because raw OCR on a cooking frame otherwise contains mostly
-        // background texture and punctuation.
-        if fields.len() < 12 || fields[0] != "5" {
-            continue;
-        }
-        let confidence = fields[10].parse::<f32>().unwrap_or(0.0);
-        let word = fields[11].trim();
-        if confidence >= 60.0 && looks_like_ocr_token(word) {
-            let key = (fields[2], fields[3], fields[4]);
-            match lines.last_mut() {
-                Some((group_key, words)) if *group_key == key => words.push(word),
-                _ => lines.push((key, vec![word])),
-            }
-        }
-    }
-    let mut text = String::new();
-    for (_, words) in lines {
-        let standalone = words.len() == 1 && alphanumeric_count(words[0]) >= KEEP_SINGLE_WORD_ALNUM;
-        if words.len() < 2 && !standalone {
-            continue;
-        }
-        for word in words {
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(word);
-        }
-    }
-    text
 }
 
 fn alphanumeric_count(value: &str) -> usize {
@@ -2945,9 +2823,8 @@ mod tests {
         FrameSample, FrameSignal, MAX_IMPORT_URL_CHARS, MediaEvidence, OCR_MAX_FRAME_JOBS,
         OcrFrame, OcrPlanOptions, OcrSnippet, canonical_social_url, clean_ocr_reading,
         cleaner_prompt, collapse_ocr_readings, consolidate_chain, decode_entities, has_real_words,
-        is_numeric_ocr_token, looks_like_ocr_token, meta_value, parse_frame_signals,
-        parse_tesseract_tsv, plan_ocr_jobs, reading_is_useful, recipe_prompt,
-        standalone_reading_is_strong,
+        is_numeric_ocr_token, looks_like_ocr_token, meta_value, parse_frame_signals, plan_ocr_jobs,
+        reading_is_useful, recipe_prompt, standalone_reading_is_strong,
     };
     use std::{fs, path::PathBuf};
 
@@ -3002,40 +2879,6 @@ mod tests {
             decode_entities("jalape&#xf1;o &#x2019; 15&#32;minutes"),
             "jalapeño ’ 15 minutes"
         );
-    }
-
-    #[test]
-    fn tesseract_tsv_keeps_confident_lines_and_drops_background_noise() {
-        let header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n";
-        let word = |block: &str, line: &str, num: &str, conf: &str, text: &str| {
-            format!("5\t1\t{block}\t1\t{line}\t{num}\t0\t0\t10\t10\t{conf}\t{text}\n")
-        };
-        // Confident words forming one visual line survive together; low
-        // confidence background readings are dropped.
-        let tsv = format!(
-            "{header}{}{}{}",
-            word("1", "1", "1", "96.2", "Place"),
-            word("1", "1", "2", "88.0", "tomatoes"),
-            word("1", "1", "3", "12.0", ""),
-        );
-        assert_eq!(parse_tesseract_tsv(tsv.as_bytes()), "Place tomatoes");
-    }
-
-    #[test]
-    fn tesseract_tsv_drops_scattered_lone_word_noise() {
-        let header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n";
-        let word = |block: &str, line: &str, num: &str, conf: &str, text: &str| {
-            format!("5\t1\t{block}\t1\t{line}\t{num}\t0\t0\t10\t10\t{conf}\t{text}\n")
-        };
-        // Lone confident words scattered over separate lines are texture
-        // noise unless they are long enough to be a real overlay word.
-        let tsv = format!(
-            "{header}{}{}{}",
-            word("1", "1", "1", "95.0", "TOFU"),
-            word("7", "9", "1", "93.0", "SS"),
-            word("9", "11", "1", "91.0", "paprika"),
-        );
-        assert_eq!(parse_tesseract_tsv(tsv.as_bytes()), "paprika");
     }
 
     #[test]
@@ -3094,6 +2937,7 @@ mod tests {
         OcrPlanOptions {
             adaptive,
             scan_hz: 2.0,
+            active_hz: 2.0,
             quiet_hz: 0.4,
             ydif_active: 6.0,
             ydif_quiet: 1.5,
@@ -3178,6 +3022,47 @@ mod tests {
         assert!(
             jobs.iter()
                 .any(|job| job.seconds == 10.0 && job.priority == 0)
+        );
+    }
+
+    #[test]
+    fn planner_keeps_short_transition_between_active_cadence_ticks() {
+        let mut options = plan_options(true);
+        options.scan_hz = 4.0;
+        options.active_hz = 2.0;
+        options.quiet_hz = 0.5;
+        options.ydif_active = 1.0;
+        options.ydif_quiet = 0.25;
+        let signals = (0..16)
+            .map(|index| signal(index as f64 * 0.25, if index == 5 { 2.0 } else { 0.0 }))
+            .collect();
+        let (dir, sample) = sample_with(16, signals);
+        let mut warnings = Vec::new();
+        let jobs = plan_ocr_jobs(&sample, 30.0, &options, &mut warnings);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(
+            jobs.iter()
+                .any(|job| { (job.seconds - 1.25).abs() < f64::EPSILON && job.priority == 0 })
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn planner_uses_uniform_tail_when_signal_metadata_is_truncated() {
+        let signals = (0..4)
+            .map(|index| signal(index as f64 * 0.5, 0.0))
+            .collect();
+        let (dir, sample) = sample_with(12, signals);
+        let mut warnings = Vec::new();
+        let jobs = plan_ocr_jobs(&sample, 30.0, &plan_options(true), &mut warnings);
+        fs::remove_dir_all(dir).unwrap();
+
+        assert!(jobs.iter().any(|job| job.path.ends_with("frame-0005.jpg")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("uniform fallback"))
         );
     }
 

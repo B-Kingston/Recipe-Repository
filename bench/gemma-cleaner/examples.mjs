@@ -4,7 +4,7 @@
 // The full pipeline (yt-dlp -> ffmpeg -> faster-whisper -> tesseract) is not
 // installed in this environment, and the user asked us to "mock the real
 // codeflow". So we fabricate realistic raw evidence that mimics what Whisper
-// and Tesseract actually return for these cooking reels: spoken numbers as
+// and PaddleOCR actually return for these cooking reels: spoken numbers as
 // words, social filler ("like and subscribe", "link in bio"), hashtags, and
 // on-screen ingredient amounts. The cleaner (Laguna via Vercel AI Gateway) is then
 // run for real against this evidence.

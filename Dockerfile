@@ -18,9 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     python3 \
     python3-venv \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    tesseract-ocr-ara \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/media-venv \
     && /opt/media-venv/bin/pip install --no-cache-dir paddlepaddle==3.2.0 \

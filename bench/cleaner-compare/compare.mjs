@@ -11,7 +11,7 @@
 //
 // The Rust extractor is used through --extract-media-evidence so this benchmark
 // does not maintain a second, drifting implementation of yt-dlp/ffmpeg/Whisper/
-// Tesseract extraction.
+// PaddleOCR extraction.
 
 import {
   existsSync,
@@ -227,7 +227,7 @@ function buildUserPrompt(evidence) {
   prompt += evidence.description.trim() === "" ? "[none]" : evidence.description.trim();
   prompt += "\n\nSPOKEN AUDIO TRANSCRIPT (untrusted Whisper output):\n";
   prompt += evidence.audio_transcript.trim() === "" ? "[none]" : evidence.audio_transcript.trim();
-  prompt += "\n\nON-SCREEN OCR (untrusted Tesseract output):\n";
+  prompt += "\n\nON-SCREEN OCR (untrusted PaddleOCR output):\n";
   if (evidence.ocr.length === 0) {
     prompt += "[none]";
   } else {

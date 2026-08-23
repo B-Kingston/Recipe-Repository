@@ -8,12 +8,10 @@ retained.
 
 ## Run configuration
 
-- Docker image: `kindle-recipes:paddle-ocr` rebuilt from the current tree
-- PaddleOCR: PP-OCRv6 `medium`, `small`, and `tiny`
-- Default/production model: `small`
+- Docker image rebuilt from the current tree
+- OCR engine/model: PP-OCRv6 small only
 - Paddle line-confidence threshold: `0.70`
 - Paddle language: `en`
-- Tesseract baseline: `eng`, `--psm 6`, four workers
 - Frames: 2 Hz, grayscale, 768px preprocessing, batch size 8, maximum 160
 - Final snippets: exact production Rust `clean_ocr_reading` plus temporal
   collapse, invoked with `kindle-recipes --clean-ocr`
@@ -36,10 +34,7 @@ URL: <https://www.instagram.com/reel/DbJNNc8IBxh/>
 
 | Engine | OCR time | Non-empty frames | Final snippets | Invalid symbols | Digit soup |
 |---|---:|---:|---:|---:|---:|
-| PP-OCRv6 medium | 310.81s | 83/156 | 18 | 0 | 0 |
 | PP-OCRv6 small | 75.56s | 75/156 | 11 | 0 | 0 |
-| PP-OCRv6 tiny | 36.90s | 67/156 | 7 | 0 | 0 |
-| Tesseract `eng` baseline (medium run) | 9.85s | 33/156 | 1 | 0 | 0 |
 
 Production adaptive OCR output:
 
@@ -58,7 +53,7 @@ more complete recipe facts than the on-screen text, including 6 parts light
 soy sauce, 2 parts oyster sauce, 1 part shallot, 1 part dark soy sauce, 1
 part sugar, 0.5 white pepper, timing, sesame oil, MSG, and optional gochujang.
 
-The raw engines produced some rejected noise (`200M1`, long counters, and
+The raw engine produced some rejected noise (`200M1`, long counters, and
 misreads such as `SHUCE`); none reached the production output.
 
 ## Reel 2: `DZNQT3Pt3Ja`
@@ -73,10 +68,7 @@ URL: <https://www.instagram.com/p/DZNQT3Pt3Ja/>
 
 | Engine | OCR time | Non-empty frames | Final snippets | Invalid symbols | Digit soup |
 |---|---:|---:|---:|---:|---:|
-| PP-OCRv6 medium | 180.50s | 83/85 | 24 | 0 | 0 |
 | PP-OCRv6 small | 42.36s | 82/85 | 24 | 0 | 0 |
-| PP-OCRv6 tiny | 20.75s | 82/85 | 24 | 0 | 0 |
-| Tesseract `eng` baseline (medium run) | 13.52s | 42/85 | 11 | 0 | 0 |
 
 Production adaptive OCR output:
 
@@ -115,12 +107,56 @@ no random symbols or digit-soup tokens. A few displayed cards are naturally
 sentence fragments because the text itself continues on the next card; no
 individual word is broken.
 
+### Optimized adaptive rerun
+
+The revised planner extracted 160 cheap candidates from the 4 Hz grid and sent
+81 frames to OCR, down from 85 inference frames in the previous production
+plan. Against the reviewed card transcription, PP-OCRv6 small retained all 26
+caption cards and matched 107/109 unique reference words.
+
+| Engine | OCR jobs | OCR time | Non-empty | Final snippets | Recall | Precision |
+|---|---:|---:|---:|---:|---:|---:|
+| PP-OCRv6 small | 81 | 49.91s | 79 | 26 | 98.17% | 100% |
+
+Paddle retained every ingredient and quantity card with no invalid symbols or
+digit soup. The two unmatched reference words are continuations absent from
+the locally emitted sentence fragments. Wall time was slower than the earlier
+42.36s Paddle run despite four fewer inference jobs, so it is treated as
+cold-process/model variance rather than a speed improvement.
+
+## Optimization negative control: `DR2WHUAEeUX`
+
+URL: <https://www.instagram.com/reel/DR2WHUAEeUX/>
+
+- Video: 34.32 seconds, 360x640, 29.97 fps
+- Visual review: no recipe captions; the only real text is Instagram's final
+  `Follow`/`Following` control. This URL is therefore a false-positive and
+  runtime control, not a caption-recall reference.
+- Previous 2 Hz plan: 68 OCR jobs
+- Optimized adaptive plan: 147 cheap candidates at the production 4 Hz grid,
+  reduced to 74 OCR jobs by the 2 Hz sustained-motion gate. Transition onsets
+  remain exempt from the gate.
+
+| Plan / engine | OCR jobs | OCR time | Non-empty frames | Final snippets |
+|---|---:|---:|---:|---:|
+| Previous / PP-OCRv6 small | 68 | 30.18s | 6 | 0 |
+| Optimized / PP-OCRv6 small | 74 | 39.92s | 4 | 0 |
+
+The higher candidate cadence adds positions where sub-500ms cards can be
+observed without sending every candidate through OCR. On this continuously
+moving reel the inference plan grew by only 8.8%, rather than the 116% growth
+of the candidate set. The Paddle wall-time result is slower and includes
+normal cold-process/model variance; it is recorded rather than presented as a
+speed win. The language-aware line gate removed two high-confidence repeated
+CJK texture hallucinations while preserving the real final UI text, and the
+production cleaner correctly emitted no recipe evidence.
+
 ## Verification
 
 - Docker Rust formatting check: passed
-- Docker Rust tests: **71 passed, 0 failed**
+- Docker Rust tests: **83 passed, 0 failed**
 - Docker image build: passed
 - Both URLs downloaded successfully with yt-dlp
 - Production extraction completed for both URLs with zero warnings
-- Every final Paddle and Tesseract result reported `invalid_symbol_tokens=0`
-  and `digit_soup_tokens=0`
+- Every final Paddle result reported `invalid_symbol_tokens=0` and
+  `digit_soup_tokens=0`
