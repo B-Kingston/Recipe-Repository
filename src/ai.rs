@@ -1,6 +1,6 @@
 use crate::media::{
-    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaDebug,
-    MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence,
+    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaChannels,
+    MediaDebug, MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence,
     extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
@@ -85,7 +85,31 @@ pub(crate) async fn import_page() -> Result<Html<String>> {
         error: String::new(),
         url: String::new(),
         notes: String::new(),
+        use_description: true,
+        use_audio: true,
+        use_ocr: true,
     })
+}
+
+/// Re-renders the video-import form with an error, keeping the pasted URL,
+/// notes, and tick-box state so a failed import never loses input.
+fn render_import_error(
+    error: impl Into<String>,
+    url: &str,
+    notes: &str,
+    channels: MediaChannels,
+) -> Response {
+    match render(MediaImportTemplate {
+        error: error.into(),
+        url: url.to_string(),
+        notes: notes.to_string(),
+        use_description: channels.description,
+        use_audio: channels.audio,
+        use_ocr: channels.ocr,
+    }) {
+        Ok(html) => html.into_response(),
+        Err(render_error) => render_error.into_response(),
+    }
 }
 
 pub(crate) async fn import_recipe(
@@ -95,52 +119,67 @@ pub(crate) async fn import_recipe(
 ) -> Result<Response> {
     let raw_url = trim(&form.url);
     let notes = trim(&form.notes);
+    // Tick boxes choose which evidence channels run; an unticked box means
+    // the extractor skips that stage entirely.
+    let channels = MediaChannels {
+        description: form.use_description.is_some(),
+        audio: form.use_audio.is_some(),
+        ocr: form.use_ocr.is_some(),
+    };
     if form.url.chars().count() > MAX_IMPORT_URL_CHARS
         || form.notes.chars().count() > MAX_IMPORT_NOTES_CHARS
     {
-        return render(MediaImportTemplate {
-            error: format!(
+        return Ok(render_import_error(
+            format!(
                 "Keep the URL under {MAX_IMPORT_URL_CHARS} characters and notes under {MAX_IMPORT_NOTES_CHARS} characters."
             ),
-            url: raw_url,
-            notes,
-        })
-        .map(IntoResponse::into_response);
+            &raw_url,
+            &notes,
+            channels,
+        ));
     }
     if raw_url.is_empty() {
-        return render(MediaImportTemplate {
-            error: "A Facebook or Instagram URL is required.".into(),
-            url: raw_url,
-            notes,
-        })
-        .map(IntoResponse::into_response);
+        return Ok(render_import_error(
+            "A Facebook or Instagram URL is required.",
+            &raw_url,
+            &notes,
+            channels,
+        ));
+    }
+    if !channels.any() {
+        return Ok(render_import_error(
+            "Tick at least one evidence source: caption, audio transcription, or on-screen text.",
+            &raw_url,
+            &notes,
+            channels,
+        ));
     }
     let source_url = match canonical_social_url(&raw_url) {
         Ok(source_url) => source_url,
         Err(error) => {
-            return render(MediaImportTemplate {
-                error: error.to_string(),
-                url: raw_url,
-                notes,
-            })
-            .map(IntoResponse::into_response);
+            return Ok(render_import_error(
+                error.to_string(),
+                &raw_url,
+                &notes,
+                channels,
+            ));
         }
     };
     if let Err(error) = ensure_media_cleaner_configured() {
-        return render(MediaImportTemplate {
-            error: error.to_string(),
-            url: raw_url,
-            notes,
-        })
-        .map(IntoResponse::into_response);
+        return Ok(render_import_error(
+            error.to_string(),
+            &raw_url,
+            &notes,
+            channels,
+        ));
     }
     if let Err(error) = ensure_ai_configured(&s, &user).await {
-        return render(MediaImportTemplate {
-            error: error.to_string(),
-            url: raw_url,
-            notes,
-        })
-        .map(IntoResponse::into_response);
+        return Ok(render_import_error(
+            error.to_string(),
+            &raw_url,
+            &notes,
+            channels,
+        ));
     }
     let _import_permit = MEDIA_IMPORT_LIMIT
         .get_or_init(|| Arc::new(Semaphore::new(1)))
@@ -148,26 +187,26 @@ pub(crate) async fn import_recipe(
         .acquire_owned()
         .await
         .map_err(|_| AppError::Internal("The media importer is unavailable.".into()))?;
-    let extracted = match extract_social_evidence(&source_url).await {
+    let extracted = match extract_social_evidence(&source_url, channels).await {
         Ok(evidence) => evidence,
         Err(error) => {
-            return render(MediaImportTemplate {
-                error: error.to_string(),
-                url: raw_url,
-                notes,
-            })
-            .map(IntoResponse::into_response);
+            return Ok(render_import_error(
+                error.to_string(),
+                &raw_url,
+                &notes,
+                channels,
+            ));
         }
     };
     let evidence = match clean_media_evidence(&s, &extracted).await {
         Ok(evidence) => evidence,
         Err(error) => {
-            return render(MediaImportTemplate {
-                error: error.to_string(),
-                url: raw_url,
-                notes,
-            })
-            .map(IntoResponse::into_response);
+            return Ok(render_import_error(
+                error.to_string(),
+                &raw_url,
+                &notes,
+                channels,
+            ));
         }
     };
     let source = evidence.source();
@@ -189,12 +228,12 @@ pub(crate) async fn import_recipe(
     .await
     {
         Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
-        Err(error) => render(MediaImportTemplate {
-            error: error.to_string(),
-            url: raw_url,
-            notes,
-        })
-        .map(IntoResponse::into_response),
+        Err(error) => Ok(render_import_error(
+            error.to_string(),
+            &raw_url,
+            &notes,
+            channels,
+        )),
     }
 }
 
@@ -1695,7 +1734,7 @@ pub(crate) async fn media_debug_start(
                 run.dir.join("frames").join(index.to_string()),
                 emitter,
             ));
-            match extract_social_evidence_debug(&url, debug).await {
+            match extract_social_evidence_debug(&url, MediaChannels::default(), debug).await {
                 Ok(extracted) => {
                     run.record_event(json!({
                         "url": index,

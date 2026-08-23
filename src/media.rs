@@ -86,6 +86,34 @@ pub(crate) struct OcrSnippet {
     pub(crate) text: String,
 }
 
+/// Which evidence channels a media import should process. The import form's
+/// tick boxes control each one independently; every channel defaults to on so
+/// the CLI path and the debugger keep the full pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MediaChannels {
+    pub(crate) description: bool,
+    pub(crate) audio: bool,
+    pub(crate) ocr: bool,
+}
+
+impl Default for MediaChannels {
+    fn default() -> Self {
+        Self {
+            description: true,
+            audio: true,
+            ocr: true,
+        }
+    }
+}
+
+impl MediaChannels {
+    /// An import with every channel disabled would only re-download the page;
+    /// the handler rejects that before extraction starts.
+    pub(crate) fn any(self) -> bool {
+        self.description || self.audio || self.ocr
+    }
+}
+
 /// Optional observation hook used by the Settings media-extraction debugger.
 /// When one is supplied, the extraction pipeline reports every phase boundary
 /// (page metadata, download, audio transcription, OCR planning and per-frame
@@ -269,21 +297,26 @@ pub(crate) fn canonical_social_url(raw: &str) -> Result<String> {
 /// Fetches the page description as a cheap first pass, then uses local
 /// command-line media tools in a blocking worker. A description-only result is
 /// still useful when a platform blocks the video download.
-pub(crate) async fn extract_social_evidence(raw: &str) -> Result<MediaEvidence> {
-    extract_social_evidence_inner(raw, None).await
+pub(crate) async fn extract_social_evidence(
+    raw: &str,
+    channels: MediaChannels,
+) -> Result<MediaEvidence> {
+    extract_social_evidence_inner(raw, channels, None).await
 }
 
 /// Same pipeline as [`extract_social_evidence`], but reporting progress and
 /// retaining OCR frames for the debugger page.
 pub(crate) async fn extract_social_evidence_debug(
     raw: &str,
+    channels: MediaChannels,
     debug: Arc<MediaDebug>,
 ) -> Result<MediaEvidence> {
-    extract_social_evidence_inner(raw, Some(debug)).await
+    extract_social_evidence_inner(raw, channels, Some(debug)).await
 }
 
 async fn extract_social_evidence_inner(
     raw: &str,
+    channels: MediaChannels,
     debug: Option<Arc<MediaDebug>>,
 ) -> Result<MediaEvidence> {
     let source_url = canonical_social_url(raw)?;
@@ -297,13 +330,19 @@ async fn extract_social_evidence_inner(
         .acquire_owned()
         .await
         .map_err(|_| AppError::Internal("The local media extractor is unavailable.".into()))?;
-    let page = fetch_page_metadata(&source_url).await;
+    // The caption fetch is a separate HTTP round trip; skip it entirely when
+    // the importer disabled the description channel.
+    let page = if channels.description {
+        fetch_page_metadata(&source_url).await
+    } else {
+        PageMetadata::default()
+    };
     tokio::task::spawn_blocking(move || {
         // Keep the permit inside the blocking job. If the HTTP client drops
         // the handler future, a running extractor must still reserve the one
         // global media slot until its child processes and cleanup finish.
         let _permit = permit;
-        extract_with_local_tools(source_url, page, debug.as_deref())
+        extract_with_local_tools(source_url, page, channels, debug.as_deref())
     })
     .await
     .map_err(|_| AppError::Internal("The local media extractor stopped unexpectedly.".into()))?
@@ -490,6 +529,7 @@ async fn fetch_page_metadata(url: &str) -> PageMetadata {
 fn extract_with_local_tools(
     source_url: String,
     page: PageMetadata,
+    channels: MediaChannels,
     debug: Option<&MediaDebug>,
 ) -> Result<MediaEvidence> {
     cleanup_stale_workdirs();
@@ -504,7 +544,7 @@ fn extract_with_local_tools(
             ))
         })?;
     let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-    let result = extract_in_directory(&source_url, page, &workdir, deadline, debug);
+    let result = extract_in_directory(&source_url, page, channels, &workdir, deadline, debug);
     if let Err(error) = fs::remove_dir_all(&workdir) {
         warn!(
             path = %workdir.display(),
@@ -542,6 +582,7 @@ fn cleanup_stale_workdirs() {
 fn extract_in_directory(
     source_url: &str,
     page: PageMetadata,
+    channels: MediaChannels,
     workdir: &Path,
     deadline: Instant,
     debug: Option<&MediaDebug>,
@@ -572,16 +613,18 @@ fn extract_in_directory(
     ) {
         Ok(output) => match parse_json_output(&output.stdout) {
             Ok(metadata) => {
-                if let Some(value) = string_field(&metadata, "title")
-                    && title.trim().is_empty()
-                {
-                    title = bounded_text(&value, DESCRIPTION_MAX_CHARS);
-                }
-                if let Some(value) = string_field(&metadata, "description") {
-                    // yt-dlp's extractor sees the actual post caption, while
-                    // a page-level og:description can be a generic login or
-                    // platform message. Prefer the caption when available.
-                    description = bounded_text(&value, DESCRIPTION_MAX_CHARS);
+                if channels.description {
+                    if let Some(value) = string_field(&metadata, "title")
+                        && title.trim().is_empty()
+                    {
+                        title = bounded_text(&value, DESCRIPTION_MAX_CHARS);
+                    }
+                    if let Some(value) = string_field(&metadata, "description") {
+                        // yt-dlp's extractor sees the actual post caption, while
+                        // a page-level og:description can be a generic login or
+                        // platform message. Prefer the caption when available.
+                        description = bounded_text(&value, DESCRIPTION_MAX_CHARS);
+                    }
                 }
                 duration_seconds = metadata
                     .get("duration")
@@ -613,7 +656,13 @@ fn extract_in_directory(
         ));
     }
 
-    let video_path = download_video(&ytdlp, source_url, workdir, &mut warnings, deadline);
+    // Nothing needs the video file itself when both local channels are off:
+    // a description-only import must not spend the download budget.
+    let video_path = if channels.audio || channels.ocr {
+        download_video(&ytdlp, source_url, workdir, &mut warnings, deadline)
+    } else {
+        None
+    };
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
     if let Some(debug) = debug {
         debug.event("download", json!({ "ok": video_path.is_some() }));
@@ -622,8 +671,14 @@ fn extract_in_directory(
     let mut ocr = Vec::new();
     if let Some(video_path) = video_path {
         let frame_rate = video_frame_rate(&video_path);
-        let (audio, frames) =
-            extract_audio_and_frames(&video_path, workdir, frame_rate, &mut warnings, deadline);
+        let (audio, frames) = extract_audio_and_frames(
+            &video_path,
+            workdir,
+            frame_rate,
+            channels,
+            &mut warnings,
+            deadline,
+        );
         if let Some(audio_path) = audio {
             audio_transcript = transcribe_audio(&audio_path, &mut warnings, deadline);
             if let Some(debug) = debug {
@@ -653,13 +708,15 @@ fn extract_in_directory(
         };
         return Err(AppError::BadRequest(tool_hint.into()));
     }
-    if audio_transcript.trim().is_empty() {
+    // Only warn about a missing channel when the importer actually asked for
+    // it; an unticked box is a deliberate omission, not a tool failure.
+    if channels.audio && audio_transcript.trim().is_empty() {
         warnings.push(
             "No local audio transcript was available; the draft uses the description and OCR."
                 .into(),
         );
     }
-    if ocr.is_empty() {
+    if channels.ocr && ocr.is_empty() {
         warnings.push(
             "No readable on-screen text was detected; the draft uses the description and audio."
                 .into(),
@@ -669,6 +726,9 @@ fn extract_in_directory(
         source_url,
         ocr_engine = %env_path("MEDIA_OCR_ENGINE", "paddle"),
         ocr_model_size = %env_path("MEDIA_OCR_MODEL_SIZE", "small"),
+        description_enabled = channels.description,
+        audio_enabled = channels.audio,
+        ocr_enabled = channels.ocr,
         has_description = !description.trim().is_empty(),
         audio_chars = audio_transcript.len(),
         ocr_snippets = ocr.len(),
@@ -764,6 +824,7 @@ fn extract_audio_and_frames(
     video_path: &Path,
     workdir: &Path,
     frame_rate: f64,
+    channels: MediaChannels,
     warnings: &mut Vec<String>,
     deadline: Instant,
 ) -> (Option<PathBuf>, Option<FrameSample>) {
@@ -788,10 +849,11 @@ fn extract_audio_and_frames(
         audio_path.to_string_lossy().to_string(),
     ];
     let frames_dir = workdir.join("frames");
-    if let Err(error) = fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&frames_dir)
+    if channels.ocr
+        && let Err(error) = fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&frames_dir)
     {
         warnings.push(format!("Could not create temporary OCR frames: {error}"));
         return (None, None);
@@ -835,7 +897,8 @@ fn extract_audio_and_frames(
 
     // Both operations read the same already-downloaded file and are
     // independent. Running them together keeps a normal short reel to one
-    // media-processing pass from the user's point of view.
+    // media-processing pass from the user's point of view. A channel turned
+    // off on the import form simply never starts its ffmpeg job.
     let timeout = match remaining_timeout(deadline, Duration::from_secs(90)) {
         Some(timeout) => timeout,
         None => {
@@ -846,28 +909,36 @@ fn extract_audio_and_frames(
     };
     let ffmpeg_for_audio = ffmpeg.clone();
     let audio_args_for_thread = audio_args.clone();
-    let audio_result = thread::scope(|scope| {
-        let audio = scope.spawn(|| {
-            run_tool(
-                &ffmpeg_for_audio,
-                &audio_args_for_thread,
-                timeout,
-                512 * 1024,
-            )
+    let (audio_result, frames_result) = thread::scope(|scope| {
+        let audio = channels.audio.then(|| {
+            scope.spawn(|| {
+                run_tool(
+                    &ffmpeg_for_audio,
+                    &audio_args_for_thread,
+                    timeout,
+                    512 * 1024,
+                )
+            })
         });
-        let frames = scope.spawn(|| run_tool(&ffmpeg, &frame_args, timeout, 512 * 1024));
+        let frames = channels
+            .ocr
+            .then(|| scope.spawn(|| run_tool(&ffmpeg, &frame_args, timeout, 512 * 1024)));
         (
-            audio.join().ok().and_then(std::result::Result::ok),
-            frames.join().ok().and_then(std::result::Result::ok),
+            audio.map(|handle| handle.join().ok().and_then(std::result::Result::ok)),
+            frames.map(|handle| handle.join().ok().and_then(std::result::Result::ok)),
         )
     });
-    let audio = if audio_result.0.is_some() && audio_path.is_file() {
+    let audio = if !channels.audio {
+        None
+    } else if audio_result.is_some() && audio_path.is_file() {
         Some(audio_path)
     } else {
         warnings.push("The local audio track could not be extracted.".into());
         None
     };
-    let frames = if audio_result.1.is_some() && frames_dir.is_dir() {
+    let frames = if !channels.ocr {
+        None
+    } else if frames_result.is_some() && frames_dir.is_dir() {
         let signals = fs::read(&signals_path)
             .map(|bytes| parse_frame_signals(&bytes))
             .unwrap_or_default();

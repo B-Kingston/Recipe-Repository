@@ -314,6 +314,9 @@ struct MediaImportTemplate {
     error: String,
     url: String,
     notes: String,
+    use_description: bool,
+    use_audio: bool,
+    use_ocr: bool,
 }
 #[derive(Template)]
 #[template(path = "draft.html")]
@@ -457,6 +460,13 @@ struct MediaImportForm {
     url: String,
     #[serde(default)]
     notes: String,
+    // Tick boxes: present only when ticked, so None means "skip this channel".
+    #[serde(default)]
+    use_description: Option<String>,
+    #[serde(default)]
+    use_audio: Option<String>,
+    #[serde(default)]
+    use_ocr: Option<String>,
 }
 #[derive(Deserialize)]
 struct SettingsForm {
@@ -501,7 +511,7 @@ async fn main() -> anyhowless::Result<()> {
                 "--extract-media-evidence requires a social-media URL",
             )
         })?;
-        let evidence = media::extract_social_evidence(url).await?;
+        let evidence = media::extract_social_evidence(url, media::MediaChannels::default()).await?;
         println!("{}", serde_json::to_string_pretty(&evidence)?);
         return Ok(());
     }

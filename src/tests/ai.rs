@@ -1,8 +1,20 @@
 use crate::ai::{
-    dedupe_sources, normalize_generated, parse_pi_response, recipe_schema, validate_generated,
+    dedupe_sources, import_recipe, normalize_generated, parse_pi_response, recipe_schema,
+    validate_generated,
 };
-use crate::{GeneratedRecipe, GeneratedStep, Ingredient, IngredientUse, Source};
+use crate::auth::AuthUser;
+use crate::media::MediaChannels;
+use crate::{
+    AppState, GeneratedRecipe, GeneratedStep, Ingredient, IngredientUse, MediaImportForm, Source,
+};
+use axum::{Form, extract::State};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+use std::{collections::HashMap, sync::Arc};
 
 fn recipe() -> GeneratedRecipe {
     GeneratedRecipe {
@@ -182,4 +194,137 @@ fn pi_response_parses_optional_critique() {
     let malformed = json!({"recipe": recipe(), "sources": [], "critique": "garbage"});
     let (_, _, _, critique) = parse_pi_response(&malformed, false).unwrap();
     assert!(critique.is_none());
+}
+
+async fn database() -> SqlitePool {
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate!().run(&db).await.unwrap();
+    db
+}
+
+fn state(db: SqlitePool) -> Arc<AppState> {
+    Arc::new(AppState {
+        db,
+        model: String::new(),
+        pi_worker_path: String::new(),
+        auth_script_path: String::new(),
+        search_grounding: false,
+        codex_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(None)),
+        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
+    })
+}
+
+async fn response_body(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn import_form(
+    url: &str,
+    use_description: bool,
+    use_audio: bool,
+    use_ocr: bool,
+) -> MediaImportForm {
+    MediaImportForm {
+        url: url.into(),
+        notes: String::new(),
+        // Checkboxes serialize only when ticked; None means unticked.
+        use_description: use_description.then(|| "on".into()),
+        use_audio: use_audio.then(|| "on".into()),
+        use_ocr: use_ocr.then(|| "on".into()),
+    }
+}
+
+#[test]
+fn media_channels_default_to_every_source_enabled() {
+    let all = MediaChannels::default();
+    assert!(all.description && all.audio && all.ocr);
+    assert!(all.any());
+
+    let none = MediaChannels {
+        description: false,
+        audio: false,
+        ocr: false,
+    };
+    assert!(!none.any());
+    assert!(
+        MediaChannels {
+            description: true,
+            audio: false,
+            ocr: false
+        }
+        .any()
+    );
+    assert!(
+        MediaChannels {
+            description: false,
+            audio: true,
+            ocr: false
+        }
+        .any()
+    );
+    assert!(
+        MediaChannels {
+            description: false,
+            audio: false,
+            ocr: true
+        }
+        .any()
+    );
+}
+
+#[tokio::test]
+async fn import_recipe_rejects_import_with_every_source_unticked() {
+    let state = state(database().await);
+    let url = "https://www.instagram.com/reel/AbCdEf123/";
+    let response = import_recipe(
+        State(state),
+        AuthUser { id: "u1".into() },
+        Form(import_form(url, false, false, false)),
+    )
+    .await
+    .unwrap();
+    let body = response_body(response).await;
+    assert!(
+        body.contains("Tick at least one evidence source"),
+        "expected the all-sources-unticked error, got: {body}"
+    );
+    // The failed submission keeps the pasted URL and the (unticked) boxes.
+    assert!(body.contains(r#"value="https://www.instagram.com/reel/AbCdEf123/""#));
+    assert!(!body.contains("name=\"use_description\" checked"));
+}
+
+#[tokio::test]
+async fn import_recipe_accepts_any_single_ticked_source() {
+    let state = state(database().await);
+    let url = "https://www.instagram.com/reel/AbCdEf123/";
+    for (description, audio, ocr) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let response = import_recipe(
+            State(state.clone()),
+            AuthUser { id: "u1".into() },
+            Form(import_form(url, description, audio, ocr)),
+        )
+        .await
+        .unwrap();
+        let body = response_body(response).await;
+        assert!(
+            !body.contains("Tick at least one evidence source"),
+            "a single ticked source must pass channel validation, got: {body}"
+        );
+    }
 }

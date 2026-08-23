@@ -8,6 +8,13 @@
 <form class="panel form-panel media-import-panel" method="post" action="/ai/import">
   <label for="social-url">Facebook or Instagram URL<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/p/..." autocomplete="url"></label>
   <p class="field-help">Supported public links include Facebook Reels and Instagram /p/, /reel/, and /tv/ posts. Private, login-only, or region-blocked posts may need a public link or a local downloader cookie file.</p>
+  <fieldset class="media-channels">
+    <legend>Evidence sources</legend>
+    <label class="check-row"><input type="checkbox" name="use_description"{% if use_description %} checked{% endif %}> Post caption / description<span class="field-help">The text the creator typed under the video. Fastest source; untick to skip the page fetch entirely.</span></label>
+    <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Spoken audio (local Whisper)<span class="field-help">Transcribes spoken ingredients and steps. Slowest stage; untick to skip audio extraction and speech-to-text.</span></label>
+    <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text (local OCR)<span class="field-help">Reads ingredient cards and overlays from sampled video frames; untick to skip frame sampling and OCR.</span></label>
+    <p class="field-help">Unticked sources are not downloaded, transcribed, or sent to the cleaner. At least one source must stay ticked.</p>
+  </fieldset>
   <label for="import-notes">Optional context<textarea id="import-notes" name="notes" maxlength="4000" placeholder="e.g. Keep it vegetarian; the creator says this serves four…">{{ notes }}</textarea></label>
   <div class="prompt-help">
     <p><strong>What gets combined:</strong></p>
@@ -17,7 +24,7 @@
       <li>Ingredient cards and other on-screen text from local Tesseract OCR</li>
       <li>A recipe-only AI Gateway pass that removes social chatter before final generation</li>
     </ul>
-    <p class="muted">The video is temporary and deleted after extraction. The raw channels go only to the cleaner; you review the complete recipe before saving it.</p>
+    <p class="muted">Only the ticked sources above are combined. The video is temporary and deleted after extraction. The raw channels go only to the cleaner; you review the complete recipe before saving it.</p>
   </div>
   <p class="actions form-actions"><a class="button" href="/recipes/new">Cancel</a><button class="primary" type="submit">Extract &amp; prepare draft</button></p>
 </form>
