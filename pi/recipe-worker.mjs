@@ -6,12 +6,16 @@ import {
   ModelRuntime,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { createNativeSearchObserver, nativeSearchPayload } from "./codex-native-search.mjs";
-import { loadEpicure, pairwiseCritique, critiqueMessage, ingredientDiff } from "./epicure-scores.mjs";
+import {
+  createNativeSearchObserver,
+  nativeSearchPayload,
+  normalizeSourceUrl,
+  optionalSearchPayload,
+} from "./codex-native-search.mjs";
 
 const PROVIDER = "openai-codex";
 
-const REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 /** Coerces a request's reasoningEffort to one of the supported values.
  *  Missing or blank means the host default ("low"); anything else is
@@ -28,9 +32,11 @@ export function normalizeEffort(value) {
 }
 
 export class WorkerError extends Error {
-  constructor(code, message) {
+  constructor(code, message, options = {}) {
     super(message);
     this.code = code;
+    this.retryable = options.retryable === true;
+    this.status = options.status;
   }
 }
 
@@ -113,15 +119,15 @@ function sourceList(value, seenSources) {
   if (!Array.isArray(value)) return [];
   const urls = new Set();
   return value.flatMap((source) => {
-    if (!source || typeof source.url !== "string" || !seenSources.has(source.url) || urls.has(source.url)) {
-      return [];
-    }
-    urls.add(source.url);
+    const url = normalizeSourceUrl(source?.url);
+    if (!url || !seenSources.has(url) || urls.has(url)) return [];
+    urls.add(url);
+    const citedTitle = seenSources.get(url);
     return [{
       title: typeof source.title === "string" && source.title.trim()
         ? source.title.trim()
-        : seenSources.get(source.url),
-      url: source.url,
+        : citedTitle || url,
+      url,
     }];
   });
 }
@@ -130,12 +136,11 @@ function sourceList(value, seenSources) {
  * Grounds the model's claimed sources against the citations the search
  * surfaced. Exact URL membership is enforced whenever citations exist, so a
  * claim that matches nothing is dropped as unverifiable. The Responses API
- * only attaches url_citation annotations when the model emits inline citation
- * markers, which the JSON-only instruction set does not trigger; the search
- * runs and informs the recipe, but the API returns zero citations to verify
- * against. In that case (`acceptUnverifiable`) the claimed http(s) URLs are
- * accepted as-is — the model was prompted to cite only URLs from the search
- * results — so grounded generation still works.
+ * may expose sources on the search action, or attach url_citation annotations
+ * when the model emits inline citation markers; the JSON-only instruction set
+ * does not reliably trigger the latter. If neither is returned and
+ * (`acceptUnverifiable`) is true, claimed http(s) URLs are accepted as-is for
+ * optional gap-fill attribution. Grounded callers leave this fallback disabled.
  */
 export function verifiedSources(claimed, citations, acceptUnverifiable) {
   const verified = sourceList(claimed, citations);
@@ -143,9 +148,8 @@ export function verifiedSources(claimed, citations, acceptUnverifiable) {
   const urls = new Set();
   const fallback = [];
   for (const source of Array.isArray(claimed) ? claimed : []) {
-    if (!source || typeof source.url !== "string") continue;
-    const url = source.url.trim();
-    if (!/^https?:\/\//.test(url) || urls.has(url)) continue;
+    const url = normalizeSourceUrl(source?.url);
+    if (!url || urls.has(url)) continue;
     urls.add(url);
     fallback.push({
       title: typeof source.title === "string" && source.title.trim() ? source.title.trim() : url,
@@ -155,17 +159,31 @@ export function verifiedSources(claimed, citations, acceptUnverifiable) {
   return fallback;
 }
 
-export function recipePrompt(systemPrompt, searchEnabled) {
+/** Tri-state search posture carried on generation requests: "grounded"
+ *  must research and cite web sources, "gapfill" may research to fill gaps
+ *  in untrusted imported evidence without requiring it, and any other
+ *  value means plain generation without the web_search tool. */
+export function searchModeOf(request) {
+  const mode = typeof request?.searchMode === "string" ? request.searchMode.trim() : "";
+  return mode === "grounded" || mode === "gapfill" || mode === "off" ? mode : "off";
+}
+
+export function recipePrompt(systemPrompt, searchMode = "off") {
   const output = `Return only one JSON object with this shape:\n{
   "recipe": { ...the supplied recipe schema... },
   "sources": [{ "title": "source title", "url": "https://source.example" }]
 }\nDo not use Markdown fences or add prose before or after the JSON.`;
-  if (!searchEnabled) return `${systemPrompt}\n\n${output}\nUse an empty sources array.`;
-  return `${systemPrompt}\n\nOpenAI's native web_search tool is enabled for this request. Research before preparing the recipe. Use only URLs cited by the native search response in sources; list every source that materially informed the recipe.\n\n${output}`;
+  if (searchMode === "gapfill") {
+    return `${systemPrompt}\n\nThe native web_search tool is available but not required for this request. The material you are given comes from an imported social video and can be incomplete, garbled, or misleading; use web_search when it is needed to fill gaps or resolve contradictions, then list every source that materially informed the recipe.\n\n${output}`;
+  }
+  if (searchMode === "grounded") {
+    return `${systemPrompt}\n\nOpenAI's native web_search tool is enabled for this request. Research before preparing the recipe. Use only URLs cited by the native search response in sources; list every source that materially informed the recipe.\n\n${output}`;
+  }
+  return `${systemPrompt}\n\n${output}\nUse an empty sources array.`;
 }
 
-export function completionContext(request, searchEnabled) {
-  const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
+export function completionContext(request, searchMode = "off") {
+  const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
 
   // Use the low-level completion API with an explicit context. Do not use
   // AgentSession/createAgentSession here: those APIs assemble pi's default
@@ -209,15 +227,23 @@ async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPO
     });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
+      const status = Number(response.status);
+      const retryable = status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
       throw new WorkerError(
         "worker",
         `API returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`,
+        { retryable, status },
       );
     }
     return await response.json();
   } catch (error) {
     if (error instanceof WorkerError) throw error;
-    throw new WorkerError("worker", `API request failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    const retryable = !(error instanceof Error && error.name === "AbortError");
+    throw new WorkerError(
+      "worker",
+      `API request failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      { retryable },
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -349,32 +375,16 @@ export function parseAiGatewayCleaner(data) {
   return formatRecipeEvidence(extractJson(text));
 }
 
-export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchEnabled, reasoningEffort = "low", fetchImpl = fetch) {
+export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchMode, reasoningEffort = "low", fetchImpl = fetch) {
   return postResponses(apiBaseUrl, apiKey, {
     model: modelId,
     input: [
       { role: "system", content: systemPrompt },
       { role: "user", content: prompt },
     ],
-    ...(searchEnabled ? { tools: [{ type: "web_search" }], tool_choice: "required" } : {}),
-    reasoning: { effort: reasoningEffort },
-    text: { verbosity: "low" },
-  }, fetchImpl);
-}
-
-/** Multi-message Responses API call for the critique-revision turn: system
- *  prompt plus arbitrary role messages, no tools (revision is never
- *  web-searched). Returns the parsed JSON body with the same error mapping as
- *  openaiResponse. Input items are reduced to role/content: the critique pass
- *  stamps its messages with `timestamp` for the pi SDK path, and the Responses
- *  API rejects unknown fields on input items (HTTP 400). */
-export async function openaiChat(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", fetchImpl = fetch) {
-  return postResponses(apiBaseUrl, apiKey, {
-    model: modelId,
-    input: [
-      { role: "system", content: systemPrompt },
-      ...messages.map(({ role, content }) => ({ role, content })),
-    ],
+    ...(searchMode !== "off"
+      ? { tools: [{ type: "web_search" }], tool_choice: searchMode === "grounded" ? "required" : "auto" }
+      : {}),
     reasoning: { effort: reasoningEffort },
     text: { verbosity: "low" },
   }, fetchImpl);
@@ -392,7 +402,12 @@ export function parseResponsesOutput(data) {
     if (item?.type === "web_search_call") {
       const action = item.action;
       const actionType = typeof action === "string" ? action : action?.type;
-      if (actionType === "search") searched = true;
+      const completed = item.status === "completed" || (actionType === "search" && item.status !== "failed");
+      if (completed) searched = true;
+      for (const source of action?.sources ?? []) {
+        const url = normalizeSourceUrl(source?.url);
+        if (url) citations.set(url, typeof source.title === "string" ? source.title : "");
+      }
     } else if (item?.type === "message") {
       for (const part of item.content ?? []) {
         if (part?.type === "refusal") refused = true;
@@ -402,8 +417,9 @@ export function parseResponsesOutput(data) {
           // ({type:"url_citation", url, title}); the nested url_citation
           // object is accepted defensively for shape variants.
           const citation = annotation?.url_citation ?? annotation;
-          if (citation && typeof citation.url === "string" && citation.url) {
-            citations.set(citation.url, typeof citation.title === "string" ? citation.title : "");
+          const url = normalizeSourceUrl(citation?.url);
+          if (url) {
+            citations.set(url, typeof citation.title === "string" ? citation.title : "");
           }
         }
       }
@@ -414,8 +430,10 @@ export function parseResponsesOutput(data) {
 
 const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20250305";
-/** Thinking budget tokens per reasoning effort; max_tokens must exceed it. */
-const ANTHROPIC_THINKING_BUDGETS = { low: 1024, medium: 4096, high: 8192 };
+/** Thinking budget tokens per reasoning effort; max_tokens must exceed it.
+ * Anthropic has no xhigh/max tiers, so those shared settings are capped at
+ * its highest available budget rather than silently falling back to low. */
+const ANTHROPIC_THINKING_BUDGETS = { low: 1024, medium: 4096, high: 8192, xhigh: 8192, max: 8192 };
 /** Output headroom added to the thinking budget for max_tokens. */
 const ANTHROPIC_OUTPUT_HEADROOM = 8192;
 
@@ -431,10 +449,10 @@ export function anthropicUrl(baseUrl) {
 }
 
 /** POST {base}/v1/messages with x-api-key auth. Extended thinking is always
- *  enabled with an effort-scaled budget; the web_search tool is attached when
- *  search is enabled. max_tokens covers the budget plus output headroom.
+ *  enabled with an effort-scaled budget; the web_search tool is attached unless
+ *  searchMode is "off". max_tokens covers the budget plus output headroom.
  *  Returns the parsed JSON body with the same error mapping as openaiResponse. */
-export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", searchEnabled = false, fetchImpl = fetch) {
+export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", searchMode = "off", fetchImpl = fetch) {
   const budget = thinkingBudget(reasoningEffort);
   const body = {
     model: modelId,
@@ -442,7 +460,7 @@ export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPromp
     system: systemPrompt,
     messages,
     thinking: { type: "enabled", budget_tokens: budget },
-    ...(searchEnabled ? { tools: [{ type: ANTHROPIC_WEB_SEARCH_TOOL }] } : {}),
+    ...(searchMode !== "off" ? { tools: [{ type: ANTHROPIC_WEB_SEARCH_TOOL }] } : {}),
   };
   return fetchJson(anthropicUrl(apiBaseUrl), {
     "x-api-key": apiKey,
@@ -470,62 +488,14 @@ export function parseAnthropicOutput(data) {
         const url = source && source.type === "url" && typeof source.url === "string"
           ? source.url
           : typeof item.url === "string" ? item.url : "";
-        if (url) citations.set(url, typeof item.title === "string" && item.title ? item.title : "");
+        const normalizedUrl = normalizeSourceUrl(url);
+        if (normalizedUrl) {
+          citations.set(normalizedUrl, typeof item.title === "string" && item.title ? item.title : "");
+        }
       }
     }
   }
   return { text: texts.join(""), searched, refused: data?.stop_reason === "refusal", citations };
-}
-
-/**
- * Two-turn critique pass: scores the turn-1 recipe's ingredient pairings with
- * the bundled epicure model, sends the compressed critique to the model on a
- * second turn (no web search), and returns the revision. Fully fail-soft —
- * any data, call, or parse failure returns the turn-1 recipe with
- * critique: null, so the pass can never break generation.
- * @returns {Promise<{recipe: object, critique: object|null}>}
- */
-export async function critiquePass({ prompt, turn1Text, turn1Recipe, systemPrompt, callModel, log = console.error }) {
-  try {
-    const data = loadEpicure();
-    const critique = pairwiseCritique(turn1Recipe, data);
-    if (!critique) {
-      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "fewer than two matched ingredients" }));
-      return { recipe: turn1Recipe, critique: null };
-    }
-    const message = critiqueMessage(critique);
-    log(JSON.stringify({ event: "pairwise_critique", ...critique, turn2Message: message }));
-    const text = await callModel([
-      { role: "user", content: prompt, timestamp: Date.now() },
-      { role: "assistant", content: turn1Text, timestamp: Date.now() },
-      { role: "user", content: message, timestamp: Date.now() },
-    ]);
-    if (text === null) {
-      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision call failed or was refused" }));
-      return { recipe: turn1Recipe, critique: null };
-    }
-    let revised;
-    try {
-      revised = extractJson(text);
-    } catch {
-      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision response was not valid JSON" }));
-      return { recipe: turn1Recipe, critique: null };
-    }
-    if (!revised || typeof revised !== "object" || !revised.recipe || typeof revised.recipe !== "object") {
-      log(JSON.stringify({ event: "pairwise_critique", skipped: true, reason: "revision response lacked a recipe object" }));
-      return { recipe: turn1Recipe, critique: null };
-    }
-    const diff = ingredientDiff(turn1Recipe, revised.recipe);
-    log(JSON.stringify({ event: "pairwise_critique_result", ...diff }));
-    return { recipe: revised.recipe, critique: { ...critique, ...diff } };
-  } catch (error) {
-    log(JSON.stringify({
-      event: "pairwise_critique",
-      skipped: true,
-      reason: error instanceof Error ? error.message : "unknown error",
-    }));
-    return { recipe: turn1Recipe, critique: null };
-  }
 }
 
 /**
@@ -596,56 +566,37 @@ async function main() {
     return;
   }
   const agentDir = process.env.PI_CODING_AGENT_DIR || getAgentDir();
-  const searchEnabled = Boolean(request.searchEnabled);
+  const searchMode = searchModeOf(request);
   const modelId = typeof request.model === "string" && request.model.trim()
     ? request.model.trim()
     : "gpt-5.4-mini";
   const reasoningEffort = normalizeEffort(request.reasoningEffort);
   if (request.provider === "openai") {
     const { apiBaseUrl, apiKey } = apiCredentials(request);
-    const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
-    const data = await openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, request.prompt, searchEnabled, reasoningEffort);
+    const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
+    const data = await openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, request.prompt, searchMode, reasoningEffort);
     if (data.status && data.status !== "completed") {
       throw new WorkerError("worker", `OpenAI response incomplete: ${data.incomplete_details?.reason ?? "unknown reason"}`);
     }
     const { text, searched, refused, citations } = parseResponsesOutput(data);
     if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
-    if (searchEnabled && !searched) {
+    if (searchMode === "grounded" && !searched) {
       throw new WorkerError("output", "OpenAI returned a recipe without running web search.");
     }
     const result = extractJson(text);
     if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
       throw new WorkerError("output", "Pi did not return a recipe object.");
     }
-    const sources = verifiedSources(result.sources, citations, true);
-    if (searchEnabled && sources.length === 0) {
+    const sources = verifiedSources(result.sources, citations, searchMode === "gapfill");
+    if (searchMode === "grounded" && sources.length === 0) {
       throw new WorkerError("output", "OpenAI did not use any valid web-search sources.");
     }
-    const pass = request.pairwiseCritique === true
-      ? await critiquePass({
-          prompt: request.prompt,
-          turn1Text: text,
-          turn1Recipe: result.recipe,
-          systemPrompt: request.systemPrompt,
-          callModel: async (messages) => {
-            try {
-              const revisionData = await openaiChat(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort);
-              const { text: revisionText, refused: revisionRefused } = parseResponsesOutput(revisionData);
-              return revisionRefused ? null : revisionText;
-            } catch {
-              return null;
-            }
-          },
-        })
-      : { recipe: result.recipe, critique: null };
-    outputJson(pass.critique
-      ? { recipe: pass.recipe, sources, critique: pass.critique }
-      : { recipe: pass.recipe, sources });
+    outputJson({ recipe: result.recipe, sources });
     return;
   }
   if (request.provider === "anthropic") {
     const { apiBaseUrl, apiKey } = apiCredentials(request);
-    const systemPrompt = recipePrompt(request.systemPrompt, searchEnabled);
+    const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
     const data = await anthropicMessages(
       apiBaseUrl,
       apiKey,
@@ -653,52 +604,25 @@ async function main() {
       systemPrompt,
       [{ role: "user", content: request.prompt }],
       reasoningEffort,
-      searchEnabled,
+      searchMode,
     );
     if (data.stop_reason === "max_tokens") {
       throw new WorkerError("worker", "Anthropic response was truncated by max_tokens.");
     }
     const { text, searched, refused, citations } = parseAnthropicOutput(data);
     if (refused) throw new WorkerError("worker", "Anthropic refused the request.");
-    if (searchEnabled && !searched) {
+    if (searchMode === "grounded" && !searched) {
       throw new WorkerError("output", "Anthropic returned a recipe without running web search.");
     }
     const result = extractJson(text);
     if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
       throw new WorkerError("output", "Pi did not return a recipe object.");
     }
-    const sources = verifiedSources(result.sources, citations, true);
-    if (searchEnabled && sources.length === 0) {
+    const sources = verifiedSources(result.sources, citations, searchMode === "gapfill");
+    if (searchMode === "grounded" && sources.length === 0) {
       throw new WorkerError("output", "Anthropic did not use any valid web-search sources.");
     }
-    const pass = request.pairwiseCritique === true
-      ? await critiquePass({
-          prompt: request.prompt,
-          turn1Text: text,
-          turn1Recipe: result.recipe,
-          systemPrompt: request.systemPrompt,
-          callModel: async (messages) => {
-            try {
-              const revisionData = await anthropicMessages(
-                apiBaseUrl,
-                apiKey,
-                modelId,
-                systemPrompt,
-                messages.map(({ role, content }) => ({ role, content })),
-                reasoningEffort,
-                false,
-              );
-              const { text: revisionText, refused: revisionRefused } = parseAnthropicOutput(revisionData);
-              return revisionRefused ? null : revisionText;
-            } catch {
-              return null;
-            }
-          },
-        })
-      : { recipe: result.recipe, critique: null };
-    outputJson(pass.critique
-      ? { recipe: pass.recipe, sources, critique: pass.critique }
-      : { recipe: pass.recipe, sources });
+    outputJson({ recipe: result.recipe, sources });
     return;
   }
   await mkdir(agentDir, { recursive: true });
@@ -723,19 +647,21 @@ async function main() {
     throw new WorkerError("configuration", `Pi does not know the ${PROVIDER}/${modelId} model.`);
   }
 
-  const observer = searchEnabled ? createNativeSearchObserver() : null;
-  const context = completionContext(request, searchEnabled);
+  const observer = searchMode === "off"
+    ? null
+    : createNativeSearchObserver(globalThis.fetch, { allowUnverifiedFallback: searchMode === "gapfill" });
+  const context = completionContext(request, searchMode);
   const response = await modelRuntime.complete(
     model,
     context,
     {
       reasoningEffort,
       textVerbosity: "low",
-      transport: "sse",
+      transport: observer ? "sse" : "auto",
       maxRetries: 1,
       ...(observer ? {
         fetch: observer.fetch,
-        onPayload: nativeSearchPayload,
+        onPayload: searchMode === "grounded" ? nativeSearchPayload : optionalSearchPayload,
       } : {}),
     },
   );
@@ -743,39 +669,19 @@ async function main() {
     throw new WorkerError("worker", response.errorMessage || "Pi model request failed.");
   }
   const observed = observer ? await observer.finish() : { invoked: false, sources: new Map() };
-  if (searchEnabled && !observed.invoked) {
+  if (searchMode === "grounded" && !observed.invoked) {
     throw new WorkerError("output", "Codex returned a recipe without running native web search.");
   }
 
-  const turn1Text = assistantText(response);
-  const result = extractJson(turn1Text);
+  const result = extractJson(assistantText(response));
   if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
     throw new WorkerError("output", "Pi did not return a recipe object.");
   }
   const sources = sourceList(result.sources, observed.sources);
-  if (searchEnabled && sources.length === 0) {
+  if (searchMode === "grounded" && sources.length === 0) {
     throw new WorkerError("output", "Pi did not use any valid web-search sources.");
   }
-  const pass = request.pairwiseCritique === true
-    ? await critiquePass({
-        prompt: request.prompt,
-        turn1Text,
-        turn1Recipe: result.recipe,
-        systemPrompt: request.systemPrompt,
-        callModel: async (messages) => {
-          const revision = await modelRuntime.complete(model, {
-            systemPrompt: recipePrompt(request.systemPrompt, false),
-            messages,
-            tools: [],
-          }, { reasoningEffort, textVerbosity: "low", transport: "sse", maxRetries: 1 });
-          if (revision.stopReason === "error" || revision.stopReason === "aborted") return null;
-          return assistantText(revision);
-        },
-      })
-    : { recipe: result.recipe, critique: null };
-  outputJson(pass.critique
-    ? { recipe: pass.recipe, sources, critique: pass.critique }
-    : { recipe: pass.recipe, sources });
+  outputJson({ recipe: result.recipe, sources });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -783,7 +689,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const workerError = error instanceof WorkerError
       ? error
       : new WorkerError("worker", error instanceof Error ? error.message : "Pi worker failed.");
-    outputJson({ error: workerError.message, code: workerError.code });
+    outputJson({
+      error: workerError.message,
+      code: workerError.code,
+      // Output validation failures are worth one host-level retry; provider
+      // transport errors carry their own status-aware retry decision.
+      retryable: workerError.retryable || workerError.code === "output",
+    });
     process.exitCode = 1;
   });
 }

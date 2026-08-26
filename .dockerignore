@@ -7,3 +7,6 @@ data
 bench
 node_modules
 **/__pycache__
+*.md
+src/tests/
+pi/*.test.mjs

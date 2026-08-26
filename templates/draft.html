@@ -19,24 +19,6 @@
     <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel"><button>Discard</button></form>
   </div>
 </header>
-{% match critique %}
-{% when Some with (crit) %}
-<section class="panel critique-panel">
-  <h2>Flavour-critique pass</h2>
-  <p class="muted">{{ crit.pair_count }} ingredient pairings scored from the bundled Epicure model · coherence {{ crit.coherence_percentile }}% · {{ crit.resolved }} of {{ crit.total }} ingredients matched{% if crit.unresolved.len() > 0 %} (unmatched: {% for name in crit.unresolved %}{{ name }}{% if !loop.last %}, {% endif %}{% endfor %}){% endif %}</p>
-  {% if crit.weakest_pairs.len() > 0 %}
-  <ul class="critique-pairs">{% for pair in crit.weakest_pairs %}<li>{{ pair.a }} — {{ pair.b }} <span class="muted">({{ pair.percentile }}th percentile)</span></li>{% endfor %}</ul>
-  {% else %}
-  <p class="muted">No pair fell below the flagging threshold.</p>
-  {% endif %}
-  {% if crit.added.len() > 0 || crit.removed.len() > 0 %}
-  <p class="critique-changes"><strong>Changes made:</strong>{% for name in crit.removed %}<span class="critique-removed">−{{ name }}</span>{% endfor %}{% for name in crit.added %}<span class="critique-added">+{{ name }}</span>{% endfor %}</p>
-  {% else %}
-  <p class="muted">No ingredient changes were made.</p>
-  {% endif %}
-</section>
-{% when None %}
-{% endmatch %}
 {% match evidence %}
 {% when Some with (evidence) %}
 <section class="panel evidence-panel">
@@ -74,7 +56,6 @@
   <h2>Alter this draft</h2>
   {% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
   <label>What should change?<textarea name="prompt" required maxlength="4000" placeholder="e.g. make it vegetarian, swap the chicken for tofu, cut the servings in half…">{{ prompt }}</textarea></label>
-  <label class="check-row"><input type="checkbox" name="pairwise_critique"{% if pairwise_critique %} checked{% endif %}> Flavour-critique pass<span class="field-help">The bundled ingredient model scores the replacement draft's pairings; the model revises once using that critique (second LLM call).</span></label>
   <p class="muted">Pi returns a complete replacement draft for review. This draft stays untouched until you save one.</p>
   <p class="actions form-actions"><button class="primary">Create altered draft</button></p>
 </form>

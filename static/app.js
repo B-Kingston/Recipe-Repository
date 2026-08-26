@@ -1,3 +1,31 @@
+/* Add recipe: one entry point with a progressive-enhancement mode switch. */
+(function () {
+  var root = document.querySelector('[data-add-recipe]');
+  if (!root) return;
+  var tabs = root.querySelectorAll('[data-add-mode]');
+  var panels = root.querySelectorAll('[data-add-panel]');
+
+  function setMode(mode) {
+    var index;
+    for (index = 0; index < tabs.length; index += 1) {
+      var active = tabs[index].getAttribute('data-add-mode') === mode;
+      tabs[index].className = 'add-mode-tab' + (active ? ' is-active' : '');
+      tabs[index].setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    for (index = 0; index < panels.length; index += 1) {
+      panels[index].hidden = panels[index].getAttribute('data-add-panel') !== mode;
+    }
+  }
+
+  for (var i = 0; i < tabs.length; i += 1) {
+    tabs[i].addEventListener('click', function (event) {
+      event.preventDefault();
+      setMode(this.getAttribute('data-add-mode'));
+      if (window.history && window.history.replaceState) window.history.replaceState({}, '', this.href);
+    });
+  }
+}());
+
 /* ES5-only progressive enhancement: an edit link can open its form without a reload. */
 (function () {
   var timerId = null;
@@ -249,7 +277,8 @@
  * atomically when its backend stage reports, avoiding partial or unsafe HTML. */
 (function () {
   var root = document.querySelector('[data-import-root]');
-  if (!root || root.getAttribute('data-import-finished') === '1') return;
+  if (!root) return;
+  var finished = root.getAttribute('data-import-finished') === '1';
   var eventsUrl = root.getAttribute('data-events-url');
   var framesBase = root.getAttribute('data-frames-base');
   var status = root.querySelector('[data-import-status]');
@@ -257,6 +286,9 @@
   var warnings = root.querySelector('[data-import-warnings]');
   var ready = root.querySelector('[data-import-ready]');
   var draftLink = root.querySelector('[data-import-draft]');
+  var progressBar = root.querySelector('[data-import-progressbar]');
+  var progressCopy = root.querySelector('[data-import-progress-copy]');
+  var progress = { extract: 0, clean: 0, generate: 0 };
   var since = 0;
   var stopped = false;
   var replayed = false;
@@ -268,6 +300,100 @@
     return node;
   }
   function clear(node) { while (node && node.firstChild) node.removeChild(node.firstChild); }
+  function clamp(value) { return Math.max(0, Math.min(1, value)); }
+  function progressState(value) { return value >= 1 ? 'done' : value > 0 ? 'working' : 'waiting'; }
+  function drawProgress() {
+    var names = ['extract', 'clean', 'generate'];
+    var total = 0;
+    var index;
+    for (index = 0; index < names.length; index += 1) {
+      var name = names[index];
+      var value = clamp(progress[name]);
+      var segment = root.querySelector('[data-progress-segment="' + name + '"]');
+      var fill = root.querySelector('[data-progress-fill="' + name + '"]');
+      var badge = root.querySelector('[data-progress-status="' + name + '"]');
+      if (fill) fill.style.width = Math.round(value * 100) + '%';
+      if (segment) segment.className = 'import-progress-segment' + (value >= 1 ? ' is-complete' : value > 0 ? ' is-active' : '');
+      if (badge) badge.textContent = progressState(value);
+      total += value;
+    }
+    total = Math.round(total / names.length * 100);
+    if (progressBar) {
+      progressBar.setAttribute('aria-valuenow', String(total));
+      progressBar.setAttribute('aria-valuetext', String(total) + '% complete');
+    }
+  }
+  function advanceProgress(name, value, copy) {
+    progress[name] = Math.max(progress[name], clamp(value));
+    if (copy && progressCopy) progressCopy.textContent = copy;
+    drawProgress();
+  }
+  function initialiseProgress() {
+    var state = (root.getAttribute('data-import-progress-state') || '').toLowerCase();
+    if (root.getAttribute('data-import-progress-complete') === '1') {
+      progress.extract = 1;
+      progress.clean = 1;
+      progress.generate = 1;
+      if (progressCopy) progressCopy.textContent = 'Recipe draft ready.';
+    } else if (state.indexOf('preparing') !== -1 || state.indexOf('draft') !== -1) {
+      progress.extract = 1;
+      progress.clean = 1;
+      progress.generate = .08;
+      if (progressCopy) progressCopy.textContent = 'Building the recipe draft…';
+    } else if (state.indexOf('clean') !== -1) {
+      progress.extract = 1;
+      progress.clean = .08;
+      if (progressCopy) progressCopy.textContent = 'Cleaning the video evidence…';
+    } else {
+      progress.extract = .03;
+      if (progressCopy) progressCopy.textContent = 'Reading the video…';
+    }
+    drawProgress();
+  }
+  function applyProgress(event) {
+    var state;
+    if (event.kind === 'status') {
+      state = (event.state || '').toLowerCase();
+      if (state.indexOf('clean') !== -1) {
+        advanceProgress('extract', 1, 'Cleaning the video evidence…');
+        advanceProgress('clean', .08, 'Cleaning the video evidence…');
+      } else if (state.indexOf('preparing') !== -1 || state.indexOf('draft') !== -1) {
+        advanceProgress('extract', 1, 'Building the recipe draft…');
+        advanceProgress('clean', 1, 'Building the recipe draft…');
+        advanceProgress('generate', .08, 'Building the recipe draft…');
+      } else if (state.indexOf('extract') !== -1 || state.indexOf('wait') !== -1) {
+        advanceProgress('extract', .06, 'Reading the video…');
+      }
+    } else if (event.kind === 'phase') {
+      state = (event.state || '').toLowerCase();
+      if (event.phase === 'worker') advanceProgress('extract', state.indexOf('wait') !== -1 ? .03 : .06, 'Reading the video…');
+      else if (event.phase === 'description') advanceProgress('extract', state === 'done' ? .25 : .12, 'Reading the video…');
+      else if (event.phase === 'download') advanceProgress('extract', state === 'done' ? .43 : .34, 'Downloading the video…');
+      else if (event.phase === 'audio') advanceProgress('extract', state === 'done' ? .68 : .54, 'Transcribing spoken audio…');
+      else if (event.phase === 'ocr') advanceProgress('extract', state === 'done' ? .96 : state.indexOf('sampling') !== -1 ? .71 : .79, 'Reading on-screen text…');
+      else if (event.phase === 'cleaner') {
+        advanceProgress('extract', 1, 'Cleaning the video evidence…');
+        advanceProgress('clean', .08, 'Cleaning the video evidence…');
+      } else if (event.phase === 'draft') {
+        advanceProgress('extract', 1, 'Building the recipe draft…');
+        advanceProgress('clean', 1, 'Building the recipe draft…');
+        advanceProgress('generate', .08, 'Building the recipe draft…');
+      }
+    } else if (event.kind === 'ocr-plan') {
+      advanceProgress('extract', .82, 'Reading on-screen text…');
+    } else if (event.kind === 'ocr-captures') {
+      advanceProgress('extract', .97, 'Reading on-screen text…');
+    } else if (event.kind === 'cleaned') {
+      advanceProgress('extract', 1, 'Preparing the recipe draft…');
+      advanceProgress('clean', 1, 'Preparing the recipe draft…');
+    } else if (event.kind === 'result') {
+      advanceProgress('extract', 1, 'Recipe draft ready.');
+      advanceProgress('clean', 1, 'Recipe draft ready.');
+      advanceProgress('generate', 1, 'Recipe draft ready.');
+    } else if (event.kind === 'error' && progressCopy) {
+      progressCopy.textContent = 'Import stopped.';
+    }
+  }
   function stage(name) { return root.querySelector('[data-import-stage="' + name + '"]'); }
   function enabled(name) { var box = stage(name); return !box || box.getAttribute('data-stage-enabled') !== '0'; }
   function stageStatus(name, value) {
@@ -337,6 +463,7 @@
     stageStatus('ocr', 'done');
   }
   function apply(event) {
+    applyProgress(event);
     if (event.kind === 'status') status.textContent = event.state || 'working';
     else if (event.kind === 'phase') stageStatus(event.phase, event.state || 'working');
     else if (event.kind === 'description') setDescription(event);
@@ -381,5 +508,6 @@
     };
     request.send();
   }
-  poll();
+  initialiseProgress();
+  if (!finished) poll();
 }());

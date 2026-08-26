@@ -1,8 +1,9 @@
 use crate::chart::build_chart;
 use crate::{
-    AiFormTemplate, AppError, AppState, AuthUser, Block, BlockForm, DeleteTemplate, Draft,
-    HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeTemplate, Result, Source, ViewBlock,
-    ViewStep, generate_guidance, number, option_number, render, required, stamp, trim,
+    AddRecipeQuery, AddRecipeTemplate, AppError, AppState, AuthUser, Block, BlockForm,
+    DeleteTemplate, Draft, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeTemplate, Result,
+    Source, ViewBlock, ViewStep, generate_guidance, number, option_number, render, required, stamp,
+    trim,
 };
 use axum::{
     Form,
@@ -27,17 +28,21 @@ pub(crate) async fn home(
     })
 }
 
-pub(crate) async fn new_recipe(State(state): State<Arc<AppState>>) -> Result<Html<String>> {
-    render(AiFormTemplate {
-        heading: "New Recipe".into(),
+pub(crate) async fn new_recipe(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AddRecipeQuery>,
+) -> Result<Html<String>> {
+    render(AddRecipeTemplate {
+        prompt_error: String::new(),
         guidance: generate_guidance(state.search_grounding).into(),
-        action: "/ai/generate".into(),
-        label: "What should this recipe be based on?".into(),
-        button: "Research & generate".into(),
-        cancel_url: "/".into(),
-        error: String::new(),
         prompt: String::new(),
-        pairwise_critique: false,
+        video_error: String::new(),
+        url: String::new(),
+        notes: String::new(),
+        use_description: true,
+        use_audio: true,
+        use_ocr: true,
+        video_mode: query.mode.as_deref() == Some("video"),
     })
 }
 

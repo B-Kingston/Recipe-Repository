@@ -4,7 +4,23 @@
   <h1>{% if finished %}{% match draft_url %}{% when Some with (_) %}Your video draft is ready{% when None %}Video import stopped{% endmatch %}{% else %}Reading the recipe video{% endif %}</h1>
   <p class="deck">Results appear below as the caption, local Whisper, OCR, cleaner, and recipe generator finish. Expand each source to see the raw evidence being used.</p>
 </div>
-<div class="media-import-progress" data-import-root data-import-finished="{% if finished %}1{% else %}0{% endif %}" data-events-url="/ai/import/{{ run_id }}/events" data-frames-base="/ai/import/{{ run_id }}/frames">
+<div class="media-import-progress" data-import-root data-import-finished="{% if finished %}1{% else %}0{% endif %}" data-import-progress-state="{{ evidence.status }}" data-import-progress-complete="{% match draft_url %}{% when Some with (_) %}1{% when None %}0{% endmatch %}" data-events-url="/ai/import/{{ run_id }}/events" data-frames-base="/ai/import/{{ run_id }}/frames">
+  <section class="panel import-progress" aria-labelledby="import-progress-heading">
+    <div class="import-progress-heading">
+      <strong id="import-progress-heading">Recipe generation progress</strong>
+      <span class="muted" data-import-progress-copy aria-live="polite">Starting…</span>
+    </div>
+    <div class="import-progress-track" data-import-progressbar role="progressbar" aria-label="Video recipe generation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="Starting">
+      <div class="import-progress-segment" data-progress-segment="extract"><span class="import-progress-fill" data-progress-fill="extract"></span></div>
+      <div class="import-progress-segment" data-progress-segment="clean"><span class="import-progress-fill" data-progress-fill="clean"></span></div>
+      <div class="import-progress-segment" data-progress-segment="generate"><span class="import-progress-fill" data-progress-fill="generate"></span></div>
+    </div>
+    <div class="import-progress-labels" aria-hidden="true">
+      <div class="import-progress-label"><span>1</span><strong>Read video</strong><em data-progress-status="extract">waiting</em></div>
+      <div class="import-progress-label"><span>2</span><strong>Clean evidence</strong><em data-progress-status="clean">waiting</em></div>
+      <div class="import-progress-label"><span>3</span><strong>Build recipe</strong><em data-progress-status="generate">waiting</em></div>
+    </div>
+  </section>
   <section class="panel import-overall" aria-live="polite">
     <p><strong>Status:</strong> <span class="codex-status import-overall-status" data-import-status>{{ evidence.status }}</span></p>
     <p class="muted import-source-url">{{ evidence.source_url }}</p>
@@ -17,7 +33,7 @@
   </section>
 
   <div class="import-stage-grid">
-    <details class="panel import-stage" data-import-stage="description" data-stage-enabled="{% if use_description %}1{% else %}0{% endif %}"{% if use_description %} open{% endif %}>
+    <details class="panel import-stage" data-import-stage="description" data-stage-enabled="{% if use_description %}1{% else %}0{% endif %}">
       <summary><span>1</span> Caption / description <em data-stage-status>{% if use_description %}{% if evidence.title != "" || evidence.description != "" %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
       <div data-import-description>
         {% match evidence.duration_seconds %}{% when Some with (duration) %}<p class="muted">Duration: {{ duration }}s</p>{% when None %}{% endmatch %}
@@ -26,12 +42,12 @@
       </div>
     </details>
 
-    <details class="panel import-stage" data-import-stage="audio" data-stage-enabled="{% if use_audio %}1{% else %}0{% endif %}"{% if use_audio %} open{% endif %}>
+    <details class="panel import-stage" data-import-stage="audio" data-stage-enabled="{% if use_audio %}1{% else %}0{% endif %}">
       <summary><span>2</span> Spoken audio <em data-stage-status>{% if use_audio %}{% if evidence.transcript != "" %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
       <div data-import-audio>{% if evidence.transcript != "" %}<div class="debug-mono">{{ evidence.transcript }}</div>{% else %}<p class="muted">{% if use_audio %}Waiting for local Whisper…{% else %}This source was not selected.{% endif %}</p>{% endif %}</div>
     </details>
 
-    <details class="panel import-stage" data-import-stage="ocr" data-stage-enabled="{% if use_ocr %}1{% else %}0{% endif %}"{% if use_ocr %} open{% endif %}>
+    <details class="panel import-stage" data-import-stage="ocr" data-stage-enabled="{% if use_ocr %}1{% else %}0{% endif %}">
       <summary><span>3</span> On-screen OCR <em data-stage-status>{% if use_ocr %}{% if evidence.captures.len() > 0 %}done{% else %}waiting{% endif %}{% else %}skipped{% endif %}</em></summary>
       <div data-import-ocr>
         {% if evidence.captures.len() > 0 %}
@@ -52,6 +68,6 @@
       <p class="muted" data-import-draft-copy>{% match draft_url %}{% when Some with (_) %}Ready for your review.{% when None %}Starts after the cleaner has reduced the raw evidence to recipe facts.{% endmatch %}</p>
     </details>
   </div>
-  <p class="actions"><a class="button" href="/ai/import">Import another video</a>{% if !finished %}<a class="button" href="/ai/import/{{ run_id }}">Refresh now</a>{% endif %}</p>
+  <p class="actions"><a class="button" href="/recipes/new?mode=video">Import another video</a>{% if !finished %}<a class="button" href="/ai/import/{{ run_id }}">Refresh now</a>{% endif %}</p>
 </div>
 {% endblock %}

@@ -5,6 +5,8 @@ import {
   createNativeSearchObserver,
   inspectNativeSearchResponse,
   nativeSearchPayload,
+  normalizeSourceUrl,
+  optionalSearchPayload,
 } from "./codex-native-search.mjs";
 
 test("nativeSearchPayload forces OpenAI hosted web search", () => {
@@ -14,6 +16,13 @@ test("nativeSearchPayload forces OpenAI hosted web search", () => {
   assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "high" }]);
   assert.deepEqual(payload.tool_choice, { type: "web_search" });
   assert.deepEqual(original.tools, [{ type: "function", name: "old" }]);
+});
+
+test("optionalSearchPayload attaches web_search but leaves tool_choice free", () => {
+  const payload = optionalSearchPayload({ model: "gpt-test", tools: [] });
+
+  assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "high" }]);
+  assert.ok(!("tool_choice" in payload));
 });
 
 test("SSE inspection requires a native call and collects citation annotations", async () => {
@@ -74,13 +83,51 @@ test("observer mirrors OMP's text URL fallback after a verified native search", 
   const observer = createNativeSearchObserver(async () => new Response(
     events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
     { status: 200 },
-  ));
+  ), { allowUnverifiedFallback: true });
 
   await observer.fetch("https://example.test");
   const state = await observer.finish();
 
   assert.equal(state.invoked, true);
   assert.deepEqual([...state.sources], [["https://example.com/recipe", "https://example.com/recipe"]]);
+});
+
+test("observer ignores malformed SSE events without rejecting the response", async () => {
+  const observer = createNativeSearchObserver(async () => new Response(
+    "data: not-json\n\ndata: {\"type\":\"response.web_search_call.completed\"}\n\n",
+    { status: 200 },
+  ));
+
+  await observer.fetch("https://example.test");
+  const state = await observer.finish();
+
+  assert.equal(state.invoked, true);
+  assert.equal(state.parseErrors, 1);
+});
+
+test("observer does not accept text URL fallback unless explicitly enabled", async () => {
+  const observer = createNativeSearchObserver(async () => new Response(
+    [
+      { type: "response.web_search_call.completed" },
+      {
+        type: "response.output_item.done",
+        item: { type: "message", content: [{ type: "output_text", text: "https://example.com/recipe", annotations: [] }] },
+      },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+    { status: 200 },
+  ));
+
+  await observer.fetch("https://example.test");
+  const state = await observer.finish();
+
+  assert.equal(state.invoked, true);
+  assert.equal(state.sources.size, 0);
+});
+
+test("source URLs are normalized before citation matching", () => {
+  assert.equal(normalizeSourceUrl("https://example.com/recipe/#step-1"), "https://example.com/recipe");
+  assert.equal(normalizeSourceUrl("https://example.com/"), "https://example.com/");
+  assert.equal(normalizeSourceUrl("ftp://example.com/recipe"), null);
 });
 
 test("recipe worker sends only its explicit non-coding completion context", () => {

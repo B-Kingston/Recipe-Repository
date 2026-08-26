@@ -466,6 +466,22 @@ async fn reasoning_effort_persists_in_codex_mode() {
 }
 
 #[tokio::test]
+async fn max_reasoning_effort_persists_in_codex_mode() {
+    let db = database().await;
+    let result = save(
+        &state(db.clone()),
+        SettingsForm {
+            model: "gpt-5.4-mini".into(),
+            reasoning_effort: "max".into(),
+            provider: "pi".into(),
+        },
+    )
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(selected_effort(&db, "low").await.unwrap(), "max");
+}
+
+#[tokio::test]
 async fn reasoning_effort_persists_in_endpoint_mode() {
     let db = database().await;
     let id = add(

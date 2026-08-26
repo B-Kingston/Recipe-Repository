@@ -58,7 +58,9 @@ const DEFAULT_REASONING_EFFORT: &str = "low";
 pub(crate) const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_PROVIDER: &str = "vercel-ai-gateway";
 /// Reasoning efforts offered for the model, matching the worker protocol.
-const REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
+/// Newer Codex models also support `xhigh` and `max`; Anthropic endpoints
+/// cap those values at their highest available thinking budget in the worker.
+const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// Built-in fallback for the Settings model list, used only when the live
 /// pi.dev catalogue cannot be fetched. Ordered newest first.
 const MODEL_OPTIONS: &[&str] = &[
@@ -78,6 +80,16 @@ Study ingredient ratios, ingredient roles, preparation, sequencing, temperatures
 When the user asks to exclude an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without nuts", and similar — do not silently drop it. First judge whether the ingredient is genuinely optional: if it only adds flavour or is truly dispensable, omitting it is fine, but make that a conscious, reasoned decision. If it plays a structural role — binding, leavening, emulsifying, thickening, moisture, browning, or setting — research suitable replacement ingredients and techniques with web_search (for example flax or chia "eggs", aquafaba, mashed banana, plant milks and butters, nut-free butters, xanthan or psyllium gum) and adapt quantities and method so the recipe still achieves its intended result. Keep the recipe true to its original character: the substitution must preserve the outcome, not merely delete the ingredient.
 
 Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Cite every source that materially informed the recipe."#;
+
+/// System prompt for drafts built from imported social-video evidence (the
+/// From Video importer and its alteration chain). The web_search tool is
+/// attached but optional: research exists to fill gaps the evidence leaves,
+/// so an answer drawn purely from sufficient evidence stays valid.
+const EVIDENCE_RECIPE_PROMPT: &str = r#"You are a meticulous recipe assistant working from imported social-video evidence. The evidence was distilled automatically from a social video's caption, spoken audio, and on-screen text, so it can be incomplete, garbled, or one-sided. Treat it as the best available record of the original creator's intent, not as verified fact.
+
+Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge, and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough. Fill every such gap so the finished recipe works end to end, keep it faithful to the ingredients, character, and method shown in the video, and note briefly in the recipe description which parts were filled by research rather than the video. Do not copy expressive prose from researched sources; write original, concise instructions.
+
+Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."#;
 
 #[derive(Clone)]
 struct AppState {
@@ -308,17 +320,20 @@ struct AiFormTemplate {
     cancel_url: String,
     error: String,
     prompt: String,
-    pairwise_critique: bool,
 }
 #[derive(Template)]
-#[template(path = "media_import.html")]
-struct MediaImportTemplate {
-    error: String,
+#[template(path = "add_recipe.html")]
+struct AddRecipeTemplate {
+    prompt_error: String,
+    guidance: String,
+    prompt: String,
+    video_error: String,
     url: String,
     notes: String,
     use_description: bool,
     use_audio: bool,
     use_ocr: bool,
+    video_mode: bool,
 }
 #[derive(Template)]
 #[template(path = "media_import_run.html")]
@@ -341,8 +356,6 @@ struct DraftTemplate {
     evidence: Option<MediaEvidence>,
     error: String,
     prompt: String,
-    pairwise_critique: bool,
-    critique: Option<Critique>,
 }
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -468,8 +481,6 @@ struct BlockForm {
 #[derive(Deserialize)]
 struct PromptForm {
     prompt: String,
-    #[serde(default)]
-    pairwise_critique: Option<String>, // checkbox present when checked
 }
 #[derive(Deserialize)]
 struct MediaImportForm {
@@ -521,6 +532,10 @@ struct RecipeQuery {
     edit_meta: Option<String>,
     view: Option<String>,
     step: Option<usize>,
+}
+#[derive(Deserialize)]
+struct AddRecipeQuery {
+    mode: Option<String>,
 }
 
 #[tokio::main]
@@ -720,41 +735,6 @@ struct GeneratedRecipe {
     ingredients: Vec<Ingredient>,
     steps: Vec<GeneratedStep>,
 }
-/// Result of the opt-in pairwise flavour-critique pass, produced by the
-/// worker from the bundled epicure ingredient model and stored on the draft
-/// row so the draft page can show what the model was told and what changed.
-/// Wire field names match the worker's stdout `critique` object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Critique {
-    total: usize,
-    resolved: usize,
-    #[serde(default)]
-    unresolved: Vec<String>,
-    #[serde(rename = "pairCount")]
-    pair_count: usize,
-    #[serde(rename = "coherencePercentile")]
-    coherence_percentile: f64,
-    #[serde(rename = "weakestPairs", default)]
-    weakest_pairs: Vec<CritiquePair>,
-    #[serde(rename = "weakestIngredient", default)]
-    weakest_ingredient: Option<CritiqueIngredient>,
-    #[serde(default)]
-    added: Vec<String>,
-    #[serde(default)]
-    removed: Vec<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CritiquePair {
-    a: String,
-    b: String,
-    percentile: f64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CritiqueIngredient {
-    name: String,
-    #[serde(rename = "meanPercentile")]
-    mean_percentile: f64,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChartRecipe {
     version: u8,
@@ -791,7 +771,6 @@ struct Draft {
     sources_json: String,
     search_suggestions: String,
     base_updated_at: Option<String>,
-    critique_json: String,
     evidence_json: String,
 }
 
@@ -1168,8 +1147,7 @@ fn model_options(fresh: Vec<String>, current: &str) -> Vec<SelectOption> {
         .collect()
 }
 
-/// Effort options for the Settings select: a fixed low/medium/high set (the
-/// worker protocol knows no other values), with the current choice selected.
+/// Effort options for the Settings select, with the current choice selected.
 fn effort_options(current: &str) -> Vec<SelectOption> {
     REASONING_EFFORTS
         .iter()
@@ -1500,12 +1478,15 @@ mod model_tests {
     }
 
     #[test]
-    fn effort_options_offer_all_three_with_current_selected() {
-        let options = effort_options("medium");
-        assert_eq!(values(&options), vec!["low", "medium", "high"]);
-        assert!(!options[0].selected && options[1].selected && !options[2].selected);
-        // An unknown stored value never marks an option selected; the worker
-        // defaults such requests to low.
+    fn effort_options_offer_all_five_with_current_selected() {
+        let options = effort_options("max");
+        assert_eq!(
+            values(&options),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(options[4].selected);
+        assert!(options[..4].iter().all(|option| !option.selected));
+        // An unknown stored value never marks an option selected.
         assert!(
             effort_options("extreme")
                 .iter()

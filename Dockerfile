@@ -1,37 +1,52 @@
 FROM node:22-bookworm-slim AS pi-deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN --mount=type=cache,id=kindle-recipes-npm,target=/root/.npm,sharing=locked \
+    npm ci --omit=dev --prefer-offline --cache=/root/.npm
 
 FROM rust:1.88-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    mkdir src && printf 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
-COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    touch src/main.rs && cargo build --release
+RUN --mount=type=cache,id=kindle-recipes-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-cargo-target,target=/app/target,sharing=locked \
+    mkdir src && printf 'fn main() {}' > src/main.rs && \
+    cargo build --release --locked && rm -rf src
+COPY src ./src
+COPY templates ./templates
+COPY migrations ./migrations
+RUN --mount=type=cache,id=kindle-recipes-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-cargo-target,target=/app/target,sharing=locked \
+    touch src/main.rs && cargo build --release --locked && \
+    cp target/release/kindle-recipes /app/kindle-recipes
 
 FROM node:22-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,id=kindle-recipes-apt-archives,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-pip,target=/root/.cache/pip,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     ffmpeg \
     python3 \
     python3-venv \
-    && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/media-venv \
-    && /opt/media-venv/bin/pip install --no-cache-dir paddlepaddle==3.2.0 \
+    && /opt/media-venv/bin/pip install --disable-pip-version-check \
+        --cache-dir=/root/.cache/pip \
+        paddlepaddle==3.2.0 \
         -i https://www.paddlepaddle.org.cn/packages/stable/cpu/ \
-    && /opt/media-venv/bin/pip install --no-cache-dir paddleocr==3.7.0 faster-whisper==1.2.1 yt-dlp==2026.8.19 \
+    && /opt/media-venv/bin/pip install --disable-pip-version-check \
+        --cache-dir=/root/.cache/pip \
+        paddleocr==3.7.0 faster-whisper==1.2.1 yt-dlp==2026.8.19 \
     && useradd --system --uid 10001 app \
     && mkdir -p /data/media-models \
     && chown -R app:app /data /opt/media-venv
 WORKDIR /app
-COPY --from=builder /app/target/release/kindle-recipes /usr/local/bin/kindle-recipes
-COPY --from=builder /app/templates /app/templates
-COPY --from=builder /app/static /app/static
-COPY --from=builder /app/pi /app/pi
-COPY --from=builder /app/package.json /app/package.json
+COPY --from=builder /app/kindle-recipes /usr/local/bin/kindle-recipes
+COPY static /app/static
+COPY templates /app/templates
+COPY pi /app/pi
+COPY --from=pi-deps /app/package.json /app/package.json
 COPY --from=pi-deps /app/node_modules /app/node_modules
 USER app
 ENV PATH=/opt/media-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

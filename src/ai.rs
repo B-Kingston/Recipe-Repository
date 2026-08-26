@@ -5,10 +5,10 @@ use crate::media::{
 };
 use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
 use crate::{
-    AppError, AppState, AuthUser, ChartRecipe, Critique, DRAFT_HOURS, DebugUrlView, DraftTemplate,
-    GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView,
-    MediaDebugCardView, MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate,
-    MediaDebugTemplate, MediaImportForm, MediaImportRunTemplate, MediaImportTemplate,
+    AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
+    DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient,
+    IngredientUse, MediaDebugCaptureView, MediaDebugCardView, MediaDebugForm, MediaDebugRunRow,
+    MediaDebugRunTemplate, MediaDebugTemplate, MediaImportForm, MediaImportRunTemplate,
     ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source, generate_guidance, render, required,
     stamp, trim,
 };
@@ -25,17 +25,18 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::Write,
+    io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::Instant,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -49,64 +50,60 @@ pub(crate) async fn generate_recipe(
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
-    let pairwise_critique = f.pairwise_critique.is_some();
     match create_draft(
         &s,
         &user,
         None,
         "generate",
         &prompt,
-        pairwise_critique,
         DraftProvenance {
             attribution: None,
             evidence_json: None,
-            search_enabled: None,
+            search_mode: None,
         },
     )
     .await
     {
         Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
-        Err(e) => render(crate::AiFormTemplate {
-            heading: "New Recipe".into(),
+        Err(e) => render(crate::AddRecipeTemplate {
+            prompt_error: e.to_string(),
             guidance: generate_guidance(s.search_grounding).into(),
-            action: "/ai/generate".into(),
-            label: "What should this recipe be based on?".into(),
-            button: "Research & generate".into(),
-            cancel_url: "/".into(),
-            error: e.to_string(),
             prompt,
-            pairwise_critique,
+            video_error: String::new(),
+            url: String::new(),
+            notes: String::new(),
+            use_description: true,
+            use_audio: true,
+            use_ocr: true,
+            video_mode: false,
         })
         .map(IntoResponse::into_response),
     }
 }
-
-pub(crate) async fn import_page() -> Result<Html<String>> {
-    render(MediaImportTemplate {
-        error: String::new(),
-        url: String::new(),
-        notes: String::new(),
-        use_description: true,
-        use_audio: true,
-        use_ocr: true,
-    })
+pub(crate) async fn import_page() -> Redirect {
+    Redirect::to("/recipes/new?mode=video")
 }
 
-/// Re-renders the video-import form with an error, keeping the pasted URL,
-/// notes, and tick-box state so a failed import never loses input.
+/// Re-renders the combined add-recipe page with the video mode selected after
+/// an import error, keeping the pasted URL, notes, and tick-box state.
 fn render_import_error(
     error: impl Into<String>,
     url: &str,
     notes: &str,
     channels: MediaChannels,
+    search_grounding: bool,
 ) -> Response {
-    match render(MediaImportTemplate {
-        error: error.into(),
+    match render(AddRecipeTemplate {
+        prompt_error: String::new(),
+        guidance: generate_guidance(search_grounding).into(),
+        prompt: String::new(),
+        video_error: error.into(),
         url: url.to_string(),
         notes: notes.to_string(),
         use_description: channels.description,
         use_audio: channels.audio,
         use_ocr: channels.ocr,
+        video_mode: true,
     }) {
         Ok(html) => html.into_response(),
         Err(render_error) => render_error.into_response(),
@@ -137,6 +134,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     if raw_url.is_empty() {
@@ -145,6 +143,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     if !channels.any() {
@@ -153,6 +152,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     let source_url = match canonical_social_url(&raw_url) {
@@ -163,6 +163,7 @@ pub(crate) async fn import_recipe(
                 &raw_url,
                 &notes,
                 channels,
+                s.search_grounding,
             ));
         }
     };
@@ -172,6 +173,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     if let Err(error) = ensure_ai_configured(&s, &user).await {
@@ -180,6 +182,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     prune_debug_runs(&s.media_debug_runs);
@@ -189,6 +192,7 @@ pub(crate) async fn import_recipe(
             &raw_url,
             &notes,
             channels,
+            s.search_grounding,
         ));
     }
     let run_id = Uuid::new_v4().to_string();
@@ -278,11 +282,10 @@ async fn run_media_import(
             None,
             "generate",
             &prompt,
-            false,
             DraftProvenance {
                 attribution: Some(&source),
                 evidence_json: Some(&evidence_json),
-                search_enabled: Some(false),
+                search_mode: Some(SearchMode::GapFill),
             },
         )
         .await?;
@@ -353,6 +356,38 @@ Return exactly one JSON object with these keys and no others: {"title":"string",
 
 static MEDIA_IMPORT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+/// Keep the single-process app from spawning unbounded Node workers. Codex
+/// itself is serialized separately because OAuth refresh tokens may rotate.
+const AI_WORKER_CONCURRENCY: usize = 2;
+const PI_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11 * 60);
+const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const MEDIA_CLEANER_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4 * 60);
+static AI_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static CODEX_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+async fn acquire_ai_worker() -> Result<OwnedSemaphorePermit> {
+    AI_WORKER_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(AI_WORKER_CONCURRENCY)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Ai)
+}
+
+async fn acquire_codex_worker() -> Result<OwnedSemaphorePermit> {
+    CODEX_WORKER_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Ai)
+}
+
+async fn retry_backoff(attempt: usize) {
+    let millis = 500_u64.saturating_mul(1_u64 << attempt.min(3));
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
 async fn ensure_media_cleaner_configured(
     state: &AppState,
     user_id: &str,
@@ -418,11 +453,20 @@ async fn clean_media_evidence(
     let mut parsed: Option<Value> = None;
     let mut config_failed = false;
     for attempt in 0..=1 {
+        let ai_worker_permit = acquire_ai_worker().await?;
         let out = tokio::task::spawn_blocking({
             let worker_path = worker_path.clone();
             let payload = payload.clone();
             let gateway = gateway.clone();
-            move || run_pi_worker_for_cleaner(&worker_path, &payload, &gateway)
+            move || {
+                let _ai_worker_permit = ai_worker_permit;
+                run_pi_worker_for_cleaner(
+                    &worker_path,
+                    &payload,
+                    &gateway,
+                    MEDIA_CLEANER_WORKER_TIMEOUT,
+                )
+            }
         })
         .await
         .map_err(|_| AppError::Ai)?
@@ -433,20 +477,22 @@ async fn clean_media_evidence(
             break;
         }
         let code = value["code"].as_str().unwrap_or("worker");
+        let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
         if code == "configuration" {
             config_failed = true;
             break;
         }
-        if attempt == 0 {
+        if attempt == 0 && retryable {
             warn!(attempt, "AI Gateway media cleaner failed; retrying once");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            retry_backoff(attempt).await;
             continue;
         }
         error!(
             code,
+            retryable,
             status = %out.status,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "AI Gateway media cleaner failed after retry"
+            "AI Gateway media cleaner failed"
         );
         return Err(AppError::Ai);
     }
@@ -496,7 +542,6 @@ pub(crate) async fn alter_page(
         cancel_url: format!("/recipes/{id}"),
         error: String::new(),
         prompt: String::new(),
-        pairwise_critique: false,
     })
 }
 
@@ -508,7 +553,6 @@ pub(crate) async fn alter_recipe(
 ) -> Result<Response> {
     let recipe = find_recipe(&s.db, &user.id, &id).await?;
     let prompt = required(&f.prompt, "Comments")?;
-    let pairwise_critique = f.pairwise_critique.is_some();
     let snapshot = recipe_snapshot(&s.db, &user.id, &recipe).await?;
     let full = format!(
         "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
@@ -521,11 +565,10 @@ pub(crate) async fn alter_recipe(
         Some((&recipe.id, &recipe.updated_at)),
         "alter",
         &full,
-        pairwise_critique,
         DraftProvenance {
             attribution: None,
             evidence_json: None,
-            search_enabled: None,
+            search_mode: None,
         },
     )
     .await
@@ -540,7 +583,6 @@ pub(crate) async fn alter_recipe(
             cancel_url: format!("/recipes/{id}"),
             error: e.to_string(),
             prompt,
-            pairwise_critique,
         })
         .map(IntoResponse::into_response),
     }
@@ -551,7 +593,7 @@ pub(crate) async fn draft_page(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    render_draft_page(&s, &user, &id, "", "", false).await
+    render_draft_page(&s, &user, &id, "", "").await
 }
 
 /// Alters the recipe held in a draft, opening the result as a new draft.
@@ -576,7 +618,6 @@ pub(crate) async fn alter_draft(
             draft.base_updated_at.as_deref().unwrap_or_default(),
         )
     });
-    let pairwise_critique = f.pairwise_critique.is_some();
     let inherited_evidence = if draft.evidence_json.trim().is_empty() {
         None
     } else {
@@ -597,23 +638,20 @@ pub(crate) async fn alter_draft(
         base,
         "alter",
         &full,
-        pairwise_critique,
         DraftProvenance {
             attribution: inherited_source.as_ref(),
             evidence_json: inherited_evidence_json,
-            search_enabled: if draft.evidence_json.trim().is_empty() {
+            search_mode: if draft.evidence_json.trim().is_empty() {
                 None
             } else {
-                Some(false)
+                Some(SearchMode::GapFill)
             },
         },
     )
     .await
     {
         Ok(new_id) => Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response()),
-        Err(e) => {
-            render_draft_page(&s, &user, &id, &e.to_string(), &prompt, pairwise_critique).await
-        }
+        Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
     }
 }
 
@@ -623,17 +661,11 @@ async fn render_draft_page(
     id: &str,
     error: &str,
     prompt: &str,
-    pairwise_critique: bool,
 ) -> Result<Response> {
     let draft = find_draft(&state.db, &user.id, id).await?;
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
-    let critique = if draft.critique_json.is_empty() {
-        None
-    } else {
-        Some(serde_json::from_str(&draft.critique_json).map_err(|_| AppError::Ai)?)
-    };
     let evidence = if draft.evidence_json.trim().is_empty() {
         None
     } else {
@@ -650,8 +682,6 @@ async fn render_draft_page(
         evidence,
         error: error.to_string(),
         prompt: prompt.to_string(),
-        pairwise_critique,
-        critique,
     })
     .map(IntoResponse::into_response)
 }
@@ -786,10 +816,66 @@ pub(crate) async fn cancel_draft(
     Ok(Redirect::to("/").into_response())
 }
 
+/// Web-search posture for one generation call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchMode {
+    /// No web_search tool; the model answers from knowledge alone.
+    Off,
+    /// Research first; the response must cite web-search sources.
+    Grounded,
+    /// Imported social-video evidence can be incomplete or garbled: the
+    /// web_search tool is attached to fill gaps, but an unsourced answer
+    /// stays valid because the social post itself is the attribution.
+    GapFill,
+}
+
+impl SearchMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Off => "off",
+            SearchMode::Grounded => "grounded",
+            SearchMode::GapFill => "gapfill",
+        }
+    }
+
+    /// Only grounded generation hard-requires cited sources. Gap-fill calls
+    /// may stay unsourced when the cleaned video evidence alone suffices;
+    /// create_draft appends the social post as the attribution source.
+    pub(crate) fn requires_sources(self) -> bool {
+        matches!(self, SearchMode::Grounded)
+    }
+}
+
+/// System prompt matching each search posture.
+pub(crate) fn system_recipe_prompt(search_mode: SearchMode) -> &'static str {
+    match search_mode {
+        SearchMode::Off => RECIPE_PROMPT,
+        SearchMode::Grounded => GROUNDED_RECIPE_PROMPT,
+        SearchMode::GapFill => EVIDENCE_RECIPE_PROMPT,
+    }
+}
+
+/// Extra instruction appended when a generation attempt fails validation.
+pub(crate) fn retry_guidance(search_mode: SearchMode) -> &'static str {
+    match search_mode {
+        SearchMode::Off => {
+            "\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
+        }
+        SearchMode::Grounded => {
+            "\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
+        }
+        SearchMode::GapFill => {
+            "\n\nImportant: fill every gap the video evidence leaves open — research similar recipes with web_search wherever the evidence is incomplete or implausible — and return the complete recipe as valid JSON matching the requested schema."
+        }
+    }
+}
+
 struct DraftProvenance<'a> {
     attribution: Option<&'a Source>,
     evidence_json: Option<&'a str>,
-    search_enabled: Option<bool>,
+    /// Generation-time search posture; `None` follows the global
+    /// `PI_SEARCH_ENABLED` grounding setting.
+    search_mode: Option<SearchMode>,
 }
 
 async fn create_draft(
@@ -798,12 +884,15 @@ async fn create_draft(
     base: Option<(&str, &str)>,
     operation: &str,
     prompt: &str,
-    pairwise_critique: bool,
     provenance: DraftProvenance<'_>,
 ) -> Result<String> {
-    let search_enabled = provenance.search_enabled.unwrap_or(state.search_grounding);
-    let (generated_recipe, mut sources, suggestions, critique) =
-        pi_recipe(state, user, prompt, pairwise_critique, search_enabled).await?;
+    let search_mode = provenance.search_mode.unwrap_or(if state.search_grounding {
+        SearchMode::Grounded
+    } else {
+        SearchMode::Off
+    });
+    let (generated_recipe, mut sources, suggestions) =
+        pi_recipe(state, user, prompt, search_mode).await?;
     if let Some(attribution) = provenance.attribution {
         sources.push(attribution.clone());
         sources = dedupe_sources(sources);
@@ -814,11 +903,7 @@ async fn create_draft(
         .bind(now.to_rfc3339())
         .execute(&state.db)
         .await?;
-    let critique_json = match &critique {
-        Some(c) => serde_json::to_string(c).map_err(|_| AppError::Ai)?,
-        None => String::new(),
-    };
-    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at,critique_json,evidence_json)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at,evidence_json)VALUES(?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(base.map(|(recipe_id, _)| recipe_id))
         .bind(operation)
@@ -829,7 +914,6 @@ async fn create_draft(
         .bind(&user.id)
         .bind(now.to_rfc3339())
         .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
-        .bind(critique_json)
         .bind(provenance.evidence_json.unwrap_or_default())
         .execute(&state.db)
         .await?;
@@ -840,47 +924,37 @@ async fn pi_recipe(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
-    pairwise_critique: bool,
-    search_enabled: bool,
-) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
+    search_mode: SearchMode,
+) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
     let provider = crate::ai_provider(&state.db).await?;
     if provider != "pi" {
         let endpoint = crate::find_endpoint(&state.db, &user.id, &provider)
             .await?
             .ok_or(AppError::AiNotConfigured)?;
-        return endpoint_recipe(state, &endpoint, prompt, pairwise_critique, search_enabled).await;
+        return endpoint_recipe(state, &endpoint, prompt, search_mode).await;
     }
     let mut credential = crate::codex_credential(&state.db, &user.id)
         .await?
         .ok_or(AppError::AiNotConfigured)?;
     let model = crate::selected_model(&state.db, &state.model).await?;
     let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
+    let mut codex_worker_permit = Some(acquire_codex_worker().await?);
     for attempt in 0..2 {
         let input = if attempt == 0 {
             prompt.to_string()
-        } else if search_enabled {
-            format!(
-                "{prompt}\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
-            )
         } else {
-            format!(
-                "{prompt}\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
-            )
+            format!("{prompt}{}", retry_guidance(search_mode))
         };
         let system_prompt = format!(
             "{}\n\nRecipe JSON schema:\n{}",
-            if search_enabled {
-                GROUNDED_RECIPE_PROMPT
-            } else {
-                RECIPE_PROMPT
-            },
+            system_recipe_prompt(search_mode),
             recipe_schema()
         );
         info!(
             provider = "codex",
             model = %model,
             reasoning_effort = %effort,
-            search_enabled,
+            search_mode = search_mode.as_str(),
             attempt,
             prompt = %input,
             system_prompt = %system_prompt,
@@ -892,11 +966,22 @@ async fn pi_recipe(
             "systemPrompt": system_prompt,
             "model": model,
             "reasoningEffort": effort,
-            "searchEnabled": search_enabled,
-            "pairwiseCritique": pairwise_critique,
+            "searchMode": search_mode.as_str(),
         });
-        let (output, refreshed) =
-            run_pi_worker_with_credential(state, &credential, &request).await?;
+        let ai_worker_permit = acquire_ai_worker().await?;
+        let codex_permit = codex_worker_permit
+            .take()
+            .expect("Codex worker permit must be available for each attempt");
+        let (output, refreshed, returned_codex_permit) = run_pi_worker_with_credential(
+            state,
+            &credential,
+            &request,
+            PI_WORKER_TIMEOUT,
+            ai_worker_permit,
+            codex_permit,
+        )
+        .await?;
+        codex_worker_permit = Some(returned_codex_permit);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if let Some(refreshed) = refreshed
             && refreshed != credential
@@ -908,15 +993,17 @@ async fn pi_recipe(
         if !output.status.success() {
             let code = value["code"].as_str().unwrap_or("worker");
             let message = value["error"].as_str().unwrap_or("no message");
-            if code == "configuration" || attempt == 1 {
-                error!(code, message, status = %output.status, elapsed_ms, "Pi worker failed");
+            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
+            if code == "configuration" || attempt == 1 || !retryable {
+                error!(code, message, retryable, status = %output.status, elapsed_ms, "Pi worker failed");
                 return if code == "configuration" {
                     Err(AppError::AiNotConfigured)
                 } else {
                     Err(AppError::Ai)
                 };
             }
-            warn!(code, message, status = %output.status, elapsed_ms, "Pi worker failed; retrying with research guidance");
+            warn!(code, message, retryable, status = %output.status, elapsed_ms, "Pi worker failed; retrying with research guidance");
+            retry_backoff(attempt).await;
             continue;
         }
         info!(
@@ -928,7 +1015,7 @@ async fn pi_recipe(
             response = %value,
             "LLM response"
         );
-        match parse_pi_response(&value, search_enabled) {
+        match parse_pi_response(&value, search_mode.requires_sources()) {
             Ok(result) => return Ok(result),
             Err(error) => {
                 if attempt == 1 {
@@ -951,9 +1038,8 @@ async fn endpoint_recipe(
     state: &AppState,
     endpoint: &crate::Endpoint,
     prompt: &str,
-    pairwise_critique: bool,
-    search_enabled: bool,
-) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
+    search_mode: SearchMode,
+) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
     let model = if endpoint.model.trim().is_empty() {
         match endpoint.spec.as_str() {
             crate::ANTHROPIC_SPEC => crate::DEFAULT_ANTHROPIC_MODEL.to_string(),
@@ -966,29 +1052,19 @@ async fn endpoint_recipe(
     for attempt in 0..2 {
         let input = if attempt == 0 {
             prompt.to_string()
-        } else if search_enabled {
-            format!(
-                "{prompt}\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
-            )
         } else {
-            format!(
-                "{prompt}\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
-            )
+            format!("{prompt}{}", retry_guidance(search_mode))
         };
         let system_prompt = format!(
             "{}\n\nRecipe JSON schema:\n{}",
-            if search_enabled {
-                GROUNDED_RECIPE_PROMPT
-            } else {
-                RECIPE_PROMPT
-            },
+            system_recipe_prompt(search_mode),
             recipe_schema()
         );
         info!(
             provider = %endpoint.spec,
             model = %model,
             reasoning_effort = %effort,
-            search_enabled,
+            search_mode = search_mode.as_str(),
             attempt,
             prompt = %input,
             system_prompt = %system_prompt,
@@ -1003,29 +1079,39 @@ async fn endpoint_recipe(
             "systemPrompt": system_prompt,
             "model": model,
             "reasoningEffort": effort,
-            "searchEnabled": search_enabled,
-            "pairwiseCritique": pairwise_critique,
+            "searchMode": search_mode.as_str(),
         });
         let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
         let worker_path = state.pi_worker_path.clone();
-        let output = tokio::task::spawn_blocking(move || run_pi_worker(&worker_path, &payload))
-            .await
-            .map_err(|_| AppError::Ai)?
-            .map_err(|_| AppError::Ai)?;
+        let ai_worker_permit = acquire_ai_worker().await?;
+        let output = tokio::task::spawn_blocking(move || {
+            let _ai_worker_permit = ai_worker_permit;
+            run_pi_worker(&worker_path, &payload)
+        })
+        .await
+        .map_err(|_| AppError::Ai)?
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                error!(%error, "Endpoint worker timed out");
+            }
+            AppError::Ai
+        })?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
         if !output.status.success() {
             let code = value["code"].as_str().unwrap_or("worker");
             let message = value["error"].as_str().unwrap_or("no message");
-            if code == "configuration" || attempt == 1 {
-                error!(code, message, status = %output.status, elapsed_ms, "Endpoint worker failed");
+            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
+            if code == "configuration" || attempt == 1 || !retryable {
+                error!(code, message, retryable, status = %output.status, elapsed_ms, "Endpoint worker failed");
                 return if code == "configuration" {
                     Err(AppError::AiNotConfigured)
                 } else {
                     Err(AppError::Ai)
                 };
             }
-            warn!(code, message, status = %output.status, elapsed_ms, "Endpoint worker failed; retrying with research guidance");
+            warn!(code, message, retryable, status = %output.status, elapsed_ms, "Endpoint worker failed; retrying with research guidance");
+            retry_backoff(attempt).await;
             continue;
         }
         info!(
@@ -1037,7 +1123,7 @@ async fn endpoint_recipe(
             response = %value,
             "LLM response"
         );
-        match parse_pi_response(&value, search_enabled) {
+        match parse_pi_response(&value, search_mode.requires_sources()) {
             Ok(result) => return Ok(result),
             Err(error) => {
                 if attempt == 1 {
@@ -1051,25 +1137,34 @@ async fn endpoint_recipe(
     Err(AppError::Ai)
 }
 
-fn run_pi_worker(worker_path: &str, payload: &[u8]) -> std::io::Result<std::process::Output> {
+fn run_pi_worker(worker_path: &str, payload: &[u8]) -> io::Result<std::process::Output> {
+    run_pi_worker_with_timeout(worker_path, payload, PI_WORKER_TIMEOUT)
+}
+
+fn run_pi_worker_with_timeout(
+    worker_path: &str,
+    payload: &[u8],
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
     let mut command = pi_worker_command(worker_path);
     // Only a cleaner worker may receive the gateway credential.
     command
         .env_remove("AI_GATEWAY_API_KEY")
         .env_remove("AI_GATEWAY_BASE_URL");
-    run_pi_worker_command(command, payload)
+    run_pi_worker_command(command, payload, timeout)
 }
 
 fn run_pi_worker_for_cleaner(
     worker_path: &str,
     payload: &[u8],
     gateway: &crate::AiGatewayCredential,
-) -> std::io::Result<std::process::Output> {
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
     let mut command = pi_worker_command(worker_path);
     command
         .env("AI_GATEWAY_API_KEY", &gateway.api_key)
         .env("AI_GATEWAY_BASE_URL", &gateway.base_url);
-    run_pi_worker_command(command, payload)
+    run_pi_worker_command(command, payload, timeout)
 }
 
 fn pi_worker_command(worker_path: &str) -> Command {
@@ -1082,17 +1177,93 @@ fn pi_worker_command(worker_path: &str) -> Command {
     command
 }
 
+fn spawn_pipe_reader<R>(reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("Pi worker pipe reader panicked"))?
+}
+
+fn kill_and_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    let _ = child.kill();
+    child.wait()
+}
+
 fn run_pi_worker_command(
     mut command: Command,
     payload: &[u8],
-) -> std::io::Result<std::process::Output> {
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
     let mut child = command.spawn()?;
-    child
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Pi worker stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Pi worker stderr was not piped"))?;
+    let stdout_reader = spawn_pipe_reader(stdout);
+    let stderr_reader = spawn_pipe_reader(stderr);
+
+    let write_result = child
         .stdin
-        .as_mut()
-        .expect("Pi worker stdin is piped")
-        .write_all(payload)?;
-    let output = child.wait_with_output()?;
+        .take()
+        .ok_or_else(|| io::Error::other("Pi worker stdin was not piped"))
+        .and_then(|mut stdin| stdin.write_all(payload));
+    if let Err(error) = write_result {
+        let _ = kill_and_reap(&mut child);
+        let _ = join_pipe_reader(stdout_reader);
+        let _ = join_pipe_reader(stderr_reader);
+        return Err(error);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                break kill_and_reap(&mut child)?;
+            }
+            Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
+            Err(error) => {
+                let _ = kill_and_reap(&mut child);
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
+                return Err(error);
+            }
+        }
+    };
+
+    let stdout = join_pipe_reader(stdout_reader)?;
+    let stderr = join_pipe_reader(stderr_reader)?;
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Pi worker exceeded its {} second timeout",
+                timeout.as_secs()
+            ),
+        ));
+    }
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     for line in String::from_utf8_lossy(&output.stderr).lines() {
         let line = line.trim();
         if !line.is_empty() {
@@ -1100,6 +1271,16 @@ fn run_pi_worker_command(
         }
     }
     Ok(output)
+}
+
+struct TempAuthFile {
+    path: PathBuf,
+}
+
+impl Drop for TempAuthFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Runs the Pi worker with the database credential materialised as a private
@@ -1110,7 +1291,10 @@ async fn run_pi_worker_with_credential(
     state: &AppState,
     credential: &Value,
     request: &Value,
-) -> Result<(std::process::Output, Option<Value>)> {
+    timeout: std::time::Duration,
+    ai_worker_permit: OwnedSemaphorePermit,
+    codex_worker_permit: OwnedSemaphorePermit,
+) -> Result<(std::process::Output, Option<Value>, OwnedSemaphorePermit)> {
     let credential_json = serde_json::to_string(credential).map_err(|_| AppError::Ai)?;
     let temp_path =
         std::env::temp_dir().join(format!("kindle-recipes-auth-{}.json", Uuid::new_v4()));
@@ -1119,6 +1303,10 @@ async fn run_pi_worker_with_credential(
     let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
     let worker_path = state.pi_worker_path.clone();
     tokio::task::spawn_blocking(move || {
+        let _ai_worker_permit = ai_worker_permit;
+        let _cleanup = TempAuthFile {
+            path: temp_path.clone(),
+        };
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1127,16 +1315,21 @@ async fn run_pi_worker_with_credential(
             .map_err(|_| AppError::Ai)?;
         file.write_all(format!("{{\n  \"openai-codex\": {credential_json}\n}}\n").as_bytes())
             .map_err(|_| AppError::Ai)?;
-        let output = run_pi_worker(&worker_path, &payload);
-        let refreshed = std::fs::read_to_string(&temp_path).ok().and_then(|text| {
+        drop(file);
+        let output = run_pi_worker_with_timeout(&worker_path, &payload, timeout);
+        let refreshed = fs::read_to_string(&temp_path).ok().and_then(|text| {
             serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|value| value.get("openai-codex").cloned())
         });
-        let _ = std::fs::remove_file(&temp_path);
         output
-            .map(|output| (output, refreshed))
-            .map_err(|_| AppError::Ai)
+            .map(|output| (output, refreshed, codex_worker_permit))
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    error!(%error, "Pi worker timed out");
+                }
+                AppError::Ai
+            })
     })
     .await
     .map_err(|_| AppError::Ai)?
@@ -1152,9 +1345,19 @@ pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Resul
         Some(credential) => credential,
         None => return Ok(Vec::new()),
     };
-    let (output, refreshed) =
-        run_pi_worker_with_credential(state, &credential, &json!({ "command": "listModels" }))
-            .await?;
+    // Keep the same lock order as recipe generation: Codex first, then the
+    // general worker slot, so a catalogue refresh cannot deadlock a request.
+    let codex_worker_permit = acquire_codex_worker().await?;
+    let ai_worker_permit = acquire_ai_worker().await?;
+    let (output, refreshed, _codex_worker_permit) = run_pi_worker_with_credential(
+        state,
+        &credential,
+        &json!({ "command": "listModels" }),
+        MODEL_LIST_TIMEOUT,
+        ai_worker_permit,
+        codex_worker_permit,
+    )
+    .await?;
     if let Some(refreshed) = refreshed
         && refreshed != credential
     {
@@ -1180,6 +1383,7 @@ pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Resul
 /// How long a successfully fetched model catalogue stays usable before the
 /// Settings page triggers another background refresh.
 const MODEL_CATALOGUE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+static MODEL_CATALOGUE_REFRESH_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Returns the live Codex model catalogue when a fresh copy is cached; otherwise
 /// starts a background refresh and returns the stale cache (or an empty list on
@@ -1194,27 +1398,35 @@ pub(crate) async fn fresh_model_catalogue(state: &Arc<AppState>, user_id: &str) 
     {
         return cached.map(|catalogue| catalogue.models).unwrap_or_default();
     }
-    let state = state.clone();
-    let user_id = user_id.to_string();
-    tokio::spawn(async move {
-        match fetch_codex_models(&state, &user_id).await {
-            Ok(models) if !models.is_empty() => {
-                (*state.model_catalogue.lock()).replace(ModelCatalogue {
-                    models: models.clone(),
-                    refreshed_at: Instant::now(),
-                });
+    let refresh_permit = MODEL_CATALOGUE_REFRESH_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone()
+        .try_acquire_owned()
+        .ok();
+    if let Some(refresh_permit) = refresh_permit {
+        let state = state.clone();
+        let user_id = user_id.to_string();
+        tokio::spawn(async move {
+            let _refresh_permit = refresh_permit;
+            match fetch_codex_models(&state, &user_id).await {
+                Ok(models) if !models.is_empty() => {
+                    (*state.model_catalogue.lock()).replace(ModelCatalogue {
+                        models: models.clone(),
+                        refreshed_at: Instant::now(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "Codex model list refresh failed; keeping cached list"),
             }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "Codex model list refresh failed; keeping cached list"),
-        }
-    });
+        });
+    }
     cached.map(|catalogue| catalogue.models).unwrap_or_default()
 }
 
 pub(crate) fn parse_pi_response(
     value: &Value,
     require_grounding: bool,
-) -> Result<(GeneratedRecipe, Vec<Source>, String, Option<Critique>)> {
+) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
     let mut recipe: GeneratedRecipe =
         serde_json::from_value(value["recipe"].clone()).map_err(|parse_error| {
             warn!(error = %parse_error, "AI response recipe failed schema deserialisation");
@@ -1230,20 +1442,8 @@ pub(crate) fn parse_pi_response(
         warn!("AI response carried no grounded search sources");
         return Err(AppError::Ai);
     }
-    // The critique is auxiliary review material; a malformed one is dropped
-    // with a warning rather than failing an otherwise valid recipe.
-    let critique = match value.get("critique") {
-        None | Some(Value::Null) => None,
-        Some(value) => match serde_json::from_value::<Critique>(value.clone()) {
-            Ok(critique) => Some(critique),
-            Err(parse_error) => {
-                warn!(error = %parse_error, "AI response critique failed deserialisation; dropping it");
-                None
-            }
-        },
-    };
     normalize_generated(&mut recipe)?;
-    Ok((recipe, sources, String::new(), critique))
+    Ok((recipe, sources, String::new()))
 }
 
 pub(crate) fn recipe_schema() -> Value {

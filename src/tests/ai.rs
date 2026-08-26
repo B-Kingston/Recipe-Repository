@@ -1,6 +1,6 @@
 use crate::ai::{
-    dedupe_sources, import_recipe, normalize_generated, parse_pi_response, recipe_schema,
-    validate_generated,
+    SearchMode, dedupe_sources, import_recipe, normalize_generated, parse_pi_response,
+    recipe_schema, retry_guidance, system_recipe_prompt, validate_generated,
 };
 use crate::auth::AuthUser;
 use crate::media::MediaChannels;
@@ -133,11 +133,10 @@ fn pi_response_extracts_recipe_and_search_sources() {
         "recipe": recipe(),
         "sources": [{"title":"Toast","url":"https://example.com/toast"}]
     });
-    let (parsed, sources, suggestions, critique) = parse_pi_response(&response, true).unwrap();
+    let (parsed, sources, suggestions) = parse_pi_response(&response, true).unwrap();
     assert_eq!(parsed.title, "Toast");
     assert_eq!(sources.len(), 1);
     assert!(suggestions.is_empty());
-    assert!(critique.is_none());
 }
 
 #[test]
@@ -149,51 +148,29 @@ fn grounded_pi_response_requires_search_sources() {
 #[test]
 fn ungrounded_pi_response_accepts_no_sources() {
     let response = json!({"recipe": recipe(), "sources": []});
-    let (_, sources, suggestions, critique) = parse_pi_response(&response, false).unwrap();
+    let (_, sources, suggestions) = parse_pi_response(&response, false).unwrap();
     assert!(sources.is_empty());
     assert!(suggestions.is_empty());
-    assert!(critique.is_none());
 }
 
 #[test]
-fn pi_response_parses_optional_critique() {
-    let with_critique = json!({
-        "recipe": recipe(),
-        "sources": [],
-        "critique": {
-            "total": 4,
-            "resolved": 3,
-            "unresolved": ["pomegranate molasses"],
-            "pairCount": 3,
-            "coherencePercentile": 41.3,
-            "weakestPairs": [{"a": "tomato", "b": "saffron", "percentile": 13.7}],
-            "weakestIngredient": {"name": "saffron", "meanPercentile": 11.9},
-            "added": ["tofu"],
-            "removed": ["chicken"]
-        }
-    });
-    let (_, _, _, critique) = parse_pi_response(&with_critique, false).unwrap();
-    let critique = critique.expect("critique must parse");
-    assert_eq!(critique.total, 4);
-    assert_eq!(critique.pair_count, 3);
-    assert_eq!(critique.coherence_percentile, 41.3);
-    assert_eq!(critique.weakest_pairs.len(), 1);
-    assert_eq!(critique.weakest_pairs[0].a, "tomato");
+fn gap_fill_mode_researches_without_requiring_sources() {
     assert_eq!(
-        critique.weakest_ingredient.as_ref().unwrap().name,
-        "saffron"
+        system_recipe_prompt(SearchMode::GapFill),
+        crate::EVIDENCE_RECIPE_PROMPT
     );
-    assert_eq!(critique.added, vec!["tofu"]);
-    assert_eq!(critique.removed, vec!["chicken"]);
-
-    let without_critique = json!({"recipe": recipe(), "sources": []});
-    let (_, _, _, critique) = parse_pi_response(&without_critique, false).unwrap();
-    assert!(critique.is_none());
-
-    // A malformed critique is dropped with a warning, never failing the recipe.
-    let malformed = json!({"recipe": recipe(), "sources": [], "critique": "garbage"});
-    let (_, _, _, critique) = parse_pi_response(&malformed, false).unwrap();
-    assert!(critique.is_none());
+    assert_eq!(
+        system_recipe_prompt(SearchMode::Grounded),
+        crate::GROUNDED_RECIPE_PROMPT
+    );
+    assert_eq!(system_recipe_prompt(SearchMode::Off), crate::RECIPE_PROMPT);
+    assert!(!SearchMode::GapFill.requires_sources());
+    assert!(SearchMode::Grounded.requires_sources());
+    assert_eq!(SearchMode::GapFill.as_str(), "gapfill");
+    assert_eq!(SearchMode::Off.as_str(), "off");
+    let guidance = retry_guidance(SearchMode::GapFill);
+    assert!(guidance.contains("web_search"));
+    assert!(guidance.contains("gap the video evidence leaves open"));
 }
 
 async fn database() -> SqlitePool {
