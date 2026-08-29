@@ -13,6 +13,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -41,6 +42,7 @@ fn state(db: SqlitePool, runs: DebugRunMap) -> Arc<AppState> {
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
         media_debug_runs: runs,
+        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
 }
 

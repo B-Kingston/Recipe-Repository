@@ -15,7 +15,7 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, fs, sync::Arc};
 use tower::ServiceExt;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -44,6 +44,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
+        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
 }
 

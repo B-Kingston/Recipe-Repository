@@ -15,10 +15,26 @@
     {% endif %}
   </div>
   <div class="actions page-actions">
-    <form class="inline" method="post" action="/ai/drafts/{{ id }}/apply"><button class="primary">Save recipe</button></form>
+    {% if thumbs.is_empty() %}<form class="inline" method="post" action="/ai/drafts/{{ id }}/apply"><button class="primary">Save recipe</button></form>{% endif %}
     <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel"><button>Discard</button></form>
   </div>
 </header>
+{% if !thumbs.is_empty() %}
+<form class="panel thumb-picker" method="post" action="/ai/drafts/{{ id }}/apply">
+  <h2>Dish photo</h2>
+  <p class="muted">Picked locally from the clearest food shots in the video. Choose one for the library card, then save.</p>
+  <div class="thumb-options">
+    {% for thumb in thumbs %}
+    <label class="thumb-option">
+      <input type="radio" name="thumbnail" value="{{ thumb.index }}"{% if loop.first %} checked{% endif %}>
+      <img src="/ai/drafts/{{ id }}/thumb/{{ thumb.index }}" alt="Dish photo candidate {{ loop.index }}, about {{ thumb.seconds }} seconds into the video">
+      <span>~{{ thumb.seconds }}s</span>
+    </label>
+    {% endfor %}
+  </div>
+  <p class="actions form-actions"><button class="primary">Save recipe</button></p>
+</form>
+{% endif %}
 {% match evidence %}
 {% when Some with (evidence) %}
 <section class="panel evidence-panel">

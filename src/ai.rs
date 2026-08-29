@@ -3,7 +3,11 @@ use crate::media::{
     MediaDebug, MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence_debug,
     recipe_prompt as media_recipe_prompt,
 };
-use crate::recipes::{find_draft, find_recipe, recipe_snapshot};
+use crate::recipes::{
+    copy_draft_thumbnails, delete_draft_thumbnails, delete_expired_draft_thumbnails, find_draft,
+    find_draft_thumbnail_jpeg, find_draft_thumbnails, find_recipe, recipe_snapshot,
+    store_draft_thumbnails,
+};
 use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
     DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient,
@@ -251,7 +255,8 @@ async fn run_media_import(
             Arc::new(move |event| sink.record_event(event))
         };
         let observer = Arc::new(MediaDebug::new(0, frames_dir, emitter));
-        let extracted = extract_social_evidence_debug(&source_url, channels, observer).await?;
+        let (extracted, thumbnail_candidates) =
+            extract_social_evidence_debug(&source_url, channels, observer, true).await?;
 
         run.record_event(json!({ "url": 0, "kind": "status", "state": "cleaning evidence" }));
         run.record_event(json!({
@@ -289,6 +294,14 @@ async fn run_media_import(
             },
         )
         .await?;
+        if !thumbnail_candidates.is_empty() {
+            store_draft_thumbnails(&state.db, &id, &thumbnail_candidates).await?;
+            run.record_event(json!({
+                "url": 0,
+                "kind": "thumbnails",
+                "count": thumbnail_candidates.len(),
+            }));
+        }
         Ok(id)
     }
     .await;
@@ -650,7 +663,11 @@ pub(crate) async fn alter_draft(
     )
     .await
     {
-        Ok(new_id) => Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response()),
+        Ok(new_id) => {
+            // Keep the dish-photo picker available while the chain runs.
+            copy_draft_thumbnails(&s.db, &id, &new_id).await?;
+            Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response())
+        }
         Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
     }
 }
@@ -674,12 +691,21 @@ async fn render_draft_page(
                 .map_err(|_| AppError::Ai)?,
         )
     };
+    let thumbs = find_draft_thumbnails(&state.db, &user.id, id)
+        .await?
+        .into_iter()
+        .map(|thumb| crate::DraftThumbView {
+            index: thumb.idx.max(0) as usize,
+            seconds: thumb.seconds.max(0) as u64,
+        })
+        .collect();
     render(DraftTemplate {
         id: id.to_string(),
         recipe,
         sources: serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?,
         suggestions: draft.search_suggestions,
         evidence,
+        thumbs,
         error: error.to_string(),
         prompt: prompt.to_string(),
     })
@@ -690,6 +716,7 @@ pub(crate) async fn apply_draft(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
+    Form(f): Form<crate::ApplyDraftForm>,
 ) -> Result<Response> {
     let draft = find_draft(&s.db, &user.id, &id).await?;
     let mut recipe: GeneratedRecipe =
@@ -794,6 +821,40 @@ pub(crate) async fn apply_draft(
             .execute(&mut *tx)
             .await?;
     }
+    // Copy the chosen candidate onto the recipe inside the same transaction;
+    // an absent or empty choice leaves any existing photo untouched.
+    if let Some(choice) = f
+        .thumbnail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let idx: i64 = choice.parse().map_err(|_| {
+            AppError::BadRequest("The selected dish photo was not recognised.".into())
+        })?;
+        let jpeg: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT t.jpeg FROM draft_thumbnails t
+             JOIN ai_drafts d ON d.id=t.draft_id
+             WHERE d.id=? AND d.user_id=? AND t.idx=?",
+        )
+        .bind(&id)
+        .bind(&user.id)
+        .bind(idx)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(jpeg) = jpeg {
+            sqlx::query("UPDATE recipes SET thumbnail_jpeg=? WHERE id=? AND user_id=?")
+                .bind(&jpeg)
+                .bind(&recipe_id)
+                .bind(&user.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(&id)
         .bind(&user.id)
@@ -803,11 +864,27 @@ pub(crate) async fn apply_draft(
     Ok(Redirect::to(&format!("/recipes/{recipe_id}")).into_response())
 }
 
+/// Serves one candidate JPEG for a live draft. Ownership and expiry ride on
+/// the same guarded draft lookup the preview page uses; the bytes themselves
+/// are never logged.
+pub(crate) async fn draft_thumbnail(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, idx)): Path<(String, usize)>,
+) -> Result<Response> {
+    find_draft(&s.db, &user.id, &id).await?;
+    let jpeg = find_draft_thumbnail_jpeg(&s.db, &user.id, &id, idx as i64)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(crate::image_response(jpeg))
+}
+
 pub(crate) async fn cancel_draft(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
+    delete_draft_thumbnails(&s.db, &id).await?;
     sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(id)
         .bind(&user.id)
@@ -899,6 +976,7 @@ async fn create_draft(
     }
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
+    delete_expired_draft_thumbnails(&state.db, &now.to_rfc3339()).await?;
     sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
         .bind(now.to_rfc3339())
         .execute(&state.db)
@@ -2063,8 +2141,9 @@ pub(crate) async fn media_debug_start(
                 run.dir.join("frames").join(index.to_string()),
                 emitter,
             ));
-            match extract_social_evidence_debug(&url, MediaChannels::default(), debug).await {
-                Ok(extracted) => {
+            match extract_social_evidence_debug(&url, MediaChannels::default(), debug, false).await
+            {
+                Ok((extracted, _)) => {
                     run.record_event(json!({
                         "url": index,
                         "kind": "status",

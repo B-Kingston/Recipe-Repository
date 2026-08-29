@@ -15,6 +15,7 @@ Single-process Axum 0.8 app (crate `kindle-recipes`, edition 2024, binary-only �
 - `src/ai.rs` — Pi/Codex generation pipeline: draft create/alter/apply/cancel handlers, `pi_recipe`, `run_pi_worker(_with_credential)`, model catalogue, `recipe_schema` / `validate_generated` / `normalize_generated` / `dedupe_sources`.
 - `src/recipes.rs` — recipe CRUD handlers **and all SQL accessor helpers** (`find_recipe`, `blocks`, `step_ingredients`, `sources`, `find_draft`, `recipe_snapshot`, …).
 - `src/chart.rs` — pure cooking-flow chart builder (`build_chart`, `selected_chart_step`), no I/O.
+- `src/thumbs.rs` — local dish-thumbnail pipeline for video imports: ffmpeg frame sampling, pixel scoring, diversity selection, square cropping. Pure functions are unit-tested inline; one integration test needs ffmpeg (present in the Docker builder stage).
 
 **AppState** is `Arc`-shared into every handler: `db: SqlitePool`, `model`, `pi_worker_path`, `auth_script_path`, `search_grounding: bool`, and `codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>` for in-flight device-code flows.
 
@@ -28,6 +29,7 @@ Key invariants:
 
 - AI output must pass `validate_generated` (every ingredient used exactly once, `inputSteps` only reference earlier steps, …) before any draft is saved.
 - `recipes.chart_json` is AI-derived only; any manual block edit MUST call `invalidate_chart` so the viewer falls back to linear inference.
+- Dish thumbnails come only from two local paths — the ffmpeg scoring pipeline during an import, or a user-uploaded image normalised through ffmpeg on the recipe card — never a cloud service. Draft candidates live in `draft_thumbnails` and recipe re-pick candidates in `recipe_thumbnail_candidates`; both MUST die when consumed (apply/choose/remove/discard/expiry). Only chosen JPEGs are copied into `recipes.thumbnail_jpeg`. Thumbnail bytes are served exclusively to the owning user and never logged. In-flight re-pick runs are tracked only by the in-memory `AppState.thumbnail_jobs` set, so a restart drops "pending" back to idle.
 - The Codex credential is DB-only; Pi SDK invocations MUST use `run_pi_worker_with_credential`, never a fixed-path credential file.
 - Endpoint API keys live in the `ai_endpoints` table, never in env or config; templates only ever receive the masked tail (`mask_key`), and the add/switch/delete handlers (`add_endpoint` / `update_settings` / `delete_endpoint`) are the only mutators. Deleting the active endpoint falls `ai_provider` back to `"pi"`; `reconcile_ai_provider` heals stale values at startup.
 - LLM call logging: every generation logs the full request (provider, model, attempt, prompt, system prompt) and the full response (recipe + sources JSON, elapsed ms) at `info` level, and the worker's stderr is forwarded into the app log, so `docker compose logs` shows the whole call. Only selected fields are logged — `apiKey`/`authPath` never appear.
@@ -37,7 +39,7 @@ Key invariants:
 
 | Path | Purpose |
 |---|---|
-| `src/` | Rust binary crate: `main.rs` (bootstrap/router/shared types), `auth.rs` (setup + basic auth + password change), `ai.rs`, `recipes.rs`, `chart.rs` |
+| `src/` | Rust binary crate: `main.rs` (bootstrap/router/shared types), `auth.rs` (setup + basic auth + password change), `ai.rs`, `recipes.rs`, `chart.rs`, `thumbs.rs` |
 | `src/tests/` | Rust unit-test tree (wired via `#[cfg(test)] mod tests;` in `main.rs`) |
 | `pi/` | Node ESM sidecar: `recipe-worker.mjs` (entry), `codex-auth.mjs` (device-flow CLI), `codex-native-search.mjs` (pure lib) + `*.test.mjs` |
 | `templates/` | Askama HTML templates, `base.html` parent + `{% block %}` children |
@@ -76,20 +78,20 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 - `src/auth.rs` — setup page, HTTP Basic auth middleware, Argon2 hashing, password change handlers.
 - `Cargo.toml` / `Dockerfile` / `compose.yaml` / `deploy.sh` / `.env.example` — build, deploy, env contract.
 - `pi/recipe-worker.mjs` — the worker protocol contract: stdin JSON `{prompt, systemPrompt, model, reasoningEffort, searchMode, authPath}` with `provider: "openai"` (adds `apiBaseUrl`/`apiKey`, Responses API) or `"anthropic"` (Messages API, thinking budget per effort, web_search tool), or `{command: "listModels"}`; `searchMode` is `off|grounded|gapfill` — `grounded` must research and cite, `gapfill` attaches `web_search` without requiring it (From Video imports fill gaps in untrusted evidence; sources stay optional because the social post is appended as attribution). stdout `{recipe, sources}` or `{error, code}` (`code: "configuration"` → `AiNotConfigured`). `reasoningEffort` is `low|medium|high|xhigh|max`, default `low` (`xhigh`/`max` are capped at the highest available thinking budget for Anthropic endpoints).
-- `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`, `0006_users.sql` adds the `users` table for basic auth, and `0008_ai_endpoints.sql` adds the `ai_endpoints` registry (OpenAI/Anthropic-spec endpoints with keys).
+- `migrations/0001_initial.sql` — core schema (`recipes`, `recipe_blocks`, `recipe_sources`, `ai_drafts`); later migrations add `recipe_step_ingredients`, `recipes.chart_json`, `pi_credentials`, `app_settings`, `0006_users.sql` adds the `users` table for basic auth, `0008_ai_endpoints.sql` adds the `ai_endpoints` registry (OpenAI/Anthropic-spec endpoints with keys), and `0011_recipe_thumbnails.sql` adds `recipes.thumbnail_jpeg` plus the expiring `draft_thumbnails` candidates.
 - `templates/recipe.html` — largest template: inline edit forms, block move/delete, chart view. `templates/setup.html` and `templates/password_reset.html` are the auth screens.
 
 ## Runtime/Tooling Preferences
 
 - **Rust**: edition 2024 (needs ≥ 1.85; Docker pins `rust:1.88-slim`). glibc, not musl. `sqlx` 0.8 no-default-features (tokio-rustls, sqlite, migrate); `reqwest` with rustls (no native-tls).
 - **Node**: ≥ 22 (`node:22-bookworm-slim` runtime image), ESM (`"type": "module"`), npm; `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` pinned together at `0.83.0` — keep them in lockstep.
-- **Env vars** (`.env.example`): `DATABASE_URL` (`sqlite:/data/recipes.sqlite3`), `APP_BIND` (`0.0.0.0:3000`), `PI_MODEL` (`gpt-5.4-mini`), `PI_SEARCH_ENABLED` (default `true`), `RUST_LOG` (`kindle_recipes=info,tower_http=info`), optional `PI_WORKER_PATH` / `PI_AUTH_SCRIPT_PATH` / `PI_CODING_AGENT_DIR`. No OAuth tokens in `.env` — the Codex credential lives in the DB.
+- **Env vars** (`.env.example`): `DATABASE_URL` (`sqlite:/data/recipes.sqlite3`), `APP_BIND` (`0.0.0.0:3000`), `PI_MODEL` (`gpt-5.4-mini`), `PI_SEARCH_ENABLED` (default `true`), `THUMBNAILS_ENABLED` (default `true`; disables dish-photo candidate extraction when false), `RUST_LOG` (`kindle_recipes=info,tower_http=info`), optional `PI_WORKER_PATH` / `PI_AUTH_SCRIPT_PATH` / `PI_CODING_AGENT_DIR`. No OAuth tokens in `.env` — the Codex credential lives in the DB.
 - Migrations run via compile-time embedded `sqlx::migrate!()`; any schema change is a new numbered `migrations/000N_*.sql`.
 - `.agents/` skills are coding-agent tooling, excluded from the Docker image.
 
 ## Testing & QA
 
-- **Rust** (`cargo test`): unit tests in `src/tests/` (`ai.rs`, `auth.rs`, `chart.rs`, `config.rs`, `recipes.rs`) plus inline `mod model_tests` in `main.rs`. Use `#[tokio::test]`; handler tests in `src/tests/recipes.rs` drive axum `State`/`Path` directly against in-memory SQLite with `sqlx::migrate!()` — reuse its `database()` / `state()` helpers. `src/tests/auth.rs` covers setup, basic-auth middleware (challenge, per-user scoping), legacy Codex credential import, and the password-change flow (wrong current password, hash replacement, router accepting the new password). Env-var tests MUST take the static `ENV_LOCK: Mutex<()>` in `src/tests/config.rs` (and note `unsafe std::env::set_var` in edition 2024).
+- **Rust** (`cargo test`): unit tests in `src/tests/` (`ai.rs`, `auth.rs`, `chart.rs`, `config.rs`, `media.rs`, `recipes.rs`, `settings.rs`, `thumbs.rs`) plus inline test modules in `main.rs`, `media.rs`, and `thumbs.rs`. Use `#[tokio::test]`; handler tests in `src/tests/recipes.rs` drive axum `State`/`Path` directly against in-memory SQLite with `sqlx::migrate!()` — reuse its `database()` / `state()` helpers. `src/tests/auth.rs` covers setup, basic-auth middleware (challenge, per-user scoping), legacy Codex credential import, and the password-change flow (wrong current password, hash replacement, router accepting the new password). Env-var tests MUST take the static `ENV_LOCK: Mutex<()>` in `src/tests/config.rs` (and note `unsafe std::env::set_var` in edition 2024).
 - **Node** (`npm test`): built-in `node:test` across `pi/*.test.mjs`. Mocking is HTTP-level: swap `globalThis.fetch` (codex-auth), inject a `fetchImpl` parameter (codex-native-search), or test pure functions (recipe-worker). No test framework deps, no coverage thresholds.
 - Touch the worker protocol → run the `pi/*.test.mjs` suites; touch validation/schema → run `cargo test`.
 - Intended full validation: `docker compose up --build`, then visit `/healthz`, create a recipe, edit and reorder blocks, and test one AI preview with a real API key.

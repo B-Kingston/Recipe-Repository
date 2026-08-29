@@ -530,3 +530,23 @@ input[type=checkbox] { width: auto; box-shadow: none; }
 .debug-final-list li { margin: 3px 0; }
 .debug-phase { margin-top: 12px; }
 .debug-phase h3 { margin-bottom: 4px; }
+
+/* Dish-photo picker on the draft preview, plus library-card thumbnails.
+   Candidates are square server-side, so no client-side cropping is needed. */
+.thumb-picker { width: min(100%, 780px); margin: 24px auto 0; padding: 17px 20px; background: #f1f5ee; }
+.thumb-picker h2 { margin: 0; }
+.thumb-picker .muted { margin: 4px 0 12px; }
+.thumb-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.thumb-option { display: grid; justify-items: center; row-gap: 6px; margin: 0; padding: 8px; border: var(--line) solid var(--ink); background: var(--paper); font: 700 12px/1 var(--sans); cursor: pointer; }
+.thumb-option input { width: auto; margin: 0; box-shadow: none; }
+.thumb-option img { display: block; width: 100%; height: auto; border: 1px solid var(--wash); }
+.thumb-option input:checked + img { outline: 3px solid var(--ink); outline-offset: -3px; }
+.thumb-option input:focus-visible + img { outline: 3px dashed var(--mid); outline-offset: -3px; }
+.recipe-thumb { display: block; width: 42px; height: 42px; object-fit: cover; border: 1px solid currentColor; }
+
+/* Dish-photo management on the recipe card. */
+.thumb-manage { width: min(100%, 780px); margin: 26px auto 0; padding: 17px 20px; }
+.thumb-manage h2 { margin: 0 0 10px; }
+.thumb-current { display: block; width: min(100%, 280px); margin-bottom: 12px; border: var(--line) solid var(--ink); }
+.thumb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.thumb-upload input[type=file] { width: auto; max-width: 260px; padding: .45rem; font-size: 13px; }

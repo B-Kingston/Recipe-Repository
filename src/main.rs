@@ -2,6 +2,7 @@ use askama::Template;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Form, Path, State},
+    http::header,
     middleware,
     response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
@@ -16,7 +17,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     io::{Read, Write},
     net::SocketAddr,
@@ -34,20 +35,22 @@ mod auth;
 mod chart;
 mod media;
 mod recipes;
+mod thumbs;
 use auth::{
     AuthUser, auth_middleware, reset_password, reset_password_page, setup_create, setup_page,
 };
 
 use ai::{
     DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
-    fresh_model_catalogue, generate_page, generate_recipe, import_events, import_frame,
-    import_page, import_recipe, import_run_page, media_debug_events, media_debug_frame,
-    media_debug_page, media_debug_run_page, media_debug_start,
+    draft_thumbnail, fresh_model_catalogue, generate_page, generate_recipe, import_events,
+    import_frame, import_page, import_recipe, import_run_page, media_debug_events,
+    media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
 };
 use media::MediaEvidence;
 use recipes::{
-    add_block, delete_block, delete_page, delete_recipe, home, move_block, new_recipe, recipe_page,
-    update_block, update_recipe,
+    add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
+    discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_thumbnail,
+    remove_thumbnail, start_thumbnail_recompute, update_block, update_recipe, upload_thumbnail,
 };
 
 const DRAFT_HOURS: i64 = 24;
@@ -101,6 +104,9 @@ struct AppState {
     codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>,
     model_catalogue: Arc<Mutex<Option<ModelCatalogue>>>,
     media_debug_runs: DebugRunMap,
+    /// Recipe ids with a dish-photo frame run in flight; in-memory only, so
+    /// a restart simply drops any "pending" state back to idle.
+    thumbnail_jobs: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Last known Codex model catalogue, refreshed in the background so page
@@ -277,7 +283,7 @@ struct ChartView {
 #[derive(Template)]
 #[template(path = "home.html")]
 struct HomeTemplate {
-    recipes: Vec<Recipe>,
+    recipes: Vec<crate::recipes::LibraryCard>,
 }
 #[derive(Template)]
 #[template(path = "setup.html")]
@@ -300,6 +306,10 @@ struct RecipeTemplate {
     chart: ChartView,
     chart_view: bool,
     edit_meta: bool,
+    has_photo: bool,
+    thumb_state: String,
+    can_pick_video_frames: bool,
+    thumb_options: Vec<DraftThumbView>,
     servings_value: String,
     prep_value: String,
     cook_value: String,
@@ -354,6 +364,7 @@ struct DraftTemplate {
     sources: Vec<Source>,
     suggestions: String,
     evidence: Option<MediaEvidence>,
+    thumbs: Vec<DraftThumbView>,
     error: String,
     prompt: String,
 }
@@ -460,7 +471,7 @@ struct RecipeForm {
     cook_minutes: String,
 }
 #[derive(Deserialize)]
-struct SetupForm {
+pub(crate) struct SetupForm {
     username: String,
     password: String,
 }
@@ -482,6 +493,37 @@ struct BlockForm {
 struct PromptForm {
     prompt: String,
 }
+/// Which dish-photo candidate (if any) the user chose on the draft preview.
+#[derive(Deserialize)]
+pub(crate) struct ApplyDraftForm {
+    pub(crate) thumbnail: Option<String>,
+}
+
+/// Which frame candidate the user picked for an existing recipe.
+#[derive(Deserialize)]
+pub(crate) struct ThumbnailPickForm {
+    pub(crate) choice: String,
+}
+
+/// One candidate offered on the draft preview; `index` is the storage slot.
+pub(crate) struct DraftThumbView {
+    pub(crate) index: usize,
+    pub(crate) seconds: u64,
+}
+
+/// Shared image response for locally produced JPEG bytes. Cache headers stay
+/// private: every thumbnail is behind the single-user Basic auth realm.
+pub(crate) fn image_response(jpeg: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=300"),
+        ],
+        jpeg,
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct MediaImportForm {
     url: String,
@@ -581,6 +623,8 @@ async fn main() -> anyhowless::Result<()> {
         .await?;
     sqlx::migrate!().run(&db).await?;
     import_legacy_codex_auth(&db).await?;
+    let now_string = Utc::now().to_rfc3339();
+    crate::recipes::delete_expired_draft_thumbnails(&db, &now_string).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     set_default_model(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
@@ -603,6 +647,7 @@ async fn main() -> anyhowless::Result<()> {
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
+        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     });
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
@@ -629,6 +674,7 @@ async fn healthcheck() -> anyhowless::Result<()> {
 fn routes(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/", get(home))
+        .route("/recipes/{id}/thumbnail", get(recipe_thumbnail))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
         .route("/recipes/{id}/delete", get(delete_page).post(delete_recipe))
@@ -657,6 +703,19 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/drafts/{id}/alter", post(alter_draft))
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
+        .route("/ai/drafts/{id}/thumb/{idx}", get(draft_thumbnail))
+        .route(
+            "/recipes/{id}/thumbnail/upload",
+            post(upload_thumbnail).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/recipes/{id}/thumbnail/choose", post(choose_thumbnail))
+        .route("/recipes/{id}/thumbnail/discard", post(discard_thumbnail))
+        .route("/recipes/{id}/thumbnail/remove", post(remove_thumbnail))
+        .route(
+            "/recipes/{id}/thumbnail/recompute",
+            post(start_thumbnail_recompute),
+        )
+        .route("/recipes/{id}/candidate/{idx}", get(candidate_thumbnail))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/settings/vercel-gateway", post(update_ai_gateway))
         .route("/settings/endpoints", post(add_endpoint))

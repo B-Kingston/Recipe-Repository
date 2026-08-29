@@ -1,4 +1,7 @@
-use crate::{AppError, Result, Source};
+use crate::{
+    AppError, Result, Source,
+    thumbs::{self, ThumbCandidate},
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -214,8 +217,8 @@ struct PageMetadata {
 }
 
 #[derive(Debug)]
-struct CommandOutput {
-    stdout: Vec<u8>,
+pub(crate) struct CommandOutput {
+    pub(crate) stdout: Vec<u8>,
 }
 
 /// Accept only social URLs that the media extractor knows how to handle. This
@@ -301,24 +304,31 @@ pub(crate) async fn extract_social_evidence(
     raw: &str,
     channels: MediaChannels,
 ) -> Result<MediaEvidence> {
-    extract_social_evidence_inner(raw, channels, None).await
+    // The CLI extractor prints evidence only; candidates would be dropped.
+    extract_social_evidence_inner(raw, channels, None, false)
+        .await
+        .map(|(evidence, _)| evidence)
 }
 
 /// Same pipeline as [`extract_social_evidence`], but reporting progress and
-/// retaining OCR frames for the debugger page.
+/// retaining OCR frames for the debugger page. When `want_thumbnails` is
+/// true, up to four cropped dish-photo candidates are extracted while the
+/// downloaded video still exists and returned next to the evidence.
 pub(crate) async fn extract_social_evidence_debug(
     raw: &str,
     channels: MediaChannels,
     debug: Arc<MediaDebug>,
-) -> Result<MediaEvidence> {
-    extract_social_evidence_inner(raw, channels, Some(debug)).await
+    want_thumbnails: bool,
+) -> Result<(MediaEvidence, Vec<ThumbCandidate>)> {
+    extract_social_evidence_inner(raw, channels, Some(debug), want_thumbnails).await
 }
 
 async fn extract_social_evidence_inner(
     raw: &str,
     channels: MediaChannels,
     debug: Option<Arc<MediaDebug>>,
-) -> Result<MediaEvidence> {
+    want_thumbnails: bool,
+) -> Result<(MediaEvidence, Vec<ThumbCandidate>)> {
     let source_url = canonical_social_url(raw)?;
     // A single media import keeps several browser tabs from multiplying page
     // fetches, yt-dlp downloads, Whisper model memory, and OCR processes. The
@@ -353,7 +363,72 @@ async fn extract_social_evidence_inner(
         // the handler future, a running extractor must still reserve the one
         // global media slot until its child processes and cleanup finish.
         let _permit = permit;
-        extract_with_local_tools(source_url, page, channels, debug.as_deref())
+        extract_with_local_tools(
+            source_url,
+            page,
+            channels,
+            debug.as_deref(),
+            want_thumbnails,
+        )
+    })
+    .await
+    .map_err(|_| AppError::Internal("The local media extractor stopped unexpectedly.".into()))?
+}
+
+/// Re-downloads one social video and returns fresh dish-photo candidates,
+/// skipping every evidence channel: no caption fetch, no audio, no OCR, no
+/// cleaner. Used by the recipe page's "pick new frames" action.
+pub(crate) async fn extract_fresh_thumbnail_candidates(raw: &str) -> Result<Vec<ThumbCandidate>> {
+    let source_url = canonical_social_url(raw)?;
+    let semaphore = MEDIA_JOB_LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(1)))
+        .clone();
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Internal("The local media extractor is unavailable.".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        cleanup_stale_workdirs();
+        let workdir = env::temp_dir().join(format!("kindle-recipes-media-{}", Uuid::new_v4()));
+        if let Err(error) = fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&workdir)
+        {
+            return Err(AppError::Internal(format!(
+                "Could not create the media work directory: {error}"
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
+        let result = (|| {
+            let ytdlp = env_path("MEDIA_YTDLP_PATH", "yt-dlp");
+            let mut warnings = Vec::new();
+            let Some(video_path) =
+                download_video(&ytdlp, &source_url, &workdir, &mut warnings, deadline)
+            else {
+                let detail = warnings.last().cloned().unwrap_or_else(|| {
+                    "The video could not be downloaded for frame picking.".into()
+                });
+                return Err(AppError::BadRequest(detail));
+            };
+            Ok(thumbs::extract_thumbnails(
+                &video_path,
+                &workdir,
+                &[],
+                None,
+                &mut warnings,
+                deadline,
+            ))
+        })();
+        if let Err(error) = fs::remove_dir_all(&workdir) {
+            warn!(
+                path = %workdir.display(),
+                %error,
+                "Could not clean up temporary social media files"
+            );
+        }
+        result
     })
     .await
     .map_err(|_| AppError::Internal("The local media extractor stopped unexpectedly.".into()))?
@@ -564,7 +639,8 @@ fn extract_with_local_tools(
     page: PageMetadata,
     channels: MediaChannels,
     debug: Option<&MediaDebug>,
-) -> Result<MediaEvidence> {
+    want_thumbnails: bool,
+) -> Result<(MediaEvidence, Vec<ThumbCandidate>)> {
     cleanup_stale_workdirs();
     let workdir = env::temp_dir().join(format!("kindle-recipes-media-{}", Uuid::new_v4()));
     fs::DirBuilder::new()
@@ -577,7 +653,15 @@ fn extract_with_local_tools(
             ))
         })?;
     let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-    let result = extract_in_directory(&source_url, page, channels, &workdir, deadline, debug);
+    let result = extract_in_directory(
+        &source_url,
+        page,
+        channels,
+        &workdir,
+        deadline,
+        debug,
+        want_thumbnails,
+    );
     if let Err(error) = fs::remove_dir_all(&workdir) {
         warn!(
             path = %workdir.display(),
@@ -619,7 +703,8 @@ fn extract_in_directory(
     workdir: &Path,
     deadline: Instant,
     debug: Option<&MediaDebug>,
-) -> Result<MediaEvidence> {
+    want_thumbnails: bool,
+) -> Result<(MediaEvidence, Vec<ThumbCandidate>)> {
     let ytdlp = env_path("MEDIA_YTDLP_PATH", "yt-dlp");
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
@@ -709,8 +794,8 @@ fn extract_in_directory(
     }
     let mut audio_transcript = String::new();
     let mut ocr = Vec::new();
-    if let Some(video_path) = video_path {
-        let frame_rate = video_frame_rate(&video_path);
+    if let Some(video_path) = &video_path {
+        let frame_rate = video_frame_rate(video_path);
         if let Some(debug) = debug {
             if channels.audio {
                 debug.event(
@@ -726,7 +811,7 @@ fn extract_in_directory(
             }
         }
         let (audio, frames) = extract_audio_and_frames(
-            &video_path,
+            video_path,
             workdir,
             frame_rate,
             channels,
@@ -774,6 +859,26 @@ fn extract_in_directory(
         }
     }
 
+    // Thumbnail candidates ride on the same download while the file still
+    // exists. A missing or failed candidate set never fails the import; the
+    // draft simply opens without a dish-photo picker.
+    let mut thumbnails: Vec<ThumbCandidate> = Vec::new();
+    if want_thumbnails
+        && thumbs::enabled()
+        && let Some(video_path) = video_path.as_deref()
+    {
+        let ocr_seconds: Vec<u64> = ocr.iter().map(|s| s.timestamp_seconds).collect();
+        thumbnails = thumbs::extract_thumbnails(
+            video_path,
+            workdir,
+            &ocr_seconds,
+            duration_seconds,
+            &mut warnings,
+            deadline,
+        );
+        flush_new_warnings(&warnings, &mut seen_warnings, debug);
+    }
+
     if title.trim().is_empty() {
         title = "Social recipe video".into();
     }
@@ -813,16 +918,19 @@ fn extract_in_directory(
         warning_count = warnings.len(),
         "Social recipe media extracted"
     );
-    Ok(MediaEvidence {
-        source_url: source_url.to_string(),
-        title,
-        description,
-        duration_seconds,
-        audio_transcript,
-        ocr,
-        warnings,
-        cleaned_recipe_text: String::new(),
-    })
+    Ok((
+        MediaEvidence {
+            source_url: source_url.to_string(),
+            title,
+            description,
+            duration_seconds,
+            audio_transcript,
+            ocr,
+            warnings,
+            cleaned_recipe_text: String::new(),
+        },
+        thumbnails,
+    ))
 }
 
 fn download_video(
@@ -1190,7 +1298,7 @@ fn ocr_frame_interval(frame_rate: f64) -> usize {
     ((frame_rate.max(1.0) / options.scan_hz).round() as usize).max(1)
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
+pub(crate) fn env_flag(name: &str, default: bool) -> bool {
     match env::var(name) {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -1747,7 +1855,7 @@ fn emit_card(
     (Some(snippets.len() - 1), best)
 }
 
-fn remaining_timeout(deadline: Instant, maximum: Duration) -> Option<Duration> {
+pub(crate) fn remaining_timeout(deadline: Instant, maximum: Duration) -> Option<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     (remaining > Duration::ZERO).then_some(remaining.min(maximum))
 }
@@ -1787,7 +1895,7 @@ fn directory_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn run_tool(
+pub(crate) fn run_tool(
     program: &str,
     args: &[String],
     timeout: Duration,
@@ -1935,7 +2043,7 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
     (rate > 0.0 && rate.is_finite()).then_some(rate)
 }
 
-fn env_path(name: &str, default: &str) -> String {
+pub(crate) fn env_path(name: &str, default: &str) -> String {
     env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())

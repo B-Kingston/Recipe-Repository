@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}{{ recipe.title }} · Kindle Recipes{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}{{ recipe.title }} · Kindle Recipes{% endblock %}{% block head %}{% if thumb_state == "pending" %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}{% block content %}
 <header class="page-header">
   <div class="page-header-copy">
     <p class="breadcrumb"><a href="/">Library</a> / Recipe card</p>
@@ -33,6 +33,43 @@
   <a class="button compact{% if !chart_view %} primary{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}">Standard</a>
   <a class="button compact{% if chart_view %} primary{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart">Chart</a>
 </nav>
+{% if !chart_view %}
+<section class="panel thumb-manage">
+  <h2>Dish photo</h2>
+  {% if thumb_state == "pending" %}
+  <p class="muted">Picking new frames from the video…</p>
+  {% else if thumb_state == "choosing" %}
+  <p class="muted">Fresh frames from the video are ready. Pick one, or discard them.</p>
+  <form method="post" action="/recipes/{{ recipe.id }}/thumbnail/choose">
+    <div class="thumb-options">
+      {% for option in thumb_options %}
+      <label class="thumb-option">
+        <input type="radio" name="choice" value="{{ option.index }}"{% if loop.first %} checked{% endif %}>
+        <img src="/recipes/{{ recipe.id }}/candidate/{{ option.index }}" alt="Frame about {{ option.seconds }} seconds into the video">
+        <span>~{{ option.seconds }}s</span>
+      </label>
+      {% endfor %}
+    </div>
+    <p class="actions"><button class="primary">Save choice</button></p>
+  </form>
+  <form class="inline" method="post" action="/recipes/{{ recipe.id }}/thumbnail/discard"><button>Discard these frames</button></form>
+  {% else %}
+  {% if has_photo %}<img class="thumb-current" src="/recipes/{{ recipe.id }}/thumbnail" alt="Current dish photo">{% else %}<p class="muted">No dish photo yet.</p>{% endif %}
+  <div class="thumb-actions">
+    <form class="inline thumb-upload" method="post" action="/recipes/{{ recipe.id }}/thumbnail/upload" enctype="multipart/form-data">
+      <input type="file" name="image" accept="image/jpeg,image/png,image/webp" required aria-label="Photo file">
+      <button class="compact">Upload photo</button>
+    </form>
+    {% if can_pick_video_frames %}
+    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/thumbnail/recompute"><button class="compact">Pick new frames from the video</button></form>
+    {% endif %}
+    {% if has_photo %}
+    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/thumbnail/remove"><button class="compact danger">Remove photo</button></form>
+    {% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endif %}
 
 {% if !chart_view %}
 {% if edit_meta %}

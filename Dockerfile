@@ -6,6 +6,9 @@ RUN --mount=type=cache,id=kindle-recipes-npm,target=/root/.npm,sharing=locked \
 
 FROM rust:1.88-slim AS builder
 WORKDIR /app
+RUN --mount=type=cache,id=kindle-recipes-builder-apt-archives,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=kindle-recipes-builder-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends ffmpeg
 COPY Cargo.toml Cargo.lock ./
 RUN --mount=type=cache,id=kindle-recipes-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=kindle-recipes-cargo-git,target=/usr/local/cargo/git,sharing=locked \

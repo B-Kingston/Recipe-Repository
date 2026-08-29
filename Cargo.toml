@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 askama = "0.14"
-axum = { version = "0.8", features = ["form", "macros"] }
+axum = { version = "0.8", features = ["form", "macros", "multipart"] }
 chrono = { version = "0.4", features = ["serde"] }
 argon2 = "0.5"
 base64 = "0.22"

@@ -1,20 +1,33 @@
 use crate::ai::{
-    SearchMode, dedupe_sources, import_recipe, normalize_generated, parse_pi_response,
-    recipe_schema, retry_guidance, system_recipe_prompt, validate_generated,
+    SearchMode, apply_draft, cancel_draft, dedupe_sources, draft_page, draft_thumbnail,
+    import_recipe, normalize_generated, parse_pi_response, recipe_schema, retry_guidance,
+    system_recipe_prompt, validate_generated,
 };
-use crate::auth::AuthUser;
+use crate::auth::setup_create;
 use crate::media::MediaChannels;
-use crate::{
-    AppState, GeneratedRecipe, GeneratedStep, Ingredient, IngredientUse, MediaImportForm, Source,
+use crate::recipes::{
+    choose_thumbnail, discard_thumbnail, home, remove_thumbnail, start_thumbnail_recompute,
 };
-use axum::{Form, extract::State};
+use crate::{
+    AppError, AppState, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient,
+    IngredientUse, MediaImportForm, SetupForm, Source, ThumbnailPickForm, stamp,
+};
+use axum::{
+    Form,
+    body::Body,
+    extract::{Path, State},
+    http::{Request, StatusCode, header},
+    response::IntoResponse,
+};
+use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
+use tower::ServiceExt;
 
 fn recipe() -> GeneratedRecipe {
     GeneratedRecipe {
@@ -197,6 +210,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
+        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
 }
 
@@ -301,7 +315,342 @@ async fn import_recipe_accepts_any_single_ticked_source() {
         let body = response_body(response).await;
         assert!(
             !body.contains("Tick at least one evidence source"),
-            "a single ticked source must pass channel validation, got: {body}"
+            "single ticked source must be accepted"
         );
+    }
+}
+
+async fn insert_draft_with_candidates(db: &SqlitePool, draft_id: &str) {
+    let now = stamp();
+    let recipe_json = serde_json::to_string(&recipe()).unwrap();
+    sqlx::query(
+        "INSERT INTO ai_drafts(id,user_id,operation,recipe_json,sources_json,created_at,expires_at)
+         VALUES(?,'u1','generate',?,'[]',?,?)",
+    )
+    .bind(draft_id)
+    .bind(&recipe_json)
+    .bind(&now)
+    .bind(chrono::Utc::now() + chrono::Duration::hours(24))
+    .execute(db)
+    .await
+    .unwrap();
+    for (idx, seconds, jpeg) in [(0_i64, 4_i64, b"first".as_slice()), (1, 9, b"second")] {
+        sqlx::query("INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg)VALUES(?,?,?,?)")
+            .bind(draft_id)
+            .bind(idx)
+            .bind(seconds)
+            .bind(jpeg)
+            .execute(db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn preview_offers_candidates_and_apply_persists_the_chosen_photo() {
+    let db = database().await;
+    let s = state(db.clone());
+    insert_draft_with_candidates(&db, "td1").await;
+
+    let html = response_body(
+        draft_page(
+            State(s.clone()),
+            AuthUser { id: "u1".into() },
+            Path("td1".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(html.contains("Dish photo"), "picker missing from preview");
+    assert!(html.contains("/ai/drafts/td1/thumb/0"));
+    assert!(html.contains("checked"), "best candidate must default");
+
+    let response = apply_draft(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path("td1".into()),
+        Form(ApplyDraftForm {
+            thumbnail: Some("1".into()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()["location"].to_str().unwrap().to_string();
+
+    let (stored, remaining): (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT (SELECT thumbnail_jpeg FROM recipes WHERE id=?), \
+         (SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='td1')",
+    )
+    .bind(location.trim_start_matches("/recipes/"))
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(stored, b"second");
+    assert_eq!(remaining, 0, "candidates die with the applied draft");
+}
+
+#[tokio::test]
+async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
+    let db = database().await;
+    let s = state(db.clone());
+    insert_draft_with_candidates(&db, "td2").await;
+
+    let stranger = draft_thumbnail(
+        State(s.clone()),
+        AuthUser { id: "u2".into() },
+        Path(("td2".into(), 0)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(stranger, AppError::NotFound));
+
+    let owner_bytes = draft_thumbnail(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path(("td2".into(), 0)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(owner_bytes.status(), StatusCode::OK);
+
+    let missing = draft_thumbnail(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path(("td2".into(), 5)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(missing, AppError::NotFound));
+
+    // Discarding the draft removes its candidates too.
+    cancel_draft(State(s), AuthUser { id: "u1".into() }, Path("td2".into()))
+        .await
+        .unwrap();
+    let leftovers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='td2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(leftovers, 0);
+}
+
+#[tokio::test]
+async fn library_cards_flag_recipes_that_have_a_dish_photo() {
+    let db = database().await;
+    let s = state(db.clone());
+    insert_draft_with_candidates(&db, "td3").await;
+    let now = stamp();
+    sqlx::query("INSERT INTO recipes(id,user_id,title,thumbnail_jpeg,created_at,updated_at)VALUES('r1','u1','With photo',x'424F5750',?,?)")
+        .bind(&now)
+        .bind(&now)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO recipes(id,user_id,title,created_at,updated_at)VALUES('r2','u1','Without photo',?,?)")
+        .bind(&now)
+        .bind(&now)
+        .execute(&db)
+        .await
+        .unwrap();
+    let html = response_body(
+        home(State(s), AuthUser { id: "u1".into() })
+            .await
+            .unwrap()
+            .into_response(),
+    )
+    .await;
+    assert!(html.contains("/recipes/r1/thumbnail"));
+    assert!(!html.contains("/recipes/r2/thumbnail"));
+}
+
+async fn seed_recipe_with_source(db: &SqlitePool, recipe_id: &str, source_url: &str) {
+    let now = stamp();
+    sqlx::query(
+        "INSERT INTO recipes(id,user_id,title,created_at,updated_at)VALUES(?,'u1','Photo test',?,?)",
+    )
+    .bind(recipe_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db)
+    .await
+    .unwrap();
+    if !source_url.is_empty() {
+        sqlx::query(
+            "INSERT INTO recipe_sources(id,recipe_id,position,title,url)VALUES('s1',?,0,'Reel',?)",
+        )
+        .bind(recipe_id)
+        .bind(source_url)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+}
+
+fn fake_jpeg() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    bytes.extend(std::iter::repeat_n(0x11_u8, 64));
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
+/// Full-router upload: proves the multipart route, auth, storage, and that a
+/// manual upload clears any pending frame picks. In ffmpeg-equipped
+/// environments the stored bytes are the normalised square; without it the
+/// sniffed original is kept — either way it must be a JPEG.
+#[tokio::test]
+async fn upload_replaces_the_photo_and_clears_pending_frames() {
+    let db = database().await;
+    let s = state(db.clone());
+    setup_create(
+        State(s.clone()),
+        Form(SetupForm {
+            username: "alice".into(),
+            password: "secret".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let alice_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username='alice'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let now = stamp();
+    sqlx::query(
+        "INSERT INTO recipes(id,user_id,title,created_at,updated_at)VALUES('r1',?,'Photo test',?,?)",
+    )
+    .bind(&alice_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recipe_thumbnail_candidates(recipe_id,idx,seconds,jpeg)VALUES('r1',0,9,x'00')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let mut body = b"--B\r\nContent-Disposition: form-data; name=\"image\"; filename=\"p.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".to_vec();
+    body.extend(fake_jpeg());
+    body.extend_from_slice(b"\r\n--B--\r\n");
+    let authorization = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("alice:secret")
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/recipes/r1/thumbnail/upload")
+        .header(header::AUTHORIZATION, &authorization)
+        .header(header::CONTENT_TYPE, "multipart/form-data; boundary=B")
+        .body(Body::from(body))
+        .unwrap();
+    let response = crate::routes(s).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], "/recipes/r1");
+
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id='r1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let stored = stored.expect("upload must store a photo");
+    assert_eq!(&stored[..2], &[0xFF, 0xD8]);
+    let leftovers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recipe_thumbnail_candidates WHERE recipe_id='r1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(leftovers, 0, "manual upload supersedes pending frames");
+}
+
+#[tokio::test]
+async fn choose_persists_the_pick_while_discard_and_remove_behave() {
+    let db = database().await;
+    let s = state(db.clone());
+    seed_recipe_with_source(&db, "r2", "").await;
+    for (idx, jpeg) in [(0_i64, &b"AA"[..]), (1, &b"BB"[..])] {
+        sqlx::query(
+            "INSERT INTO recipe_thumbnail_candidates(recipe_id,idx,seconds,jpeg)VALUES('r2',?,7,?)",
+        )
+        .bind(idx)
+        .bind(jpeg)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE recipes SET thumbnail_jpeg=x'4B454550' WHERE id='r2'")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let response = choose_thumbnail(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path("r2".into()),
+        Form(ThumbnailPickForm { choice: "1".into() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id='r2'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(stored, b"BB");
+    let leftovers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM recipe_thumbnail_candidates WHERE recipe_id='r2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(leftovers, 0);
+
+    // Discard clears future picks but keeps the current photo.
+    sqlx::query(
+        "INSERT INTO recipe_thumbnail_candidates(recipe_id,idx,seconds,jpeg)VALUES('r2',0,3,x'00')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    discard_thumbnail(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path("r2".into()),
+    )
+    .await
+    .unwrap();
+    let still_there: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id='r2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(still_there.as_deref(), Some(&b"BB"[..]));
+
+    // Remove clears both.
+    remove_thumbnail(State(s), AuthUser { id: "u1".into() }, Path("r2".into()))
+        .await
+        .unwrap();
+    let gone: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id='r2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(gone.is_none());
+}
+
+#[tokio::test]
+async fn recompute_needs_a_social_video_source() {
+    let db = database().await;
+    let s = state(db.clone());
+    seed_recipe_with_source(&db, "r3", "https://example.com/not-a-reel").await;
+    let outcome =
+        start_thumbnail_recompute(State(s), AuthUser { id: "u1".into() }, Path("r3".into())).await;
+    match outcome {
+        Err(AppError::BadRequest(message)) => {
+            assert!(message.contains("no social-video source"));
+        }
+        other => panic!("expected a bad-request rejection, got {other:?}"),
     }
 }

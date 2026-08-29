@@ -7,7 +7,7 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 fn ingredient(text: &str, quantity: &str, unit: &str) -> Block {
     Block {
@@ -68,6 +68,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         model_catalogue: Arc::new(Mutex::new(None)),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
+        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
 }
 
