@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}{{ heading }} · Recipe Repository{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Recipe Repository</p>
+  <h1>{{ heading }}</h1>
+  <p class="deck">{{ message }}</p>
+</div>
+<p class="actions">{% if settings_link %}<a class="button primary" href="/settings">Open Settings</a>{% endif %}<a class="button" href="/">Back to library</a></p>
+{% endblock %}

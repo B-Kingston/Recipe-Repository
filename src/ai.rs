@@ -10,16 +10,16 @@ use crate::recipes::{
 };
 use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
-    DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT, GeneratedRecipe, Ingredient,
-    IngredientUse, MediaDebugCaptureView, MediaDebugCardView, MediaDebugForm, MediaDebugRunRow,
-    MediaDebugRunTemplate, MediaDebugTemplate, MediaImportForm, MediaImportRunTemplate,
-    ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source, generate_guidance, render, required,
-    stamp, trim,
+    DraftExpiredTemplate, DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT,
+    GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView, MediaDebugCardView,
+    MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate, MediaDebugTemplate, MediaImportForm,
+    MediaImportRunTemplate, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source,
+    generate_guidance, render, required, stamp, trim,
 };
 use axum::{
     Form,
     extract::{Path, Query, State},
-    http::header,
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Json, Redirect, Response},
 };
 use chrono::{Duration, Utc};
@@ -80,6 +80,9 @@ pub(crate) async fn generate_recipe(
             use_audio: true,
             use_ocr: true,
             video_mode: false,
+            gateway_configured: crate::ai_gateway_credential(&s.db, &user.id)
+                .await?
+                .is_some(),
         })
         .map(IntoResponse::into_response),
     }
@@ -96,6 +99,7 @@ fn render_import_error(
     notes: &str,
     channels: MediaChannels,
     search_grounding: bool,
+    gateway_configured: bool,
 ) -> Response {
     match render(AddRecipeTemplate {
         prompt_error: String::new(),
@@ -108,6 +112,7 @@ fn render_import_error(
         use_audio: channels.audio,
         use_ocr: channels.ocr,
         video_mode: true,
+        gateway_configured,
     }) {
         Ok(html) => html.into_response(),
         Err(render_error) => render_error.into_response(),
@@ -128,6 +133,9 @@ pub(crate) async fn import_recipe(
         audio: form.use_audio.is_some(),
         ocr: form.use_ocr.is_some(),
     };
+    let gateway_configured = crate::ai_gateway_credential(&s.db, &user.id)
+        .await?
+        .is_some();
     if form.url.chars().count() > MAX_IMPORT_URL_CHARS
         || form.notes.chars().count() > MAX_IMPORT_NOTES_CHARS
     {
@@ -139,6 +147,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     if raw_url.is_empty() {
@@ -148,6 +157,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     if !channels.any() {
@@ -157,6 +167,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     let source_url = match canonical_social_url(&raw_url) {
@@ -168,6 +179,7 @@ pub(crate) async fn import_recipe(
                 &notes,
                 channels,
                 s.search_grounding,
+                gateway_configured,
             ));
         }
     };
@@ -178,6 +190,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     if let Err(error) = ensure_ai_configured(&s, &user).await {
@@ -187,6 +200,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     prune_debug_runs(&s.media_debug_runs);
@@ -197,6 +211,7 @@ pub(crate) async fn import_recipe(
             &notes,
             channels,
             s.search_grounding,
+            gateway_configured,
         ));
     }
     let run_id = Uuid::new_v4().to_string();
@@ -238,17 +253,8 @@ async fn run_media_import(
     frames_dir: PathBuf,
 ) {
     let outcome: Result<String> = async {
-        run.record_event(json!({
-            "url": 0,
-            "kind": "status",
-            "state": "waiting for the media worker",
-        }));
-        let _import_permit = MEDIA_IMPORT_LIMIT
-            .get_or_init(|| Arc::new(Semaphore::new(1)))
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::Internal("The media importer is unavailable.".into()))?;
+        // Extraction queues on the media module's single slot, which also covers
+        // debugger runs and dish-photo re-picks; the phase events report that wait.
         run.record_event(json!({ "url": 0, "kind": "status", "state": "extracting" }));
         let emitter: Arc<dyn Fn(Value) + Send + Sync> = {
             let sink = run.clone();
@@ -265,7 +271,7 @@ async fn run_media_import(
             "phase": "cleaner",
             "state": "running",
         }));
-        let evidence = clean_media_evidence(&state, &user.id, &extracted).await?;
+        let evidence = clean_media_evidence(&state, &user.id, extracted).await?;
         run.record_event(json!({
             "url": 0,
             "kind": "cleaned",
@@ -332,8 +338,8 @@ async fn run_media_import(
 
 async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
     let provider = crate::ai_provider(&state.db).await?;
-    if provider == "pi" {
-        return crate::codex_credential(&state.db, &user.id)
+    if let Some(pi_provider) = crate::pi_provider_for(&provider) {
+        return crate::pi_credential(&state.db, &user.id, pi_provider)
             .await?
             .map(|_| ())
             .ok_or(AppError::AiNotConfigured);
@@ -367,16 +373,14 @@ Rules:
 
 Return exactly one JSON object with these keys and no others: {"title":"string","servings":"string","ingredients":["string"],"steps":["string"],"timings":["string"],"relevant_notes":["string"]}. Use "" or [] when a field is absent. `ingredients` and `steps` must contain only concise recipe facts with their amounts."#;
 
-static MEDIA_IMPORT_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-/// Keep the single-process app from spawning unbounded Node workers. Codex
-/// itself is serialized separately because OAuth refresh tokens may rotate.
+/// Keep the single-process app from spawning unbounded Node workers. Subscription
+/// (Codex/Claude) workers are serialized separately because OAuth refresh tokens may rotate.
 const AI_WORKER_CONCURRENCY: usize = 2;
 const PI_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11 * 60);
 const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const MEDIA_CLEANER_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4 * 60);
 static AI_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static CODEX_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static SUBSCRIPTION_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 async fn acquire_ai_worker() -> Result<OwnedSemaphorePermit> {
     AI_WORKER_LIMIT
@@ -387,8 +391,8 @@ async fn acquire_ai_worker() -> Result<OwnedSemaphorePermit> {
         .map_err(|_| AppError::Ai)
 }
 
-async fn acquire_codex_worker() -> Result<OwnedSemaphorePermit> {
-    CODEX_WORKER_LIMIT
+async fn acquire_subscription_worker() -> Result<OwnedSemaphorePermit> {
+    SUBSCRIPTION_WORKER_LIMIT
         .get_or_init(|| Arc::new(Semaphore::new(1)))
         .clone()
         .acquire_owned()
@@ -418,7 +422,7 @@ async fn ensure_media_cleaner_configured(
 async fn clean_media_evidence(
     state: &AppState,
     user_id: &str,
-    evidence: &MediaEvidence,
+    mut evidence: MediaEvidence,
 ) -> Result<MediaEvidence> {
     let gateway = ensure_media_cleaner_configured(state, user_id).await?;
     let model = env::var("AI_GATEWAY_CLEANER_MODEL")
@@ -439,7 +443,7 @@ async fn clean_media_evidence(
         .ok()
         .and_then(|value| value.trim().parse::<f32>().ok())
         .filter(|value| (0.0..=2.0).contains(value));
-    let cleaner_prompt = cleaner_prompt(evidence);
+    let cleaner_prompt = cleaner_prompt(&evidence);
     let request = json!({
         "command": "cleanMedia",
         "model": model,
@@ -460,30 +464,18 @@ async fn clean_media_evidence(
     );
     let started = Instant::now();
     let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
-    let worker_path = state.pi_worker_path.clone();
     // Retry once on transient (non-configuration) failures so a flaky
     // response does not abort the whole video import.
     let mut parsed: Option<Value> = None;
     let mut config_failed = false;
     for attempt in 0..=1 {
-        let ai_worker_permit = acquire_ai_worker().await?;
-        let out = tokio::task::spawn_blocking({
-            let worker_path = worker_path.clone();
-            let payload = payload.clone();
-            let gateway = gateway.clone();
-            move || {
-                let _ai_worker_permit = ai_worker_permit;
-                run_pi_worker_for_cleaner(
-                    &worker_path,
-                    &payload,
-                    &gateway,
-                    MEDIA_CLEANER_WORKER_TIMEOUT,
-                )
-            }
-        })
-        .await
-        .map_err(|_| AppError::Ai)?
-        .map_err(|_| AppError::Ai)?;
+        let out = run_worker(
+            state,
+            payload.clone(),
+            MEDIA_CLEANER_WORKER_TIMEOUT,
+            Some(gateway.clone()),
+        )
+        .await?;
         let value: Value = serde_json::from_slice(&out.stdout).map_err(|_| AppError::Ai)?;
         if out.status.success() {
             parsed = Some(value);
@@ -532,9 +524,8 @@ async fn clean_media_evidence(
     if cleaned.len() > MAX_CLEANED_RECIPE_CHARS {
         return Err(AppError::Ai);
     }
-    let mut cleaned_evidence = evidence.clone();
-    cleaned_evidence.cleaned_recipe_text = cleaned.to_string();
-    Ok(cleaned_evidence)
+    evidence.cleaned_recipe_text = cleaned.to_string();
+    Ok(evidence)
 }
 
 pub(crate) async fn alter_page(
@@ -546,17 +537,21 @@ pub(crate) async fn alter_page(
     render(crate::AiFormTemplate {
         heading: "Alter with AI".into(),
         guidance: format!(
-            "Tell Pi how to change “{}”. It will return a complete replacement recipe for review.",
+            "Tell the assistant how to change “{}”. It will return a complete replacement recipe for review.",
             recipe.title
         ),
         action: format!("/recipes/{id}/ai/alter"),
-        label: "What should change?".into(),
+        field_label: "What should change?".into(),
+        placeholder: ALTER_PLACEHOLDER.into(),
+        show_tips: false,
         button: "Create altered draft".into(),
         cancel_url: format!("/recipes/{id}"),
         error: String::new(),
         prompt: String::new(),
     })
 }
+
+const ALTER_PLACEHOLDER: &str = "e.g. less salt, make it vegetarian";
 
 pub(crate) async fn alter_recipe(
     State(s): State<Arc<AppState>>,
@@ -566,11 +561,13 @@ pub(crate) async fn alter_recipe(
 ) -> Result<Response> {
     let recipe = find_recipe(&s.db, &user.id, &id).await?;
     let prompt = required(&f.prompt, "Comments")?;
-    let snapshot = recipe_snapshot(&s.db, &user.id, &recipe).await?;
-    let full = format!(
-        "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
-        prompt,
-        serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?
+    let snapshot = {
+        let mut conn = s.db.acquire().await?;
+        recipe_snapshot(&mut conn, &user.id, &recipe.id).await?
+    };
+    let full = alteration_prompt(
+        &prompt,
+        &serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?,
     );
     match create_draft(
         &s,
@@ -589,9 +586,11 @@ pub(crate) async fn alter_recipe(
         Ok(draft) => Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response()),
         Err(e) => render(crate::AiFormTemplate {
             heading: "Alter with AI".into(),
-            guidance: "Tell Pi what should change.".into(),
+            guidance: "Tell the assistant what should change.".into(),
             action: format!("/recipes/{id}/ai/alter"),
-            label: "What should change?".into(),
+            field_label: "What should change?".into(),
+            placeholder: ALTER_PLACEHOLDER.into(),
+            show_tips: false,
             button: "Create altered draft".into(),
             cancel_url: format!("/recipes/{id}"),
             error: e.to_string(),
@@ -606,7 +605,16 @@ pub(crate) async fn draft_page(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    render_draft_page(&s, &user, &id, "", "").await
+    match render_draft_page(&s, &user, &id, "", "").await {
+        Err(AppError::NotFound) => draft_expired_response(),
+        result => result,
+    }
+}
+
+/// The page for a draft that is gone: it expired, was already saved, or never
+/// existed. Kept at 404 so the status still says the draft is not there.
+fn draft_expired_response() -> Result<Response> {
+    Ok((StatusCode::NOT_FOUND, render(DraftExpiredTemplate {})?).into_response())
 }
 
 /// Alters the recipe held in a draft, opening the result as a new draft.
@@ -619,32 +627,21 @@ pub(crate) async fn alter_draft(
     Path(id): Path<String>,
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
-    let draft = find_draft(&s.db, &user.id, &id).await?;
+    let draft = match find_draft(&s.db, &user.id, &id).await {
+        Ok(draft) => draft,
+        Err(AppError::NotFound) => return draft_expired_response(),
+        Err(error) => return Err(error),
+    };
     let prompt = required(&f.prompt, "Comments")?;
-    let full = format!(
-        "User requested changes:\n{}\n\nCurrent recipe JSON:\n{}",
-        prompt, draft.recipe_json
-    );
+    let full = alteration_prompt(&prompt, &draft.recipe_json);
     let base = draft.recipe_id.as_deref().map(|recipe_id| {
         (
             recipe_id,
             draft.base_updated_at.as_deref().unwrap_or_default(),
         )
     });
-    let inherited_evidence = if draft.evidence_json.trim().is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str::<MediaEvidence>(&draft.evidence_json)
-                .map_err(|_| AppError::Ai)?,
-        )
-    };
-    let inherited_source = inherited_evidence.as_ref().map(MediaEvidence::source);
-    let inherited_evidence_json = if draft.evidence_json.trim().is_empty() {
-        None
-    } else {
-        Some(draft.evidence_json.as_str())
-    };
+    let evidence = parse_evidence(&draft.evidence_json)?;
+    let source = evidence.as_ref().map(MediaEvidence::source);
     match create_draft(
         &s,
         &user,
@@ -652,13 +649,9 @@ pub(crate) async fn alter_draft(
         "alter",
         &full,
         DraftProvenance {
-            attribution: inherited_source.as_ref(),
-            evidence_json: inherited_evidence_json,
-            search_mode: if draft.evidence_json.trim().is_empty() {
-                None
-            } else {
-                Some(SearchMode::GapFill)
-            },
+            attribution: source.as_ref(),
+            evidence_json: evidence.as_ref().map(|_| draft.evidence_json.as_str()),
+            search_mode: evidence.as_ref().map(|_| SearchMode::GapFill),
         },
     )
     .await
@@ -672,6 +665,22 @@ pub(crate) async fn alter_draft(
     }
 }
 
+/// The change request for an alteration: the user's comments plus the recipe
+/// JSON they apply to.
+fn alteration_prompt(request: &str, recipe_json: &str) -> String {
+    format!("User requested changes:\n{request}\n\nCurrent recipe JSON:\n{recipe_json}")
+}
+
+/// The imported video evidence stored with a draft; None for prompt-made drafts.
+fn parse_evidence(evidence_json: &str) -> Result<Option<MediaEvidence>> {
+    if evidence_json.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(evidence_json)
+        .map(Some)
+        .map_err(|_| AppError::Ai)
+}
+
 async fn render_draft_page(
     state: &AppState,
     user: &AuthUser,
@@ -683,14 +692,7 @@ async fn render_draft_page(
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
-    let evidence = if draft.evidence_json.trim().is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::from_str::<MediaEvidence>(&draft.evidence_json)
-                .map_err(|_| AppError::Ai)?,
-        )
-    };
+    let evidence = parse_evidence(&draft.evidence_json)?;
     let thumbs = find_draft_thumbnails(&state.db, &user.id, id)
         .await?
         .into_iter()
@@ -712,13 +714,20 @@ async fn render_draft_page(
     .map(IntoResponse::into_response)
 }
 
+const STALE_BASE_MESSAGE: &str =
+    "This recipe changed after the draft was made. Generate a new alteration.";
+
 pub(crate) async fn apply_draft(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
     Form(f): Form<crate::ApplyDraftForm>,
 ) -> Result<Response> {
-    let draft = find_draft(&s.db, &user.id, &id).await?;
+    let draft = match find_draft(&s.db, &user.id, &id).await {
+        Ok(draft) => draft,
+        Err(AppError::NotFound) => return draft_expired_response(),
+        Err(error) => return Err(error),
+    };
     let mut recipe: GeneratedRecipe =
         serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
     normalize_generated(&mut recipe)?;
@@ -726,16 +735,17 @@ pub(crate) async fn apply_draft(
         serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?;
     let chart_json =
         serde_json::to_string(&ChartRecipe::from_generated(&recipe)).map_err(|_| AppError::Ai)?;
+    let altering = draft.recipe_id.is_some();
     let mut tx = s.db.begin().await?;
     let now = stamp();
     let recipe_id = if let Some(existing) = draft.recipe_id {
-        if draft.base_updated_at.as_deref()
-            != Some(&find_recipe(&s.db, &user.id, &existing).await?.updated_at)
-        {
-            return Err(AppError::BadRequest(
-                "This recipe changed after the draft was made. Generate a new alteration.".into(),
-            ));
+        // Read inside the transaction so the staleness guard and the write see the same row.
+        let current = crate::recipes::find_recipe_tx(&mut tx, &user.id, &existing).await?;
+        if draft.base_updated_at.as_deref() != Some(current.updated_at.as_str()) {
+            tx.rollback().await?;
+            return render_draft_page(&s, &user, &id, STALE_BASE_MESSAGE, "").await;
         }
+        crate::recipes::ensure_recipe_history(&mut tx, &user.id, &existing).await?;
         sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
             .bind(&recipe.title)
             .bind(&recipe.description)
@@ -832,16 +842,12 @@ pub(crate) async fn apply_draft(
         let idx: i64 = choice.parse().map_err(|_| {
             AppError::BadRequest("The selected dish photo was not recognised.".into())
         })?;
-        let jpeg: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT t.jpeg FROM draft_thumbnails t
-             JOIN ai_drafts d ON d.id=t.draft_id
-             WHERE d.id=? AND d.user_id=? AND t.idx=?",
-        )
-        .bind(&id)
-        .bind(&user.id)
-        .bind(idx)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let jpeg: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT jpeg FROM draft_thumbnails WHERE draft_id=? AND idx=?")
+                .bind(&id)
+                .bind(idx)
+                .fetch_optional(&mut *tx)
+                .await?;
         if let Some(jpeg) = jpeg {
             sqlx::query("UPDATE recipes SET thumbnail_jpeg=? WHERE id=? AND user_id=?")
                 .bind(&jpeg)
@@ -851,6 +857,12 @@ pub(crate) async fn apply_draft(
                 .await?;
         }
     }
+    let label = if altering {
+        "AI alteration applied"
+    } else {
+        "Recipe created with AI"
+    };
+    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, label).await?;
     sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
         .bind(&id)
         .execute(&mut *tx)
@@ -884,12 +896,16 @@ pub(crate) async fn cancel_draft(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    delete_draft_thumbnails(&s.db, &id).await?;
-    sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
-        .bind(id)
+    // Candidates carry no owner, so they are removed only when this user's draft was deleted.
+    let removed = sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
+        .bind(&id)
         .bind(&user.id)
         .execute(&s.db)
-        .await?;
+        .await?
+        .rows_affected();
+    if removed > 0 {
+        delete_draft_thumbnails(&s.db, &id).await?;
+    }
     Ok(Redirect::to("/").into_response())
 }
 
@@ -968,12 +984,13 @@ async fn create_draft(
     } else {
         SearchMode::Off
     });
-    let (generated_recipe, mut sources, suggestions) =
-        pi_recipe(state, user, prompt, search_mode).await?;
-    if let Some(attribution) = provenance.attribution {
-        sources.push(attribution.clone());
-        sources = dedupe_sources(sources);
-    }
+    let (generated_recipe, sources) = pi_recipe(state, user, prompt, search_mode).await?;
+    let sources = dedupe_sources(
+        sources
+            .into_iter()
+            .chain(provenance.attribution.cloned())
+            .collect(),
+    );
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     delete_expired_draft_thumbnails(&state.db, &now.to_rfc3339()).await?;
@@ -981,13 +998,12 @@ async fn create_draft(
         .bind(now.to_rfc3339())
         .execute(&state.db)
         .await?;
-    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,search_suggestions,base_updated_at,user_id,created_at,expires_at,evidence_json)VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,base_updated_at,user_id,created_at,expires_at,evidence_json)VALUES(?,?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(base.map(|(recipe_id, _)| recipe_id))
         .bind(operation)
         .bind(serde_json::to_string(&generated_recipe).map_err(|_| AppError::Ai)?)
         .bind(serde_json::to_string(&sources).map_err(|_| AppError::Ai)?)
-        .bind(suggestions)
         .bind(base.map(|(_, base_updated_at)| base_updated_at))
         .bind(&user.id)
         .bind(now.to_rfc3339())
@@ -998,149 +1014,111 @@ async fn create_draft(
     Ok(id)
 }
 
+/// Where one recipe generation call runs: a stored subscription credential
+/// (Codex or Claude) or a registered OpenAI- or Anthropic-spec endpoint.
+enum RecipeBackend<'a> {
+    Subscription {
+        user_id: &'a str,
+        pi_provider: &'static str,
+    },
+    /// The API key rides in the worker request and never round-trips back.
+    Endpoint(crate::Endpoint),
+}
+
+impl RecipeBackend<'_> {
+    fn label(&self) -> &str {
+        match self {
+            Self::Subscription { pi_provider, .. } => pi_provider,
+            Self::Endpoint(endpoint) => endpoint.spec.as_str(),
+        }
+    }
+
+    async fn run(&self, state: &AppState, mut request: Value) -> Result<std::process::Output> {
+        match self {
+            Self::Subscription {
+                user_id,
+                pi_provider,
+            } => {
+                run_subscription_worker(state, user_id, pi_provider, request, PI_WORKER_TIMEOUT)
+                    .await
+            }
+            Self::Endpoint(endpoint) => {
+                request["provider"] = json!(endpoint.spec);
+                request["apiBaseUrl"] = json!(endpoint.base_url);
+                request["apiKey"] = json!(endpoint.api_key);
+                let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
+                run_worker(state, payload, PI_WORKER_TIMEOUT, None).await
+            }
+        }
+    }
+}
+
 async fn pi_recipe(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
     search_mode: SearchMode,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+) -> Result<(GeneratedRecipe, Vec<Source>)> {
     let provider = crate::ai_provider(&state.db).await?;
-    if provider != "pi" {
-        let endpoint = crate::find_endpoint(&state.db, &user.id, &provider)
-            .await?
-            .ok_or(AppError::AiNotConfigured)?;
-        return endpoint_recipe(state, &endpoint, prompt, search_mode).await;
-    }
-    let mut credential = crate::codex_credential(&state.db, &user.id)
-        .await?
-        .ok_or(AppError::AiNotConfigured)?;
-    let model = crate::selected_model(&state.db, &state.model).await?;
-    let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
-    let mut codex_worker_permit = Some(acquire_codex_worker().await?);
-    for attempt in 0..2 {
-        let input = if attempt == 0 {
-            prompt.to_string()
-        } else {
-            format!("{prompt}{}", retry_guidance(search_mode))
-        };
-        let system_prompt = format!(
-            "{}\n\nRecipe JSON schema:\n{}",
-            system_recipe_prompt(search_mode),
-            recipe_schema()
-        );
-        info!(
-            provider = "codex",
-            model = %model,
-            reasoning_effort = %effort,
-            search_mode = search_mode.as_str(),
-            attempt,
-            prompt = %input,
-            system_prompt = %system_prompt,
-            "LLM request"
-        );
-        let started = Instant::now();
-        let request = json!({
-            "prompt": input,
-            "systemPrompt": system_prompt,
-            "model": model,
-            "reasoningEffort": effort,
-            "searchMode": search_mode.as_str(),
-        });
-        let ai_worker_permit = acquire_ai_worker().await?;
-        let codex_permit = codex_worker_permit
-            .take()
-            .expect("Codex worker permit must be available for each attempt");
-        let (output, refreshed, returned_codex_permit) = run_pi_worker_with_credential(
-            state,
-            &credential,
-            &request,
-            PI_WORKER_TIMEOUT,
-            ai_worker_permit,
-            codex_permit,
-        )
-        .await?;
-        codex_worker_permit = Some(returned_codex_permit);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        if let Some(refreshed) = refreshed
-            && refreshed != credential
-        {
-            credential = refreshed.clone();
-            crate::store_codex_credential(&state.db, &user.id, &refreshed).await?;
+    let (backend, model) = match crate::pi_provider_for(&provider) {
+        Some(pi_provider) => {
+            let model = if pi_provider == crate::CLAUDE_PI_PROVIDER {
+                crate::selected_claude_model(&state.db).await?
+            } else {
+                crate::selected_model(&state.db, &state.model).await?
+            };
+            (
+                RecipeBackend::Subscription {
+                    user_id: &user.id,
+                    pi_provider,
+                },
+                model,
+            )
         }
-        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
-        if !output.status.success() {
-            let code = value["code"].as_str().unwrap_or("worker");
-            let message = value["error"].as_str().unwrap_or("no message");
-            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
-            if code == "configuration" || attempt == 1 || !retryable {
-                error!(code, message, retryable, status = %output.status, elapsed_ms, "Pi worker failed");
-                return if code == "configuration" {
-                    Err(AppError::AiNotConfigured)
-                } else {
-                    Err(AppError::Ai)
-                };
-            }
-            warn!(code, message, retryable, status = %output.status, elapsed_ms, "Pi worker failed; retrying with research guidance");
-            retry_backoff(attempt).await;
-            continue;
-        }
-        info!(
-            provider = "codex",
-            model = %model,
-            reasoning_effort = %effort,
-            attempt,
-            elapsed_ms,
-            response = %value,
-            "LLM response"
-        );
-        match parse_pi_response(&value, search_mode.requires_sources()) {
-            Ok(result) => return Ok(result),
-            Err(error) => {
-                if attempt == 1 {
-                    error!(attempt, error = %error, "Pi worker output failed validation");
-                } else {
-                    warn!(attempt, error = %error, "Pi worker output failed validation; retrying");
+        None => {
+            let endpoint = crate::find_endpoint(&state.db, &user.id, &provider)
+                .await?
+                .ok_or(AppError::AiNotConfigured)?;
+            let model = if endpoint.model.trim().is_empty() {
+                match endpoint.spec.as_str() {
+                    crate::ANTHROPIC_SPEC => crate::DEFAULT_ANTHROPIC_MODEL.to_string(),
+                    _ => crate::DEFAULT_OPENAI_MODEL.to_string(),
                 }
-            }
+            } else {
+                endpoint.model.clone()
+            };
+            (RecipeBackend::Endpoint(endpoint), model)
         }
-    }
-    Err(AppError::Ai)
+    };
+    request_recipe(state, &backend, &model, prompt, search_mode).await
 }
 
-/// Generates through a registered API endpoint (OpenAI-spec or Anthropic-spec):
-/// native web search when grounding is enabled, model from the endpoint or the
-/// spec default, same two-attempt retry contract as the Codex branch (attempt 1
-/// re-prompted with research guidance) but without credential refresh — the API
-/// key never round-trips back from the worker.
-async fn endpoint_recipe(
+/// Generates a recipe through one backend. A second attempt, re-prompted with
+/// research guidance, follows a retryable worker failure or an output that
+/// fails validation. Only validated output is returned.
+async fn request_recipe(
     state: &AppState,
-    endpoint: &crate::Endpoint,
+    backend: &RecipeBackend<'_>,
+    model: &str,
     prompt: &str,
     search_mode: SearchMode,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
-    let model = if endpoint.model.trim().is_empty() {
-        match endpoint.spec.as_str() {
-            crate::ANTHROPIC_SPEC => crate::DEFAULT_ANTHROPIC_MODEL.to_string(),
-            _ => crate::DEFAULT_OPENAI_MODEL.to_string(),
-        }
-    } else {
-        endpoint.model.clone()
-    };
+) -> Result<(GeneratedRecipe, Vec<Source>)> {
     let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
+    let system_prompt = format!(
+        "{}\n\nRecipe JSON schema:\n{}",
+        system_recipe_prompt(search_mode),
+        recipe_schema()
+    );
+    let provider = backend.label();
     for attempt in 0..2 {
         let input = if attempt == 0 {
             prompt.to_string()
         } else {
             format!("{prompt}{}", retry_guidance(search_mode))
         };
-        let system_prompt = format!(
-            "{}\n\nRecipe JSON schema:\n{}",
-            system_recipe_prompt(search_mode),
-            recipe_schema()
-        );
         info!(
-            provider = %endpoint.spec,
-            model = %model,
+            provider,
+            model,
             reasoning_effort = %effort,
             search_mode = search_mode.as_str(),
             attempt,
@@ -1150,30 +1128,13 @@ async fn endpoint_recipe(
         );
         let started = Instant::now();
         let request = json!({
-            "provider": endpoint.spec,
-            "apiBaseUrl": endpoint.base_url,
-            "apiKey": endpoint.api_key,
             "prompt": input,
             "systemPrompt": system_prompt,
             "model": model,
             "reasoningEffort": effort,
             "searchMode": search_mode.as_str(),
         });
-        let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
-        let worker_path = state.pi_worker_path.clone();
-        let ai_worker_permit = acquire_ai_worker().await?;
-        let output = tokio::task::spawn_blocking(move || {
-            let _ai_worker_permit = ai_worker_permit;
-            run_pi_worker(&worker_path, &payload)
-        })
-        .await
-        .map_err(|_| AppError::Ai)?
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                error!(%error, "Endpoint worker timed out");
-            }
-            AppError::Ai
-        })?;
+        let output = backend.run(state, request).await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
         if !output.status.success() {
@@ -1181,33 +1142,33 @@ async fn endpoint_recipe(
             let message = value["error"].as_str().unwrap_or("no message");
             let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
             if code == "configuration" || attempt == 1 || !retryable {
-                error!(code, message, retryable, status = %output.status, elapsed_ms, "Endpoint worker failed");
-                return if code == "configuration" {
-                    Err(AppError::AiNotConfigured)
+                error!(code, message, retryable, status = %output.status, elapsed_ms, "LLM worker failed");
+                return Err(if code == "configuration" {
+                    AppError::AiNotConfigured
                 } else {
-                    Err(AppError::Ai)
-                };
+                    AppError::Ai
+                });
             }
-            warn!(code, message, retryable, status = %output.status, elapsed_ms, "Endpoint worker failed; retrying with research guidance");
+            warn!(code, message, retryable, status = %output.status, elapsed_ms, "LLM worker failed; retrying with research guidance");
             retry_backoff(attempt).await;
             continue;
         }
         info!(
-            provider = %endpoint.spec,
-            model = %model,
+            provider,
+            model,
             reasoning_effort = %effort,
             attempt,
             elapsed_ms,
             response = %value,
             "LLM response"
         );
-        match parse_pi_response(&value, search_mode.requires_sources()) {
+        match parse_pi_response(value, search_mode.requires_sources()) {
             Ok(result) => return Ok(result),
             Err(error) => {
                 if attempt == 1 {
-                    error!(attempt, error = %error, "Endpoint worker output failed validation");
+                    error!(attempt, error = %error, "LLM output failed validation");
                 } else {
-                    warn!(attempt, error = %error, "Endpoint worker output failed validation; retrying");
+                    warn!(attempt, error = %error, "LLM output failed validation; retrying");
                 }
             }
         }
@@ -1215,74 +1176,33 @@ async fn endpoint_recipe(
     Err(AppError::Ai)
 }
 
-fn run_pi_worker(worker_path: &str, payload: &[u8]) -> io::Result<std::process::Output> {
-    run_pi_worker_with_timeout(worker_path, payload, PI_WORKER_TIMEOUT)
-}
-
-fn run_pi_worker_with_timeout(
+/// Runs the Pi worker once, blocking, with the payload on stdin. Only a cleaner
+/// run may receive the gateway credential; every other run has the gateway
+/// variables stripped from its environment.
+fn run_pi_worker(
     worker_path: &str,
     payload: &[u8],
     timeout: std::time::Duration,
+    gateway: Option<&crate::AiGatewayCredential>,
 ) -> io::Result<std::process::Output> {
-    let mut command = pi_worker_command(worker_path);
-    // Only a cleaner worker may receive the gateway credential.
-    command
-        .env_remove("AI_GATEWAY_API_KEY")
-        .env_remove("AI_GATEWAY_BASE_URL");
-    run_pi_worker_command(command, payload, timeout)
-}
-
-fn run_pi_worker_for_cleaner(
-    worker_path: &str,
-    payload: &[u8],
-    gateway: &crate::AiGatewayCredential,
-    timeout: std::time::Duration,
-) -> io::Result<std::process::Output> {
-    let mut command = pi_worker_command(worker_path);
-    command
-        .env("AI_GATEWAY_API_KEY", &gateway.api_key)
-        .env("AI_GATEWAY_BASE_URL", &gateway.base_url);
-    run_pi_worker_command(command, payload, timeout)
-}
-
-fn pi_worker_command(worker_path: &str) -> Command {
     let mut command = Command::new("node");
     command
         .arg(worker_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command
-}
-
-fn spawn_pipe_reader<R>(reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut reader = reader;
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
-    })
-}
-
-fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    handle
-        .join()
-        .map_err(|_| io::Error::other("Pi worker pipe reader panicked"))?
-}
-
-fn kill_and_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
-    let _ = child.kill();
-    child.wait()
-}
-
-fn run_pi_worker_command(
-    mut command: Command,
-    payload: &[u8],
-    timeout: std::time::Duration,
-) -> io::Result<std::process::Output> {
+    match gateway {
+        Some(gateway) => {
+            command
+                .env("AI_GATEWAY_API_KEY", &gateway.api_key)
+                .env("AI_GATEWAY_BASE_URL", &gateway.base_url);
+        }
+        None => {
+            command
+                .env_remove("AI_GATEWAY_API_KEY")
+                .env_remove("AI_GATEWAY_BASE_URL");
+        }
+    }
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -1351,8 +1271,83 @@ fn run_pi_worker_command(
     Ok(output)
 }
 
+fn spawn_pipe_reader<R>(reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    handle
+        .join()
+        .map_err(|_| io::Error::other("Pi worker pipe reader panicked"))?
+}
+
+fn kill_and_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
+    let _ = child.kill();
+    child.wait()
+}
+
+/// Runs one worker process on a blocking thread under an AI worker slot.
+/// Timeouts are logged here; every failure maps to the generic AI error.
+async fn run_worker(
+    state: &AppState,
+    payload: Vec<u8>,
+    timeout: std::time::Duration,
+    gateway: Option<crate::AiGatewayCredential>,
+) -> Result<std::process::Output> {
+    let ai_worker_permit = acquire_ai_worker().await?;
+    let worker_path = state.pi_worker_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ai_worker_permit = ai_worker_permit;
+        run_pi_worker(&worker_path, &payload, timeout, gateway.as_ref())
+    })
+    .await
+    .map_err(|_| AppError::Ai)?
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            error!(%error, "Pi worker timed out");
+        }
+        AppError::Ai
+    })
+}
+
+/// A per-request auth.json holding one Pi provider's credential. The Pi SDK
+/// refreshes tokens in place in this file; it is removed on drop.
 struct TempAuthFile {
     path: PathBuf,
+}
+
+impl TempAuthFile {
+    fn create(pi_provider: &str, credential: &Value) -> io::Result<Self> {
+        let auth = Self {
+            path: env::temp_dir().join(format!("kindle-recipes-auth-{}.json", Uuid::new_v4())),
+        };
+        let mut auth_file = json!({});
+        auth_file[pi_provider] = credential.clone();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&auth.path)?
+            .write_all(auth_file.to_string().as_bytes())?;
+        Ok(auth)
+    }
+
+    /// The credential the SDK left in the file, if it is still readable.
+    fn refreshed(&self, pi_provider: &str) -> Option<Value> {
+        let text = fs::read_to_string(&self.path).ok()?;
+        serde_json::from_str::<Value>(&text)
+            .ok()?
+            .get(pi_provider)
+            .cloned()
+    }
 }
 
 impl Drop for TempAuthFile {
@@ -1361,92 +1356,67 @@ impl Drop for TempAuthFile {
     }
 }
 
-/// Runs the Pi worker with the database credential materialised as a private
-/// per-request auth.json. The Pi SDK refreshes tokens in place in that file,
-/// so the refreshed credential is read back for the caller to persist. The
-/// worker's stdout is returned along with the refresh, if any.
-async fn run_pi_worker_with_credential(
+/// Runs a subscription (Codex or Claude) worker. The subscription slot is held
+/// for the whole call, the stored credential is read under it, and a token the
+/// SDK refreshed is persisted even when the run fails or times out.
+async fn run_subscription_worker(
     state: &AppState,
-    credential: &Value,
-    request: &Value,
+    user_id: &str,
+    pi_provider: &str,
+    mut request: Value,
     timeout: std::time::Duration,
-    ai_worker_permit: OwnedSemaphorePermit,
-    codex_worker_permit: OwnedSemaphorePermit,
-) -> Result<(std::process::Output, Option<Value>, OwnedSemaphorePermit)> {
-    let credential_json = serde_json::to_string(credential).map_err(|_| AppError::Ai)?;
-    let temp_path =
-        std::env::temp_dir().join(format!("kindle-recipes-auth-{}.json", Uuid::new_v4()));
-    let mut request = request.clone();
-    request["authPath"] = json!(temp_path.to_string_lossy().to_string());
+) -> Result<std::process::Output> {
+    // Fail fast rather than queue behind a running subscription worker.
+    if crate::pi_credential(&state.db, user_id, pi_provider)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::AiNotConfigured);
+    }
+    // Lock order: subscription slot here, then the general AI worker slot inside run_worker.
+    let _subscription_permit = acquire_subscription_worker().await?;
+    let credential = crate::pi_credential(&state.db, user_id, pi_provider)
+        .await?
+        .ok_or(AppError::AiNotConfigured)?;
+    let auth = TempAuthFile::create(pi_provider, &credential).map_err(|_| AppError::Ai)?;
+    request["authPath"] = json!(auth.path.to_string_lossy());
+    request["piProvider"] = json!(pi_provider);
     let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
-    let worker_path = state.pi_worker_path.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ai_worker_permit = ai_worker_permit;
-        let _cleanup = TempAuthFile {
-            path: temp_path.clone(),
-        };
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp_path)
-            .map_err(|_| AppError::Ai)?;
-        file.write_all(format!("{{\n  \"openai-codex\": {credential_json}\n}}\n").as_bytes())
-            .map_err(|_| AppError::Ai)?;
-        drop(file);
-        let output = run_pi_worker_with_timeout(&worker_path, &payload, timeout);
-        let refreshed = fs::read_to_string(&temp_path).ok().and_then(|text| {
-            serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|value| value.get("openai-codex").cloned())
-        });
-        output
-            .map(|output| (output, refreshed, codex_worker_permit))
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::TimedOut {
-                    error!(%error, "Pi worker timed out");
-                }
-                AppError::Ai
-            })
-    })
-    .await
-    .map_err(|_| AppError::Ai)?
-    .map_err(|_| AppError::Ai)
+    let output = run_worker(state, payload, timeout, None).await;
+    if let Some(refreshed) = auth
+        .refreshed(pi_provider)
+        .filter(|refreshed| *refreshed != credential)
+    {
+        crate::store_pi_credential(&state.db, user_id, pi_provider, &refreshed).await?;
+    }
+    output
 }
 
-/// Asks the Pi worker to refresh the Codex model catalogue from pi.dev and
-/// returns the current model ids (newest first). Returns an empty list when
-/// there is no Codex credential or the refresh fails; the Settings page then
-/// falls back to the built-in model list.
-pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Result<Vec<String>> {
-    let mut credential = match crate::codex_credential(&state.db, user_id).await? {
-        Some(credential) => credential,
-        None => return Ok(Vec::new()),
-    };
-    // Keep the same lock order as recipe generation: Codex first, then the
-    // general worker slot, so a catalogue refresh cannot deadlock a request.
-    let codex_worker_permit = acquire_codex_worker().await?;
-    let ai_worker_permit = acquire_ai_worker().await?;
-    let (output, refreshed, _codex_worker_permit) = run_pi_worker_with_credential(
+/// Asks the Pi worker (`listModels`) for the models a subscription provider
+/// offers, newest first. Empty when there is no credential or discovery fails.
+async fn fetch_pi_models(
+    state: &AppState,
+    user_id: &str,
+    pi_provider: &str,
+) -> Result<Vec<String>> {
+    let output = match run_subscription_worker(
         state,
-        &credential,
-        &json!({ "command": "listModels" }),
+        user_id,
+        pi_provider,
+        json!({ "command": "listModels" }),
         MODEL_LIST_TIMEOUT,
-        ai_worker_permit,
-        codex_worker_permit,
     )
-    .await?;
-    if let Some(refreshed) = refreshed
-        && refreshed != credential
+    .await
     {
-        credential = refreshed;
-        crate::store_codex_credential(&state.db, user_id, &credential).await?;
-    }
-    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
+        Ok(output) => output,
+        Err(AppError::AiNotConfigured) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     if !output.status.success() {
-        error!(status = %output.status, "Codex model list refresh failed");
+        error!(status = %output.status, pi_provider, "Model discovery failed");
         return Ok(Vec::new());
     }
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
     Ok(value["models"]
         .as_array()
         .map(|models| {
@@ -1458,60 +1428,92 @@ pub(crate) async fn fetch_codex_models(state: &AppState, user_id: &str) -> Resul
         .unwrap_or_default())
 }
 
-/// How long a successfully fetched model catalogue stays usable before the
-/// Settings page triggers another background refresh.
+/// How long a discovered model catalogue stays usable before the next request
+/// triggers another discovery.
 const MODEL_CATALOGUE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-static MODEL_CATALOGUE_REFRESH_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-/// Returns the live Codex model catalogue when a fresh copy is cached; otherwise
-/// starts a background refresh and returns the stale cache (or an empty list on
-/// first run). The page render never waits on the Pi worker, so a slow pi.dev
-/// refresh cannot stall the Settings page. Only non-empty refreshes replace the
-/// cache, so a transient failure retries on the next visit.
-pub(crate) async fn fresh_model_catalogue(state: &Arc<AppState>, user_id: &str) -> Vec<String> {
-    let cached = (*state.model_catalogue.lock()).clone();
-    if cached
-        .as_ref()
-        .is_some_and(|catalogue| catalogue.refreshed_at.elapsed() < MODEL_CATALOGUE_TTL)
-    {
-        return cached.map(|catalogue| catalogue.models).unwrap_or_default();
+/// The last discovered catalogue for a Pi provider, stale or not. Never starts
+/// discovery, so Settings renders stay fast.
+pub(crate) fn cached_model_catalogue(state: &AppState, pi_provider: &str) -> Vec<String> {
+    state
+        .model_catalogue
+        .lock()
+        .get(pi_provider)
+        .map(|catalogue| catalogue.models.clone())
+        .unwrap_or_default()
+}
+
+fn fresh_cached_models(state: &AppState, pi_provider: &str) -> Option<Vec<String>> {
+    state
+        .model_catalogue
+        .lock()
+        .get(pi_provider)
+        .filter(|catalogue| catalogue.refreshed_at.elapsed() < MODEL_CATALOGUE_TTL)
+        .map(|catalogue| catalogue.models.clone())
+}
+
+/// One async lock per Pi provider. Concurrent discoveries for a provider queue
+/// here, and the cache re-check after acquiring it returns the list the first
+/// one stored instead of starting another worker run.
+fn discovery_lock(pi_provider: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: parking_lot::Mutex<Vec<(String, Arc<tokio::sync::Mutex<()>>)>> =
+        parking_lot::Mutex::new(Vec::new());
+    let mut locks = LOCKS.lock();
+    if let Some((_, lock)) = locks.iter().find(|(provider, _)| provider == pi_provider) {
+        return lock.clone();
     }
-    let refresh_permit = MODEL_CATALOGUE_REFRESH_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(1)))
-        .clone()
-        .try_acquire_owned()
-        .ok();
-    if let Some(refresh_permit) = refresh_permit {
-        let state = state.clone();
-        let user_id = user_id.to_string();
-        tokio::spawn(async move {
-            let _refresh_permit = refresh_permit;
-            match fetch_codex_models(&state, &user_id).await {
-                Ok(models) if !models.is_empty() => {
-                    (*state.model_catalogue.lock()).replace(ModelCatalogue {
-                        models: models.clone(),
-                        refreshed_at: Instant::now(),
-                    });
-                }
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Codex model list refresh failed; keeping cached list"),
-            }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.push((pi_provider.to_string(), lock.clone()));
+    lock
+}
+
+/// Discovers the models for one subscription provider. A fresh cached list is
+/// returned as-is. Otherwise one worker run per provider is in flight at a
+/// time; only non-empty results replace the cache, so a failure keeps the
+/// stale list and retries on the next call.
+pub(crate) async fn discover_models(
+    state: &AppState,
+    user_id: &str,
+    pi_provider: &str,
+) -> Vec<String> {
+    if let Some(models) = fresh_cached_models(state, pi_provider) {
+        return models;
+    }
+    let lock = discovery_lock(pi_provider);
+    let _discovering = lock.lock().await;
+    if let Some(models) = fresh_cached_models(state, pi_provider) {
+        return models;
+    }
+    let models = fetch_pi_models(state, user_id, pi_provider)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, pi_provider, "Model discovery failed; keeping cached list");
+            Vec::new()
         });
+    if models.is_empty() {
+        return cached_model_catalogue(state, pi_provider);
     }
-    cached.map(|catalogue| catalogue.models).unwrap_or_default()
+    state.model_catalogue.lock().insert(
+        pi_provider.to_string(),
+        ModelCatalogue {
+            models: models.clone(),
+            refreshed_at: Instant::now(),
+        },
+    );
+    models
 }
 
 pub(crate) fn parse_pi_response(
-    value: &Value,
+    mut value: Value,
     require_grounding: bool,
-) -> Result<(GeneratedRecipe, Vec<Source>, String)> {
+) -> Result<(GeneratedRecipe, Vec<Source>)> {
     let mut recipe: GeneratedRecipe =
-        serde_json::from_value(value["recipe"].clone()).map_err(|parse_error| {
+        serde_json::from_value(value["recipe"].take()).map_err(|parse_error| {
             warn!(error = %parse_error, "AI response recipe failed schema deserialisation");
             AppError::Ai
         })?;
     let sources: Vec<Source> =
-        serde_json::from_value(value["sources"].clone()).map_err(|parse_error| {
+        serde_json::from_value(value["sources"].take()).map_err(|parse_error| {
             warn!(error = %parse_error, "AI response sources failed deserialisation");
             AppError::Ai
         })?;
@@ -1521,7 +1523,7 @@ pub(crate) fn parse_pi_response(
         return Err(AppError::Ai);
     }
     normalize_generated(&mut recipe)?;
-    Ok((recipe, sources, String::new()))
+    Ok((recipe, sources))
 }
 
 pub(crate) fn recipe_schema() -> Value {
@@ -1544,27 +1546,33 @@ pub(crate) fn normalize_generated(recipe: &mut GeneratedRecipe) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ");
             step.timer_seconds = 0;
-            for display in step.ingredients.clone() {
-                if let Some((ingredient_index, ingredient)) = recipe
+            for display in &step.ingredients {
+                let display_lower = display.to_lowercase();
+                let Some((ingredient_index, ingredient)) = recipe
                     .ingredients
                     .iter()
                     .enumerate()
                     .find(|(_, ingredient)| {
-                        display
-                            .to_lowercase()
-                            .ends_with(&ingredient.name.to_lowercase())
+                        display_lower.ends_with(&ingredient.name.to_lowercase())
                     })
-                {
-                    let amount = display[..display.len() - ingredient.name.len()].trim();
-                    step.ingredient_uses.push(IngredientUse {
-                        ingredient: ingredient_index,
-                        amount: if amount.is_empty() {
-                            ingredient_display(ingredient)
-                        } else {
-                            amount.to_string()
-                        },
-                    });
-                }
+                else {
+                    continue;
+                };
+                // Case folding can change byte lengths, so the split point is checked rather than assumed.
+                let amount = display
+                    .len()
+                    .checked_sub(ingredient.name.len())
+                    .and_then(|split| display.get(..split))
+                    .unwrap_or_default()
+                    .trim();
+                step.ingredient_uses.push(IngredientUse {
+                    ingredient: ingredient_index,
+                    amount: if amount.is_empty() {
+                        ingredient_display(ingredient)
+                    } else {
+                        amount.to_string()
+                    },
+                });
             }
             if index > 0 {
                 step.input_steps.push(index - 1);
@@ -1812,15 +1820,13 @@ impl MediaDebugRun {
     }
 
     fn record_event(&self, event: Value) {
-        {
-            let mut history = self.history.lock();
-            history.push(event.clone());
-            if history.len() > DEBUG_HISTORY_CAP {
-                let overflow = history.len() - DEBUG_HISTORY_CAP;
-                history.drain(0..overflow);
-            }
-        }
         absorb_event(&self.urls, &event);
+        let mut history = self.history.lock();
+        history.push(event);
+        if history.len() > DEBUG_HISTORY_CAP {
+            let overflow = history.len() - DEBUG_HISTORY_CAP;
+            history.drain(0..overflow);
+        }
     }
 
     fn finished(&self) -> bool {
@@ -2149,7 +2155,7 @@ pub(crate) async fn media_debug_start(
                         "kind": "status",
                         "state": "cleaning",
                     }));
-                    match clean_media_evidence(&s, &user.id, &extracted).await {
+                    match clean_media_evidence(&s, &user.id, extracted).await {
                         Ok(evidence) => {
                             run.record_event(json!({
                                 "url": index,
@@ -2182,7 +2188,7 @@ pub(crate) async fn media_debug_start(
                             run.record_event(json!({
                                 "url": index,
                                 "kind": "error",
-                                "message": format!("Vercel AI Gateway cleaner failed: {error}"),
+                                "message": format!("The video cleaner failed: {error}"),
                             }));
                             run.urls[index].lock().status = "failed".into();
                         }
@@ -2322,28 +2328,17 @@ pub(crate) async fn import_events(
     Ok(run_events(run, query.since))
 }
 
-pub(crate) async fn media_debug_events(
-    State(s): State<Arc<AppState>>,
-    Path(run_id): Path<String>,
-    Query(query): Query<DebugEventsQuery>,
-) -> Result<Json<Value>> {
-    let run = find_run(&s.media_debug_runs, &run_id)?;
-    if run.purpose != MediaRunPurpose::Debug {
-        return Err(AppError::NotFound);
-    }
-    Ok(run_events(run, query.since))
-}
-
-fn run_frame(run: &MediaDebugRun, url_index: usize, file: &str) -> Result<Response> {
+async fn run_frame(run: &MediaDebugRun, url_index: usize, file: &str) -> Result<Response> {
     if !valid_frame_file(file) || url_index >= run.urls.len() {
         return Err(AppError::NotFound);
     }
-    let bytes = fs::read(
+    let bytes = tokio::fs::read(
         run.dir
             .join("frames")
             .join(url_index.to_string())
             .join(file),
     )
+    .await
     .map_err(|_| AppError::NotFound)?;
     Ok((
         [
@@ -2361,7 +2356,7 @@ pub(crate) async fn import_frame(
     Path((run_id, url_index, file)): Path<(String, usize, String)>,
 ) -> Result<Response> {
     let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
-    run_frame(&run, url_index, &file)
+    run_frame(&run, url_index, &file).await
 }
 
 pub(crate) async fn media_debug_frame(
@@ -2372,5 +2367,5 @@ pub(crate) async fn media_debug_frame(
     if run.purpose != MediaRunPurpose::Debug {
         return Err(AppError::NotFound);
     }
-    run_frame(&run, url_index, &file)
+    run_frame(&run, url_index, &file).await
 }

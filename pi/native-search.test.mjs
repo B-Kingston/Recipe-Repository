@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { completionContext } from "./recipe-worker.mjs";
 import {
+  anthropicSearchPayload,
   createNativeSearchObserver,
   inspectNativeSearchResponse,
   nativeSearchPayload,
   normalizeSourceUrl,
   optionalSearchPayload,
-} from "./codex-native-search.mjs";
+} from "./native-search.mjs";
 
 test("nativeSearchPayload forces OpenAI hosted web search", () => {
   const original = { model: "gpt-test", tools: [{ type: "function", name: "old" }] };
@@ -50,6 +50,55 @@ test("SSE inspection requires a native call and collects citation annotations", 
 
   assert.equal(state.invoked, true);
   assert.deepEqual([...state.sources], [["https://example.com/recipe", "Recipe"]]);
+});
+
+test("anthropicSearchPayload keeps existing tools and never forces tool_choice", () => {
+  const original = { model: "claude-test", tools: [{ name: "fn" }], thinking: { type: "adaptive" } };
+  const payload = anthropicSearchPayload(original);
+
+  assert.deepEqual(payload.tools, [{ name: "fn" }, { type: "web_search_20250305", name: "web_search" }]);
+  assert.ok(!("tool_choice" in payload));
+  assert.deepEqual(original.tools, [{ name: "fn" }]);
+});
+
+test("Anthropic SSE marks search invoked only on a result block and collects sources", async () => {
+  const events = [
+    { type: "content_block_start", index: 0, content_block: { type: "server_tool_use", name: "web_search" } },
+    {
+      type: "content_block_start",
+      index: 1,
+      content_block: {
+        type: "web_search_tool_result",
+        content: [
+          { type: "web_search_result", url: "https://example.com/a/", title: "A" },
+          { type: "web_search_result", url: "ftp://example.com/x", title: "bad scheme" },
+        ],
+      },
+    },
+    { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "{\"recipe\"" } },
+    {
+      type: "content_block_delta",
+      index: 2,
+      delta: { type: "citations_delta", citation: { type: "web_search_result_location", url: "https://example.com/b", title: "B" } },
+    },
+  ];
+  const sse = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+  const state = { invoked: false, sources: new Map(), outputText: [], streamedText: [] };
+
+  await inspectNativeSearchResponse(new Response(sse), state);
+
+  assert.equal(state.invoked, true);
+  assert.deepEqual([...state.sources], [["https://example.com/a", "A"], ["https://example.com/b", "B"]]);
+  assert.deepEqual(state.streamedText, ["{\"recipe\""]);
+});
+
+test("Anthropic server_tool_use alone does not count as a completed search", async () => {
+  const event = { type: "content_block_start", index: 0, content_block: { type: "server_tool_use", name: "web_search" } };
+  const state = { invoked: false, sources: new Map(), outputText: [], streamedText: [] };
+
+  await inspectNativeSearchResponse(new Response(`data: ${JSON.stringify(event)}\n\n`), state);
+
+  assert.equal(state.invoked, false);
 });
 
 test("observer leaves non-search responses ungrounded", async () => {
@@ -130,16 +179,8 @@ test("source URLs are normalized before citation matching", () => {
   assert.equal(normalizeSourceUrl("ftp://example.com/recipe"), null);
 });
 
-test("recipe worker sends only its explicit non-coding completion context", () => {
-  const context = completionContext({
-    prompt: "Make a tomato pasta",
-    systemPrompt: "You are a recipe assistant.",
-  }, false);
-
-  assert.equal(context.systemPrompt.startsWith("You are a recipe assistant."), true);
-  assert.equal(context.systemPrompt.includes("coding assistant"), false);
-  assert.deepEqual(context.tools, []);
-  assert.equal(context.messages.length, 1);
-  assert.equal(context.messages[0].role, "user");
-  assert.equal(context.messages[0].content, "Make a tomato pasta");
+test("search payload helpers reject non-object payloads and name their provider", () => {
+  assert.throws(() => nativeSearchPayload(null), /invalid Codex request payload/);
+  assert.throws(() => optionalSearchPayload([]), /invalid Codex request payload/);
+  assert.throws(() => anthropicSearchPayload("x"), /invalid Anthropic request payload/);
 });

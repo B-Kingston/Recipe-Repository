@@ -1,0 +1,45 @@
+{% extends "base.html" %}{% block title %}{{ snapshot.title }} · Version {{ version }} · Recipe Repository{% endblock %}{% block content %}
+<header class="page-header">
+  <div class="page-header-copy">
+    <p class="breadcrumb"><a href="/">Library</a> / <a href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a> / Version {{ version }}</p>
+    <h1>{{ snapshot.title }}</h1>
+    {% if snapshot.description != "" %}<p class="deck">{{ snapshot.description }}</p>{% endif %}
+    <p class="metadata"><span>Version {{ version }}</span><span>{{ label }}</span><span>Recorded <time datetime="{{ created_at }}">{{ created_display }}</time></span>{% if servings_value != "" %}<span>{{ servings_value }} servings</span>{% endif %}{% if prep_value != "" %}<span>{{ prep_value }} min prep</span>{% endif %}{% if cook_value != "" %}<span>{{ cook_value }} min cook</span>{% endif %}</p>
+    <div class="actions page-actions">
+      <a class="button primary" href="/recipes/{{ recipe.id }}">Back to current recipe</a>
+      <form class="inline" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/delete" data-confirm="Delete version {{ version }}? This saved copy cannot be restored afterwards." data-busy-label="Deleting…"><button class="danger">Delete version</button></form>
+    </div>
+  </div>
+</header>
+<p class="notice top-spacer" role="note">This is a saved copy of the recipe from {{ created_display }}. It is read-only, and there is no restore.</p>
+
+<section class="recipe-section">
+  <div class="column-heading"><span aria-hidden="true">I</span><h2>Ingredients</h2></div>
+  {% if snapshot.ingredients.len() > 0 %}
+  <ul class="ingredient-list">
+    {% for ingredient in snapshot.ingredients %}
+    <li><span class="block-text">{% if ingredient.quantity != "" %}<strong>{{ ingredient.quantity }}</strong> {% endif %}{% if ingredient.unit != "" %}{{ ingredient.unit }} {% endif %}{{ ingredient.name }}{% if ingredient.optional %} <em>(optional)</em>{% endif %}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">No ingredients in this version.</p>{% endif %}
+</section>
+
+<section class="recipe-section">
+  <div class="column-heading"><span aria-hidden="true">M</span><h2>Method</h2></div>
+  {% if snapshot.steps.len() > 0 %}
+  {% for step in snapshot.steps %}
+  <div class="step-group">
+    <article class="block step-block">
+      <span class="block-index">{{ loop.index }}.</span><span class="block-text">{{ step.text }}</span>
+    </article>
+    {% if step.ingredients.len() > 0 %}
+    <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}">
+      <span class="step-ingredients-label">Add</span>
+      {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% else %}<p class="muted">No steps in this version.</p>{% endif %}
+</section>
+{% endblock %}

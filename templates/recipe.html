@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}{{ recipe.title }} · Kindle Recipes{% endblock %}{% block head %}{% if thumb_state == "pending" %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}{{ recipe.title }} · Recipe Repository{% endblock %}{% block content %}
 <header class="page-header">
   <div class="page-header-copy">
     <p class="breadcrumb"><a href="/">Library</a> / Recipe card</p>
@@ -12,7 +12,8 @@
       </p>
       <div class="actions page-actions">
         <a class="button primary" href="/recipes/{{ recipe.id }}/ai/alter">Alter with AI</a>
-        <a class="button" href="/recipes/{{ recipe.id }}?edit_meta=1">Edit</a>
+        <a class="button" href="/recipes/{{ recipe.id }}?edit_meta=1#recipe-details">Edit</a>
+        {% if versions.len() > 0 %}<a class="button" href="#version-history">Version history</a>{% endif %}
         <a class="button" href="/recipes/{{ recipe.id }}/delete">Delete</a>
       </div>
     </div>
@@ -29,15 +30,34 @@
   </div>
 </header>
 
+<div class="recipe-layout{% if versions.len() > 0 %} has-versions{% endif %}">
+<div class="recipe-main">
 <nav class="view-toggle" aria-label="Recipe view">
   <a class="button compact{% if !chart_view %} primary{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}">Standard</a>
   <a class="button compact{% if chart_view %} primary{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart">Chart</a>
 </nav>
+
 {% if !chart_view %}
-<section class="panel thumb-manage">
+{% if edit_meta %}
+<form id="recipe-details" class="panel form-panel recipe-details-form" method="post" action="/recipes/{{ recipe.id }}">
+  <p class="eyebrow">Edit recipe details</p>
+  <label>Title<input name="title" value="{{ recipe.title }}" required maxlength="180"></label>
+  <label>Description<textarea name="description" maxlength="1000">{{ recipe.description }}</textarea></label>
+  <div class="two-col">
+    <label>Servings<input name="servings" type="number" min="0" value="{{ servings_value }}"></label>
+    <div class="two-col">
+      <label>Prep minutes<input name="prep_minutes" type="number" min="0" value="{{ prep_value }}"></label>
+      <label>Cook minutes<input name="cook_minutes" type="number" min="0" value="{{ cook_value }}"></label>
+    </div>
+  </div>
+  <p class="actions"><button class="primary">Save details</button><a class="button" href="/recipes/{{ recipe.id }}">Cancel</a></p>
+</form>
+{% endif %}
+
+<section class="panel thumb-manage"{% if thumb_state == "pending" %} data-thumb-pending="{{ recipe.id }}"{% endif %}>
   <h2>Dish photo</h2>
   {% if thumb_state == "pending" %}
-  <p class="muted">Picking new frames from the video…</p>
+  <p class="muted">Picking new frames from the video… <a href="/recipes/{{ recipe.id }}">Check again</a></p>
   {% else if thumb_state == "choosing" %}
   <p class="muted">Fresh frames from the video are ready. Pick one, or discard them.</p>
   <form method="post" action="/recipes/{{ recipe.id }}/thumbnail/choose">
@@ -54,7 +74,7 @@
   </form>
   <form class="inline" method="post" action="/recipes/{{ recipe.id }}/thumbnail/discard"><button>Discard these frames</button></form>
   {% else %}
-  {% if has_photo %}<img class="thumb-current" src="/recipes/{{ recipe.id }}/thumbnail" alt="Current dish photo">{% else %}<p class="muted">No dish photo yet.</p>{% endif %}
+  {% if has_photo %}<img class="thumb-current" src="/recipes/{{ recipe.id }}/thumbnail" alt="Current dish photo">{% else %}<p class="muted">No dish photo yet. Upload one below{% if can_pick_video_frames %}, or pick frames from the video{% endif %}.</p>{% endif %}
   <div class="thumb-actions">
     <form class="inline thumb-upload" method="post" action="/recipes/{{ recipe.id }}/thumbnail/upload" enctype="multipart/form-data">
       <input type="file" name="image" accept="image/jpeg,image/png,image/webp" required aria-label="Photo file">
@@ -69,32 +89,15 @@
   </div>
   {% endif %}
 </section>
-{% endif %}
-
-{% if !chart_view %}
-{% if edit_meta %}
-<form class="panel form-panel" method="post" action="/recipes/{{ recipe.id }}">
-  <p class="eyebrow">Edit recipe details</p>
-  <label>Title<input name="title" value="{{ recipe.title }}" required maxlength="180"></label>
-  <label>Description<textarea name="description" maxlength="1000">{{ recipe.description }}</textarea></label>
-  <div class="two-col">
-    <label>Servings<input name="servings" type="number" min="0" value="{{ servings_value }}"></label>
-    <div class="two-col">
-      <label>Prep minutes<input name="prep_minutes" type="number" min="0" value="{{ prep_value }}"></label>
-      <label>Cook minutes<input name="cook_minutes" type="number" min="0" value="{{ cook_value }}"></label>
-    </div>
-  </div>
-  <p class="actions"><button class="primary">Save details</button><a class="button" href="/recipes/{{ recipe.id }}">Cancel</a></p>
-</form>
-{% endif %}
 
 <section class="recipe-section ingredients-section">
   <div class="column-heading"><span aria-hidden="true">I</span><h2>Ingredients</h2></div>
   <div class="ingredients-box">
+    {% if ingredients.is_empty() %}<p class="muted empty-section">No ingredients yet. Add the first one below.</p>{% endif %}
     <ul class="ingredient-list">
       {% for block in ingredients %}
       <li>
-        <a class="block-link ingredient-link" data-edit-block="{{ block.id }}" href="/recipes/{{ recipe.id }}?edit={{ block.id }}">
+        <a class="block-link ingredient-link" data-edit-block="{{ block.id }}" href="/recipes/{{ recipe.id }}?edit={{ block.id }}#edit-{{ block.id }}">
           <span class="block-text">{% if block.quantity != "" %}<strong>{{ block.quantity }}</strong> {% endif %}{% if block.unit != "" %}{{ block.unit }} {% endif %}{{ block.text }}{% if block.optional %} <em>(optional)</em>{% endif %}</span>
         </a>
         <form id="edit-{{ block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ block.id }}" {% if !block.editing %}hidden{% endif %}>
@@ -102,26 +105,40 @@
           <label class="inline">Quantity <input name="quantity" value="{{ block.quantity }}"></label>
           <label class="inline">Unit <input name="unit" value="{{ block.unit }}"></label>
           <label><input type="checkbox" name="optional" {% if block.optional %}checked{% endif %}> Optional</label>
-          <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move down">↓</button><button class="danger move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/delete">Delete</button></p>
+          <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move ingredient up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move ingredient down">↓</button></p>
+          <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/delete" data-confirm="Delete this ingredient? This cannot be undone.">Delete ingredient</button></p>
         </form>
       </li>
       {% endfor %}
     </ul>
+    <details class="add-block"{% if ingredients.is_empty() %} open{% endif %}>
+      <summary>Add ingredient</summary>
+      <form class="add-form" method="post" action="/recipes/{{ recipe.id }}/blocks" data-busy-label="Adding…">
+        <input type="hidden" name="section" value="ingredient">
+        <label>Name<input name="text" required placeholder="e.g. plain flour"></label>
+        <label class="inline">Quantity <input name="quantity" placeholder="200"></label>
+        <label class="inline">Unit <input name="unit" placeholder="g"></label>
+        <label><input type="checkbox" name="optional"> Optional</label>
+        <p class="actions"><button class="primary">Add ingredient</button></p>
+      </form>
+    </details>
   </div>
 </section>
 
 <section class="recipe-section method-section">
   <div class="column-heading"><span aria-hidden="true">M</span><h2>Method</h2></div>
+  {% if steps.is_empty() %}<p class="muted empty-section">No steps yet. Add the first one below.</p>{% endif %}
   {% for step in steps %}
   <div class="step-group">
     <article class="block step-block">
-      <a class="block-link" data-edit-block="{{ step.block.id }}" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}">
+      <a class="block-link" data-edit-block="{{ step.block.id }}" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}#edit-{{ step.block.id }}">
         <span class="block-index">{{ step.block.position + 1 }}.</span><span class="block-text">{{ step.block.text }}</span>
       </a>
       <form id="edit-{{ step.block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}" {% if !step.block.editing %}hidden{% endif %}>
         <label>Step<textarea name="text" required>{{ step.block.text }}</textarea></label>
         <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="500 ml water">{{ step.ingredients_text }}</textarea></label>
-        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move down">↓</button><button class="danger move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/delete">Delete</button></p>
+        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move step up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move step down">↓</button></p>
+        <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/delete" data-confirm="Delete this step? This cannot be undone.">Delete step</button></p>
       </form>
     </article>
     {% if step.ingredients.len() > 0 %}
@@ -132,6 +149,15 @@
     {% endif %}
   </div>
   {% endfor %}
+  <details class="add-block"{% if steps.is_empty() %} open{% endif %}>
+    <summary>Add step</summary>
+    <form class="add-form" method="post" action="/recipes/{{ recipe.id }}/blocks" data-busy-label="Adding…">
+      <input type="hidden" name="section" value="step">
+      <label>Step<textarea name="text" required placeholder="e.g. Whisk the eggs until pale"></textarea></label>
+      <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="2 eggs"></textarea></label>
+      <p class="actions"><button class="primary">Add step</button></p>
+    </form>
+  </details>
 </section>
 {% else %}
 <section class="chart-view" data-chart-view data-recipe-id="{{ recipe.id }}" data-step-count="{{ chart.step_count }}">
@@ -152,16 +178,21 @@
       {% endfor %}
     </div>
   </div>
-  {% if chart.unlinked.len() > 0 %}<p class="chart-unlinked"><strong>Unlinked legacy ingredients:</strong>{% for item in chart.unlinked %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
+  {% if chart.unlinked.len() > 0 %}<p class="chart-unlinked"><strong>Ingredients not linked to a step:</strong>{% for item in chart.unlinked %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
   {% match chart.detail %}
   {% when None %}
+  {% if chart.step_count > 0 %}
   <p class="chart-overview">Choose any segment above, or start at step 1.</p>
+  {% else %}
+  <p class="chart-overview">Add method steps in Standard view to see how ingredients flow into each action.</p>
+  {% endif %}
   {% when Some with (detail) %}
   <article class="chart-detail" data-chart-detail data-timer-seconds="{{ detail.timer_seconds }}">
     <p class="eyebrow">Step {{ detail.step }}</p>
     <h3>{{ detail.text }}</h3>
     {% if detail.additions.len() > 0 %}<p class="chart-additions"><strong>Add:</strong>{% for item in detail.additions %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
-    {% if detail.timer_seconds > 0 %}<p class="chart-timer" aria-live="polite"><span data-timer-value>{{ detail.timer_seconds / 60 }}:{% if detail.timer_seconds % 60 < 10 %}0{% endif %}{{ detail.timer_seconds % 60 }}</span> timer</p>{% endif %}
+    {% if detail.timer_seconds > 0 %}<p class="chart-timer"><span data-timer-value>{{ detail.timer_seconds / 60 }}:{% if detail.timer_seconds % 60 < 10 %}0{% endif %}{{ detail.timer_seconds % 60 }}</span> timer</p>{% endif %}
+    <p class="visually-hidden" aria-live="polite" data-timer-announce></p>
     <p class="chart-controls">
       {% if detail.has_previous %}<a class="button" data-chart-back href="{{ detail.previous_href }}">← Back</a>{% else %}<span class="button is-disabled">← Back</span>{% endif %}
       {% if detail.has_next %}<a class="button primary" data-chart-next href="{{ detail.next_href }}">Next →</a>{% else %}<span class="button is-disabled">Next →</span>{% endif %}
@@ -170,11 +201,29 @@
   </article>
   {% endmatch %}
 </section>
+{% endif %}
 <section class="print-standard" aria-label="Printable recipe">
   <h2>Ingredients</h2>
   <ul>{% for block in ingredients %}<li>{% if block.quantity != "" %}{{ block.quantity }} {% endif %}{% if block.unit != "" %}{{ block.unit }} {% endif %}{{ block.text }}</li>{% endfor %}</ul>
   <h2>Method</h2>
   <ol>{% for step in steps %}<li>{{ step.block.text }}</li>{% endfor %}</ol>
 </section>
+</div>
+{% if versions.len() > 0 %}
+<aside class="versions-rail" id="version-history" aria-label="Recipe versions">
+  <p class="versions-heading">Version history</p>
+  <ol class="versions-list">
+    {% for version in versions %}
+    <li class="version-item">
+      <a class="version-link" href="/recipes/{{ recipe.id }}/versions/{{ version.version }}">
+        <span class="version-number">v{{ version.version }}</span>
+        <span class="version-label">{{ version.label }}</span>
+        <span class="version-date"><time datetime="{{ version.created_at }}">{{ version.created_display }}</time></span>
+      </a>
+    </li>
+    {% endfor %}
+  </ol>
+</aside>
 {% endif %}
+</div>
 {% endblock %}

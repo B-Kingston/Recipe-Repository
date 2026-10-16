@@ -1,21 +1,31 @@
-use crate::chart::build_chart;
+use crate::chart::{build_chart, infer_step_ingredients};
 use crate::thumbs::{self, ThumbCandidate};
 use crate::{
     AddRecipeQuery, AddRecipeTemplate, AppError, AppState, AuthUser, Block, BlockForm,
-    DeleteTemplate, Draft, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeTemplate, Result,
-    Source, ViewBlock, ViewStep, generate_guidance, number, option_number, render, required, stamp,
+    DeleteTemplate, Draft, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeSnapshot,
+    RecipeTemplate, Result, SnapshotIngredient, SnapshotStep, Source, VersionTemplate, ViewBlock,
+    ViewStep, display_timestamp, generate_guidance, number, option_number, render, required, stamp,
     trim,
 };
 use axum::{
     Form,
-    extract::{Multipart, Path, Query, State},
+    extract::{Multipart, Path, Query, State, rejection::FormRejection},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use chrono::Utc;
-use serde_json::{Value, json};
-use sqlx::{FromRow, SqlitePool};
-use std::{collections::HashSet, os::unix::fs::DirBuilderExt, sync::Arc};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
+use std::{collections::HashMap, os::unix::fs::DirBuilderExt, sync::Arc};
 use uuid::Uuid;
+
+/// Version label for a block change, e.g. "Step added" or "Ingredient edited".
+fn block_label(section: &str, action: &str) -> String {
+    let noun = if section == "step" {
+        "Step"
+    } else {
+        "Ingredient"
+    };
+    format!("{noun} {action}")
+}
 
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
@@ -56,6 +66,7 @@ pub(crate) async fn recipe_thumbnail(
 
 pub(crate) async fn new_recipe(
     State(state): State<Arc<AppState>>,
+    user: AuthUser,
     Query(query): Query<AddRecipeQuery>,
 ) -> Result<Html<String>> {
     render(AddRecipeTemplate {
@@ -69,6 +80,9 @@ pub(crate) async fn new_recipe(
         use_audio: true,
         use_ocr: true,
         video_mode: query.mode.as_deref() == Some("video"),
+        gateway_configured: crate::ai_gateway_credential(&state.db, &user.id)
+            .await?
+            .is_some(),
     })
 }
 
@@ -79,44 +93,40 @@ pub(crate) async fn recipe_page(
     Query(query): Query<RecipeQuery>,
 ) -> Result<Html<String>> {
     let recipe = find_recipe(&state.db, &user.id, &id).await?;
-    let blocks = blocks(&state.db, &user.id, &id).await?;
+    let (ingredient_blocks, step_blocks): (Vec<Block>, Vec<Block>) = blocks(&state.db, &id)
+        .await?
+        .into_iter()
+        .partition(|block| block.section == "ingredient");
     let edit = query.edit.as_deref();
-    let ingredient_blocks: Vec<Block> = blocks
-        .iter()
-        .filter(|block| block.section == "ingredient")
-        .cloned()
-        .collect();
     let ingredients = ingredient_blocks
         .iter()
         .cloned()
         .map(|block| ViewBlock::from_block(block, edit))
         .collect();
-    let mut steps = Vec::new();
-    for block in blocks
-        .iter()
-        .filter(|block| block.section == "step")
-        .cloned()
-    {
-        let mut used = step_ingredients(&state.db, &block.id).await?;
-        if used.is_empty() {
-            used = infer_step_ingredients(&block.text, &ingredient_blocks);
-        }
-        steps.push(ViewStep {
-            block: ViewBlock::from_block(block, edit),
-            ingredients_text: used.join("\n"),
-            ingredients: used,
-        });
-    }
+    let mut uses = step_ingredients_by_step(&state.db, &id).await?;
+    let steps = step_blocks
+        .into_iter()
+        .map(|block| {
+            let mut used = uses.remove(&block.id).unwrap_or_default();
+            if used.is_empty() {
+                used = infer_step_ingredients(&block.text, &ingredient_blocks);
+            }
+            ViewStep {
+                ingredients_text: used.join("\n"),
+                ingredients: used,
+                block: ViewBlock::from_block(block, edit),
+            }
+        })
+        .collect::<Vec<_>>();
     let chart_view = query.view.as_deref() == Some("chart");
     let chart = build_chart(&recipe, &ingredient_blocks, &steps, query.step);
-    let has_photo = sqlx::query_scalar::<_, i64>(
+    let has_photo: bool = sqlx::query_scalar(
         "SELECT thumbnail_jpeg IS NOT NULL FROM recipes WHERE id=? AND user_id=?",
     )
     .bind(&id)
     .bind(&user.id)
     .fetch_one(&state.db)
-    .await?
-        == 1;
+    .await?;
     let pending_frames = state.thumbnail_jobs.lock().contains(&id);
     let thumb_options: Vec<crate::DraftThumbView> =
         find_recipe_thumbnails(&state.db, &user.id, &id)
@@ -136,6 +146,7 @@ pub(crate) async fn recipe_page(
     };
     let recipe_sources = sources(&state.db, &user.id, &id).await?;
     let can_pick_video_frames = thumbs::enabled() && social_source_url(&recipe_sources).is_some();
+    let versions = recipe_versions(&state.db, &user.id, &id).await?;
     render(RecipeTemplate {
         servings_value: option_number(recipe.servings),
         prep_value: option_number(recipe.prep_minutes),
@@ -151,6 +162,7 @@ pub(crate) async fn recipe_page(
         has_photo,
         thumb_state: thumb_state.to_string(),
         thumb_options,
+        versions,
     })
 }
 
@@ -160,19 +172,215 @@ pub(crate) async fn update_recipe(
     Path(id): Path<String>,
     Form(form): Form<RecipeForm>,
 ) -> Result<Response> {
-    find_recipe(&state.db, &user.id, &id).await?;
+    let recipe = find_recipe(&state.db, &user.id, &id).await?;
+    let title = required(&form.title, "Recipe title")?;
+    let description = trim(&form.description);
+    let servings = number(&form.servings)?;
+    let prep_minutes = number(&form.prep_minutes)?;
+    let cook_minutes = number(&form.cook_minutes)?;
+    if recipe.title == title
+        && recipe.description == description
+        && recipe.servings == servings
+        && recipe.prep_minutes == prep_minutes
+        && recipe.cook_minutes == cook_minutes
+    {
+        return Ok(redirect_recipe(&id));
+    }
+    let mut tx = state.db.begin().await?;
+    ensure_recipe_history(&mut tx, &user.id, &id).await?;
     sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE user_id=? AND id=?")
-        .bind(required(&form.title, "Recipe title")?)
-        .bind(trim(&form.description))
-        .bind(number(&form.servings)?)
-        .bind(number(&form.prep_minutes)?)
-        .bind(number(&form.cook_minutes)?)
+        .bind(title)
+        .bind(description)
+        .bind(servings)
+        .bind(prep_minutes)
+        .bind(cook_minutes)
         .bind(stamp())
         .bind(&user.id)
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
-    Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
+    record_version(&mut tx, &user.id, &id, "Details edited").await?;
+    tx.commit().await?;
+    Ok(redirect_recipe(&id))
+}
+
+const SNAPSHOT_SCHEMA_VERSION: u8 = 1;
+
+/// Records the pre-change state of a recipe with no history yet, so the first
+/// edit keeps the content it replaces. Call before mutating inside the transaction.
+pub(crate) async fn ensure_recipe_history(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<()> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM recipe_versions WHERE recipe_id=?)")
+            .bind(recipe_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !exists {
+        record_version(tx, user_id, recipe_id, "Original recipe").await?;
+    }
+    Ok(())
+}
+
+/// Stores one post-change content snapshot inside the caller's transaction.
+pub(crate) async fn record_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    recipe_id: &str,
+    label: &str,
+) -> Result<()> {
+    let snapshot = recipe_snapshot(tx, user_id, recipe_id).await?;
+    let version: i64 = sqlx::query_scalar(
+        "INSERT INTO recipe_version_counters(recipe_id,last_version) VALUES(?,1)
+         ON CONFLICT(recipe_id) DO UPDATE SET last_version=last_version+1
+         RETURNING last_version",
+    )
+    .bind(recipe_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let snapshot = serde_json::to_string(&snapshot).map_err(|error| {
+        AppError::Internal(format!("Could not encode the recipe version: {error}"))
+    })?;
+    sqlx::query("INSERT INTO recipe_versions(id,recipe_id,version,label,snapshot,created_at)VALUES(?,?,?,?,?,?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(recipe_id)
+        .bind(version)
+        .bind(label)
+        .bind(snapshot)
+        .bind(stamp())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Version row for the sidebar list; the snapshot text itself stays out of it.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct VersionListRow {
+    pub(crate) version: i64,
+    pub(crate) label: String,
+    pub(crate) created_at: String,
+    #[sqlx(skip)]
+    pub(crate) created_display: String,
+}
+
+pub(crate) async fn recipe_versions(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<Vec<VersionListRow>> {
+    let mut rows = sqlx::query_as::<_, VersionListRow>(
+        "SELECT v.version,v.label,v.created_at FROM recipe_versions v
+         JOIN recipes r ON r.id=v.recipe_id
+         WHERE v.recipe_id=? AND r.user_id=?
+         ORDER BY v.version DESC",
+    )
+    .bind(recipe_id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    for row in &mut rows {
+        row.created_display = display_timestamp(&row.created_at);
+    }
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct StoredVersionRow {
+    version: i64,
+    label: String,
+    created_at: String,
+    snapshot: String,
+}
+
+/// One stored version with its JSON contract checked at the repository edge.
+#[derive(Debug, Clone)]
+pub(crate) struct VersionDetail {
+    pub(crate) version: i64,
+    pub(crate) label: String,
+    pub(crate) created_at: String,
+    pub(crate) snapshot: RecipeSnapshot,
+}
+
+pub(crate) async fn find_version(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    version: i64,
+) -> Result<VersionDetail> {
+    let row = sqlx::query_as::<_, StoredVersionRow>(
+        "SELECT v.version,v.label,v.created_at,v.snapshot FROM recipe_versions v
+         JOIN recipes r ON r.id=v.recipe_id
+         WHERE v.recipe_id=? AND v.version=? AND r.user_id=?",
+    )
+    .bind(recipe_id)
+    .bind(version)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let snapshot: RecipeSnapshot = serde_json::from_str(&row.snapshot).map_err(|error| {
+        AppError::Internal(format!("Stored recipe version is invalid: {error}"))
+    })?;
+    if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
+        return Err(AppError::Internal(format!(
+            "Stored recipe version uses unsupported schema {}.",
+            snapshot.schema_version
+        )));
+    }
+    Ok(VersionDetail {
+        version: row.version,
+        label: row.label,
+        created_at: row.created_at,
+        snapshot,
+    })
+}
+
+pub(crate) async fn delete_version(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, version)): Path<(String, i64)>,
+) -> Result<Response> {
+    let result = sqlx::query(
+        "DELETE FROM recipe_versions
+         WHERE recipe_id=? AND version=?
+           AND EXISTS (
+               SELECT 1 FROM recipes r
+               WHERE r.id=recipe_versions.recipe_id AND r.user_id=?
+           )",
+    )
+    .bind(&id)
+    .bind(version)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(redirect_recipe(&id))
+}
+
+/// View one stored version read-only. Renders the saved snapshot JSON, not
+/// the live tables, so the page shows exactly what the recipe looked like.
+pub(crate) async fn view_version(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, version)): Path<(String, i64)>,
+) -> Result<Html<String>> {
+    let recipe = find_recipe(&state.db, &user.id, &id).await?;
+    let detail = find_version(&state.db, &user.id, &id, version).await?;
+    render(VersionTemplate {
+        recipe,
+        version: detail.version,
+        label: detail.label,
+        created_display: display_timestamp(&detail.created_at),
+        created_at: detail.created_at,
+        servings_value: option_number(detail.snapshot.servings),
+        prep_value: option_number(detail.snapshot.prep_minutes),
+        cook_value: option_number(detail.snapshot.cook_minutes),
+        snapshot: detail.snapshot,
+    })
 }
 
 pub(crate) async fn delete_page(
@@ -217,6 +425,7 @@ pub(crate) async fn add_block(
     }
     let text = required(&form.text, "Block text")?;
     let mut tx = state.db.begin().await?;
+    ensure_recipe_history(&mut tx, &user.id, &id).await?;
     let position: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(position)+1,0) FROM recipe_blocks WHERE recipe_id=? AND section=?",
     )
@@ -233,7 +442,7 @@ pub(crate) async fn add_block(
         .bind(text)
         .bind(trim(form.quantity.as_deref().unwrap_or("")))
         .bind(trim(form.unit.as_deref().unwrap_or("")))
-        .bind(if form.optional.is_some() { 1 } else { 0 })
+        .bind(form.optional.is_some())
         .execute(&mut *tx)
         .await?;
     if section == "step" {
@@ -245,8 +454,9 @@ pub(crate) async fn add_block(
         .await?;
     }
     invalidate_chart(&mut tx, &id).await?;
+    record_version(&mut tx, &user.id, &id, &block_label(section, "added")).await?;
     tx.commit().await?;
-    Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
+    Ok(redirect_recipe(&id))
 }
 
 pub(crate) async fn update_block(
@@ -258,42 +468,105 @@ pub(crate) async fn update_block(
     let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let text = required(&form.text, "Block text")?;
     let mut tx = state.db.begin().await?;
+    save_block_edit(&mut tx, &user.id, &id, &block, &text, &form).await?;
+    tx.commit().await?;
+    Ok(redirect_recipe(&id))
+}
+
+/// Writes one block's edited fields, its step ingredients, and the matching
+/// version. Shared by the edit form and the move buttons, which post the same
+/// fields.
+async fn save_block_edit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    recipe_id: &str,
+    block: &Block,
+    text: &str,
+    form: &BlockForm,
+) -> Result<()> {
+    let is_ingredient = block.section == "ingredient";
+    ensure_recipe_history(tx, user_id, recipe_id).await?;
     sqlx::query(
         "UPDATE recipe_blocks SET text=?,quantity=?,unit=?,optional=? WHERE id=? AND recipe_id=?",
     )
     .bind(text)
-    .bind(if block.section == "ingredient" {
+    .bind(if is_ingredient {
         trim(form.quantity.as_deref().unwrap_or(""))
     } else {
         String::new()
     })
-    .bind(if block.section == "ingredient" {
+    .bind(if is_ingredient {
         trim(form.unit.as_deref().unwrap_or(""))
     } else {
         String::new()
     })
-    .bind(if form.optional.is_some() { 1 } else { 0 })
-    .bind(&block_id)
-    .bind(&id)
-    .execute(&mut *tx)
+    .bind(form.optional.is_some())
+    .bind(&block.id)
+    .bind(recipe_id)
+    .execute(&mut **tx)
     .await?;
     if block.section == "step" {
         replace_step_ingredients(
-            &mut tx,
-            &block_id,
+            tx,
+            &block.id,
             form.step_ingredients.as_deref().unwrap_or(""),
         )
         .await?;
     }
-    invalidate_chart(&mut tx, &id).await?;
-    tx.commit().await?;
-    Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
+    invalidate_chart(tx, recipe_id).await?;
+    record_version(
+        tx,
+        user_id,
+        recipe_id,
+        &block_label(&block.section, "edited"),
+    )
+    .await
 }
 
+/// Whether a submitted block edit would change anything stored. The move buttons
+/// post the whole edit form, so an unchanged form must not add a history entry.
+async fn block_edit_differs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    recipe_id: &str,
+    block: &Block,
+    text: &str,
+    form: &BlockForm,
+) -> Result<bool> {
+    if text != block.text || form.optional.is_some() != block.optional() {
+        return Ok(true);
+    }
+    if block.section == "ingredient"
+        && (trim(form.quantity.as_deref().unwrap_or("")) != block.quantity
+            || trim(form.unit.as_deref().unwrap_or("")) != block.unit)
+    {
+        return Ok(true);
+    }
+    if block.section == "step" {
+        let stored = step_ingredients_by_step(&mut **tx, recipe_id)
+            .await?
+            .remove(&block.id)
+            .unwrap_or_default();
+        let submitted: Vec<String> = form
+            .step_ingredients
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .map(trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        return Ok(stored != submitted);
+    }
+    Ok(false)
+}
+
+/// Moves a block one place up or down within its section. The move buttons sit
+/// inside the block's edit form, so a changed edit submitted with them is saved
+/// first, in the same transaction, instead of being dropped.
 pub(crate) async fn move_block(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path((id, block_id, direction)): Path<(String, String, String)>,
+    body: std::result::Result<Form<BlockForm>, FormRejection>,
 ) -> Result<Response> {
     let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let delta = match direction.as_str() {
@@ -302,37 +575,57 @@ pub(crate) async fn move_block(
         _ => return Err(AppError::BadRequest("Invalid movement.".into())),
     };
     let target = block.position + delta;
-    if target < 0 {
-        return Ok(Redirect::to(&format!("/recipes/{id}")).into_response());
+    let edit = body
+        .ok()
+        .map(|Form(form)| form)
+        .filter(|form| !trim(&form.text).is_empty());
+    if edit.is_none() && target < 0 {
+        return Ok(redirect_recipe(&id));
     }
     let mut tx = state.db.begin().await?;
-    let neighbor: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM recipe_blocks WHERE recipe_id=? AND section=? AND position=?",
-    )
-    .bind(&id)
-    .bind(&block.section)
-    .bind(target)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(other) = neighbor {
-        sqlx::query("UPDATE recipe_blocks SET position=-1 WHERE id=?")
-            .bind(&block_id)
-            .execute(&mut *tx)
+    if let Some(form) = &edit {
+        let text = trim(&form.text);
+        if block_edit_differs(&mut tx, &id, &block, &text, form).await? {
+            save_block_edit(&mut tx, &user.id, &id, &block, &text, form).await?;
+        }
+    }
+    if target >= 0 {
+        let neighbor: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM recipe_blocks WHERE recipe_id=? AND section=? AND position=?",
+        )
+        .bind(&id)
+        .bind(&block.section)
+        .bind(target)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(other) = neighbor {
+            ensure_recipe_history(&mut tx, &user.id, &id).await?;
+            sqlx::query("UPDATE recipe_blocks SET position=-1 WHERE id=?")
+                .bind(&block_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE recipe_blocks SET position=? WHERE id=?")
+                .bind(block.position)
+                .bind(other)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE recipe_blocks SET position=? WHERE id=?")
+                .bind(target)
+                .bind(&block_id)
+                .execute(&mut *tx)
+                .await?;
+            invalidate_chart(&mut tx, &id).await?;
+            record_version(
+                &mut tx,
+                &user.id,
+                &id,
+                &block_label(&block.section, "reordered"),
+            )
             .await?;
-        sqlx::query("UPDATE recipe_blocks SET position=? WHERE id=?")
-            .bind(block.position)
-            .bind(other)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE recipe_blocks SET position=? WHERE id=?")
-            .bind(target)
-            .bind(&block_id)
-            .execute(&mut *tx)
-            .await?;
-        invalidate_chart(&mut tx, &id).await?;
+        }
     }
     tx.commit().await?;
-    Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
+    Ok(redirect_recipe(&id))
 }
 
 pub(crate) async fn delete_block(
@@ -342,6 +635,7 @@ pub(crate) async fn delete_block(
 ) -> Result<Response> {
     let block = find_block(&state.db, &user.id, &id, &block_id).await?;
     let mut tx = state.db.begin().await?;
+    ensure_recipe_history(&mut tx, &user.id, &id).await?;
     sqlx::query("DELETE FROM recipe_blocks WHERE id=?")
         .bind(&block_id)
         .execute(&mut *tx)
@@ -353,8 +647,15 @@ pub(crate) async fn delete_block(
         .execute(&mut *tx)
         .await?;
     invalidate_chart(&mut tx, &id).await?;
+    record_version(
+        &mut tx,
+        &user.id,
+        &id,
+        &block_label(&block.section, "deleted"),
+    )
+    .await?;
     tx.commit().await?;
-    Ok(Redirect::to(&format!("/recipes/{id}")).into_response())
+    Ok(redirect_recipe(&id))
 }
 
 pub(crate) async fn find_recipe(db: &SqlitePool, user_id: &str, id: &str) -> Result<Recipe> {
@@ -362,6 +663,19 @@ pub(crate) async fn find_recipe(db: &SqlitePool, user_id: &str, id: &str) -> Res
         .bind(user_id)
         .bind(id)
         .fetch_optional(db)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+pub(crate) async fn find_recipe_tx(
+    conn: &mut SqliteConnection,
+    user_id: &str,
+    id: &str,
+) -> Result<Recipe> {
+    sqlx::query_as("SELECT * FROM recipes WHERE user_id=? AND id=?")
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(conn)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -380,26 +694,40 @@ async fn find_block(db: &SqlitePool, user_id: &str, recipe_id: &str, id: &str) -
     .ok_or(AppError::NotFound)
 }
 
-async fn blocks(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Block>> {
-    Ok(sqlx::query_as(
-        "SELECT b.* FROM recipe_blocks b
-             JOIN recipes r ON r.id=b.recipe_id
-             WHERE b.recipe_id=? AND r.user_id=?
-             ORDER BY b.section,b.position",
+/// Blocks of a recipe in display order. The caller has already checked that
+/// the recipe belongs to the signed-in user.
+async fn blocks<'c>(
+    conn: impl sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    recipe_id: &str,
+) -> Result<Vec<Block>> {
+    Ok(
+        sqlx::query_as("SELECT * FROM recipe_blocks WHERE recipe_id=? ORDER BY section,position")
+            .bind(recipe_id)
+            .fetch_all(conn)
+            .await?,
     )
-    .bind(id)
-    .bind(user_id)
-    .fetch_all(db)
-    .await?)
 }
 
-async fn step_ingredients(db: &SqlitePool, step_id: &str) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar(
-        "SELECT text FROM recipe_step_ingredients WHERE step_id=? ORDER BY position",
+/// Ingredient lines per step block id, loaded in one query for the recipe.
+/// Like `blocks`, the caller owns the ownership check.
+async fn step_ingredients_by_step<'c>(
+    conn: impl sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    recipe_id: &str,
+) -> Result<HashMap<String, Vec<String>>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.step_id,s.text FROM recipe_step_ingredients s
+         JOIN recipe_blocks b ON b.id=s.step_id
+         WHERE b.recipe_id=?
+         ORDER BY s.step_id,s.position",
     )
-    .bind(step_id)
-    .fetch_all(db)
-    .await?)
+    .bind(recipe_id)
+    .fetch_all(conn)
+    .await?;
+    let mut by_step: HashMap<String, Vec<String>> = HashMap::new();
+    for (step_id, text) in rows {
+        by_step.entry(step_id).or_default().push(text);
+    }
+    Ok(by_step)
 }
 
 async fn replace_step_ingredients(
@@ -477,6 +805,7 @@ pub(crate) async fn store_draft_thumbnails(
     draft_id: &str,
     candidates: &[ThumbCandidate],
 ) -> Result<()> {
+    let mut tx = db.begin().await?;
     for (idx, candidate) in candidates.iter().enumerate() {
         sqlx::query(
             "INSERT OR REPLACE INTO draft_thumbnails(draft_id,idx,seconds,jpeg)VALUES(?,?,?,?)",
@@ -485,9 +814,10 @@ pub(crate) async fn store_draft_thumbnails(
         .bind(idx as i64)
         .bind(candidate.seconds as i64)
         .bind(&candidate.jpeg)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -575,53 +905,43 @@ pub(crate) async fn find_recipe_thumbnail(
     )
 }
 
+/// Content snapshot of a recipe, read inside the caller's transaction so a
+/// version captures the state the write just produced.
 pub(crate) async fn recipe_snapshot(
-    db: &SqlitePool,
+    conn: &mut SqliteConnection,
     user_id: &str,
-    recipe: &Recipe,
-) -> Result<Value> {
-    let blocks = blocks(db, user_id, &recipe.id).await?;
-    let mut steps = Vec::new();
-    for step in blocks.iter().filter(|block| block.section == "step") {
-        steps.push(json!({"text":step.text,"ingredients":step_ingredients(db,&step.id).await?}));
-    }
-    Ok(
-        json!({"title":recipe.title,"description":recipe.description,"servings":recipe.servings,"prepMinutes":recipe.prep_minutes,"cookMinutes":recipe.cook_minutes,"ingredients":blocks.iter().filter(|block|block.section=="ingredient").map(|block|json!({"name":block.text,"quantity":block.quantity,"unit":block.unit,"optional":block.optional()})).collect::<Vec<_>>(),"steps":steps}),
-    )
-}
-
-pub(crate) fn infer_step_ingredients(step: &str, ingredients: &[Block]) -> Vec<String> {
-    let lower = step.to_lowercase();
-    let words: HashSet<String> = lower
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_string)
-        .collect();
-    ingredients
-        .iter()
-        .filter(|ingredient| {
-            if ingredient.quantity.is_empty() || ingredient.unit.is_empty() {
-                return false;
-            }
-            let unit = ingredient.unit.to_lowercase();
-            let keyword = ingredient
-                .text
-                .to_lowercase()
-                .split(|character: char| !character.is_alphanumeric())
-                .rfind(|word| word.len() > 2)
-                .unwrap_or_default()
-                .to_string();
-            lower.contains(&ingredient.quantity.to_lowercase())
-                && words.contains(&unit)
-                && words.contains(&keyword)
-        })
-        .map(|ingredient| {
-            format!(
-                "{} {} {}",
-                ingredient.quantity, ingredient.unit, ingredient.text
-            )
-        })
-        .collect()
+    recipe_id: &str,
+) -> Result<RecipeSnapshot> {
+    let recipe = find_recipe_tx(conn, user_id, recipe_id).await?;
+    let (ingredients, steps): (Vec<Block>, Vec<Block>) = blocks(&mut *conn, recipe_id)
+        .await?
+        .into_iter()
+        .partition(|block| block.section == "ingredient");
+    let mut uses = step_ingredients_by_step(&mut *conn, recipe_id).await?;
+    Ok(RecipeSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        title: recipe.title,
+        description: recipe.description,
+        servings: recipe.servings,
+        prep_minutes: recipe.prep_minutes,
+        cook_minutes: recipe.cook_minutes,
+        ingredients: ingredients
+            .into_iter()
+            .map(|block| SnapshotIngredient {
+                optional: block.optional(),
+                name: block.text,
+                quantity: block.quantity,
+                unit: block.unit,
+            })
+            .collect(),
+        steps: steps
+            .into_iter()
+            .map(|block| SnapshotStep {
+                ingredients: uses.remove(&block.id).unwrap_or_default(),
+                text: block.text,
+            })
+            .collect(),
+    })
 }
 
 /// First source URL that is a supported social-video post, if any. This is
@@ -889,16 +1209,14 @@ pub(crate) async fn start_thumbnail_recompute(
             "This recipe has no social-video source to re-pick frames from.".into(),
         )
     })?;
-    if state.thumbnail_jobs.lock().contains(&id) {
+    if !state.thumbnail_jobs.lock().insert(id.clone()) {
         return Ok(redirect_recipe(&id));
     }
-    state.thumbnail_jobs.lock().insert(id.clone());
     let db = state.db.clone();
     let jobs = state.thumbnail_jobs.clone();
     let job_recipe_id = id.clone();
     tokio::spawn(async move {
-        let outcome = crate::media::extract_fresh_thumbnail_candidates(&video_url).await;
-        if let Ok(candidates) = outcome {
+        if let Ok(candidates) = crate::media::extract_fresh_thumbnail_candidates(&video_url).await {
             let _ = store_recipe_thumbnails(&db, &job_recipe_id, &candidates).await;
         }
         // A failed or empty run simply returns the page to its idle state.

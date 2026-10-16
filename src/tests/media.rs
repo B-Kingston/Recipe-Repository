@@ -38,9 +38,11 @@ fn state(db: SqlitePool, runs: DebugRunMap) -> Arc<AppState> {
         model: String::new(),
         pi_worker_path: String::new(),
         auth_script_path: String::new(),
+        claude_auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(None)),
+        claude_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: runs,
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })

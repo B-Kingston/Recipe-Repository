@@ -1,7 +1,10 @@
-use crate::auth::{AuthUser, hash_password, reset_password, setup_create, verify_password};
+use super::config::ENV_LOCK;
+use crate::auth::{
+    AuthUser, create_user, hash_password, reset_password, setup_create, verify_password,
+};
 use crate::{
-    AppState, ResetPasswordForm, SetupForm, codex_credential, import_legacy_codex_auth, routes,
-    stamp, store_codex_credential,
+    AppState, CODEX_PI_PROVIDER, ResetPasswordForm, SetupForm, import_legacy_codex_auth,
+    pi_credential, routes, stamp, store_pi_credential,
 };
 use axum::{
     body::{Body, to_bytes},
@@ -17,8 +20,6 @@ use sqlx::{
 };
 use std::{collections::HashMap, collections::HashSet, fs, sync::Arc};
 use tower::ServiceExt;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 async fn database() -> SqlitePool {
     let db = SqlitePoolOptions::new()
@@ -40,9 +41,11 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model: String::new(),
         pi_worker_path: String::new(),
         auth_script_path: String::new(),
+        claude_auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(None)),
+        claude_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
@@ -76,26 +79,55 @@ fn request(path: &str, authorization: Option<&str>) -> Request<Body> {
 #[tokio::test]
 async fn credential_round_trips_through_the_database() {
     let db = database().await;
-    assert!(codex_credential(&db, "u1").await.unwrap().is_none());
+    assert!(
+        pi_credential(&db, "u1", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
-    store_codex_credential(&db, "u1", &credential("access_1", "acct_1"))
+    store_pi_credential(
+        &db,
+        "u1",
+        CODEX_PI_PROVIDER,
+        &credential("access_1", "acct_1"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        pi_credential(&db, "u2", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stored = pi_credential(&db, "u1", CODEX_PI_PROVIDER)
         .await
+        .unwrap()
         .unwrap();
-    assert!(codex_credential(&db, "u2").await.unwrap().is_none());
-    let stored = codex_credential(&db, "u1").await.unwrap().unwrap();
     assert_eq!(stored["type"], "oauth");
     assert_eq!(stored["accountId"], "acct_1");
 
     // A refresh replaces the stored access token rather than appending.
-    store_codex_credential(&db, "u1", &credential("access_2", "acct_1"))
-        .await
-        .unwrap();
+    store_pi_credential(
+        &db,
+        "u1",
+        CODEX_PI_PROVIDER,
+        &credential("access_2", "acct_1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        codex_credential(&db, "u1").await.unwrap().unwrap()["access"],
+        pi_credential(&db, "u1", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["access"],
         "access_2"
     );
 }
 
+// The env lock spans awaits on purpose: the runtime is current-thread, so the
+// guard never crosses threads and serialises env access against other tests.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn legacy_auth_json_is_imported_once_and_never_overrides_the_database() {
     let _lock = ENV_LOCK.lock();
@@ -109,7 +141,12 @@ async fn legacy_auth_json_is_imported_once_and_never_overrides_the_database() {
 
     // No file yet: nothing to import.
     import_legacy_codex_auth(&db).await.unwrap();
-    assert!(codex_credential(&db, "").await.unwrap().is_none());
+    assert!(
+        pi_credential(&db, "", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // A legacy Pi CLI credential is imported once.
     fs::write(
@@ -119,7 +156,10 @@ async fn legacy_auth_json_is_imported_once_and_never_overrides_the_database() {
     .unwrap();
     import_legacy_codex_auth(&db).await.unwrap();
     assert_eq!(
-        codex_credential(&db, "").await.unwrap().unwrap()["accountId"],
+        pi_credential(&db, "", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["accountId"],
         "x"
     );
 
@@ -131,7 +171,10 @@ async fn legacy_auth_json_is_imported_once_and_never_overrides_the_database() {
     .unwrap();
     import_legacy_codex_auth(&db).await.unwrap();
     assert_eq!(
-        codex_credential(&db, "").await.unwrap().unwrap()["accountId"],
+        pi_credential(&db, "", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["accountId"],
         "x"
     );
 
@@ -147,6 +190,25 @@ fn password_hashes_verify_and_reject() {
     assert!(verify_password("hunter2", &hash));
     assert!(!verify_password("nope", &hash));
     assert!(!verify_password("hunter2", "not a password hash"));
+}
+
+#[tokio::test]
+async fn whitespace_only_passwords_are_rejected_and_stored_exactly() {
+    let db = database().await;
+    assert!(matches!(
+        create_user(&db, "alice", "   ", "   ").await,
+        Err(crate::AppError::BadRequest(_))
+    ));
+    create_user(&db, "alice", " spaced ", " spaced ")
+        .await
+        .unwrap();
+    let stored: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE username='alice'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(verify_password(" spaced ", &stored));
+    assert!(!verify_password("spaced", &stored));
 }
 
 #[tokio::test]
@@ -183,7 +245,8 @@ async fn first_setup_creates_user_and_claims_orphans() {
         State(state(db.clone())),
         Form(SetupForm {
             username: "alice".into(),
-            password: "x".into(),
+            password: "password-1".into(),
+            confirm_password: "password-1".into(),
         }),
     )
     .await
@@ -216,6 +279,7 @@ async fn first_setup_creates_user_and_claims_orphans() {
         Form(SetupForm {
             username: "bob".into(),
             password: "anything".into(),
+            confirm_password: "anything".into(),
         }),
     )
     .await
@@ -225,6 +289,46 @@ async fn first_setup_creates_user_and_claims_orphans() {
         .await
         .unwrap();
     assert_eq!(user_count, 1);
+}
+
+#[tokio::test]
+async fn setup_requires_matching_passwords_of_at_least_eight_characters() {
+    let db = database().await;
+    let state = state(db.clone());
+    let cases = [
+        (
+            "alice",
+            "password-1",
+            "password-2",
+            "Passwords do not match.",
+        ),
+        (
+            "alice",
+            "short",
+            "short",
+            "Password must be at least 8 characters.",
+        ),
+        ("alice", "      ", "      ", "Password is required."),
+    ];
+    for (username, password, confirm, expected) in cases {
+        let response = setup_create(
+            State(state.clone()),
+            Form(SetupForm {
+                username: username.into(),
+                password: password.into(),
+                confirm_password: confirm.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_body(response).await.contains(expected));
+    }
+    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(user_count, 0);
 }
 
 #[tokio::test]
@@ -241,7 +345,8 @@ async fn protected_routes_require_basic_auth_and_scope_items() {
         State(state.clone()),
         Form(SetupForm {
             username: "alice".into(),
-            password: "secret".into(),
+            password: "secret-pass".into(),
+            confirm_password: "secret-pass".into(),
         }),
     )
     .await
@@ -266,10 +371,10 @@ async fn protected_routes_require_basic_auth_and_scope_items() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
-        "Basic realm=\"Kindle Recipes\""
+        "Basic realm=\"Recipe Repository\""
     );
 
-    let alice_auth = basic_header("alice", "secret");
+    let alice_auth = basic_header("alice", "secret-pass");
     let response = app
         .clone()
         .oneshot(request("/", Some(&alice_auth)))
@@ -277,13 +382,27 @@ async fn protected_routes_require_basic_auth_and_scope_items() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let wrong_auth = basic_header("alice", "wrong");
+    let lowercase_scheme = alice_auth.replacen("Basic", "basic", 1);
     let response = app
         .clone()
-        .oneshot(request("/", Some(&wrong_auth)))
+        .oneshot(request("/", Some(&lowercase_scheme)))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for rejected in [
+        basic_header("alice", "wrong"),
+        basic_header("mallory", "secret"),
+        "Bearer secret".to_string(),
+        "Basic !!not-base64".to_string(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("/", Some(&rejected)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{rejected}");
+    }
 
     let response = app
         .clone()
@@ -331,6 +450,7 @@ async fn reset_password_requires_current_password_and_updates_login() {
         Form(SetupForm {
             username: "alice".into(),
             password: "old-secret".into(),
+            confirm_password: "old-secret".into(),
         }),
     )
     .await
@@ -362,6 +482,7 @@ async fn reset_password_requires_current_password_and_updates_login() {
         Form(ResetPasswordForm {
             current_password: "wrong".into(),
             new_password: "reset-secret".into(),
+            confirm_password: "reset-secret".into(),
         }),
     )
     .await
@@ -386,6 +507,7 @@ async fn reset_password_requires_current_password_and_updates_login() {
         Form(ResetPasswordForm {
             current_password: "old-secret".into(),
             new_password: "   ".into(),
+            confirm_password: "   ".into(),
         }),
     )
     .await
@@ -396,6 +518,26 @@ async fn reset_password_requires_current_password_and_updates_login() {
             .await
             .contains("New password is required.")
     );
+
+    // Mismatched confirmation and a short password are both refused.
+    for (new_password, confirm_password, expected) in [
+        ("reset-secret", "reset-secres", "Passwords do not match."),
+        ("short", "short", "Password must be at least 8 characters."),
+    ] {
+        let response = reset_password(
+            State(state.clone()),
+            user.clone(),
+            Form(ResetPasswordForm {
+                current_password: "old-secret".into(),
+                new_password: new_password.into(),
+                confirm_password: confirm_password.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response_body(response).await.contains(expected));
+    }
     let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
         .bind(&user_id)
         .fetch_one(&db)
@@ -410,6 +552,7 @@ async fn reset_password_requires_current_password_and_updates_login() {
         Form(ResetPasswordForm {
             current_password: "old-secret".into(),
             new_password: "reset-secret".into(),
+            confirm_password: "reset-secret".into(),
         }),
     )
     .await
@@ -417,7 +560,7 @@ async fn reset_password_requires_current_password_and_updates_login() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         response.headers().get(header::LOCATION).unwrap(),
-        "/settings"
+        "/settings?notice=password_changed"
     );
     let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
         .bind(&user_id)

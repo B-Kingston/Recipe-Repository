@@ -16,12 +16,11 @@ import sys
 from pathlib import Path
 
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
+def _env_int(name: str, default: int) -> int:
     try:
-        value = int(os.environ.get(name, str(default)))
+        return max(1, int(os.environ.get(name, str(default))))
     except ValueError:
         return default
-    return max(minimum, value)
 
 
 def _configure_paddle_cache() -> None:
@@ -101,8 +100,8 @@ def _paddle_frame_reading(
         if score < score_threshold or not _text_matches_language(text, lang):
             continue
         # A lone short token is usually background texture, while a quantity
-        # remains useful when it
-        # is attached to the ingredient line that contains it.
+        # remains useful when it is attached to the ingredient line that
+        # contains it.
         if len(text.split()) < 2 and sum(character.isalnum() for character in text) < 5:
             continue
         box = boxes[index] if index < len(boxes) else []
@@ -279,6 +278,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as error:  # Keep stdout a single machine-readable line.
+    except Exception as error:  # The Rust caller reads this JSON line from stderr first.
         print(json.dumps({"error": str(error)}), file=sys.stderr)
         raise

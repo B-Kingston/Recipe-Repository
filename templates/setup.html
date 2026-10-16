@@ -13,15 +13,19 @@
       <div class="form-intro">
         <p class="eyebrow">First access</p>
         <h1>Set up Recipe Repository</h1>
-        <p class="deck">Choose a username and any password. This account will protect the recipe library.</p>
+        <p class="deck">Choose a username and a password. This account will protect the recipe library.</p>
       </div>
       <div class="compact-panel">
         <form method="post" action="/setup">
           <label for="username">Username</label>
           <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" required>
           <label for="password">Password</label>
-          <input id="password" name="password" type="password" autocomplete="new-password" required>
-          {% if !error.is_empty() %}<p class="muted">{{ error }}</p>{% endif %}
+          <input id="password" name="password" type="password" autocomplete="new-password" required aria-describedby="password-hint">
+          <p class="muted" id="password-hint">At least 8 characters.</p>
+          <label for="confirm_password">Confirm password</label>
+          <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required aria-describedby="confirm-hint">
+          <p class="muted" id="confirm-hint">Both passwords must match.</p>
+          {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
           <p class="actions"><button class="button" type="submit">Create account</button></p>
         </form>
       </div>

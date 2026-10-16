@@ -7,3 +7,5 @@ deploy.sh
 target/
 .cargo-home/
 node_modules/
+.DS_Store
+bench/*/out/

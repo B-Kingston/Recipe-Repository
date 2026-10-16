@@ -1,7 +1,8 @@
 use crate::env_bool;
 use parking_lot::Mutex;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises every test that mutates process environment variables.
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn env_bool_accepts_true_and_false_and_uses_default_for_invalid_values() {

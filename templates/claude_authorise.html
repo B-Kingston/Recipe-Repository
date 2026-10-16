@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}Authorise Claude · Recipe Repository{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Configuration / AI</p>
+  <h1>Authorise Claude</h1>
+  <p class="deck">Sign in with your Claude Pro or Max account so Recipe Repository can generate recipes with Claude.</p>
+</div>
+<div class="compact-panel">
+  <div class="block">
+    <h2>1. Open the sign-in page</h2>
+    <p class="muted"><a href="{{ url }}">Sign in to Claude</a> and approve access. Then come back to this page.</p>
+    <h2>2. Paste the code</h2>
+    <p class="muted">Claude shows a code once you approve. Paste it here. This sign-in expires in {{ expires_minutes }} minutes.</p>
+    <form method="post" action="/settings/authorise-claude">
+      <input type="hidden" name="flow_id" value="{{ flow_id }}">
+      <label for="claude-code">Code</label>
+      <input type="text" id="claude-code" name="code" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+      {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+      <p class="actions"><button class="primary" type="submit">Connect Claude</button><a class="button" href="/settings">Cancel</a></p>
+    </form>
+  </div>
+</div>
+{% endblock %}

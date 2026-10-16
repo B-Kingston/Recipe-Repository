@@ -1,7 +1,8 @@
-{% extends "base.html" %}{% block title %}AI Draft · Kindle Recipes{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}AI Draft · Recipe Repository{% endblock %}{% block content %}
+{% if error != "" %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 <header class="page-header">
   <div class="page-header-copy">
-    <p class="breadcrumb">AI Kitchen / Draft for review</p>
+    <p class="breadcrumb">Cookbook / Draft for review</p>
     <h1>{{ recipe.title }}</h1>
     <p class="deck">{{ recipe.description }}</p>
     <p class="metadata"><span>{{ recipe.servings }} servings</span><span>{{ recipe.prep_minutes }} min prep</span><span>{{ recipe.cook_minutes }} min cook</span></p>
@@ -15,12 +16,12 @@
     {% endif %}
   </div>
   <div class="actions page-actions">
-    {% if thumbs.is_empty() %}<form class="inline" method="post" action="/ai/drafts/{{ id }}/apply"><button class="primary">Save recipe</button></form>{% endif %}
-    <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel"><button>Discard</button></form>
+    {% if thumbs.is_empty() %}<form class="inline" method="post" action="/ai/drafts/{{ id }}/apply" data-busy-label="Saving…"><button class="primary">Save recipe</button></form>{% endif %}
+    <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel" data-confirm="Discard this draft? You will need to research it again to get it back." data-busy-label="Discarding…"><button>Discard</button></form>
   </div>
 </header>
 {% if !thumbs.is_empty() %}
-<form class="panel thumb-picker" method="post" action="/ai/drafts/{{ id }}/apply">
+<form class="panel thumb-picker" method="post" action="/ai/drafts/{{ id }}/apply" data-busy-label="Saving…">
   <h2>Dish photo</h2>
   <p class="muted">Picked locally from the clearest food shots in the video. Choose one for the library card, then save.</p>
   <div class="thumb-options">
@@ -39,11 +40,11 @@
 {% when Some with (evidence) %}
 <section class="panel evidence-panel">
   <div class="evidence-heading"><h2>Evidence combined from video</h2><a href="{{ evidence.source_url }}" target="_blank" rel="noopener noreferrer">Open original post</a></div>
-  <p class="muted">Local audio and OCR were combined with the post caption, then reduced to recipe-only facts by the AI Gateway cleaner before this draft was generated{% if evidence.duration_seconds.is_some() %} from the first {{ evidence.duration_seconds.unwrap() }} seconds{% endif %}.</p>
+  <p class="muted">The post caption, the audio transcript and the on-screen text were reduced to recipe-only facts by the video cleaner before this draft was generated{% if evidence.duration_seconds.is_some() %} from the first {{ evidence.duration_seconds.unwrap() }} seconds{% endif %}.</p>
   {% if evidence.cleaned_recipe_text != "" %}<details class="cleaned-evidence" open><summary>Recipe-only evidence sent to the final model</summary><p class="evidence-text">{{ evidence.cleaned_recipe_text }}</p></details>{% endif %}
   {% if evidence.description != "" %}<details><summary>Raw post description (cleaner input only)</summary><p class="evidence-text">{{ evidence.description }}</p></details>{% endif %}
   {% if evidence.audio_transcript != "" %}<details><summary>Raw audio transcript (cleaner input only)</summary><p class="evidence-text">{{ evidence.audio_transcript }}</p></details>{% endif %}
-  {% if evidence.ocr.len() > 0 %}<details><summary>{{ evidence.ocr.len() }} raw OCR capture{% if evidence.ocr.len() != 1 %}s{% endif %} (cleaner input only)</summary><ul class="evidence-ocr">{% for item in evidence.ocr %}<li><span class="muted">~{{ item.timestamp_seconds }}s</span> {{ item.text }}</li>{% endfor %}</ul></details>{% endif %}
+  {% if evidence.ocr.len() > 0 %}<details><summary>{{ evidence.ocr.len() }} on-screen text capture{% if evidence.ocr.len() != 1 %}s{% endif %} (cleaner input only)</summary><ul class="evidence-ocr">{% for item in evidence.ocr %}<li><span class="muted">~{{ item.timestamp_seconds }}s</span> {{ item.text }}</li>{% endfor %}</ul></details>{% endif %}
   {% if evidence.warnings.len() > 0 %}<p class="evidence-warning"><strong>Extraction notes:</strong> {% for warning in evidence.warnings %}{{ warning }}{% if !loop.last %} {% endif %}{% endfor %}</p>{% endif %}
 </section>
 {% when None %}
@@ -68,20 +69,11 @@
     {% endfor %}
   </section>
 </article>
-<form class="panel form-panel top-spacer" method="post" action="/ai/drafts/{{ id }}/alter">
+<form class="panel form-panel top-spacer" method="post" action="/ai/drafts/{{ id }}/alter" data-busy-label="Generating">
   <h2>Alter this draft</h2>
-  {% if error != "" %}<p class="error">{{ error }}</p>{% endif %}
   <label>What should change?<textarea name="prompt" required maxlength="4000" placeholder="e.g. make it vegetarian, swap the chicken for tofu, cut the servings in half…">{{ prompt }}</textarea></label>
-  <p class="muted">Pi returns a complete replacement draft for review. This draft stays untouched until you save one.</p>
+  <p class="muted">The assistant returns a complete replacement draft for review. This draft stays untouched until you save one.</p>
   <p class="actions form-actions"><button class="primary">Create altered draft</button></p>
 </form>
 {% if suggestions != "" %}<div class="top-spacer">{{ suggestions }}</div>{% endif %}
-<script>
-  (function () {
-    var form = document.querySelector('form.form-panel');
-    var button = form && form.querySelector('button.primary');
-    if (!form || !button) return;
-    form.addEventListener('submit', function () { button.textContent = 'Generating'; });
-  }());
-</script>
 {% endblock %}

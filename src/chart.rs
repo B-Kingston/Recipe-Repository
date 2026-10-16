@@ -13,6 +13,46 @@ pub(crate) fn selected_chart_step(requested: Option<usize>, step_count: usize) -
     }
 }
 
+fn ingredient_line(ingredient: &Block) -> String {
+    format!(
+        "{} {} {}",
+        ingredient.quantity, ingredient.unit, ingredient.text
+    )
+    .trim()
+    .to_string()
+}
+
+/// Ingredients a step names by explicit quantity, unit and keyword, used when
+/// a step has no saved ingredient links.
+pub(crate) fn infer_step_ingredients(step: &str, ingredients: &[Block]) -> Vec<String> {
+    let lower = step.to_lowercase();
+    let words: HashSet<String> = lower
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    ingredients
+        .iter()
+        .filter(|ingredient| {
+            if ingredient.quantity.is_empty() || ingredient.unit.is_empty() {
+                return false;
+            }
+            let unit = ingredient.unit.to_lowercase();
+            let keyword = ingredient
+                .text
+                .to_lowercase()
+                .split(|character: char| !character.is_alphanumeric())
+                .rfind(|word| word.len() > 2)
+                .unwrap_or_default()
+                .to_string();
+            lower.contains(&ingredient.quantity.to_lowercase())
+                && words.contains(&unit)
+                && words.contains(&keyword)
+        })
+        .map(ingredient_line)
+        .collect()
+}
+
 pub(crate) fn build_chart(
     recipe: &Recipe,
     ingredients: &[Block],
@@ -102,25 +142,18 @@ pub(crate) fn build_chart(
     let unlinked = if using_rich {
         Vec::new()
     } else {
+        let used: Vec<String> = steps
+            .iter()
+            .flat_map(|step| step.ingredients.iter())
+            .map(|line| line.to_lowercase())
+            .collect();
         ingredients
             .iter()
             .filter(|ingredient| {
-                !steps
-                    .iter()
-                    .flat_map(|step| step.ingredients.iter())
-                    .any(|used| {
-                        used.to_lowercase()
-                            .contains(&ingredient.text.to_lowercase())
-                    })
+                let name = ingredient.text.to_lowercase();
+                !used.iter().any(|line| line.contains(&name))
             })
-            .map(|ingredient| {
-                format!(
-                    "{} {} {}",
-                    ingredient.quantity, ingredient.unit, ingredient.text
-                )
-                .trim()
-                .to_string()
-            })
+            .map(ingredient_line)
             .collect()
     };
     let selected = selected_chart_step(requested, flow.len());

@@ -7,7 +7,6 @@ The screenshots are selected by src/media.rs and uniformly thinned to at most
 Example (inside the media Docker image):
     /opt/media-venv/bin/python bench/ocr/benchmark.py \
         --frames-dir bench/ocr/data/frames \
-        --expected-file bench/ocr/reference-ig-post.txt \
         --output bench/ocr/out/result.json
 """
 

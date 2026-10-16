@@ -7,13 +7,54 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import {
+  anthropicSearchPayload,
   createNativeSearchObserver,
   nativeSearchPayload,
   normalizeSourceUrl,
   optionalSearchPayload,
-} from "./codex-native-search.mjs";
+  webSearchCompleted,
+} from "./native-search.mjs";
+import { outputJson, readStdin, runMain } from "./cli.mjs";
 
-const PROVIDER = "openai-codex";
+/** Subscription providers the worker runs through pi's ModelRuntime, keyed by
+ * pi provider id. The host stores each OAuth credential under the same key in
+ * the per-request auth.json. Both go through completeSimple, so `reasoning` maps
+ * to each model's own thinking control and a level the model lacks is clamped to
+ * the nearest one it offers (Codex max runs as xhigh; Claude xhigh and max run
+ * as high). */
+const SUBSCRIPTIONS = {
+  "openai-codex": {
+    label: "Codex",
+    notLoggedIn: "Pi is not logged in to ChatGPT. Authorise Codex from the Settings page.",
+    defaultModel: "gpt-6-luna",
+    // The observer reads search events from SSE through fetch, so an observed
+    // Codex request must pin that transport; websocket would bypass it.
+    searchOptions: (searchMode) => ({
+      transport: "sse",
+      onPayload: searchMode === "grounded" ? nativeSearchPayload : optionalSearchPayload,
+    }),
+  },
+  anthropic: {
+    label: "Claude",
+    notLoggedIn: "Pi is not logged in to Claude. Authorise Claude from the Settings page.",
+    defaultModel: "claude-sonnet-5-5",
+    searchOptions: () => ({ onPayload: anthropicSearchPayload }),
+  },
+};
+
+/** The trimmed string value, or null when it is missing or blank. */
+function nonBlank(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/** The subscription entry for a request's piProvider; defaults to Codex. */
+export function subscriptionOf(request) {
+  const id = nonBlank(request.piProvider) ?? "openai-codex";
+  if (!Object.hasOwn(SUBSCRIPTIONS, id)) {
+    throw new WorkerError("configuration", `Unsupported pi provider: ${id}`);
+  }
+  return { id, ...SUBSCRIPTIONS[id] };
+}
 
 const REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
@@ -36,36 +77,25 @@ export class WorkerError extends Error {
     super(message);
     this.code = code;
     this.retryable = options.retryable === true;
-    this.status = options.status;
   }
 }
 
-async function readRequest() {
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
+/** Parses one stdin request. listModels needs no prompt; every other command does. */
+export function parseRequest(input) {
+  let request;
   try {
-    const request = JSON.parse(input);
-    if (!request || typeof request !== "object" || Array.isArray(request)) {
-      throw new Error("invalid request");
-    }
-    if (request.command === "listModels") return request;
-    if (request.command === "cleanMedia") {
-      if (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string") {
-        throw new Error("missing cleaner prompt or systemPrompt");
-      }
-      return request;
-    }
-    if (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string") {
-      throw new Error("missing prompt or systemPrompt");
-    }
-    return request;
+    request = JSON.parse(input);
   } catch (error) {
     throw new WorkerError("input", `Invalid worker request: ${error.message}`);
   }
-}
-
-function outputJson(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    throw new WorkerError("input", "Invalid worker request: invalid request");
+  }
+  if (request.command !== "listModels"
+    && (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string")) {
+    throw new WorkerError("input", "Invalid worker request: missing prompt or systemPrompt");
+  }
+  return request;
 }
 
 /**
@@ -84,28 +114,32 @@ export function catalogModelIds(models) {
   return ids.sort((a, b) => b.localeCompare(a));
 }
 
+/** Parses the first JSON object in a model reply, which may be fenced or have
+ * prose around it. A JSON object ends at a closing brace, so only those
+ * positions are tried, last first. */
 function extractJson(text) {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim();
-  const candidates = [trimmed, fenced].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // A model occasionally prefixes an otherwise valid JSON object with one sentence.
-    }
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim() ?? "";
+  for (const candidate of [trimmed, fenced]) {
     const start = candidate.indexOf("{");
     if (start === -1) continue;
-    for (let end = candidate.length; end > start; end -= 1) {
+    for (let end = candidate.lastIndexOf("}"); end > start; end = candidate.lastIndexOf("}", end - 1)) {
       try {
-        return JSON.parse(candidate.slice(start, end));
+        return JSON.parse(candidate.slice(start, end + 1));
       } catch {
-        // Continue until the matching JSON object is found.
+        // Not a complete object ending here; try the previous closing brace.
       }
     }
   }
   throw new WorkerError("output", "Pi did not return the required JSON response.");
+}
+
+function recipeObject(text) {
+  const result = extractJson(text);
+  if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
+    throw new WorkerError("output", "Pi did not return a recipe object.");
+  }
+  return result;
 }
 
 function assistantText(message) {
@@ -113,23 +147,6 @@ function assistantText(message) {
     .filter((part) => part.type === "text")
     .map((part) => part.text)
     .join("");
-}
-
-function sourceList(value, seenSources) {
-  if (!Array.isArray(value)) return [];
-  const urls = new Set();
-  return value.flatMap((source) => {
-    const url = normalizeSourceUrl(source?.url);
-    if (!url || !seenSources.has(url) || urls.has(url)) return [];
-    urls.add(url);
-    const citedTitle = seenSources.get(url);
-    return [{
-      title: typeof source.title === "string" && source.title.trim()
-        ? source.title.trim()
-        : citedTitle || url,
-      url,
-    }];
-  });
 }
 
 /**
@@ -143,20 +160,19 @@ function sourceList(value, seenSources) {
  * optional gap-fill attribution. Grounded callers leave this fallback disabled.
  */
 export function verifiedSources(claimed, citations, acceptUnverifiable) {
-  const verified = sourceList(claimed, citations);
-  if (verified.length > 0 || citations.size > 0 || !acceptUnverifiable) return verified;
-  const urls = new Set();
-  const fallback = [];
+  const seen = new Set();
+  const claims = [];
   for (const source of Array.isArray(claimed) ? claimed : []) {
     const url = normalizeSourceUrl(source?.url);
-    if (!url || urls.has(url)) continue;
-    urls.add(url);
-    fallback.push({
-      title: typeof source.title === "string" && source.title.trim() ? source.title.trim() : url,
-      url,
-    });
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    claims.push({ url, title: typeof source.title === "string" ? source.title.trim() : "" });
   }
-  return fallback;
+  const verified = claims
+    .filter(({ url }) => citations.has(url))
+    .map(({ url, title }) => ({ title: title || citations.get(url) || url, url }));
+  if (verified.length > 0 || citations.size > 0 || !acceptUnverifiable) return verified;
+  return claims.map(({ url, title }) => ({ title: title || url, url }));
 }
 
 /** Tri-state search posture carried on generation requests: "grounded"
@@ -198,20 +214,10 @@ export function completionContext(request, searchMode = "off") {
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
 const AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000;
 
-function apiCredentials(request) {
-  const apiBaseUrl = typeof request.apiBaseUrl === "string" && request.apiBaseUrl.trim()
-    ? request.apiBaseUrl.trim() : null;
-  const apiKey = typeof request.apiKey === "string" && request.apiKey.trim()
-    ? request.apiKey.trim() : null;
-  if (!apiBaseUrl || !apiKey) {
-    throw new WorkerError("worker", "Missing apiBaseUrl or apiKey for the API request.");
-  }
-  return { apiBaseUrl, apiKey };
-}
-
 /** POST JSON and return the parsed body. Throws WorkerError on transport
  *  failure or non-2xx (error body truncated to 300 chars; never includes the
- *  key). Shared by the Responses API path and the Messages API path. */
+ *  key). Shared by the Responses API path, the Messages API path and the
+ *  AI Gateway cleaner. */
 async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -232,7 +238,7 @@ async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPO
       throw new WorkerError(
         "worker",
         `API returned HTTP ${response.status}${detail ? `: ${detail.slice(0, 300)}` : ""}`,
-        { retryable, status },
+        { retryable },
       );
     }
     return await response.json();
@@ -247,12 +253,6 @@ async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPO
   } finally {
     clearTimeout(timer);
   }
-}
-
-/** POST {base}/responses; returns the parsed JSON body. */
-async function postResponses(apiBaseUrl, apiKey, body, fetchImpl) {
-  const url = `${apiBaseUrl.replace(/\/+$/, "")}/responses`;
-  return fetchJson(url, { Authorization: `Bearer ${apiKey}` }, body, fetchImpl);
 }
 
 /** Vercel AI Gateway's OpenAI-compatible chat-completions request used only
@@ -375,19 +375,25 @@ export function parseAiGatewayCleaner(data) {
   return formatRecipeEvidence(extractJson(text));
 }
 
+/** POST {base}/responses with bearer auth; returns the parsed JSON body. */
 export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchMode, reasoningEffort = "low", fetchImpl = fetch) {
-  return postResponses(apiBaseUrl, apiKey, {
-    model: modelId,
-    input: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: prompt },
-    ],
-    ...(searchMode !== "off"
-      ? { tools: [{ type: "web_search" }], tool_choice: searchMode === "grounded" ? "required" : "auto" }
-      : {}),
-    reasoning: { effort: reasoningEffort },
-    text: { verbosity: "low" },
-  }, fetchImpl);
+  return fetchJson(
+    `${apiBaseUrl.replace(/\/+$/, "")}/responses`,
+    { Authorization: `Bearer ${apiKey}` },
+    {
+      model: modelId,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: prompt },
+      ],
+      ...(searchMode !== "off"
+        ? { tools: [{ type: "web_search" }], tool_choice: searchMode === "grounded" ? "required" : "auto" }
+        : {}),
+      reasoning: { effort: reasoningEffort },
+      text: { verbosity: "low" },
+    },
+    fetchImpl,
+  );
 }
 
 /** Reduces a Responses API body to what the worker needs.
@@ -400,11 +406,8 @@ export function parseResponsesOutput(data) {
   const texts = [];
   for (const item of output) {
     if (item?.type === "web_search_call") {
-      const action = item.action;
-      const actionType = typeof action === "string" ? action : action?.type;
-      const completed = item.status === "completed" || (actionType === "search" && item.status !== "failed");
-      if (completed) searched = true;
-      for (const source of action?.sources ?? []) {
+      if (webSearchCompleted(item)) searched = true;
+      for (const source of item.action?.sources ?? []) {
         const url = normalizeSourceUrl(source?.url);
         if (url) citations.set(url, typeof source.title === "string" ? source.title : "");
       }
@@ -438,7 +441,7 @@ const ANTHROPIC_THINKING_BUDGETS = { low: 1024, medium: 4096, high: 8192, xhigh:
 const ANTHROPIC_OUTPUT_HEADROOM = 8192;
 
 export function thinkingBudget(reasoningEffort) {
-  return ANTHROPIC_THINKING_BUDGETS[normalizeEffort(reasoningEffort)] ?? ANTHROPIC_THINKING_BUDGETS.low;
+  return ANTHROPIC_THINKING_BUDGETS[normalizeEffort(reasoningEffort)];
 }
 
 /** The Messages API path for a stored base URL: append /v1/messages, unless
@@ -469,138 +472,103 @@ export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPromp
 }
 
 /** Reduces a Messages API body to what the worker needs. Web search results
- *  arrive as content blocks of type web_search_tool_result, each holding
- *  search_result items with source.url / title; those become the citations
- *  the claimed sources are verified against. */
+ *  arrive as web_search_result items inside a web_search_tool_result block; the
+ *  answer's own citations are web_search_result_location entries on its text
+ *  blocks. Both are the URLs the claimed sources are verified against. */
 export function parseAnthropicOutput(data) {
   const content = Array.isArray(data?.content) ? data.content : [];
   let searched = false;
   const citations = new Map();
+  const cite = (item) => {
+    const url = normalizeSourceUrl(item.url);
+    if (url) citations.set(url, typeof item.title === "string" ? item.title : "");
+  };
   const texts = [];
   for (const block of content) {
     if (block?.type === "text") {
       if (typeof block.text === "string") texts.push(block.text);
+      for (const citation of block.citations ?? []) {
+        if (citation?.type === "web_search_result_location") cite(citation);
+      }
     } else if (block?.type === "web_search_tool_result") {
       searched = true;
-      for (const item of Array.isArray(block.content) ? block.content : []) {
-        if (item?.type !== "search_result") continue;
-        const source = item.source;
-        const url = source && source.type === "url" && typeof source.url === "string"
-          ? source.url
-          : typeof item.url === "string" ? item.url : "";
-        const normalizedUrl = normalizeSourceUrl(url);
-        if (normalizedUrl) {
-          citations.set(normalizedUrl, typeof item.title === "string" && item.title ? item.title : "");
-        }
+      for (const result of Array.isArray(block.content) ? block.content : []) {
+        if (result?.type === "web_search_result") cite(result);
       }
     }
   }
   return { text: texts.join(""), searched, refused: data?.stop_reason === "refusal", citations };
 }
 
+/** Checks a generated recipe against the search posture and returns it with
+ * its verified sources. `citations` maps URL to title from the provider. */
+function finishRecipe({ label, text, citations, searched, searchMode, acceptUnverifiable }) {
+  if (searchMode === "grounded" && !searched) {
+    throw new WorkerError("output", `${label} returned a recipe without running web search.`);
+  }
+  const result = recipeObject(text);
+  const sources = verifiedSources(result.sources, citations, acceptUnverifiable);
+  if (searchMode === "grounded" && sources.length === 0) {
+    throw new WorkerError("output", `${label} did not use any valid web-search sources.`);
+  }
+  return { recipe: result.recipe, sources };
+}
+
 /**
- * Refreshes the openai-codex provider catalogue from pi.dev (the same source
+ * Refreshes the subscription provider's catalogue from pi.dev (the same source
  * `pi update --models` uses) and returns the current model ids, newest first.
  * The refresh is credential-gated: the host materialises the database-backed
- * Codex credential at `authPath`; an expired token is refreshed in place in
+ * OAuth credential at `authPath`; an expired token is refreshed in place in
  * that file, so the host reads it back to persist the refresh.
  */
 async function listModels(request) {
-  const agentDir = process.env.PI_CODING_AGENT_DIR || getAgentDir();
+  const subscription = subscriptionOf(request);
+  const modelRuntime = await subscriptionRuntime(request);
+  await modelRuntime.refresh({ allowNetwork: true, force: true, signal: AbortSignal.timeout(20_000) });
+  outputJson({ models: catalogModelIds(modelRuntime.getModels(subscription.id)) });
+}
+
+/** The pi runtime over the request's per-request auth.json. The SDK refreshes
+ * an expired token in that file, and the host reads the refresh back. */
+async function subscriptionRuntime(request) {
+  const authPath = nonBlank(request.authPath);
+  if (!authPath) throw new WorkerError("input", "Missing authPath for the subscription credential.");
+  const agentDir = getAgentDir();
   await mkdir(agentDir, { recursive: true });
-  const authPath = typeof request.authPath === "string" && request.authPath.trim()
-    ? request.authPath
-    : join(agentDir, "auth.json");
-  const modelRuntime = await ModelRuntime.create({
-    authPath,
-    modelsPath: join(agentDir, "models.json"),
-  });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  try {
-    await modelRuntime.refresh({ allowNetwork: true, force: true, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-  outputJson({ models: catalogModelIds(modelRuntime.getModels(PROVIDER)) });
+  return ModelRuntime.create({ authPath, modelsPath: join(agentDir, "models.json") });
 }
 
 async function cleanMedia(request) {
-  const apiKey = process.env.AI_GATEWAY_API_KEY?.trim();
-  if (!apiKey) {
-    throw new WorkerError("configuration", "AI_GATEWAY_API_KEY is not configured.");
-  }
-  const apiBaseUrl = process.env.AI_GATEWAY_BASE_URL?.trim() || "https://ai-gateway.vercel.sh/v1";
-  const modelId = typeof request.model === "string" && request.model.trim()
-    ? request.model.trim()
-    : process.env.AI_GATEWAY_CLEANER_MODEL?.trim() || "poolside/laguna-s-2.1-free";
-  // Optional tuning knobs forwarded from the host (ai.rs).
-  const options = {
-    reasoning: typeof request.reasoning === "object" && request.reasoning ? request.reasoning : undefined,
+  const apiKey = nonBlank(process.env.AI_GATEWAY_API_KEY);
+  if (!apiKey) throw new WorkerError("configuration", "AI_GATEWAY_API_KEY is not configured.");
+  const apiBaseUrl = nonBlank(process.env.AI_GATEWAY_BASE_URL) ?? "https://ai-gateway.vercel.sh/v1";
+  const modelId = nonBlank(request.model)
+    ?? nonBlank(process.env.AI_GATEWAY_CLEANER_MODEL)
+    ?? "poolside/laguna-s-2.1-free";
+  const data = await aiGatewayChatCompletion(apiBaseUrl, apiKey, modelId, request.systemPrompt, request.prompt, fetch, {
+    reasoning: request.reasoning && typeof request.reasoning === "object" ? request.reasoning : undefined,
     maxTokens: typeof request.maxTokens === "number" ? request.maxTokens : undefined,
     temperature: typeof request.temperature === "number" ? request.temperature : undefined,
-  };
-  for (const key of Object.keys(options)) {
-    if (options[key] === undefined) delete options[key];
-  }
-  const data = await aiGatewayChatCompletion(
-    apiBaseUrl,
-    apiKey,
-    modelId,
-    request.systemPrompt,
-    request.prompt,
-    undefined,
-    options,
-  );
+  });
   outputJson({ cleanedText: parseAiGatewayCleaner(data), model: modelId });
 }
 
-async function main() {
-  const request = await readRequest();
-  if (request.command === "listModels") {
-    await listModels(request);
-    return;
+/** Recipe generation against an OpenAI- or Anthropic-spec endpoint. The base
+ * URL and key come from the host and are never logged. */
+async function generateViaEndpoint(request, searchMode, reasoningEffort) {
+  const apiBaseUrl = nonBlank(request.apiBaseUrl);
+  const apiKey = nonBlank(request.apiKey);
+  const model = nonBlank(request.model);
+  if (!apiBaseUrl || !apiKey || !model) {
+    throw new WorkerError("worker", "Missing apiBaseUrl, apiKey, or model for the API request.");
   }
-  if (request.command === "cleanMedia") {
-    await cleanMedia(request);
-    return;
-  }
-  const agentDir = process.env.PI_CODING_AGENT_DIR || getAgentDir();
-  const searchMode = searchModeOf(request);
-  const modelId = typeof request.model === "string" && request.model.trim()
-    ? request.model.trim()
-    : "gpt-5.4-mini";
-  const reasoningEffort = normalizeEffort(request.reasoningEffort);
-  if (request.provider === "openai") {
-    const { apiBaseUrl, apiKey } = apiCredentials(request);
-    const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
-    const data = await openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, request.prompt, searchMode, reasoningEffort);
-    if (data.status && data.status !== "completed") {
-      throw new WorkerError("worker", `OpenAI response incomplete: ${data.incomplete_details?.reason ?? "unknown reason"}`);
-    }
-    const { text, searched, refused, citations } = parseResponsesOutput(data);
-    if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
-    if (searchMode === "grounded" && !searched) {
-      throw new WorkerError("output", "OpenAI returned a recipe without running web search.");
-    }
-    const result = extractJson(text);
-    if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
-      throw new WorkerError("output", "Pi did not return a recipe object.");
-    }
-    const sources = verifiedSources(result.sources, citations, searchMode === "gapfill");
-    if (searchMode === "grounded" && sources.length === 0) {
-      throw new WorkerError("output", "OpenAI did not use any valid web-search sources.");
-    }
-    outputJson({ recipe: result.recipe, sources });
-    return;
-  }
+  const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
+  const acceptUnverifiable = searchMode === "gapfill";
   if (request.provider === "anthropic") {
-    const { apiBaseUrl, apiKey } = apiCredentials(request);
-    const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
     const data = await anthropicMessages(
       apiBaseUrl,
       apiKey,
-      modelId,
+      model,
       systemPrompt,
       [{ role: "user", content: request.prompt }],
       reasoningEffort,
@@ -611,91 +579,73 @@ async function main() {
     }
     const { text, searched, refused, citations } = parseAnthropicOutput(data);
     if (refused) throw new WorkerError("worker", "Anthropic refused the request.");
-    if (searchMode === "grounded" && !searched) {
-      throw new WorkerError("output", "Anthropic returned a recipe without running web search.");
-    }
-    const result = extractJson(text);
-    if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
-      throw new WorkerError("output", "Pi did not return a recipe object.");
-    }
-    const sources = verifiedSources(result.sources, citations, searchMode === "gapfill");
-    if (searchMode === "grounded" && sources.length === 0) {
-      throw new WorkerError("output", "Anthropic did not use any valid web-search sources.");
-    }
-    outputJson({ recipe: result.recipe, sources });
-    return;
+    return finishRecipe({ label: "Anthropic", text, citations, searched, searchMode, acceptUnverifiable });
   }
-  await mkdir(agentDir, { recursive: true });
+  const data = await openaiResponse(apiBaseUrl, apiKey, model, systemPrompt, request.prompt, searchMode, reasoningEffort);
+  if (data.status && data.status !== "completed") {
+    throw new WorkerError("worker", `OpenAI response incomplete: ${data.incomplete_details?.reason ?? "unknown reason"}`);
+  }
+  const { text, searched, refused, citations } = parseResponsesOutput(data);
+  if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
+  return finishRecipe({ label: "OpenAI", text, citations, searched, searchMode, acceptUnverifiable });
+}
 
-  // The host supplies a per-request auth.json (its database-backed credential)
-  // through `authPath`; the SDK refreshes tokens in place in that file.
-  const authPath = typeof request.authPath === "string" && request.authPath.trim()
-    ? request.authPath
-    : join(agentDir, "auth.json");
-  const modelRuntime = await ModelRuntime.create({
-    authPath,
-    modelsPath: join(agentDir, "models.json"),
-  });
-  if (!(await modelRuntime.checkAuth(PROVIDER))) {
-    throw new WorkerError(
-      "configuration",
-      "Pi is not logged in to ChatGPT. Authorise Codex from the Settings page.",
-    );
+/** Recipe generation through a pi subscription (ChatGPT for Codex, Claude Pro/Max). */
+async function generateViaSubscription(request, searchMode, reasoningEffort) {
+  const subscription = subscriptionOf(request);
+  const modelRuntime = await subscriptionRuntime(request);
+  if (!(await modelRuntime.checkAuth(subscription.id))) {
+    throw new WorkerError("configuration", subscription.notLoggedIn);
   }
-  const model = modelRuntime.getModel(PROVIDER, modelId);
+  const modelId = nonBlank(request.model) ?? subscription.defaultModel;
+  const model = modelRuntime.getModel(subscription.id, modelId);
   if (!model) {
-    throw new WorkerError("configuration", `Pi does not know the ${PROVIDER}/${modelId} model.`);
+    throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
   }
 
   const observer = searchMode === "off"
     ? null
     : createNativeSearchObserver(globalThis.fetch, { allowUnverifiedFallback: searchMode === "gapfill" });
-  const context = completionContext(request, searchMode);
-  const response = await modelRuntime.complete(
-    model,
-    context,
-    {
-      reasoningEffort,
-      textVerbosity: "low",
-      transport: observer ? "sse" : "auto",
-      maxRetries: 1,
-      ...(observer ? {
-        fetch: observer.fetch,
-        onPayload: searchMode === "grounded" ? nativeSearchPayload : optionalSearchPayload,
-      } : {}),
-    },
-  );
+  const response = await modelRuntime.completeSimple(model, completionContext(request, searchMode), {
+    reasoning: reasoningEffort,
+    maxRetries: 1,
+    ...(observer ? { fetch: observer.fetch, ...subscription.searchOptions(searchMode) } : {}),
+  });
   if (response.stopReason === "error" || response.stopReason === "aborted") {
     throw new WorkerError("worker", response.errorMessage || "Pi model request failed.");
   }
   const observed = observer ? await observer.finish() : { invoked: false, sources: new Map() };
-  if (searchMode === "grounded" && !observed.invoked) {
-    throw new WorkerError("output", "Codex returned a recipe without running native web search.");
-  }
+  return finishRecipe({
+    label: subscription.label,
+    text: assistantText(response),
+    citations: observed.sources,
+    searched: observed.invoked,
+    searchMode,
+    acceptUnverifiable: false,
+  });
+}
 
-  const result = extractJson(assistantText(response));
-  if (!result || typeof result !== "object" || !result.recipe || typeof result.recipe !== "object") {
-    throw new WorkerError("output", "Pi did not return a recipe object.");
-  }
-  const sources = sourceList(result.sources, observed.sources);
-  if (searchMode === "grounded" && sources.length === 0) {
-    throw new WorkerError("output", "Pi did not use any valid web-search sources.");
-  }
-  outputJson({ recipe: result.recipe, sources });
+async function main() {
+  const request = parseRequest(await readStdin());
+  if (request.command === "listModels") return listModels(request);
+  if (request.command === "cleanMedia") return cleanMedia(request);
+  const searchMode = searchModeOf(request);
+  const reasoningEffort = normalizeEffort(request.reasoningEffort);
+  const endpoint = request.provider === "openai" || request.provider === "anthropic";
+  outputJson(endpoint
+    ? await generateViaEndpoint(request, searchMode, reasoningEffort)
+    : await generateViaSubscription(request, searchMode, reasoningEffort));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main().catch((error) => {
-    const workerError = error instanceof WorkerError
-      ? error
-      : new WorkerError("worker", error instanceof Error ? error.message : "Pi worker failed.");
-    outputJson({
-      error: workerError.message,
-      code: workerError.code,
+  runMain(main, (error) => {
+    const known = error instanceof WorkerError;
+    return {
+      error: error instanceof Error ? error.message : "Pi worker failed.",
+      code: known ? error.code : "worker",
       // Output validation failures are worth one host-level retry; provider
       // transport errors carry their own status-aware retry decision.
-      retryable: workerError.retryable || workerError.code === "output",
-    });
-    process.exitCode = 1;
+      retryable: known && (error.retryable || error.code === "output"),
+    };
   });
 }

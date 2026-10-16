@@ -3,7 +3,7 @@
 #
 # The host machine deliberately carries no media toolchain (yt-dlp, ffmpeg,
 # tesseract, faster-whisper); the production Docker image is the only place
-# they exist. This script forwards the extractor invocation into a throwaway
+# they exist. Build it first: docker build -t kindle-recipes:bench . This script forwards the extractor invocation into a throwaway
 # container and streams the JSON evidence back on stdout. The recipe-data
 # volume is mounted so the Whisper model download persists between runs.
 set -eu

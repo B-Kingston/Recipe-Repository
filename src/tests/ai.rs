@@ -118,6 +118,31 @@ fn chart_flow_accepts_branch_and_merge_and_rejects_bad_references() {
     assert!(validate_generated(&branched).is_ok());
     branched.steps[1].input_steps = vec![1];
     assert!(validate_generated(&branched).is_err());
+
+    let mut dangling = recipe();
+    dangling.steps[1].input_steps.clear();
+    assert!(
+        validate_generated(&dangling).is_err(),
+        "step 0 must flow somewhere"
+    );
+}
+
+#[test]
+fn legacy_ingredient_matching_survives_case_folding_with_length_change() {
+    // The Kelvin sign lowercases to ASCII "k" but is three bytes long, so the
+    // display string cannot be split at the ingredient name's byte length.
+    let mut legacy = recipe();
+    legacy.ingredients[0].name = "\u{212A}".into();
+    legacy.ingredients[0].quantity.clear();
+    legacy.ingredients[0].unit.clear();
+    for step in &mut legacy.steps {
+        step.chart_label.clear();
+        step.ingredient_uses.clear();
+        step.input_steps.clear();
+    }
+    legacy.steps[1].ingredients = vec!["k".into()];
+    assert!(normalize_generated(&mut legacy).is_ok());
+    assert_eq!(legacy.steps[1].ingredient_uses[0].amount, "as needed");
 }
 
 #[test]
@@ -146,24 +171,17 @@ fn pi_response_extracts_recipe_and_search_sources() {
         "recipe": recipe(),
         "sources": [{"title":"Toast","url":"https://example.com/toast"}]
     });
-    let (parsed, sources, suggestions) = parse_pi_response(&response, true).unwrap();
+    let (parsed, sources) = parse_pi_response(response, true).unwrap();
     assert_eq!(parsed.title, "Toast");
     assert_eq!(sources.len(), 1);
-    assert!(suggestions.is_empty());
 }
 
 #[test]
-fn grounded_pi_response_requires_search_sources() {
-    let response = json!({"recipe": recipe(), "sources": []});
-    assert!(parse_pi_response(&response, true).is_err());
-}
-
-#[test]
-fn ungrounded_pi_response_accepts_no_sources() {
-    let response = json!({"recipe": recipe(), "sources": []});
-    let (_, sources, suggestions) = parse_pi_response(&response, false).unwrap();
+fn grounding_decides_whether_empty_sources_are_accepted() {
+    let empty = || json!({"recipe": recipe(), "sources": []});
+    assert!(parse_pi_response(empty(), true).is_err());
+    let (_, sources) = parse_pi_response(empty(), false).unwrap();
     assert!(sources.is_empty());
-    assert!(suggestions.is_empty());
 }
 
 #[test]
@@ -206,9 +224,11 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model: String::new(),
         pi_worker_path: String::new(),
         auth_script_path: String::new(),
+        claude_auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(None)),
+        claude_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
@@ -276,11 +296,11 @@ fn media_channels_default_to_every_source_enabled() {
 }
 
 #[tokio::test]
-async fn import_recipe_rejects_import_with_every_source_unticked() {
+async fn import_requires_a_ticked_evidence_source() {
     let state = state(database().await);
     let url = "https://www.instagram.com/reel/AbCdEf123/";
     let response = import_recipe(
-        State(state),
+        State(state.clone()),
         AuthUser { id: "u1".into() },
         Form(import_form(url, false, false, false)),
     )
@@ -294,12 +314,7 @@ async fn import_recipe_rejects_import_with_every_source_unticked() {
     // The failed submission keeps the pasted URL and the (unticked) boxes.
     assert!(body.contains(r#"value="https://www.instagram.com/reel/AbCdEf123/""#));
     assert!(!body.contains("name=\"use_description\" checked"));
-}
 
-#[tokio::test]
-async fn import_recipe_accepts_any_single_ticked_source() {
-    let state = state(database().await);
-    let url = "https://www.instagram.com/reel/AbCdEf123/";
     for (description, audio, ocr) in [
         (true, false, false),
         (false, true, false),
@@ -320,20 +335,31 @@ async fn import_recipe_accepts_any_single_ticked_source() {
     }
 }
 
-async fn insert_draft_with_candidates(db: &SqlitePool, draft_id: &str) {
-    let now = stamp();
-    let recipe_json = serde_json::to_string(&recipe()).unwrap();
+async fn insert_draft(
+    db: &SqlitePool,
+    draft_id: &str,
+    recipe_id: Option<&str>,
+    base_updated_at: Option<&str>,
+) {
+    let now = chrono::Utc::now();
     sqlx::query(
-        "INSERT INTO ai_drafts(id,user_id,operation,recipe_json,sources_json,created_at,expires_at)
-         VALUES(?,'u1','generate',?,'[]',?,?)",
+        "INSERT INTO ai_drafts(id,recipe_id,base_updated_at,operation,recipe_json,sources_json,user_id,created_at,expires_at)
+         VALUES(?,?,?,?,?,'[]','u1',?,?)",
     )
     .bind(draft_id)
-    .bind(&recipe_json)
-    .bind(&now)
-    .bind(chrono::Utc::now() + chrono::Duration::hours(24))
+    .bind(recipe_id)
+    .bind(base_updated_at)
+    .bind(if recipe_id.is_some() { "alter" } else { "generate" })
+    .bind(serde_json::to_string(&recipe()).unwrap())
+    .bind(now.to_rfc3339())
+    .bind((now + chrono::Duration::hours(24)).to_rfc3339())
     .execute(db)
     .await
     .unwrap();
+}
+
+async fn insert_draft_with_candidates(db: &SqlitePool, draft_id: &str) {
+    insert_draft(db, draft_id, None, None).await;
     for (idx, seconds, jpeg) in [(0_i64, 4_i64, b"first".as_slice()), (1, 9, b"second")] {
         sqlx::query("INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg)VALUES(?,?,?,?)")
             .bind(draft_id)
@@ -424,6 +450,20 @@ async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
     .unwrap_err();
     assert!(matches!(missing, AppError::NotFound));
 
+    cancel_draft(
+        State(s.clone()),
+        AuthUser { id: "u2".into() },
+        Path("td2".into()),
+    )
+    .await
+    .unwrap();
+    let kept: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='td2'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(kept, 2, "a stranger cannot discard the candidates");
+
     // Discarding the draft removes its candidates too.
     cancel_draft(State(s), AuthUser { id: "u1".into() }, Path("td2".into()))
         .await
@@ -434,6 +474,106 @@ async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
             .await
             .unwrap();
     assert_eq!(leftovers, 0);
+}
+
+async fn version_labels(db: &SqlitePool, recipe_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT label FROM recipe_versions WHERE recipe_id=? ORDER BY version")
+        .bind(recipe_id)
+        .fetch_all(db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn alteration_applies_only_to_the_version_it_was_based_on() {
+    let db = database().await;
+    let s = state(db.clone());
+    let apply = |draft: &'static str| {
+        apply_draft(
+            State(s.clone()),
+            AuthUser { id: "u1".into() },
+            Path(draft.into()),
+            Form(ApplyDraftForm { thumbnail: None }),
+        )
+    };
+
+    insert_draft(&db, "ta1", None, None).await;
+    let created = apply("ta1").await.unwrap();
+    let recipe_id = created.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .trim_start_matches("/recipes/")
+        .to_string();
+    assert_eq!(
+        version_labels(&db, &recipe_id).await,
+        ["Recipe created with AI"]
+    );
+
+    let updated_at: String = sqlx::query_scalar("SELECT updated_at FROM recipes WHERE id=?")
+        .bind(&recipe_id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    insert_draft(
+        &db,
+        "ta2",
+        Some(&recipe_id),
+        Some("2000-01-01T00:00:00+00:00"),
+    )
+    .await;
+    // A stale base re-renders the preview with the draft kept, and writes nothing.
+    let stale = apply("ta2").await.unwrap();
+    assert_eq!(stale.status(), StatusCode::OK);
+    assert!(
+        response_body(stale)
+            .await
+            .contains("This recipe changed after the draft was made.")
+    );
+    assert_eq!(version_labels(&db, &recipe_id).await.len(), 1);
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_drafts WHERE id='ta2'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+
+    insert_draft(&db, "ta3", Some(&recipe_id), Some(&updated_at)).await;
+    apply("ta3").await.unwrap();
+    assert_eq!(
+        version_labels(&db, &recipe_id)
+            .await
+            .last()
+            .map(String::as_str),
+        Some("AI alteration applied")
+    );
+
+    // A recipe saved before history existed gets its pre-AI state recorded first.
+    seed_recipe_with_source(&db, "ta4", "").await;
+    let legacy_updated: String =
+        sqlx::query_scalar("SELECT updated_at FROM recipes WHERE id='ta4'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    insert_draft(&db, "ta5", Some("ta4"), Some(&legacy_updated)).await;
+    apply("ta5").await.unwrap();
+    assert_eq!(version_labels(&db, "ta4").await.len(), 2);
+}
+
+#[tokio::test]
+async fn expired_or_saved_drafts_show_the_expired_page() {
+    let db = database().await;
+    let response = draft_page(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path("gone".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response_body(response)
+            .await
+            .contains("This draft is no longer available")
+    );
 }
 
 #[tokio::test]
@@ -507,7 +647,8 @@ async fn upload_replaces_the_photo_and_clears_pending_frames() {
         State(s.clone()),
         Form(SetupForm {
             username: "alice".into(),
-            password: "secret".into(),
+            password: "secret-pass".into(),
+            confirm_password: "secret-pass".into(),
         }),
     )
     .await
@@ -538,7 +679,7 @@ async fn upload_replaces_the_photo_and_clears_pending_frames() {
     body.extend_from_slice(b"\r\n--B--\r\n");
     let authorization = format!(
         "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode("alice:secret")
+        base64::engine::general_purpose::STANDARD.encode("alice:secret-pass")
     );
     let request = Request::builder()
         .method("POST")

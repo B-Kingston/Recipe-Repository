@@ -47,7 +47,6 @@ RUN --mount=type=cache,id=kindle-recipes-apt-archives,target=/var/cache/apt,shar
 WORKDIR /app
 COPY --from=builder /app/kindle-recipes /usr/local/bin/kindle-recipes
 COPY static /app/static
-COPY templates /app/templates
 COPY pi /app/pi
 COPY --from=pi-deps /app/package.json /app/package.json
 COPY --from=pi-deps /app/node_modules /app/node_modules

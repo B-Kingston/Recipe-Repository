@@ -1,15 +1,14 @@
 use askama::Template;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Form, Path, State},
-    http::header,
+    extract::{DefaultBodyLimit, Form, Path, Query, State},
+    http::{StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
 };
 use chrono::Utc;
 use parking_lot::Mutex;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{
@@ -41,39 +40,53 @@ use auth::{
 };
 
 use ai::{
-    DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cancel_draft, draft_page,
-    draft_thumbnail, fresh_model_catalogue, generate_page, generate_recipe, import_events,
-    import_frame, import_page, import_recipe, import_run_page, media_debug_events,
-    media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
+    DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cached_model_catalogue,
+    cancel_draft, discover_models, draft_page, draft_thumbnail, generate_page, generate_recipe,
+    import_events, import_frame, import_page, import_recipe, import_run_page, media_debug_frame,
+    media_debug_page, media_debug_run_page, media_debug_start,
 };
 use media::MediaEvidence;
 use recipes::{
     add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
-    discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_thumbnail,
+    delete_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_thumbnail,
     remove_thumbnail, start_thumbnail_recompute, update_block, update_recipe, upload_thumbnail,
+    view_version,
 };
 
 const DRAFT_HOURS: i64 = 24;
-const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_MODEL: &str = "gpt-6-luna";
+const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
 const DEFAULT_REASONING_EFFORT: &str = "low";
-pub(crate) const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_PROVIDER: &str = "vercel-ai-gateway";
 /// Reasoning efforts offered for the model, matching the worker protocol.
 /// Newer Codex models also support `xhigh` and `max`; Anthropic endpoints
 /// cap those values at their highest available thinking budget in the worker.
 const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-/// Built-in fallback for the Settings model list, used only when the live
-/// pi.dev catalogue cannot be fetched. Ordered newest first.
+/// Fallback for the Codex model select, used only when the worker's live
+/// `listModels` discovery is unavailable (no credential or refresh failure).
 const MODEL_OPTIONS: &[&str] = &[
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
     "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
+];
+/// Fallback for the Claude model select, used only when live discovery is
+/// unavailable. Newest first.
+const CLAUDE_MODEL_OPTIONS: &[&str] = &[
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+    "claude-sonnet-5",
+    "claude-opus-5",
 ];
 const RECIPE_PROMPT: &str = r#"You are a recipe assistant. Prefer credible guidance and synthesize practical advice without copying source text. Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Notice when the user's request excludes an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without X" — and do not silently drop it. Judge whether the ingredient is genuinely optional; when it plays a structural role (binding, leavening, emulsifying, thickening, moisture, or browning), substitute a suitable alternative from sound cooking knowledge (such as flax or chia "eggs", aquafaba, plant milks and butters, or xanthan gum) and adjust technique so the recipe still achieves its intended result. Be concise and practical for a home cook."#;
 const GROUNDED_RECIPE_PROMPT: &str = r#"You are a meticulous recipe research assistant. Research before generating. Always use the web_search tool. When the user supplies one or more URLs, search for their published title, author, and recipe details. When the user names an existing recipe, cook, book, restaurant, or website, locate the likely original and cross-check it against at least two independent, credible sources when available.
@@ -100,17 +113,21 @@ struct AppState {
     model: String,
     pi_worker_path: String,
     auth_script_path: String,
+    claude_auth_script_path: String,
     search_grounding: bool,
     codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>,
-    model_catalogue: Arc<Mutex<Option<ModelCatalogue>>>,
+    claude_flows: Arc<Mutex<HashMap<String, ClaudeFlow>>>,
+    /// Last discovered model catalogue per Pi provider id, so Codex and
+    /// Claude lists never overwrite each other.
+    model_catalogue: Arc<Mutex<HashMap<String, ModelCatalogue>>>,
     media_debug_runs: DebugRunMap,
     /// Recipe ids with a dish-photo frame run in flight; in-memory only, so
     /// a restart simply drops any "pending" state back to idle.
     thumbnail_jobs: Arc<Mutex<HashSet<String>>>,
 }
 
-/// Last known Codex model catalogue, refreshed in the background so page
-/// renders never wait on a pi.dev refresh.
+/// Last successfully discovered model catalogue for one Pi provider; reused
+/// until stale (see MODEL_CATALOGUE_TTL in ai.rs).
 #[derive(Clone)]
 struct ModelCatalogue {
     models: Vec<String>,
@@ -126,10 +143,22 @@ struct CodexFlow {
     expires_at: i64,
 }
 
+/// In-flight Claude "copy code" authorisation, keyed by flow id. Holds the
+/// PKCE verifier server-side; it expires after CLAUDE_FLOW_TTL.
+#[derive(Clone)]
+struct ClaudeFlow {
+    user_id: String,
+    url: String,
+    verifier: String,
+    created: std::time::Instant,
+}
+const CLAUDE_FLOW_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// A registered AI endpoint (OpenAI-spec or Anthropic-spec) with its API key,
 /// as stored in ai_endpoints. Shared into the AI pipeline; the key is sent to
 /// the worker per request and never rendered into templates.
-#[derive(Debug, Clone, FromRow)]
+/// Not `Debug`: the key must never reach a log line through `{:?}`.
+#[derive(Clone, FromRow)]
 pub(crate) struct Endpoint {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -148,31 +177,75 @@ enum AppError {
     #[error("{0}")]
     Internal(String),
     #[error(
-        "The AI service is not configured. Authorise Codex or add an API endpoint from the Settings page."
+        "The AI service is not configured. Authorise Codex, connect your Claude subscription, or add an API endpoint from the Settings page."
     )]
     AiNotConfigured,
     #[error(
-        "The video recipe cleaner is not configured. Add Vercel AI Gateway credentials in Settings before importing a video."
+        "The video cleaner is not set up. Save its API key in Settings before importing a video."
     )]
     MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
     Ai,
     #[error("Codex authorisation failed: {0}")]
     CodexAuth(String),
+    #[error("Claude authorisation failed: {0}")]
+    ClaudeAuth(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
     Template(#[from] askama::Error),
 }
+/// Shown in place of any internal detail for server-side failures.
+const GENERIC_FAILURE: &str = "Something went wrong on our side. Please try again.";
+/// Used only if the error page itself cannot be rendered.
+const ERROR_PAGE_FALLBACK: &str = "<!doctype html><title>Recipe Repository</title><p>Something went wrong. <a href=\"/\">Back to library</a></p>";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let status = match self {
-            Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
         error!(error = %self, "request failed");
-        (status, Html(format!("<!doctype html><main style=\"font:18px Georgia;margin:2rem\"><h1>Something needs attention</h1><p>{}</p><p><a href=\"/\">Back to recipes</a></p></main>", html_escape(&self.to_string())))).into_response()
+        let (status, heading, message, settings_link) = match &self {
+            Self::NotFound => (StatusCode::NOT_FOUND, "Not found", self.to_string(), false),
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                "Something needs attention",
+                message.clone(),
+                false,
+            ),
+            Self::AiNotConfigured => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AI is not set up",
+                self.to_string(),
+                true,
+            ),
+            Self::MediaCleanerNotConfigured => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Video cleaner not set up",
+                self.to_string(),
+                true,
+            ),
+            Self::Ai => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Recipe not created",
+                self.to_string(),
+                false,
+            ),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong",
+                GENERIC_FAILURE.into(),
+                false,
+            ),
+        };
+        let page = ErrorTemplate {
+            heading: heading.into(),
+            message,
+            settings_link,
+        }
+        .render();
+        match page {
+            Ok(html) => (status, Html(html)).into_response(),
+            Err(_) => (status, Html(ERROR_PAGE_FALLBACK)).into_response(),
+        }
     }
 }
 type Result<T> = std::result::Result<T, AppError>;
@@ -310,10 +383,66 @@ struct RecipeTemplate {
     thumb_state: String,
     can_pick_video_frames: bool,
     thumb_options: Vec<DraftThumbView>,
+    versions: Vec<recipes::VersionListRow>,
     servings_value: String,
     prep_value: String,
     cook_value: String,
 }
+#[derive(Template)]
+#[template(path = "error.html")]
+struct ErrorTemplate {
+    heading: String,
+    message: String,
+    settings_link: bool,
+}
+#[derive(Template)]
+#[template(path = "draft_expired.html")]
+struct DraftExpiredTemplate {}
+#[derive(Template)]
+#[template(path = "version.html")]
+struct VersionTemplate {
+    recipe: Recipe,
+    version: i64,
+    label: String,
+    created_at: String,
+    created_display: String,
+    snapshot: RecipeSnapshot,
+    servings_value: String,
+    prep_value: String,
+    cook_value: String,
+}
+
+/// The editable recipe content captured in version history. Derived chart
+/// data and thumbnail bytes are intentionally excluded; they are not shown on
+/// the read-only version page and duplicating images per edit would make the
+/// history unbounded in size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecipeSnapshot {
+    pub(crate) schema_version: u8,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) servings: Option<i64>,
+    pub(crate) prep_minutes: Option<i64>,
+    pub(crate) cook_minutes: Option<i64>,
+    pub(crate) ingredients: Vec<SnapshotIngredient>,
+    pub(crate) steps: Vec<SnapshotStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotIngredient {
+    pub(crate) name: String,
+    pub(crate) quantity: String,
+    pub(crate) unit: String,
+    pub(crate) optional: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SnapshotStep {
+    pub(crate) text: String,
+    pub(crate) ingredients: Vec<String>,
+}
+
 #[derive(Template)]
 #[template(path = "delete.html")]
 struct DeleteTemplate {
@@ -325,7 +454,9 @@ struct AiFormTemplate {
     heading: String,
     guidance: String,
     action: String,
-    label: String,
+    field_label: String,
+    placeholder: String,
+    show_tips: bool,
     button: String,
     cancel_url: String,
     error: String,
@@ -344,6 +475,7 @@ struct AddRecipeTemplate {
     use_audio: bool,
     use_ocr: bool,
     video_mode: bool,
+    gateway_configured: bool,
 }
 #[derive(Template)]
 #[template(path = "media_import_run.html")]
@@ -372,15 +504,24 @@ struct DraftTemplate {
 #[template(path = "settings.html")]
 struct SettingsTemplate {
     model_options: Vec<SelectOption>,
+    claude_model_options: Vec<SelectOption>,
     effort_options: Vec<SelectOption>,
     codex_authorised: bool,
     codex_auth_url: String,
     codex_selected: bool,
+    claude_authorised: bool,
+    claude_auth_url: String,
+    claude_selected: bool,
+    claude_connected_notice: bool,
+    claude_error: String,
     has_endpoints: bool,
     endpoints: Vec<EndpointRow>,
     gateway_configured: bool,
     gateway_key_masked: String,
     gateway_base_url: String,
+    saved: bool,
+    password_changed: bool,
+    notice: String,
 }
 struct SelectOption {
     value: String,
@@ -405,6 +546,36 @@ struct CodexAuthoriseTemplate {
     verification_uri: String,
     interval_seconds: u64,
     expires_seconds: i64,
+}
+#[derive(Template)]
+#[template(path = "claude_authorise.html")]
+struct ClaudeAuthoriseTemplate {
+    flow_id: String,
+    url: String,
+    expires_minutes: u64,
+    error: String,
+}
+#[derive(Deserialize)]
+struct ClaudeExchangeForm {
+    flow_id: String,
+    #[serde(default)]
+    code: String,
+}
+#[derive(Deserialize)]
+struct SettingsQuery {
+    #[serde(default)]
+    claude: String,
+    #[serde(default)]
+    claude_error: String,
+    #[serde(default)]
+    saved: String,
+    #[serde(default)]
+    notice: String,
+}
+#[derive(Deserialize)]
+struct ModelsQuery {
+    #[serde(default)]
+    provider: String,
 }
 #[derive(Template)]
 #[template(path = "media_debug.html")]
@@ -474,15 +645,20 @@ struct RecipeForm {
 pub(crate) struct SetupForm {
     username: String,
     password: String,
+    #[serde(default)]
+    confirm_password: String,
 }
 #[derive(Deserialize)]
 struct ResetPasswordForm {
     current_password: String,
     new_password: String,
+    #[serde(default)]
+    confirm_password: String,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct BlockForm {
     section: Option<String>,
+    #[serde(default)]
     text: String,
     quantity: Option<String>,
     unit: Option<String>,
@@ -540,11 +716,13 @@ struct MediaImportForm {
 #[derive(Deserialize)]
 struct SettingsForm {
     #[serde(default)]
-    model: String, // Codex-only; endpoint models are stored per endpoint
+    model: String, // Codex model; endpoint models are stored per endpoint
+    #[serde(default)]
+    claude_model: String, // Claude subscription model
     #[serde(default)]
     reasoning_effort: String,
     #[serde(default)]
-    provider: String, // "pi" (Codex) or an ai_endpoints row id
+    provider: String, // "pi" (Codex), "claude" (Claude subscription) or an ai_endpoints row id
 }
 #[derive(Deserialize)]
 struct EndpointForm {
@@ -623,13 +801,12 @@ async fn main() -> anyhowless::Result<()> {
         .await?;
     sqlx::migrate!().run(&db).await?;
     import_legacy_codex_auth(&db).await?;
-    let now_string = Utc::now().to_rfc3339();
-    crate::recipes::delete_expired_draft_thumbnails(&db, &now_string).await?;
+    crate::recipes::delete_expired_draft_thumbnails(&db, &stamp()).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     set_default_model(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
     let removed_expired_drafts = sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
-        .bind(Utc::now().to_rfc3339())
+        .bind(stamp())
         .execute(&db)
         .await?
         .rows_affected();
@@ -643,9 +820,12 @@ async fn main() -> anyhowless::Result<()> {
             .unwrap_or_else(|_| "pi/recipe-worker.mjs".into()),
         auth_script_path: env::var("PI_AUTH_SCRIPT_PATH")
             .unwrap_or_else(|_| "pi/codex-auth.mjs".into()),
+        claude_auth_script_path: env::var("PI_CLAUDE_AUTH_SCRIPT_PATH")
+            .unwrap_or_else(|_| "pi/claude-auth.mjs".into()),
         search_grounding: env_bool("PI_SEARCH_ENABLED", true),
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(None)),
+        claude_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     });
@@ -653,7 +833,7 @@ async fn main() -> anyhowless::Result<()> {
     let addr: SocketAddr = env::var("APP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:3000".into())
         .parse()?;
-    info!(%addr, "Kindle Recipes listening");
+    info!(%addr, "Recipe Repository listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -677,6 +857,14 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/recipes/{id}/thumbnail", get(recipe_thumbnail))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
+        .route(
+            "/recipes/{id}/versions/{version}",
+            get(view_version).delete(delete_version),
+        )
+        .route(
+            "/recipes/{id}/versions/{version}/delete",
+            post(delete_version),
+        )
         .route("/recipes/{id}/delete", get(delete_page).post(delete_recipe))
         .route("/recipes/{id}/blocks", post(add_block))
         .route("/recipes/{id}/blocks/{block_id}", post(update_block))
@@ -720,6 +908,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings/vercel-gateway", post(update_ai_gateway))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
+        .route("/settings/disconnect/codex", post(disconnect_codex))
+        .route("/settings/disconnect/claude", post(disconnect_claude))
         .route(
             "/settings/password",
             get(reset_password_page).post(reset_password),
@@ -729,15 +919,16 @@ fn routes(state: Arc<AppState>) -> Router {
             "/settings/authorise-codex/status/{flow_id}",
             get(authorise_codex_status),
         )
+        .route("/settings/models", get(settings_models))
+        .route(
+            "/settings/authorise-claude",
+            get(authorise_claude_start).post(authorise_claude_exchange),
+        )
         .route(
             "/settings/media-debug",
             get(media_debug_page).post(media_debug_start),
         )
         .route("/settings/media-debug/{run_id}", get(media_debug_run_page))
-        .route(
-            "/settings/media-debug/{run_id}/events",
-            get(media_debug_events),
-        )
         .route(
             "/settings/media-debug/{run_id}/frames/{url_index}/{file}",
             get(media_debug_frame),
@@ -872,11 +1063,15 @@ fn option_number(n: Option<i64>) -> String {
 fn stamp() -> String {
     Utc::now().to_rfc3339()
 }
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+/// A stored RFC3339 timestamp as a short UTC date, e.g. "15 Oct 2026, 22:11".
+fn display_timestamp(stored: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(stored)
+        .map(|time| {
+            time.with_timezone(&Utc)
+                .format("%-d %b %Y, %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| stored.to_string())
 }
 fn env_bool(name: &str, default: bool) -> bool {
     env::var(name)
@@ -886,35 +1081,58 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 fn generate_guidance(search_grounding: bool) -> &'static str {
     if search_grounding {
-        "Describe what you want to cook, name a recipe to recreate, or paste one or more recipe URLs. Pi will research the web before preparing a complete draft."
+        "Describe what you want to cook, name a recipe to recreate, or paste one or more recipe URLs. The assistant will research the web before preparing a complete draft."
     } else {
-        "Describe what you want to cook or name a recipe to recreate. Pi will prepare a complete draft for review."
+        "Describe what you want to cook or name a recipe to recreate. The assistant will prepare a complete draft for review."
     }
 }
 
-const CODEX_PROVIDER: &str = "openai-codex";
+/// Provider value stored in `ai_provider` for the Codex (ChatGPT) subscription.
+pub(crate) const PROVIDER_CODEX: &str = "pi";
+/// Provider value stored in `ai_provider` for the Claude (Pro/Max) subscription.
+pub(crate) const PROVIDER_CLAUDE: &str = "claude";
+/// Pi SDK provider ids; also the `pi_credentials.provider` key and the
+/// `piProvider` field sent to the worker.
+pub(crate) const CODEX_PI_PROVIDER: &str = "openai-codex";
+pub(crate) const CLAUDE_PI_PROVIDER: &str = "anthropic";
 const OPENAI_SPEC: &str = "openai";
 const ANTHROPIC_SPEC: &str = "anthropic";
 
-/// The stored Codex OAuth credential, if any. The database is the source of
-/// truth; the Pi worker only ever sees a per-request materialised auth.json.
-pub(crate) async fn codex_credential(db: &SqlitePool, user_id: &str) -> Result<Option<Value>> {
+/// Maps an `ai_provider` value to its Pi SDK provider id; None for API endpoints.
+pub(crate) fn pi_provider_for(provider: &str) -> Option<&'static str> {
+    match provider {
+        PROVIDER_CODEX => Some(CODEX_PI_PROVIDER),
+        PROVIDER_CLAUDE => Some(CLAUDE_PI_PROVIDER),
+        _ => None,
+    }
+}
+
+/// The stored subscription OAuth credential for a Pi provider id, if any. The
+/// database is the source of truth; the Pi worker only ever sees a per-request
+/// materialised auth.json.
+pub(crate) async fn pi_credential(
+    db: &SqlitePool,
+    user_id: &str,
+    pi_provider: &str,
+) -> Result<Option<Value>> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
             .bind(user_id)
-            .bind(CODEX_PROVIDER)
+            .bind(pi_provider)
             .fetch_optional(db)
             .await?;
     Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
 }
-/// Persists (or replaces) the Codex OAuth credential for one user.
-pub(crate) async fn store_codex_credential(
+/// Persists (or replaces) the credential for one user and provider id. The
+/// Vercel AI Gateway key shares this table under its own provider id.
+pub(crate) async fn store_pi_credential<T: Serialize>(
     db: &SqlitePool,
     user_id: &str,
-    credential: &Value,
+    pi_provider: &str,
+    credential: &T,
 ) -> Result<()> {
     let json = serde_json::to_string(credential)
-        .map_err(|_| AppError::CodexAuth("credential could not be serialised".into()))?;
+        .map_err(|_| AppError::Internal("Credential could not be serialised.".into()))?;
     sqlx::query(
         "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
          VALUES (?, ?, ?, ?)
@@ -923,7 +1141,7 @@ pub(crate) async fn store_codex_credential(
            updated_at = excluded.updated_at",
     )
     .bind(user_id)
-    .bind(CODEX_PROVIDER)
+    .bind(pi_provider)
     .bind(json)
     .bind(stamp())
     .execute(db)
@@ -937,48 +1155,42 @@ pub(crate) async fn ai_gateway_credential(
     db: &SqlitePool,
     user_id: &str,
 ) -> Result<Option<AiGatewayCredential>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
-            .bind(user_id)
-            .bind(AI_GATEWAY_PROVIDER)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
+    Ok(pi_credential(db, user_id, AI_GATEWAY_PROVIDER)
+        .await?
+        .and_then(|value| serde_json::from_value(value).ok()))
 }
 
-async fn store_ai_gateway_credential(
-    db: &SqlitePool,
-    user_id: &str,
-    credential: &AiGatewayCredential,
-) -> Result<()> {
-    let json = serde_json::to_string(credential)
-        .map_err(|_| AppError::Internal("Gateway credential could not be serialised.".into()))?;
+/// One app_settings value, if it has been saved.
+async fn app_setting(db: &SqlitePool, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
+        .bind(key)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(|(value,)| value))
+}
+
+/// Saves one app_settings value, replacing any previous one.
+async fn set_app_setting(db: &SqlitePool, key: &str, value: &str) -> Result<()> {
     sqlx::query(
-        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id,provider) DO UPDATE SET
-           credential_json = excluded.credential_json,
-           updated_at = excluded.updated_at",
+        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
-    .bind(user_id)
-    .bind(AI_GATEWAY_PROVIDER)
-    .bind(json)
+    .bind(key)
+    .bind(value)
     .bind(stamp())
     .execute(db)
     .await?;
     Ok(())
 }
 
-/// The active AI provider: "pi" (Codex) or an ai_endpoints row id.
-/// Stored app-wide like the model; reconcile_ai_provider keeps the value
-/// valid at startup and the endpoint handlers keep it valid at runtime.
-/// Anything absent resolves to "pi".
+/// The active AI provider: "pi" (Codex), "claude" (Claude subscription) or an
+/// ai_endpoints row id. Stored app-wide like the model; reconcile_ai_provider
+/// keeps the value valid at startup and the endpoint handlers keep it valid at
+/// runtime. Anything absent resolves to "pi".
 pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
-            .fetch_optional(db)
-            .await?;
-    Ok(row.map(|(value,)| value).unwrap_or_else(|| "pi".into()))
+    Ok(app_setting(db, "ai_provider")
+        .await?
+        .unwrap_or_else(|| PROVIDER_CODEX.into()))
 }
 
 /// All registered AI endpoints for one user, oldest first.
@@ -1066,12 +1278,10 @@ fn mask_key(key: &str) -> String {
 /// falling back to Codex ("pi"). Missing settings are left alone (the read
 /// path defaults to "pi").
 async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'ai_provider'")
-            .fetch_optional(db)
-            .await?;
-    let Some((current,)) = row else { return Ok(()) };
-    if current == "pi" {
+    let Some(current) = app_setting(db, "ai_provider").await? else {
+        return Ok(());
+    };
+    if current == PROVIDER_CODEX || current == PROVIDER_CLAUDE {
         return Ok(());
     }
     let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? LIMIT 1")
@@ -1085,15 +1295,10 @@ async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
         sqlx::query_as("SELECT id FROM ai_endpoints ORDER BY created_at LIMIT 1")
             .fetch_optional(db)
             .await?;
-    let value = first.map(|(id,)| id).unwrap_or_else(|| "pi".into());
-    sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(&value)
-    .bind(stamp())
-    .execute(db)
-    .await?;
+    let value = first
+        .map(|(id,)| id)
+        .unwrap_or_else(|| PROVIDER_CODEX.into());
+    set_app_setting(db, "ai_provider", &value).await?;
     if value != current {
         info!(from = %current, to = %value, "Reconciled stale AI provider setting");
     }
@@ -1104,7 +1309,8 @@ async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
 /// `<agent dir>/auth.json` into the database. Only runs before the first user
 /// exists; the setup transaction claims the orphan credential for that user.
 async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
-    if auth::user_count(db).await? > 0 || codex_credential(db, "").await?.is_some() {
+    if auth::user_count(db).await? > 0 || pi_credential(db, "", CODEX_PI_PROVIDER).await?.is_some()
+    {
         return Ok(());
     }
     let agent_dir = env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| {
@@ -1118,24 +1324,35 @@ async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return Ok(());
     };
-    if let Some(credential) = value.get(CODEX_PROVIDER) {
-        store_codex_credential(db, "", credential).await?;
+    if let Some(credential) = value.get(CODEX_PI_PROVIDER) {
+        store_pi_credential(db, "", CODEX_PI_PROVIDER, credential).await?;
         info!("Imported existing Codex credential into the database");
     }
     Ok(())
 }
 
-async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Html<String>> {
-    let codex_authorised = match codex_credential(&s.db, &user.id).await {
+/// Whether the user has a stored OAuth credential for a Pi provider.
+async fn pi_authorised(db: &SqlitePool, user_id: &str, pi_provider: &str) -> bool {
+    match pi_credential(db, user_id, pi_provider).await {
         Ok(Some(credential)) => credential["type"].as_str() == Some("oauth"),
         Ok(None) => false,
         Err(error) => {
-            warn!(%error, "Codex credential read failed");
+            warn!(%error, pi_provider, "Subscription credential read failed");
             false
         }
-    };
+    }
+}
+
+async fn settings_page(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(query): Query<SettingsQuery>,
+) -> Result<Html<String>> {
+    let codex_authorised = pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await;
+    let claude_authorised = pi_authorised(&s.db, &user.id, CLAUDE_PI_PROVIDER).await;
     let provider = crate::ai_provider(&s.db).await?;
-    let codex_selected = provider == "pi";
+    let codex_selected = provider == PROVIDER_CODEX;
+    let claude_selected = provider == PROVIDER_CLAUDE;
     let endpoints = crate::list_endpoints(&s.db, &user.id)
         .await?
         .into_iter()
@@ -1160,37 +1377,53 @@ async fn settings_page(State(s): State<Arc<AppState>>, user: AuthUser) -> Result
         .as_ref()
         .map(|credential| credential.base_url.clone())
         .unwrap_or_else(|| AI_GATEWAY_DEFAULT_BASE_URL.into());
-    // The model list is Codex-only: endpoint models are stored per endpoint,
-    // so no catalogue refresh is ever triggered for them.
-    let (model, fresh) = if codex_selected {
-        (
-            selected_model(&s.db, &s.model).await?,
-            fresh_model_catalogue(&s, &user.id).await,
-        )
+    // First paint shows the cached catalogues; the page's script then replaces
+    // the options from /settings/models with live discovery.
+    let model = selected_model(&s.db, &s.model).await?;
+    let claude_model = selected_claude_model(&s.db).await?;
+    let codex_models = if codex_authorised {
+        cached_model_catalogue(&s, CODEX_PI_PROVIDER)
     } else {
-        (String::new(), Vec::new())
+        Vec::new()
+    };
+    let claude_models = if claude_authorised {
+        cached_model_catalogue(&s, CLAUDE_PI_PROVIDER)
+    } else {
+        Vec::new()
     };
     render(SettingsTemplate {
-        model_options: model_options(fresh, &model),
+        model_options: model_options(codex_models, &model, MODEL_OPTIONS),
+        claude_model_options: model_options(claude_models, &claude_model, CLAUDE_MODEL_OPTIONS),
         effort_options: effort_options(&selected_effort(&s.db, DEFAULT_REASONING_EFFORT).await?),
         codex_authorised,
         codex_auth_url: "/settings/authorise-codex".into(),
         codex_selected,
+        claude_authorised,
+        claude_auth_url: "/settings/authorise-claude".into(),
+        claude_selected,
+        claude_connected_notice: query.claude == "connected",
+        claude_error: query.claude_error,
         has_endpoints,
         endpoints,
         gateway_configured,
         gateway_key_masked,
         gateway_base_url,
+        saved: query.saved == "1",
+        password_changed: query.notice == "password_changed",
+        notice: if query.notice == "disconnected" {
+            "Subscription disconnected.".into()
+        } else {
+            String::new()
+        },
     })
 }
 
-/// Model options for the Settings select: the live catalogue from the Codex
-/// worker when available, otherwise the built-in fallback list. The current
-/// selection is always included (marked selected) so saving never silently
-/// changes the model.
-fn model_options(fresh: Vec<String>, current: &str) -> Vec<SelectOption> {
+/// Model options for the Settings select: the discovered catalogue when
+/// available, otherwise the provider's fallback list. The current selection is
+/// always included (marked selected) so saving never silently changes the model.
+fn model_options(fresh: Vec<String>, current: &str, fallback: &[&str]) -> Vec<SelectOption> {
     let mut values = if fresh.is_empty() {
-        MODEL_OPTIONS.iter().map(|model| (*model).into()).collect()
+        fallback.iter().map(|model| (*model).into()).collect()
     } else {
         fresh
     };
@@ -1217,10 +1450,36 @@ fn effort_options(current: &str) -> Vec<SelectOption> {
         .collect()
 }
 
-/// Accepts models from the live catalogue when present, or the built-in
-/// fallback list — matching what the Settings page offers.
-fn model_supported(model: &str, fresh: &[String]) -> bool {
-    fresh.iter().any(|candidate| candidate == model) || MODEL_OPTIONS.contains(&model)
+/// Models for one subscription provider: the live catalogue when discovery
+/// yields one, otherwise the provider's built-in fallback list.
+async fn provider_models(s: &Arc<AppState>, user_id: &str, pi_provider: &str) -> Vec<String> {
+    let discovered = discover_models(s, user_id, pi_provider).await;
+    if !discovered.is_empty() {
+        return discovered;
+    }
+    let fallback = if pi_provider == CLAUDE_PI_PROVIDER {
+        CLAUDE_MODEL_OPTIONS
+    } else {
+        MODEL_OPTIONS
+    };
+    fallback.iter().map(|model| (*model).to_string()).collect()
+}
+
+/// JSON model list for the Settings select, awaiting live discovery.
+async fn settings_models(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(query): Query<ModelsQuery>,
+) -> Result<Json<Value>> {
+    let pi_provider = pi_provider_for(&query.provider)
+        .ok_or_else(|| AppError::BadRequest("Unknown model provider.".into()))?;
+    let models = provider_models(&s, &user.id, pi_provider).await;
+    let selected = if pi_provider == CLAUDE_PI_PROVIDER {
+        selected_claude_model(&s.db).await?
+    } else {
+        selected_model(&s.db, &s.model).await?
+    };
+    Ok(Json(json!({ "models": models, "selected": selected })))
 }
 
 async fn update_settings(
@@ -1229,7 +1488,6 @@ async fn update_settings(
     Form(form): Form<SettingsForm>,
 ) -> Result<Redirect> {
     let provider = trim(&form.provider);
-    // The effort applies to all providers, so it is saved regardless of mode.
     let effort = trim(&form.reasoning_effort);
     let effort = if effort.is_empty() {
         DEFAULT_REASONING_EFFORT.to_string()
@@ -1241,52 +1499,62 @@ async fn update_settings(
             "Choose a supported reasoning effort.".into(),
         ));
     }
-    sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ('reasoning_effort', ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(effort)
-    .bind(stamp())
-    .execute(&s.db)
-    .await?;
-    if provider == "pi" {
-        let model = trim(&form.model);
-        if model.is_empty() {
-            return Err(AppError::BadRequest("Choose a model.".into()));
-        }
-        let fresh = fresh_model_catalogue(&s, &user.id).await;
-        if !model_supported(&model, &fresh) {
+    if provider == PROVIDER_CODEX {
+        save_subscription_model(&s, &user, CODEX_PI_PROVIDER, "model", &form.model, "Codex")
+            .await?;
+    } else if provider == PROVIDER_CLAUDE {
+        if !pi_authorised(&s.db, &user.id, CLAUDE_PI_PROVIDER).await {
             return Err(AppError::BadRequest(
-                "Choose a supported Codex model.".into(),
+                "Connect your Claude subscription before selecting it.".into(),
             ));
         }
-        sqlx::query(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES ('model', ?, ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        save_subscription_model(
+            &s,
+            &user,
+            CLAUDE_PI_PROVIDER,
+            "claude_model",
+            &form.claude_model,
+            "Claude",
         )
-        .bind(&model)
-        .bind(stamp())
-        .execute(&s.db)
         .await?;
     } else {
-        let endpoint = crate::find_endpoint(&s.db, &user.id, &provider)
+        crate::find_endpoint(&s.db, &user.id, &provider)
             .await?
+            .filter(|endpoint| endpoint.spec == OPENAI_SPEC || endpoint.spec == ANTHROPIC_SPEC)
             .ok_or_else(|| AppError::BadRequest("Choose a saved API endpoint.".into()))?;
-        if endpoint.spec != OPENAI_SPEC && endpoint.spec != ANTHROPIC_SPEC {
-            return Err(AppError::BadRequest(
-                "The saved endpoint has an unknown API spec.".into(),
-            ));
-        }
     }
-    sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(&provider)
-    .bind(stamp())
-    .execute(&s.db)
-    .await?;
-    Ok(Redirect::to("/settings"))
+    // Saved only once the provider and model are valid, so a rejected form
+    // leaves the previous settings untouched.
+    set_app_setting(&s.db, "reasoning_effort", &effort).await?;
+    set_app_setting(&s.db, "ai_provider", &provider).await?;
+    Ok(Redirect::to("/settings?saved=1"))
+}
+
+/// Validates the model against the provider's discovered list (fallback list
+/// when discovery is unavailable) and stores it under the provider's own
+/// app_settings key, so each provider keeps its own choice. A blank value keeps
+/// the stored model.
+async fn save_subscription_model(
+    s: &Arc<AppState>,
+    user: &AuthUser,
+    pi_provider: &str,
+    setting_key: &str,
+    submitted: &str,
+    label: &str,
+) -> Result<()> {
+    let model = trim(submitted);
+    if model.is_empty() {
+        return Ok(());
+    }
+    if !provider_models(s, &user.id, pi_provider)
+        .await
+        .contains(&model)
+    {
+        return Err(AppError::BadRequest(format!(
+            "Choose a supported {label} model."
+        )));
+    }
+    set_app_setting(&s.db, setting_key, &model).await
 }
 
 /// Saves the Vercel AI Gateway credential for video evidence cleaning. A
@@ -1297,25 +1565,35 @@ async fn update_ai_gateway(
     user: AuthUser,
     Form(form): Form<AiGatewayForm>,
 ) -> Result<Redirect> {
-    let base_url = required(&form.base_url, "Gateway base URL")?;
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        return Err(AppError::BadRequest(
-            "Gateway base URL must start with http:// or https://.".into(),
-        ));
-    }
-    let base_url = base_url.trim_end_matches('/').to_string();
+    let base_url = normalise_url(&form.base_url, "Video cleaner base URL")?;
     let api_key = trim(&form.api_key);
     let api_key = if api_key.is_empty() {
         ai_gateway_credential(&s.db, &user.id)
             .await?
             .map(|credential| credential.api_key)
-            .ok_or_else(|| AppError::BadRequest("Enter a Vercel AI Gateway API key.".into()))?
+            .ok_or_else(|| AppError::BadRequest("Enter the video cleaner API key.".into()))?
     } else {
         api_key
     };
-    store_ai_gateway_credential(&s.db, &user.id, &AiGatewayCredential { api_key, base_url })
-        .await?;
+    store_pi_credential(
+        &s.db,
+        &user.id,
+        AI_GATEWAY_PROVIDER,
+        &AiGatewayCredential { api_key, base_url },
+    )
+    .await?;
     Ok(Redirect::to("/settings"))
+}
+
+/// A required http(s) base URL with any trailing slash removed.
+fn normalise_url(raw: &str, name: &str) -> Result<String> {
+    let url = required(raw, name)?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(AppError::BadRequest(format!(
+            "{name} must start with http:// or https://."
+        )));
+    }
+    Ok(url.trim_end_matches('/').to_string())
 }
 
 /// Registers a new AI endpoint (OpenAI-spec or Anthropic-spec) with its API
@@ -1333,13 +1611,7 @@ async fn add_endpoint(
             "API spec must be openai or anthropic.".into(),
         ));
     }
-    let base_url = required(&form.base_url, "API base URL")?;
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        return Err(AppError::BadRequest(
-            "API base URL must start with http:// or https://.".into(),
-        ));
-    }
-    let base_url = base_url.trim_end_matches('/').to_string();
+    let base_url = normalise_url(&form.base_url, "API base URL")?;
     let api_key = required(&form.api_key, "API key")?;
     let model = trim(&form.model);
     crate::insert_endpoint(&s.db, &user.id, &name, &spec, &base_url, &api_key, &model).await?;
@@ -1354,57 +1626,51 @@ async fn delete_endpoint(
     Path(id): Path<String>,
 ) -> Result<Redirect> {
     crate::remove_endpoint(&s.db, &user.id, &id).await?;
-    if crate::ai_provider(&s.db).await? == id {
-        sqlx::query(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES ('ai_provider', 'pi', ?)
-             ON CONFLICT(key) DO UPDATE SET value = 'pi', updated_at = excluded.updated_at",
-        )
-        .bind(stamp())
-        .execute(&s.db)
-        .await?;
+    if ai_provider(&s.db).await? == id {
+        set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
     }
     Ok(Redirect::to("/settings"))
 }
 
+/// Codex models the pi SDK no longer serves. A stored choice of one of these
+/// would fail every generation, so startup moves it to the default model.
+const RETIRED_CODEX_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4"];
+
+/// Seeds the Codex model from PI_MODEL on first run, and replaces a stored
+/// choice that the pi SDK no longer serves.
 async fn set_default_model(db: &SqlitePool, model: &str) -> Result<()> {
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'model'")
-            .fetch_optional(db)
-            .await?;
-    if existing.is_none() {
-        sqlx::query("INSERT INTO app_settings (key, value, updated_at) VALUES ('model', ?, ?)")
-            .bind(model)
-            .bind(stamp())
-            .execute(db)
-            .await?;
+    match app_setting(db, "model").await? {
+        Some(stored) if !RETIRED_CODEX_MODELS.contains(&stored.as_str()) => {}
+        _ => set_app_setting(db, "model", model).await?,
     }
     Ok(())
 }
 
 pub(crate) async fn selected_model(db: &SqlitePool, fallback: &str) -> Result<String> {
-    let model: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'model'")
-            .fetch_optional(db)
-            .await?;
-    Ok(model
-        .map(|(model,)| model)
+    Ok(app_setting(db, "model")
+        .await?
         .unwrap_or_else(|| fallback.into()))
 }
 
+/// The Claude subscription model; separate from the Codex `model` setting so
+/// switching providers keeps each choice.
+pub(crate) async fn selected_claude_model(db: &SqlitePool) -> Result<String> {
+    Ok(app_setting(db, "claude_model")
+        .await?
+        .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.into()))
+}
+
 pub(crate) async fn selected_effort(db: &SqlitePool, fallback: &str) -> Result<String> {
-    let effort: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE key = 'reasoning_effort'")
-            .fetch_optional(db)
-            .await?;
-    Ok(effort
-        .map(|(effort,)| effort)
+    Ok(app_setting(db, "reasoning_effort")
+        .await?
         .unwrap_or_else(|| fallback.into()))
 }
 
 /// Starts an OpenAI Codex device-code flow and shows the code to enter at
 /// chatgpt.com/codex/device. The rendered page polls the status route below.
 async fn authorise_codex_start(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
-    let output = run_node_script(&s.auth_script_path, "start", b"")
+    let output = run_node_script(s.auth_script_path.clone(), "start", Vec::new())
+        .await
         .map_err(|_| AppError::CodexAuth("could not start the authorisation flow".into()))?;
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
         AppError::CodexAuth("unexpected response from the authorisation helper".into())
@@ -1475,7 +1741,8 @@ async fn authorise_codex_status(
     });
     let payload = serde_json::to_vec(&payload)
         .map_err(|_| AppError::CodexAuth("invalid flow state".into()))?;
-    let output = run_node_script(&s.auth_script_path, "poll", &payload)
+    let output = run_node_script(s.auth_script_path.clone(), "poll", payload)
+        .await
         .map_err(|_| AppError::CodexAuth("the authorisation helper could not be run".into()))?;
     let mut value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         json!({ "status": "failed", "message": "unexpected response from the authorisation helper" })
@@ -1486,7 +1753,7 @@ async fn authorise_codex_status(
     if value["status"].as_str() == Some("complete") {
         s.codex_flows.lock().remove(&flow_id);
         if let Some(credential) = value.get("credential").cloned() {
-            store_codex_credential(&s.db, &user.id, &credential).await?;
+            store_pi_credential(&s.db, &user.id, CODEX_PI_PROVIDER, &credential).await?;
         }
     }
     if let Some(object) = value.as_object_mut() {
@@ -1495,9 +1762,159 @@ async fn authorise_codex_status(
     Ok(Json(value))
 }
 
+/// Starts a Claude "copy code" flow: the helper builds the sign-in URL and
+/// PKCE verifier; the verifier stays server-side until the user pastes the code.
+async fn authorise_claude_start(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Response> {
+    let output = run_node_script(s.claude_auth_script_path.clone(), "start", Vec::new())
+        .await
+        .map_err(|_| AppError::ClaudeAuth("could not start the authorisation flow".into()))?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        AppError::ClaudeAuth("unexpected response from the authorisation helper".into())
+    })?;
+    if !output.status.success() || value["status"].as_str() != Some("ok") {
+        let message = value["message"]
+            .as_str()
+            .unwrap_or("authorisation could not be started");
+        return Err(AppError::ClaudeAuth(message.to_string()));
+    }
+    let url = value["url"].as_str().ok_or_else(|| {
+        AppError::ClaudeAuth("authorisation helper returned no sign-in URL".into())
+    })?;
+    let verifier = value["verifier"]
+        .as_str()
+        .ok_or_else(|| AppError::ClaudeAuth("authorisation helper returned no verifier".into()))?;
+    let flow_id = Uuid::new_v4().to_string();
+    {
+        let mut flows = s.claude_flows.lock();
+        flows.retain(|_, flow| flow.created.elapsed() < CLAUDE_FLOW_TTL);
+        flows.insert(
+            flow_id.clone(),
+            ClaudeFlow {
+                user_id: user.id.clone(),
+                url: url.to_string(),
+                verifier: verifier.to_string(),
+                created: std::time::Instant::now(),
+            },
+        );
+    }
+    render(ClaudeAuthoriseTemplate {
+        flow_id,
+        url: url.to_string(),
+        expires_minutes: CLAUDE_FLOW_TTL.as_secs() / 60,
+        error: String::new(),
+    })
+    .map(IntoResponse::into_response)
+}
+
+/// Sends the user back to Settings with a Claude error notice.
+fn claude_failure_redirect(message: &str) -> Redirect {
+    let message: String = message.chars().take(200).collect();
+    let url =
+        reqwest::Url::parse_with_params("http://localhost/settings", [("claude_error", message)])
+            .expect("static base URL with query pairs parses");
+    Redirect::to(&format!("/settings?{}", url.query().unwrap_or_default()))
+}
+
+/// Completes a Claude flow: the pasted code (or redirect URL) is exchanged by
+/// the helper using the stored verifier, and the credential is saved. The flow
+/// is single-use once an exchange is attempted, because authorisation codes
+/// are; an empty paste leaves the flow intact for a retry.
+async fn authorise_claude_exchange(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<ClaudeExchangeForm>,
+) -> Result<Response> {
+    let input = trim(&form.code);
+    if input.is_empty() {
+        return Ok(claude_failure_redirect("Paste the code Claude showed you.").into_response());
+    }
+    // The flow is only read here and removed once the exchange succeeds, so a
+    // failed attempt leaves the sign-in page usable for another paste.
+    let flow = {
+        let mut flows = s.claude_flows.lock();
+        flows.retain(|_, flow| flow.created.elapsed() < CLAUDE_FLOW_TTL);
+        flows
+            .get(&form.flow_id)
+            .filter(|flow| flow.user_id == user.id)
+            .cloned()
+    };
+    let Some(flow) = flow else {
+        return Ok(
+            claude_failure_redirect("This sign-in expired. Start the authorisation again.")
+                .into_response(),
+        );
+    };
+    let payload = serde_json::to_vec(&json!({ "input": input, "verifier": flow.verifier }))
+        .map_err(|_| AppError::ClaudeAuth("invalid flow state".into()))?;
+    let value: Value =
+        match run_node_script(s.claude_auth_script_path.clone(), "exchange", payload).await {
+            Ok(output) => serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                json!({ "status": "failed", "message": "unexpected response from the authorisation helper" })
+            }),
+            Err(error) => {
+                warn!(%error, "Claude authorisation helper could not be run");
+                json!({ "status": "failed" })
+            }
+        };
+    if value["status"].as_str() == Some("complete")
+        && let Some(credential) = value.get("credential")
+    {
+        store_pi_credential(&s.db, &user.id, CLAUDE_PI_PROVIDER, credential).await?;
+        s.claude_flows.lock().remove(&form.flow_id);
+        return Ok(Redirect::to("/settings?claude=connected").into_response());
+    }
+    let message = value["message"]
+        .as_str()
+        .filter(|message| !message.is_empty())
+        .unwrap_or("Claude authorisation could not be completed. Check the code and try again.");
+    warn!(message, "Claude authorisation failed");
+    let remaining = CLAUDE_FLOW_TTL.saturating_sub(flow.created.elapsed());
+    render(ClaudeAuthoriseTemplate {
+        flow_id: form.flow_id,
+        url: flow.url,
+        expires_minutes: (remaining.as_secs() / 60).max(1),
+        error: message.to_string(),
+    })
+    .map(IntoResponse::into_response)
+}
+
+/// Removes one subscription credential and leaves the other provider's alone.
+/// When the removed provider was active, Codex takes over if it is still
+/// connected; otherwise the setting stays and generation reports that AI is
+/// not set up.
+async fn disconnect_subscription(
+    s: &Arc<AppState>,
+    user: &AuthUser,
+    pi_provider: &str,
+    provider: &str,
+) -> Result<Redirect> {
+    sqlx::query("DELETE FROM pi_credentials WHERE user_id=? AND provider=?")
+        .bind(&user.id)
+        .bind(pi_provider)
+        .execute(&s.db)
+        .await?;
+    if ai_provider(&s.db).await? == provider
+        && pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await
+    {
+        set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
+    }
+    Ok(Redirect::to("/settings?notice=disconnected"))
+}
+
+async fn disconnect_codex(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Redirect> {
+    disconnect_subscription(&s, &user, CODEX_PI_PROVIDER, PROVIDER_CODEX).await
+}
+
+async fn disconnect_claude(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Redirect> {
+    disconnect_subscription(&s, &user, CLAUDE_PI_PROVIDER, PROVIDER_CLAUDE).await
+}
+
 #[cfg(test)]
 mod model_tests {
-    use super::{MODEL_OPTIONS, SelectOption, effort_options, model_options, model_supported};
+    use super::{CLAUDE_MODEL_OPTIONS, MODEL_OPTIONS, SelectOption, effort_options, model_options};
 
     fn values(options: &[SelectOption]) -> Vec<&str> {
         options.iter().map(|option| option.value.as_str()).collect()
@@ -1514,26 +1931,29 @@ mod model_tests {
     #[test]
     fn fresh_catalogue_supersedes_fallback() {
         let fresh = vec!["gpt-5.6-sol".to_string(), "gpt-5.5".to_string()];
-        let options = model_options(fresh.clone(), "gpt-5.6-sol");
+        let options = model_options(fresh, "gpt-5.6-sol", MODEL_OPTIONS);
         assert_eq!(values(&options), vec!["gpt-5.6-sol", "gpt-5.5"]);
         assert!(options[0].selected && !options[1].selected);
-        // Fresh-only, fallback-only, and stale models resolve consistently.
-        assert!(model_supported("gpt-5.6-sol", &fresh));
-        assert!(model_supported("gpt-5.4", &fresh));
-        assert!(!model_supported("gpt-5.2-codex", &fresh));
     }
 
     #[test]
     fn current_selection_survives_a_catalogue_that_dropped_it() {
-        let options = model_options(vec!["gpt-5.6-sol".to_string()], "gpt-5.4");
-        assert_eq!(values(&options), vec!["gpt-5.4", "gpt-5.6-sol"]);
+        let options = model_options(vec!["gpt-5.6-sol".to_string()], "gpt-5.5", MODEL_OPTIONS);
+        assert_eq!(values(&options), vec!["gpt-5.5", "gpt-5.6-sol"]);
         assert!(options[0].selected && !options[1].selected);
     }
 
     #[test]
     fn empty_fresh_list_falls_back_to_builtin() {
-        let options = model_options(Vec::new(), "gpt-5.4-mini");
+        let options = model_options(Vec::new(), "gpt-5.5", MODEL_OPTIONS);
         assert_eq!(values(&options), MODEL_OPTIONS);
+    }
+
+    #[test]
+    fn claude_fallback_uses_claude_ids_only() {
+        let options = model_options(Vec::new(), "claude-sonnet-5-5", CLAUDE_MODEL_OPTIONS);
+        assert_eq!(values(&options), CLAUDE_MODEL_OPTIONS);
+        assert!(!CLAUDE_MODEL_OPTIONS.contains(&"gpt-5.5"));
     }
 
     #[test]
@@ -1554,24 +1974,73 @@ mod model_tests {
     }
 }
 
-fn run_node_script(
-    script_path: &str,
-    subcommand: &str,
-    payload: &[u8],
+#[cfg(test)]
+mod error_tests {
+    use super::AppError;
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+
+    async fn respond(error: AppError) -> (StatusCode, String) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn statuses_follow_the_error_mapping() {
+        assert_eq!(respond(AppError::NotFound).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            respond(AppError::BadRequest("Bad input.".into())).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            respond(AppError::Ai).await.0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn server_failures_hide_internal_detail_inside_the_layout() {
+        let (status, body) = respond(AppError::Internal("sqlite exploded at row 7".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("sqlite exploded"), "{body}");
+        assert!(body.contains("Something went wrong on our side"), "{body}");
+        assert!(body.contains("Back to library"), "{body}");
+        assert!(body.contains("/static/app.css"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn missing_ai_setup_links_to_settings() {
+        let (status, body) = respond(AppError::AiNotConfigured).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("href=\"/settings\""), "{body}");
+    }
+}
+
+/// Runs a Node helper script on the blocking pool, writing `payload` to its
+/// stdin and collecting stdout and stderr.
+async fn run_node_script(
+    script_path: String,
+    subcommand: &'static str,
+    payload: Vec<u8>,
 ) -> std::io::Result<std::process::Output> {
-    let mut child = std::process::Command::new("node")
-        .arg(script_path)
-        .arg(subcommand)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .expect("script stdin is piped")
-        .write_all(payload)?;
-    child.wait_with_output()
+    tokio::task::spawn_blocking(move || {
+        let mut child = std::process::Command::new("node")
+            .arg(&script_path)
+            .arg(subcommand)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .expect("script stdin is piped")
+            .write_all(&payload)?;
+        child.wait_with_output()
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 // Keeps main's error type small without adding an application dependency solely for startup errors.
 mod anyhowless {

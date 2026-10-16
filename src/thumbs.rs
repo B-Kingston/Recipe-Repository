@@ -8,8 +8,9 @@
 //! service, model download, or new dependency is involved: ffmpeg is already
 //! a hard requirement of the media importer.
 
-use crate::media::{env_flag, env_path, remaining_timeout, run_tool};
-use std::os::unix::fs::DirBuilderExt;
+use crate::media::{
+    VideoProbe, create_private_dir, env_flag, env_path, remaining_timeout, run_tool,
+};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -75,19 +76,14 @@ pub(crate) fn enabled() -> bool {
 /// missing thumbnail must never fail the recipe import itself.
 pub(crate) fn extract_thumbnails(
     video_path: &Path,
+    probe: &VideoProbe,
     workdir: &Path,
     ocr_seconds: &[u64],
     duration_hint: Option<u64>,
     warnings: &mut Vec<String>,
     deadline: Instant,
 ) -> Vec<ThumbCandidate> {
-    let Some((width, height)) = video_dimensions(video_path, warnings) else {
-        return Vec::new();
-    };
-    if width == 0 || height == 0 {
-        warnings.push("The video reported no usable frame size.".into());
-        return Vec::new();
-    }
+    let (width, height) = (probe.width, probe.height);
     let analysis_height =
         (((height as f64) * ANALYSIS_WIDTH as f64 / width as f64).round() as usize).max(16);
     let frame_bytes = ANALYSIS_WIDTH * analysis_height * 3;
@@ -160,11 +156,7 @@ pub(crate) fn extract_thumbnails(
     // Pass two: one precise seek per winner, cropping a square around the
     // saliency centroid measured on that sample's own pixels.
     let out_dir = workdir.join("thumbs");
-    if let Err(error) = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&out_dir)
-    {
+    if let Err(error) = create_private_dir(&out_dir) {
         warnings.push(format!("Could not create the thumbnail directory: {error}"));
         return Vec::new();
     }
@@ -224,7 +216,7 @@ pub(crate) fn extract_thumbnails(
 
 /// Per-sample raw measurements, before cross-video normalisation.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FrameMetrics {
+struct FrameMetrics {
     t: f64,
     luma_mean: f32,
     colorfulness: f32,
@@ -234,11 +226,11 @@ pub(crate) struct FrameMetrics {
     sharpness: f32,
 }
 
-/// Tiny block-mean grayscale fingerprint of one sample.
+/// Tiny grayscale fingerprint of one sample, read on a regular grid.
 type Signature = [u8; SIGNATURE_SIDE * SIGNATURE_SIDE];
 
 /// Measures one RGB24 frame. Returns `None` only for degenerate sizes.
-pub(crate) fn analyze_frame(
+fn analyze_frame(
     rgb: &[u8],
     width: usize,
     height: usize,
@@ -346,7 +338,7 @@ pub(crate) fn analyze_frame(
     ))
 }
 
-/// Nearest-neighbour block-mean grayscale signature.
+/// Nearest-neighbour grayscale signature: one pixel per grid cell.
 fn block_signature(gray: &[u8], width: usize, height: usize) -> Signature {
     let mut signature = [0_u8; SIGNATURE_SIDE * SIGNATURE_SIDE];
     for (cell, value) in signature.iter_mut().enumerate() {
@@ -368,10 +360,10 @@ fn signature_distance(a: &Signature, b: &Signature) -> f32 {
 
 /// One scored sample ready for diversity-aware picking.
 #[derive(Debug, Clone)]
-pub(crate) struct ScoredSample {
-    pub(crate) index: usize,
-    pub(crate) t: f64,
-    pub(crate) score: f32,
+struct ScoredSample {
+    index: usize,
+    t: f64,
+    score: f32,
     signature: Signature,
 }
 
@@ -379,12 +371,11 @@ pub(crate) struct ScoredSample {
 /// survivors best-first. Samples inside the head/tail skip zones or with
 /// degenerate exposure never enter the ranking; OCR-caption neighbourhoods
 /// are demoted rather than removed.
-pub(crate) fn rank_samples(
+fn rank_samples(
     samples: &[(FrameMetrics, Signature)],
     ocr_seconds: &[u64],
     span_seconds: f64,
 ) -> Vec<ScoredSample> {
-    let head_skip = HEAD_SKIP_SECONDS;
     let tail_skip = span_seconds * TAIL_SKIP_FRACTION as f64;
     let eligible: Vec<usize> = samples
         .iter()
@@ -392,7 +383,7 @@ pub(crate) fn rank_samples(
         .filter(|(_, (m, _))| {
             m.luma_mean >= 24.0
                 && m.luma_mean <= 232.0
-                && m.t >= head_skip
+                && m.t >= HEAD_SKIP_SECONDS
                 && (span_seconds <= 0.0 || m.t <= span_seconds - tail_skip)
         })
         .map(|(index, _)| index)
@@ -400,31 +391,20 @@ pub(crate) fn rank_samples(
     if eligible.is_empty() {
         return Vec::new();
     }
-    let metric = |index: usize, pick: fn(&FrameMetrics) -> f32| pick(&samples[index].0);
-    let mut ranges = [
-        (f32::INFINITY, f32::NEG_INFINITY),
-        (f32::INFINITY, f32::NEG_INFINITY),
-        (f32::INFINITY, f32::NEG_INFINITY),
-        (f32::INFINITY, f32::NEG_INFINITY),
-        (f32::INFINITY, f32::NEG_INFINITY),
-    ];
-    let pickers: [fn(&FrameMetrics) -> f32; 5] = [
-        |m| m.colorfulness,
-        |m| m.saturation,
-        |m| m.warmth,
-        |m| m.texture,
-        |m| m.sharpness,
-    ];
-    for &index in &eligible {
-        for (slot, picker) in pickers.iter().enumerate() {
-            let value = metric(index, *picker);
-            let range = &mut ranges[slot];
-            range.0 = range.0.min(value);
-            range.1 = range.1.max(value);
-        }
-    }
-    let normalise = |slot: usize, value: f32| -> f32 {
-        let (low, high) = ranges[slot];
+    let range = |pick: fn(&FrameMetrics) -> f32| {
+        eligible
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &index| {
+                let value = pick(&samples[index].0);
+                (low.min(value), high.max(value))
+            })
+    };
+    let colorfulness = range(|m| m.colorfulness);
+    let saturation = range(|m| m.saturation);
+    let warmth = range(|m| m.warmth);
+    let texture = range(|m| m.texture);
+    let sharpness = range(|m| m.sharpness);
+    let normalise = |(low, high): (f32, f32), value: f32| -> f32 {
         if (high - low).abs() < f32::EPSILON {
             // A flat video (single scene) gives every sample a neutral mark
             // instead of a meaningless zero or one.
@@ -438,11 +418,11 @@ pub(crate) fn rank_samples(
         .iter()
         .map(|&index| {
             let (m, signature) = (&samples[index].0, &samples[index].1);
-            let composite = WEIGHT_COLORFULNESS * normalise(0, m.colorfulness)
-                + WEIGHT_SATURATION * normalise(1, m.saturation)
-                + WEIGHT_WARMTH * normalise(2, m.warmth)
-                + WEIGHT_TEXTURE * normalise(3, m.texture)
-                + WEIGHT_SHARPNESS * normalise(4, m.sharpness);
+            let composite = WEIGHT_COLORFULNESS * normalise(colorfulness, m.colorfulness)
+                + WEIGHT_SATURATION * normalise(saturation, m.saturation)
+                + WEIGHT_WARMTH * normalise(warmth, m.warmth)
+                + WEIGHT_TEXTURE * normalise(texture, m.texture)
+                + WEIGHT_SHARPNESS * normalise(sharpness, m.sharpness);
             let exposure = exposure_factor(m.luma_mean);
             let near_text = ocr_seconds
                 .iter()
@@ -486,11 +466,7 @@ fn exposure_factor(luma_mean: f32) -> f32 {
 /// duplicate check, so the four options show different moments of the cook.
 /// A relaxed-gap second sweep tops up short videos where strict spacing
 /// cannot fill the quota.
-pub(crate) fn select_diverse(
-    scored: Vec<ScoredSample>,
-    max: usize,
-    min_gap: f64,
-) -> Vec<ScoredSample> {
+fn select_diverse(scored: Vec<ScoredSample>, max: usize, min_gap: f64) -> Vec<ScoredSample> {
     let mut picked: Vec<ScoredSample> = Vec::with_capacity(max);
     for relax in [false, true] {
         let gap = if relax { min_gap / 3.0 } else { min_gap };
@@ -523,7 +499,7 @@ pub(crate) fn select_diverse(
 
 /// Squared-crop window centred near the given normalised point, clamped to
 /// the frame. Returns `(x, y, side)` in full-resolution pixels.
-pub(crate) fn square_crop_window(width: u32, height: u32, cx: f32, cy: f32) -> (u32, u32, u32) {
+fn square_crop_window(width: u32, height: u32, cx: f32, cy: f32) -> (u32, u32, u32) {
     let side = width.min(height);
     let clamp_x = (width - side) as f32;
     let clamp_y = (height - side) as f32;
@@ -539,7 +515,7 @@ pub(crate) fn square_crop_window(width: u32, height: u32, cx: f32, cy: f32) -> (
 /// Centre of mass of the food-evidence signal (centre-weighted saturation
 /// times edges), blended toward the geometric centre so a stray glint cannot
 /// shove the crop to a corner. Falls back to the exact centre on flat input.
-pub(crate) fn saliency_centroid(rgb: &[u8], width: usize, height: usize) -> (f32, f32) {
+fn saliency_centroid(rgb: &[u8], width: usize, height: usize) -> (f32, f32) {
     if rgb.len() < width * height * 3 {
         return (0.5, 0.5);
     }
@@ -574,40 +550,6 @@ pub(crate) fn saliency_centroid(rgb: &[u8], width: usize, height: usize) -> (f32
         0.75 * cx.clamp(0.0, 1.0) + 0.25 * 0.5,
         0.75 * cy.clamp(0.0, 1.0) + 0.25 * 0.5,
     )
-}
-
-/// Reads the first video stream's pixel size as `(width, height)`; `None`
-/// when ffprobe is unavailable or reports nothing usable.
-fn video_dimensions(video_path: &Path, warnings: &mut Vec<String>) -> Option<(u32, u32)> {
-    let ffprobe = env_path("MEDIA_FFPROBE_PATH", "ffprobe");
-    let args = vec![
-        "-v".into(),
-        "error".into(),
-        "-select_streams".into(),
-        "v:0".into(),
-        "-show_entries".into(),
-        "stream=width,height".into(),
-        "-of".into(),
-        "csv=s=x:p=0".into(),
-        video_path.to_string_lossy().to_string(),
-    ];
-    let output = match run_tool(&ffprobe, &args, Duration::from_secs(20), 4 * 1024) {
-        Ok(output) => output,
-        Err(error) => {
-            warnings.push(format!("Video dimensions could not be probed: {error}"));
-            return None;
-        }
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().next().unwrap_or_default().trim();
-    let (w, h) = line.split_once('x')?;
-    match (w.trim().parse::<u32>(), h.trim().parse::<u32>()) {
-        (Ok(w), Ok(h)) => Some((w, h)),
-        _ => {
-            warnings.push("Video dimensions were not readable.".into());
-            None
-        }
-    }
 }
 
 #[cfg(test)]

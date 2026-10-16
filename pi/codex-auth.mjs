@@ -13,8 +13,10 @@
 //                 | {status:"failed", message}
 //
 // Endpoints and constants intentionally mirror pi-ai's OpenAI Codex OAuth
-// flow (auth/oauth/openai-codex.ts) so the credential shape stays compatible
+// flow (auth/oauth/openai-codex.js) so the credential shape stays compatible
 // with ModelRuntime's credential store.
+
+import { outputJson, readStdin, runMain } from "./cli.mjs";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -24,16 +26,6 @@ const DEVICE_VERIFICATION_URI = "https://auth.openai.com/codex/device";
 const DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_CODE_TIMEOUT_SECONDS = 15 * 60;
 const ACCOUNT_CLAIM_PATH = "https://api.openai.com/auth";
-
-function outputJson(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
-}
-
-async function readStdin() {
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
-  return input;
-}
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
@@ -178,13 +170,4 @@ async function main() {
   }
 }
 
-if (process.argv[1] === import.meta.filename) {
-  main().catch((error) => {
-    outputJson({
-      status: "error",
-      code: "internal",
-      message: error instanceof Error ? error.message : String(error),
-    });
-    process.exitCode = 1;
-  });
-}
+if (process.argv[1] === import.meta.filename) runMain(main);

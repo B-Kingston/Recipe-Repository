@@ -41,7 +41,7 @@ Key invariants:
 |---|---|
 | `src/` | Rust binary crate: `main.rs` (bootstrap/router/shared types), `auth.rs` (setup + basic auth + password change), `ai.rs`, `recipes.rs`, `chart.rs`, `thumbs.rs` |
 | `src/tests/` | Rust unit-test tree (wired via `#[cfg(test)] mod tests;` in `main.rs`) |
-| `pi/` | Node ESM sidecar: `recipe-worker.mjs` (entry), `codex-auth.mjs` (device-flow CLI), `codex-native-search.mjs` (pure lib) + `*.test.mjs` |
+| `pi/` | Node ESM sidecar: `recipe-worker.mjs` (entry), `codex-auth.mjs` (Codex device-flow CLI), `claude-auth.mjs` (Claude copy-code OAuth CLI), `native-search.mjs` (pure lib: Codex + Anthropic native web search) + `*.test.mjs` |
 | `templates/` | Askama HTML templates, `base.html` parent + `{% block %}` children |
 | `static/` | `app.css`, `app.js` (strict ES5 IIFE, progressive enhancement) |
 | `migrations/` | sqlx SQL migrations, `NNNN_name.sql` naming |
@@ -84,14 +84,14 @@ The binary accepts `--healthcheck` (probes `GET /healthz` without starting the s
 ## Runtime/Tooling Preferences
 
 - **Rust**: edition 2024 (needs ≥ 1.85; Docker pins `rust:1.88-slim`). glibc, not musl. `sqlx` 0.8 no-default-features (tokio-rustls, sqlite, migrate); `reqwest` with rustls (no native-tls).
-- **Node**: ≥ 22 (`node:22-bookworm-slim` runtime image), ESM (`"type": "module"`), npm; `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` pinned together at `0.83.0` — keep them in lockstep.
-- **Env vars** (`.env.example`): `DATABASE_URL` (`sqlite:/data/recipes.sqlite3`), `APP_BIND` (`0.0.0.0:3000`), `PI_MODEL` (`gpt-5.4-mini`), `PI_SEARCH_ENABLED` (default `true`), `THUMBNAILS_ENABLED` (default `true`; disables dish-photo candidate extraction when false), `RUST_LOG` (`kindle_recipes=info,tower_http=info`), optional `PI_WORKER_PATH` / `PI_AUTH_SCRIPT_PATH` / `PI_CODING_AGENT_DIR`. No OAuth tokens in `.env` — the Codex credential lives in the DB.
+- **Node**: ≥ 22.19 (`node:22-bookworm-slim` runtime image), ESM (`"type": "module"`), npm; `@earendil-works/pi-ai` and `@earendil-works/pi-coding-agent` pinned together at `1.2.0` — keep them in lockstep. Subscription providers run through `ModelRuntime`: `openai-codex` (Codex) and `anthropic` (Claude Pro/Max OAuth); the worker request field `piProvider` selects one.
+- **Env vars** (`.env.example`): `DATABASE_URL` (`sqlite:/data/recipes.sqlite3`), `APP_BIND` (`0.0.0.0:3000`), `PI_MODEL` (`gpt-6-luna`), `PI_SEARCH_ENABLED` (default `true`), `THUMBNAILS_ENABLED` (default `true`; disables dish-photo candidate extraction when false), `RUST_LOG` (`kindle_recipes=info,tower_http=info`), optional `PI_WORKER_PATH` / `PI_AUTH_SCRIPT_PATH` / `PI_CLAUDE_AUTH_SCRIPT_PATH` / `PI_CODING_AGENT_DIR`. No OAuth tokens in `.env` — the Codex and Claude credentials live in the DB.
 - Migrations run via compile-time embedded `sqlx::migrate!()`; any schema change is a new numbered `migrations/000N_*.sql`.
 - `.agents/` skills are coding-agent tooling, excluded from the Docker image.
 
 ## Testing & QA
 
 - **Rust** (`cargo test`): unit tests in `src/tests/` (`ai.rs`, `auth.rs`, `chart.rs`, `config.rs`, `media.rs`, `recipes.rs`, `settings.rs`, `thumbs.rs`) plus inline test modules in `main.rs`, `media.rs`, and `thumbs.rs`. Use `#[tokio::test]`; handler tests in `src/tests/recipes.rs` drive axum `State`/`Path` directly against in-memory SQLite with `sqlx::migrate!()` — reuse its `database()` / `state()` helpers. `src/tests/auth.rs` covers setup, basic-auth middleware (challenge, per-user scoping), legacy Codex credential import, and the password-change flow (wrong current password, hash replacement, router accepting the new password). Env-var tests MUST take the static `ENV_LOCK: Mutex<()>` in `src/tests/config.rs` (and note `unsafe std::env::set_var` in edition 2024).
-- **Node** (`npm test`): built-in `node:test` across `pi/*.test.mjs`. Mocking is HTTP-level: swap `globalThis.fetch` (codex-auth), inject a `fetchImpl` parameter (codex-native-search), or test pure functions (recipe-worker). No test framework deps, no coverage thresholds.
+- **Node** (`npm test`): built-in `node:test` across `pi/*.test.mjs`. Mocking is HTTP-level: swap `globalThis.fetch` (codex-auth), inject a `fetchImpl` parameter (native-search, claude-auth), or test pure functions (recipe-worker). No test framework deps, no coverage thresholds.
 - Touch the worker protocol → run the `pi/*.test.mjs` suites; touch validation/schema → run `cargo test`.
 - Intended full validation: `docker compose up --build`, then visit `/healthz`, create a recipe, edit and reorder blocks, and test one AI preview with a real API key.

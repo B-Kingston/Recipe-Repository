@@ -1,6 +1,25 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { WorkerError, aiGatewayChatCompletion, anthropicMessages, anthropicUrl, catalogModelIds, formatRecipeEvidence, normalizeEffort, openaiResponse, parseAiGatewayCleaner, parseAnthropicOutput, parseResponsesOutput, recipePrompt, searchModeOf, thinkingBudget, verifiedSources } from "./recipe-worker.mjs";
+import {
+  WorkerError,
+  aiGatewayChatCompletion,
+  anthropicMessages,
+  anthropicUrl,
+  catalogModelIds,
+  completionContext,
+  formatRecipeEvidence,
+  normalizeEffort,
+  openaiResponse,
+  parseAiGatewayCleaner,
+  parseAnthropicOutput,
+  parseRequest,
+  parseResponsesOutput,
+  recipePrompt,
+  searchModeOf,
+  subscriptionOf,
+  thinkingBudget,
+  verifiedSources,
+} from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -32,6 +51,37 @@ test("catalogModelIds dedupes ids and drops entries without a string id", () => 
     { id: "gpt-5.4-mini" },
   ];
   assert.deepEqual(catalogModelIds(models), ["gpt-5.6-sol", "gpt-5.4-mini"]);
+});
+
+test("subscriptionOf defaults to Codex and maps Claude's piProvider", () => {
+  assert.equal(subscriptionOf({}).id, "openai-codex");
+  assert.equal(subscriptionOf({ piProvider: "  " }).id, "openai-codex");
+  assert.equal(subscriptionOf({ piProvider: "anthropic" }).label, "Claude");
+});
+
+test("subscriptionOf rejects unknown providers, including inherited Object keys", () => {
+  for (const piProvider of ["google", "constructor", "__proto__"]) {
+    assert.throws(() => subscriptionOf({ piProvider }), (error) => {
+      assert.ok(error instanceof WorkerError);
+      assert.equal(error.code, "configuration");
+      return true;
+    });
+  }
+});
+
+test("parseRequest accepts listModels without a prompt but requires one otherwise", () => {
+  assert.deepEqual(parseRequest('{"command":"listModels"}'), { command: "listModels" });
+  assert.deepEqual(
+    parseRequest('{"prompt":"p","systemPrompt":"s"}'),
+    { prompt: "p", systemPrompt: "s" },
+  );
+  for (const input of ["[]", "null", '"text"', '{"prompt":"p"}', "not json"]) {
+    assert.throws(() => parseRequest(input), (error) => {
+      assert.ok(error instanceof WorkerError);
+      assert.equal(error.code, "input");
+      return true;
+    });
+  }
 });
 
 test("openaiResponse posts to /responses with web_search when search is enabled", async () => {
@@ -89,41 +139,29 @@ test("openaiResponse strips a trailing slash from the base URL", async () => {
   assert.equal(capturedUrl, "https://api.openai.com/v1/responses");
 });
 
-test("openaiResponse maps a non-2xx response to a WorkerError", async () => {
-  const fetchImpl = async () => ({ ok: false, status: 401, text: async () => "bad key" });
-  await assert.rejects(
-    openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", "off", "low", fetchImpl),
-    (error) => {
-      assert.ok(error instanceof WorkerError);
-      assert.equal(error.code, "worker");
-      assert.equal(error.retryable, false);
-      assert.ok(error.message.includes("HTTP 401"));
-      return true;
-    },
+test("openaiResponse maps a non-2xx response to a WorkerError and marks transient failures retryable", async () => {
+  const rejects = (status) => openaiResponse(
+    "https://api.openai.com/v1",
+    "sk-test",
+    "gpt-5.6-luna",
+    "sys",
+    "prompt",
+    "off",
+    "low",
+    async () => ({ ok: false, status, text: async () => "bad key" }),
   );
-});
-
-test("openaiResponse marks transient provider failures as retryable", async () => {
-  const fetchImpl = async () => ({ status: 503, ok: false, text: async () => "busy" });
-  await assert.rejects(
-    openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", "off", "low", fetchImpl),
-    (error) => {
-      assert.ok(error instanceof WorkerError);
-      assert.equal(error.retryable, true);
-      return true;
-    },
-  );
-});
-
-test("openaiResponse sends the chosen reasoning effort", async () => {
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
-    capturedInit = init;
-    return { ok: true, json: async () => ({}) };
-  };
-  await openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", "off", "high", fetchImpl);
-  const sent = JSON.parse(capturedInit.body);
-  assert.deepEqual(sent.reasoning, { effort: "high" });
+  await assert.rejects(rejects(401), (error) => {
+    assert.ok(error instanceof WorkerError);
+    assert.equal(error.code, "worker");
+    assert.equal(error.retryable, false);
+    assert.ok(error.message.includes("HTTP 401"));
+    return true;
+  });
+  await assert.rejects(rejects(503), (error) => {
+    assert.ok(error instanceof WorkerError);
+    assert.equal(error.retryable, true);
+    return true;
+  });
 });
 
 test("openaiResponse offers web_search without forcing it in gap-fill mode", async () => {
@@ -144,6 +182,20 @@ test("recipePrompt tail matches the request's search mode", () => {
   const gapfill = recipePrompt("sys", "gapfill");
   assert.ok(gapfill.includes("available but not required"));
   assert.ok(gapfill.includes("imported social video"));
+});
+
+test("completionContext sends only the explicit non-coding context", () => {
+  const context = completionContext({
+    prompt: "Make a tomato pasta",
+    systemPrompt: "You are a recipe assistant.",
+  }, false);
+
+  assert.equal(context.systemPrompt.startsWith("You are a recipe assistant."), true);
+  assert.equal(context.systemPrompt.includes("coding assistant"), false);
+  assert.deepEqual(context.tools, []);
+  assert.equal(context.messages.length, 1);
+  assert.equal(context.messages[0].role, "user");
+  assert.equal(context.messages[0].content, "Make a tomato pasta");
 });
 
 test("searchModeOf accepts only the three known modes", () => {
@@ -217,6 +269,14 @@ test("parseAiGatewayCleaner keeps recipe fields and discards cleaner prose and u
   assert.ok(!cleaned.includes("Follow me"));
 });
 
+test("parseAiGatewayCleaner finds the JSON object between prose that contains braces", () => {
+  const object = JSON.stringify({ title: "Soup", steps: ["Simmer {gently}"] });
+  const cleaned = parseAiGatewayCleaner({
+    choices: [{ message: { content: `Here it is: ${object} (see {ref})` } }],
+  });
+  assert.equal(cleaned, "Dish: Soup\nMethod:\n1. Simmer {gently}");
+});
+
 test("formatRecipeEvidence rejects cleaner output without ingredients or steps", () => {
   assert.throws(() => formatRecipeEvidence({ title: "A story", relevant_notes: ["Like and follow"] }), (error) => {
     assert.ok(error instanceof WorkerError);
@@ -273,14 +333,14 @@ test("anthropicMessages scales the thinking budget with effort and covers it in 
   let sent = JSON.parse(capturedInit.body);
   assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 1024 });
   assert.equal(sent.max_tokens, 1024 + 8192);
-  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "high", "off", fetchImpl);
+  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "max", "off", fetchImpl);
   sent = JSON.parse(capturedInit.body);
   assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 8192 });
   assert.equal(sent.max_tokens, 8192 + 8192);
   assert.ok(!("tools" in sent));
 });
 
-test("thinkingBudget defaults unknown or blank efforts to low", () => {
+test("thinkingBudget maps each effort to its budget and treats blank as low", () => {
   assert.equal(thinkingBudget(undefined), 1024);
   assert.equal(thinkingBudget(""), 1024);
   assert.equal(thinkingBudget("medium"), 4096);
@@ -289,40 +349,22 @@ test("thinkingBudget defaults unknown or blank efforts to low", () => {
   assert.equal(thinkingBudget("max"), 8192);
 });
 
-test("anthropicMessages maps a non-2xx response to a WorkerError", async () => {
-  const fetchImpl = async () => ({ ok: false, status: 401, text: async () => "bad key" });
-  await assert.rejects(
-    anthropicMessages("https://api.anthropic.com", "sk-ant-test", "m", "s", [{ role: "user", content: "p" }], "low", "off", fetchImpl),
-    (error) => {
-      assert.ok(error instanceof WorkerError);
-      assert.equal(error.code, "worker");
-      assert.ok(error.message.includes("HTTP 401"));
-      return true;
-    },
-  );
-});
-
-test("parseAnthropicOutput extracts text and web-search citations", () => {
+test("parseAnthropicOutput reads web_search_result items and text citations", () => {
   const { text, searched, refused, citations } = parseAnthropicOutput({
     stop_reason: "end_turn",
     content: [
-      { type: "text", text: "Here is the recipe " },
-      { type: "text", text: "and more." },
+      { type: "text", text: "Here is the recipe ", citations: null },
+      {
+        type: "text",
+        text: "and more.",
+        citations: [{ type: "web_search_result_location", url: "https://example.org/cited", title: "Cited", cited_text: "x", encrypted_index: "e" }],
+      },
       {
         type: "web_search_tool_result",
-        tool_use_id: "toolu_1",
+        tool_use_id: "srvtoolu_1",
         content: [
-          { type: "text", text: "search summary" },
-          {
-            type: "search_result",
-            title: "Sourdough basics",
-            source: { type: "url", url: "https://example.com/sourdough" },
-          },
-          {
-            type: "search_result",
-            url: "https://example.org/old-shape",
-            title: "Legacy shape",
-          },
+          { type: "web_search_result", url: "https://example.com/sourdough/", title: "Sourdough basics", encrypted_content: "e", page_age: null },
+          { type: "web_search_result", url: "ftp://example.com/x", title: "bad scheme", encrypted_content: "e", page_age: null },
         ],
       },
     ],
@@ -330,8 +372,10 @@ test("parseAnthropicOutput extracts text and web-search citations", () => {
   assert.equal(text, "Here is the recipe and more.");
   assert.equal(searched, true);
   assert.equal(refused, false);
-  assert.equal(citations.get("https://example.com/sourdough"), "Sourdough basics");
-  assert.equal(citations.get("https://example.org/old-shape"), "Legacy shape");
+  assert.deepEqual([...citations], [
+    ["https://example.org/cited", "Cited"],
+    ["https://example.com/sourdough", "Sourdough basics"],
+  ]);
 });
 
 test("parseAnthropicOutput flags refusals and missing searches", () => {

@@ -4,8 +4,8 @@
   <h1>Delete this recipe?</h1>
   <p class="deck">“{{ recipe.title }}” and every ingredient, step, and source will be removed.</p>
 </div>
-<form class="panel form-panel" method="post" action="/recipes/{{ recipe.id }}/delete">
+<form class="panel form-panel" method="post" action="/recipes/{{ recipe.id }}/delete" data-busy-label="Deleting…">
   <p>This action cannot be undone.</p>
-  <p class="actions"><button class="danger">Delete permanently</button><a class="button" href="/recipes/{{ recipe.id }}">Keep recipe</a></p>
+  <p class="actions"><a class="button quiet" href="/recipes/{{ recipe.id }}">Keep recipe</a><button class="danger">Delete permanently</button></p>
 </form>
 {% endblock %}

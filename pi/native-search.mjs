@@ -37,23 +37,32 @@ function collectContent(state, content) {
   }
 }
 
+/** Whether a Responses API web_search_call item ran to completion. */
+export function webSearchCompleted(item) {
+  const actionType = typeof item.action === "string" ? item.action : item.action?.type;
+  return item.status === "completed" || (actionType === "search" && item.status !== "failed");
+}
+
 function collectItem(state, item) {
   if (!item || typeof item !== "object") return;
   if (item.type === "web_search_call") {
-    const actionType = typeof item.action === "string" ? item.action : item.action?.type;
-    const completed = item.status === "completed" || (actionType === "search" && item.status !== "failed");
-    if (completed) state.invoked = true;
+    if (webSearchCompleted(item)) state.invoked = true;
     for (const source of item.action?.sources ?? []) addSource(state, source);
   }
   collectContent(state, item.content);
 }
 
-export function nativeSearchPayload(payload) {
+function requestPayload(payload, provider) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new Error("Pi produced an invalid Codex request payload.");
+    throw new Error(`Pi produced an invalid ${provider} request payload.`);
   }
+  return payload;
+}
+
+/** Forces the hosted web_search tool onto a Codex Responses payload. */
+export function nativeSearchPayload(payload) {
   return {
-    ...payload,
+    ...requestPayload(payload, "Codex"),
     tools: [{ type: "web_search", search_context_size: "high" }],
     tool_choice: { type: "web_search" },
   };
@@ -63,17 +72,47 @@ export function nativeSearchPayload(payload) {
  * generation over imported video evidence may stay unsourced when the
  * cleaned evidence alone answers the request. */
 export function optionalSearchPayload(payload) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new Error("Pi produced an invalid Codex request payload.");
-  }
   return {
-    ...payload,
+    ...requestPayload(payload, "Codex"),
     tools: [{ type: "web_search", search_context_size: "high" }],
   };
 }
 
-export function collectNativeSearchEvent(state, event) {
+/** Attaches Anthropic's server-side web_search tool to a Messages API payload.
+ * The tool is never forced with tool_choice: Anthropic rejects a forced tool
+ * while extended thinking is on. Grounded mode relies on the prompt and on the
+ * worker's check that a search result arrived. */
+export function anthropicSearchPayload(payload) {
+  const body = requestPayload(payload, "Anthropic");
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  return { ...body, tools: [...tools, { type: "web_search_20250305", name: "web_search" }] };
+}
+
+/** Anthropic SSE: web_search_tool_result blocks carry the search results;
+ * citations_delta events carry the citations on the answer text. */
+function collectAnthropicEvent(state, event) {
+  const block = event.type === "content_block_start" ? event.content_block : null;
+  if (block?.type === "web_search_tool_result" && Array.isArray(block.content)) {
+    state.invoked = true;
+    for (const result of block.content) {
+      if (result?.type === "web_search_result") addSource(state, result);
+    }
+  }
+  if (event.type === "content_block_delta") {
+    const delta = event.delta;
+    if (delta?.type === "text_delta" && typeof delta.text === "string") state.streamedText.push(delta.text);
+    if (delta?.type === "citations_delta" && delta.citation?.type === "web_search_result_location") {
+      addSource(state, delta.citation);
+    }
+  }
+}
+
+function collectNativeSearchEvent(state, event) {
   if (!event || typeof event !== "object") return;
+  if (event.type === "content_block_start" || event.type === "content_block_delta") {
+    collectAnthropicEvent(state, event);
+    return;
+  }
   if (event.type === "response.web_search_call.completed") state.invoked = true;
   if (event.type === "response.output_text.annotation.added" && event.annotation?.type === "url_citation") {
     addSource(state, event.annotation);
@@ -142,13 +181,11 @@ export function createNativeSearchObserver(fetchImpl = globalThis.fetch, options
     async fetch(input, init) {
       const response = await fetchImpl(input, init);
       if (response.ok) {
-        try {
-          const inspection = inspectNativeSearchResponse(response.clone(), state)
-            .catch(() => { state.parseErrors += 1; });
-          inspections.push(inspection);
-        } catch {
-          state.parseErrors += 1;
-        }
+        inspections.push(
+          inspectNativeSearchResponse(response.clone(), state).catch(() => {
+            state.parseErrors += 1;
+          }),
+        );
       }
       return response;
     },

@@ -8,6 +8,8 @@ readings and the final production `clean_ocr_reading`/`collapse_ocr_readings`
 output are reported; the latter is invoked through the app's `--clean-ocr`
 command so this script does not carry a second cleanup implementation.
 
+Build the image once with `docker build -t kindle-recipes:paddle-ocr .`, then:
+
 ```sh
 docker run --rm --user root \
   -v "$PWD":/workspace -v recipe-data:/data -w /workspace \

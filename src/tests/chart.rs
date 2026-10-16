@@ -1,5 +1,31 @@
-use crate::chart::{build_chart, selected_chart_step};
+use crate::chart::{build_chart, infer_step_ingredients, selected_chart_step};
 use crate::{Block, ChartRecipe, ChartStep, IngredientUse, Recipe, ViewBlock, ViewStep};
+
+fn ingredient(text: &str, quantity: &str, unit: &str) -> Block {
+    Block {
+        id: String::new(),
+        section: "ingredient".into(),
+        position: 0,
+        text: text.into(),
+        quantity: quantity.into(),
+        unit: unit.into(),
+        optional: 0,
+    }
+}
+
+#[test]
+fn old_steps_infer_explicitly_measured_ingredients() {
+    assert_eq!(
+        infer_step_ingredients(
+            "Heat 2 tbsp olive oil until shimmering.",
+            &[
+                ingredient("olive oil", "2", "tbsp"),
+                ingredient("salt", "1", "tsp")
+            ]
+        ),
+        vec!["2 tbsp olive oil"]
+    );
+}
 
 #[test]
 fn chart_step_query_is_clamped_to_valid_bounds() {

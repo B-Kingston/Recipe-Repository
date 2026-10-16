@@ -1,27 +1,39 @@
-{% extends "base.html" %}{% block title %}Settings · Kindle Recipes{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Settings · Recipe Repository{% endblock %}{% block content %}
 <div class="form-intro">
   <p class="eyebrow">Configuration</p>
   <h1>Settings</h1>
 </div>
+{% if saved %}<p class="notice" role="status">Settings saved.</p>{% endif %}
+{% if password_changed %}<p class="notice" role="status">Password changed.</p>{% endif %}
+{% if !notice.is_empty() %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 <div class="compact-panel">
   <div class="block">
     <h2>AI Provider</h2>
     <form method="post" action="/settings">
       <fieldset>
         <legend class="muted">Active provider</legend>
-        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}> Codex <span class="muted">(ChatGPT subscription)</span></label>
+        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if codex_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}</label>
+        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}{% if !claude_authorised %} disabled{% endif %}><span>Claude (Pro/Max)</span>{% if claude_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}{% if !claude_authorised %}<span class="muted">Connect it below first.</span>{% endif %}</label>
         {% for endpoint in endpoints %}
-        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}> {{ endpoint.name }} <span class="muted">({{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }})</span></label>
+        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span>{% if endpoint.selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}<span class="muted">({{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }})</span></label>
         {% endfor %}
       </fieldset>
-      {% if codex_selected %}
-      <label for="model">Codex model</label>
-      <select id="model" name="model">
-        {% for option in model_options %}
-        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
-        {% endfor %}
-      </select>
-      {% endif %}
+      <div id="model-codex"{% if !codex_selected %} hidden{% endif %}>
+        <label for="model">Codex model</label>
+        <select id="model" name="model" data-models-provider="pi">
+          {% for option in model_options %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div id="model-claude"{% if !claude_selected %} hidden{% endif %}>
+        <label for="claude_model">Claude model</label>
+        <select id="claude_model" name="claude_model" data-models-provider="claude">
+          {% for option in claude_model_options %}
+          <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <label for="reasoning_effort">Reasoning effort</label>
       <select id="reasoning_effort" name="reasoning_effort">
         {% for option in effort_options %}
@@ -34,7 +46,7 @@
   </div>
   <div class="block">
     <h2>API endpoints</h2>
-    <p class="muted" style="margin-bottom: 10px;">Register OpenAI-spec or Anthropic-spec endpoints with their API keys, then switch between them above.</p>
+    <p class="muted block-note">Register OpenAI-spec or Anthropic-spec endpoints with their API keys, then switch between them above.</p>
     <form method="post" action="/settings/endpoints">
       <label for="endpoint_name">Name</label>
       <input type="text" id="endpoint_name" name="name" placeholder="Claude, Local server, …">
@@ -56,7 +68,7 @@
       {% for endpoint in endpoints %}
       <li class="endpoint-row{% if endpoint.selected %} endpoint-row--active{% endif %}">
         <div class="endpoint-detail">
-          <strong>{{ endpoint.name }}</strong>{% if endpoint.selected %} <span class="codex-status codex-status--connected">Active</span>{% endif %}
+          <strong>{{ endpoint.name }}</strong>
           <p class="muted">{{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }}</p>
         </div>
         <form method="post" action="/settings/endpoints/{{ endpoint.id }}/delete">
@@ -68,23 +80,50 @@
     {% endif %}
   </div>
   <div class="block">
-    <h2>Vercel AI Gateway <span class="codex-status{% if gateway_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if gateway_configured %}&#10003; Configured{% else %}Not configured{% endif %}</span></h2>
-    <p class="muted" style="margin-bottom: 10px;">Used to clean caption, transcript, and OCR evidence before a video recipe is generated.</p>
+    <h2>Video cleaner <span class="codex-status{% if gateway_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if gateway_configured %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
+    <p class="muted block-note">Enter the Vercel gateway details for the cleaner. It removes chatter from captions, transcripts and on-screen text before a video recipe is generated.</p>
     <form method="post" action="/settings/vercel-gateway">
       <label for="gateway_base_url">Base URL</label>
       <input type="url" id="gateway_base_url" name="base_url" value="{{ gateway_base_url }}" required>
       <label for="gateway_api_key">API key{% if gateway_configured %} <span class="muted">(current key {{ gateway_key_masked }} · leave blank to keep it)</span>{% endif %}</label>
       <input type="password" id="gateway_api_key" name="api_key" autocomplete="off"{% if !gateway_configured %} required{% endif %}>
-      <button class="primary" type="submit">Save gateway</button>
+      <button class="primary" type="submit">Save video cleaner</button>
     </form>
   </div>
   <div class="block">
-    <h2>Authorise Codex <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
-    <p class="muted" style="margin-bottom: 10px;">Connect your OpenAI Codex account to enable AI recipe generation.</p>
+    <h2>Codex (ChatGPT) <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
+    <p class="muted block-note">Connect your ChatGPT account to generate recipes with Codex.</p>
     {% if codex_authorised %}
     <p class="muted">Connected to ChatGPT Plus/Pro.</p>
+    <div class="actions">
+      <a class="button" href="{{ codex_auth_url }}">Reconnect</a>
+      <form class="inline" method="post" action="/settings/disconnect/codex" data-confirm="Disconnect Codex? Recipes will stop generating with Codex until you reconnect.">
+        <button class="danger" type="submit">Disconnect</button>
+      </form>
+    </div>
     {% else %}
-    <a class="button primary" href="{{ codex_auth_url }}">Authorise Codex</a>
+    <div class="actions">
+      <a class="button primary" href="{{ codex_auth_url }}">Authorise Codex</a>
+    </div>
+    {% endif %}
+  </div>
+  <div class="block">
+    <h2>Claude (Pro/Max) <span class="codex-status{% if claude_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if claude_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
+    <p class="muted block-note">Sign in with your Claude Pro or Max account to generate recipes with Claude.</p>
+    {% if claude_connected_notice %}<p class="notice" role="status">Claude connected.</p>{% endif %}
+    {% if claude_error != "" %}<p class="error" role="alert">{{ claude_error }}</p>{% endif %}
+    {% if claude_authorised %}
+    <p class="muted">Connected to Claude.</p>
+    <div class="actions">
+      <a class="button" href="{{ claude_auth_url }}">Reconnect</a>
+      <form class="inline" method="post" action="/settings/disconnect/claude" data-confirm="Disconnect Claude? Recipes will stop generating with Claude until you reconnect.">
+        <button class="danger" type="submit">Disconnect</button>
+      </form>
+    </div>
+    {% else %}
+    <div class="actions">
+      <a class="button primary" href="{{ claude_auth_url }}">Authorise Claude</a>
+    </div>
     {% endif %}
   </div>
   <div class="block">
@@ -92,10 +131,54 @@
     <p class="muted">Set a new password. Your current password is required.</p>
     <a class="button" href="/settings/password">Reset password</a>
   </div>
-  <div class="block">
-    <h2>Media extraction debugger</h2>
-    <p class="muted">Run the Instagram/Facebook reel analysis pipeline on one or more URLs and review the description, audio, and OCR captures phase by phase as they come back.</p>
-    <a class="button" href="/settings/media-debug">Open debugger</a>
-  </div>
+  <details class="block developer-tools">
+    <summary>Developer tools</summary>
+    <h3>Media extraction debugger</h3>
+    <p class="muted">A developer tool. Runs the Instagram and Facebook reel analysis on one or more URLs and shows each phase as it finishes: caption, transcript, on-screen text, and the cleaner's output.</p>
+    <p class="actions"><a class="button" href="/settings/media-debug">Open debugger</a></p>
+  </details>
+<script>
+(function () {
+  var radios = document.querySelectorAll('input[name="provider"]');
+  var panels = { pi: document.getElementById('model-codex'), claude: document.getElementById('model-claude') };
+  var loaded = {};
+  function fill(select, data) {
+    var keep = select.value || data.selected;
+    var models = data.models.slice();
+    if (keep && models.indexOf(keep) === -1) { models.unshift(keep); }
+    select.innerHTML = '';
+    models.forEach(function (id) {
+      var option = document.createElement('option');
+      option.value = id;
+      option.textContent = id;
+      if (id === keep) { option.selected = true; }
+      select.appendChild(option);
+    });
+  }
+  function load(provider) {
+    var panel = panels[provider];
+    if (!panel || loaded[provider]) { return; }
+    loaded[provider] = true;
+    var select = panel.querySelector('select');
+    var request = new XMLHttpRequest();
+    request.open('GET', '/settings/models?provider=' + encodeURIComponent(provider), true);
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) { return; }
+      if (request.status !== 200) { loaded[provider] = false; return; }
+      try { fill(select, JSON.parse(request.responseText)); } catch (e) { loaded[provider] = false; }
+    };
+    request.send();
+  }
+  function sync() {
+    Array.prototype.forEach.call(radios, function (radio) {
+      if (!radio.checked) { return; }
+      Object.keys(panels).forEach(function (key) { if (panels[key]) { panels[key].hidden = key !== radio.value; } });
+      load(radio.value);
+    });
+  }
+  Array.prototype.forEach.call(radios, function (radio) { radio.addEventListener('change', sync); });
+  sync();
+}());
+</script>
 </div>
 {% endblock %}

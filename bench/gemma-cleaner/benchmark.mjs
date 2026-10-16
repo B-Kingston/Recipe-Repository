@@ -56,7 +56,7 @@ const VARIANTS = [
   },
   {
     id: "reasoning_off",
-    label: "Reasoning OFF (production prompt)",
+    label: "Reasoning OFF (baseline prompt)",
     systemPrompt: PRODUCTION_SYSTEM_PROMPT,
     options: { reasoning: { effort: "none" }, maxTokens: 2048 },
   },

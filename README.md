@@ -1,23 +1,28 @@
-# Kindle Recipes
+# Recipe Repository
 
-A deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page on the server, SQLite holds the data, and the only browser script is an optional ES5 inline-edit convenience.
+A deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page on the server, SQLite holds the data, and the only browser script (`static/app.js`) is an optional ES5 progressive enhancement.
 
 ## Start it
 
 1. Copy `.env.example` to `.env`.
 2. Run `docker compose up --build`.
-3. Open `http://localhost:3000/settings` and choose **Authorise Codex**. A one-time sign-in code opens at chatgpt.com/codex/device; the app waits for the ChatGPT Plus/Pro sign-in and stores the OAuth credential in the recipes database. (The same flow is reachable from the gear menu. A credential previously saved by the pi CLI in `~/.pi/agent/auth.json` is imported into the database automatically on the first start after upgrading.)
-4. Open `http://localhost:3000` (or the machine's LAN address from the Kindle).
+3. Open `http://localhost:3000`. The first visit asks you to create a username and password; every page after that requires them (HTTP Basic). Change the password later at **Settings → Reset password**.
+4. Open `http://localhost:3000/settings` and authorise a subscription:
+   - **Authorise Codex**: a one-time sign-in code opens at chatgpt.com/codex/device; the app waits for the ChatGPT Plus/Pro sign-in and stores the OAuth credential in the recipes database. (A credential previously saved by the pi CLI in `~/.pi/agent/auth.json` is imported into the database automatically on the first start after upgrading.)
+   - **Authorise Claude**: sign in with your Claude Pro/Max account (the login Claude Code uses) on claude.ai, then paste the code Anthropic shows back into the app. The app stores the OAuth credential in the recipes database.
+
+   The same flows are reachable from the gear menu. The same page also registers OpenAI-spec or Anthropic-spec API endpoints with their keys (stored in the database and shown masked) that can be selected as the active provider.
+5. Open `http://localhost:3000` (or the machine's LAN address from the Kindle).
 
 Recipe data is kept in Docker's `recipe-data` volume at `/data/recipes.sqlite3`. It survives container rebuilds and restarts. To use a local database instead, set `DATABASE_URL=sqlite:recipes.sqlite3` before starting the binary.
 
-`PI_MODEL` sets the initial Pi OpenAI Codex model; it defaults to `gpt-5.4-mini`. After startup, the model can be changed and persisted from the Settings page. `PI_SEARCH_ENABLED` controls OpenAI's hosted native `web_search` tool and defaults to `true`. Set it to `false` to generate without web research.
+`PI_MODEL` sets the initial Pi OpenAI Codex model; it defaults to `gpt-6-luna`. After startup, the provider and model can be changed and persisted from the Settings page; the model list is discovered live from the selected subscription's catalogue. `PI_SEARCH_ENABLED` controls the provider's hosted native `web_search` tool (OpenAI or Anthropic) and defaults to `true`. Set it to `false` to generate without web research.
 
-The Docker image includes the local video-analysis runtime. `MEDIA_WHISPER_MODEL=base` is a good CPU default; the first import downloads that open-source model into `/data/media-models`, then later imports reuse it. The benchmarked production OCR model is fixed to `PP-OCRv6_small_det` plus `PP-OCRv6_small_rec`, downloaded there on the first OCR import. Frames are sampled frequently with ffmpeg and sent to one PaddleOCR process in batches (`MEDIA_OCR_BATCH_SIZE=8` by default), so the OCR model is not instantiated once per frame. `MEDIA_YTDLP_PATH`, `MEDIA_FFMPEG_PATH`, `MEDIA_OCR_SCRIPT`, `MEDIA_PYTHON`, and `MEDIA_TRANSCRIBE_SCRIPT` can point at local replacements. If a public post requires login, `MEDIA_COOKIES_FILE` may point at a locally mounted yt-dlp cookies file; never commit or expose that file. Video imports also require `AI_GATEWAY_API_KEY`: the worker sends the caption, local transcript, and OCR to Vercel AI Gateway's `poolside/laguna-s-2.1-free` cleaner (override with `AI_GATEWAY_CLEANER_MODEL`) using the OpenAI-compatible chat-completions API. The key is inherited by the worker and is never stored in SQLite, passed in process arguments, or logged.
+The Docker image includes the local video-analysis runtime. `MEDIA_WHISPER_MODEL=base` is a good CPU default; the first import downloads that open-source model into `/data/media-models`, then later imports reuse it. `MEDIA_WHISPER_TASK` defaults to `transcribe`, which keeps the spoken language; set it to `translate` to have Whisper render non-English audio as English. The benchmarked production OCR model is fixed to `PP-OCRv6_small_det` plus `PP-OCRv6_small_rec`, downloaded there on the first OCR import. Frames are sampled frequently with ffmpeg and sent to one PaddleOCR process in batches (`MEDIA_OCR_BATCH_SIZE=8` by default), so the OCR model is not instantiated once per frame. `MEDIA_YTDLP_PATH`, `MEDIA_FFMPEG_PATH`, `MEDIA_OCR_SCRIPT`, `MEDIA_PYTHON`, and `MEDIA_TRANSCRIBE_SCRIPT` can point at local replacements. If a public post requires login, `MEDIA_COOKIES_FILE` may point at a locally mounted yt-dlp cookies file; never commit or expose that file. Video imports also need a Vercel AI Gateway API key, saved once in **Settings**: the worker sends the caption, local transcript, and OCR to Vercel AI Gateway's `poolside/laguna-s-2.1-free` cleaner (override with `AI_GATEWAY_CLEANER_MODEL`) using the OpenAI-compatible chat-completions API. The key is stored in the recipes database, reaches the worker only through its environment, and is never passed in process arguments or logged.
 
 ## Using it
 
-- Open **Add recipe**. Switch between researching a dish idea, named recipe, or recipe URLs with Pi, and importing a public Facebook Reel or Instagram post/reel. The video importer uses `yt-dlp` for the caption and a temporary video copy, `ffmpeg` for audio/frequent screenshots, local CPU `faster-whisper` for speech-to-text, and batched PaddleOCR PP-OCRv6 for on-screen text. A dedicated Vercel AI Gateway cleaner (`poolside/laguna-s-2.1-free`) then keeps only dish, ingredients, quantities, method, timing, temperature, serving, and relevant cooking-note facts; unknown fields and social chatter are discarded before the final recipe-generation request. Reasoning is disabled on the cleaner by default, and a single retry absorbs transient malformed responses. Media final generation runs in gap-fill mode: the final recipe model receives only that…
+- Open **Add recipe**. Switch between researching a dish idea, named recipe, or recipe URLs with the active AI provider, and importing a public Facebook Reel or Instagram post/reel. The video importer uses `yt-dlp` for the caption and a temporary video copy, `ffmpeg` for audio/frequent screenshots, local CPU `faster-whisper` for speech-to-text, and batched PaddleOCR PP-OCRv6 for on-screen text. A dedicated Vercel AI Gateway cleaner (`poolside/laguna-s-2.1-free`) then keeps only dish, ingredients, quantities, method, timing, temperature, serving, and relevant cooking-note facts; unknown fields and social chatter are discarded before the final recipe-generation request. Reasoning is disabled on the cleaner by default, and a single retry absorbs transient malformed responses. Media final generation runs in gap-fill mode: the final recipe model receives only that cleaned evidence and may use web search to fill whatever gaps it leaves open, with the original post kept as the attribution source.
 - Video imports end with a **Dish photo** picker on the draft preview: a local ffmpeg pass scores sampled frames for colour, texture, sharpness, and centre composition, skips intros/outros and OCR caption cards, and crops up to four square candidates around the food. The best-scoring shot is pre-selected; saving copies your choice onto the recipe so the library card shows the dish. Set `THUMBNAILS_ENABLED=false` to skip this entirely.
 - Saved recipes keep a **Dish photo** panel on the card: upload any image (normalised to a square 600 px JPEG locally), remove the photo, or — when the recipe carries a social-video source — re-run just the frame-sampling half of the pipeline to get four fresh candidates to choose from.
 - Recipes keep one compact ingredient list at the top, then repeat the exact amounts used in small boxes beneath the relevant method step. Tap an ingredient or step to edit it; step ingredients are entered one exact amount per line. With JavaScript off, the same tap opens an ordinary edit form.
@@ -28,20 +33,21 @@ The Docker image includes the local video-analysis runtime. `MEDIA_WHISPER_MODEL
 
 The social importer is intentionally single-URL and best-effort: Meta may require login, block datacenter IPs, or change its page format. Public Facebook Reels are less reliable to download than Instagram posts. The UI reports missing local audio/OCR tools or cleaner configuration instead of silently sending raw social chatter to the final model. To keep the local process bounded, it analyzes at most the first five minutes, downloads at most a 60 MiB media file, limits the temporary workdir, and runs one import at a time.
 
-To debug the reel pipeline itself, open **Settings → Media extraction debugger**. It runs the same extractor on up to five URLs (one per line), streams each phase live — post description capture, audio transcription, per-frame OCR — and finishes with a review page showing every OCR frame thumbnail next to its raw engine reading, the cleaner's verdict for that reading, the caption chains that became evidence cards, and the full description/audio captures.
+To debug the reel pipeline itself, open **Settings → Media extraction debugger**. It runs the same extractor on up to five URLs (one per line), shows each phase as it completes — post description capture, audio transcription, per-frame OCR — and ends with a review page showing every OCR frame thumbnail next to its raw engine reading, the cleaner's verdict for that reading, the caption chains that became evidence cards, and the full description/audio captures.
 
 ## Deployment note
 
-This first release deliberately has no login. Only expose it on a trusted LAN or behind a VPN/reverse proxy with access control. Do not place it directly on the public internet.
+Access is a single HTTP Basic account, created on first visit, with its password stored only as an Argon2 hash in the database. There are no other users. Expose it only on a trusted LAN or behind a VPN/reverse proxy with access control. Do not place it directly on the public internet.
 
 ## Verification
 
-The project has Rust unit tests for generated recipe validation, source deduplication, and the structured recipe schema. When Rust is available locally, run:
+The project has Rust unit tests (recipe validation, source deduplication, auth, media and thumbnail pipelines) and Node tests for the Pi worker. Run them in throwaway containers so the host needs no toolchain:
 
 ```sh
-cargo fmt --check
-cargo test
-cargo clippy -- -D warnings
+docker run --rm -v "$PWD":/src:ro -e CARGO_TARGET_DIR=/tmp/target rust:1.88-slim sh -c \
+  'apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null && rustup component add rustfmt clippy >/dev/null && cp -r /src /work && cd /work && cargo fmt --check && cargo test && cargo clippy -- -D warnings'
+docker run --rm -v "$PWD":/src:ro node:22-bookworm-slim sh -c \
+  'cp -r /src /work && cd /work && npm ci && npm test'
 ```
 
 The intended complete validation command is:

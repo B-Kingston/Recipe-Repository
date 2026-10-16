@@ -1,17 +1,27 @@
 use crate::auth::AuthUser;
 use crate::{
-    AiGatewayForm, AppError, AppState, EndpointForm, SettingsForm, add_endpoint,
-    ai_gateway_credential, ai_provider, delete_endpoint, find_endpoint, insert_endpoint,
-    list_endpoints, mask_key, reconcile_ai_provider, remove_endpoint, selected_effort,
-    selected_model, stamp, update_ai_gateway, update_settings,
+    AiGatewayForm, AppError, AppState, CLAUDE_PI_PROVIDER, CODEX_PI_PROVIDER, ClaudeExchangeForm,
+    ClaudeFlow, EndpointForm, SettingsForm, add_endpoint, ai_gateway_credential, ai_provider,
+    authorise_claude_exchange, delete_endpoint, disconnect_claude, disconnect_codex, find_endpoint,
+    insert_endpoint, list_endpoints, mask_key, pi_credential, reconcile_ai_provider,
+    selected_claude_model, selected_effort, selected_model, stamp, store_pi_credential,
+    update_ai_gateway, update_settings,
 };
-use axum::extract::{Form, Path, State};
+use axum::{
+    extract::{Form, Path, State},
+    http::{StatusCode, header},
+    response::IntoResponse,
+};
 use parking_lot::Mutex;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 async fn database() -> SqlitePool {
     let db = SqlitePoolOptions::new()
@@ -33,9 +43,11 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model: String::new(),
         pi_worker_path: String::new(),
         auth_script_path: String::new(),
+        claude_auth_script_path: String::new(),
         search_grounding: false,
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(None)),
+        claude_flows: Arc::new(Mutex::new(HashMap::new())),
+        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
     })
@@ -55,9 +67,19 @@ async fn save(
 
 fn settings_form(provider: &str) -> SettingsForm {
     SettingsForm {
-        model: "gpt-5.4-mini".into(),
+        model: "gpt-5.5".into(),
+        claude_model: String::new(),
         reasoning_effort: String::new(),
         provider: provider.into(),
+    }
+}
+
+fn claude_form(model: &str) -> SettingsForm {
+    SettingsForm {
+        model: String::new(),
+        claude_model: model.into(),
+        reasoning_effort: String::new(),
+        provider: "claude".into(),
     }
 }
 
@@ -157,10 +179,7 @@ async fn saving_codex_mode_stores_model_and_provider() {
     let result = save(&state, settings_form("pi")).await;
     assert!(result.is_ok());
     assert_eq!(ai_provider(&db).await.unwrap(), "pi");
-    assert_eq!(
-        selected_model(&db, "gpt-5.4-mini").await.unwrap(),
-        "gpt-5.4-mini"
-    );
+    assert_eq!(selected_model(&db, "gpt-5.5").await.unwrap(), "gpt-5.5");
 }
 
 #[tokio::test]
@@ -179,6 +198,7 @@ async fn saving_an_endpoint_switches_the_provider() {
         &state,
         SettingsForm {
             model: String::new(),
+            claude_model: String::new(),
             reasoning_effort: String::new(),
             provider: id.clone(),
         },
@@ -223,7 +243,7 @@ async fn unknown_or_foreign_provider_is_rejected() {
         .execute(&db)
         .await
         .unwrap();
-    for provider in ["missing-id", &foreign] {
+    for provider in ["missing-id", foreign.as_str()] {
         let result = save(&state(db.clone()), settings_form(provider)).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))), "{provider}");
     }
@@ -237,47 +257,23 @@ async fn add_endpoint_registers_the_combo_with_its_key() {
         State(state),
         AuthUser { id: "u1".into() },
         Form(EndpointForm {
-            name: "Claude".into(),
-            spec: "anthropic".into(),
-            base_url: "https://api.anthropic.com/".into(),
-            api_key: "sk-ant-test".into(),
-            model: String::new(),
-        }),
-    )
-    .await;
-    assert!(result.is_ok());
-    let endpoints = list_endpoints(&db, "u1").await.unwrap();
-    assert_eq!(endpoints.len(), 1);
-    let endpoint = &endpoints[0];
-    assert_eq!(endpoint.name, "Claude");
-    assert_eq!(endpoint.spec, "anthropic");
-    assert_eq!(endpoint.base_url, "https://api.anthropic.com");
-    assert_eq!(endpoint.api_key, "sk-ant-test");
-    assert_eq!(endpoint.model, "");
-    // Registering a combo never activates it.
-    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
-}
-
-#[tokio::test]
-async fn add_endpoint_strips_the_trailing_slash_and_keeps_model() {
-    let db = database().await;
-    let state = state(db.clone());
-    let _ = add_endpoint(
-        State(state),
-        AuthUser { id: "u1".into() },
-        Form(EndpointForm {
             name: "Local".into(),
             spec: "openai".into(),
             base_url: "http://127.0.0.1:8080/v1/".into(),
             api_key: "sk-local".into(),
-            model: "gpt-5.4-mini".into(),
+            model: "gpt-5.5".into(),
         }),
     )
-    .await
-    .unwrap();
+    .await;
+    assert!(result.is_ok());
     let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
+    assert_eq!(endpoint.name, "Local");
+    assert_eq!(endpoint.spec, "openai");
     assert_eq!(endpoint.base_url, "http://127.0.0.1:8080/v1");
-    assert_eq!(endpoint.model, "gpt-5.4-mini");
+    assert_eq!(endpoint.api_key, "sk-local");
+    assert_eq!(endpoint.model, "gpt-5.5");
+    // Registering a combo never activates it.
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
 }
 
 #[tokio::test]
@@ -393,17 +389,6 @@ async fn deleting_another_users_endpoint_does_nothing() {
 }
 
 #[tokio::test]
-async fn reconcile_maps_the_legacy_openai_provider_to_the_first_endpoint() {
-    let db = database().await;
-    add(&db, "Old", "openai", "https://api.example.com/v1", "sk-1").await;
-    set_provider(&db, "openai").await;
-    reconcile_ai_provider(&db).await.unwrap();
-    let resolved = ai_provider(&db).await.unwrap();
-    assert_ne!(resolved, "openai");
-    assert!(find_endpoint(&db, "u1", &resolved).await.unwrap().is_some());
-}
-
-#[tokio::test]
 async fn reconcile_resolves_a_dangling_endpoint_to_codex() {
     let db = database().await;
     set_provider(&db, "deleted-endpoint-id").await;
@@ -416,7 +401,7 @@ async fn reconcile_resolves_a_dangling_endpoint_to_the_first_registered() {
     let db = database().await;
     let first = add(&db, "A", "openai", "https://api.example.com/v1", "sk-1").await;
     add(&db, "B", "anthropic", "https://api.anthropic.com", "sk-2").await;
-    set_provider(&db, "deleted-endpoint-id").await;
+    set_provider(&db, "openai").await;
     reconcile_ai_provider(&db).await.unwrap();
     assert_eq!(ai_provider(&db).await.unwrap(), first);
 }
@@ -442,44 +427,23 @@ fn mask_key_never_exposes_the_full_key() {
 }
 
 #[tokio::test]
-async fn deleting_a_saved_endpoint_removes_it_for_that_user_only() {
-    let db = database().await;
-    let id = add(&db, "A", "openai", "https://api.example.com/v1", "sk-1").await;
-    remove_endpoint(&db, "u1", &id).await.unwrap();
-    assert!(find_endpoint(&db, "u1", &id).await.unwrap().is_none());
-}
-
-#[tokio::test]
 async fn reasoning_effort_persists_in_codex_mode() {
     let db = database().await;
     let state = state(db.clone());
-    let result = save(
-        &state,
-        SettingsForm {
-            model: "gpt-5.4-mini".into(),
-            reasoning_effort: "high".into(),
-            provider: "pi".into(),
-        },
-    )
-    .await;
-    assert!(result.is_ok());
-    assert_eq!(selected_effort(&db, "low").await.unwrap(), "high");
-}
-
-#[tokio::test]
-async fn max_reasoning_effort_persists_in_codex_mode() {
-    let db = database().await;
-    let result = save(
-        &state(db.clone()),
-        SettingsForm {
-            model: "gpt-5.4-mini".into(),
-            reasoning_effort: "max".into(),
-            provider: "pi".into(),
-        },
-    )
-    .await;
-    assert!(result.is_ok());
-    assert_eq!(selected_effort(&db, "low").await.unwrap(), "max");
+    for effort in ["high", "max"] {
+        let result = save(
+            &state,
+            SettingsForm {
+                model: "gpt-5.5".into(),
+                claude_model: String::new(),
+                reasoning_effort: effort.into(),
+                provider: "pi".into(),
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(selected_effort(&db, "low").await.unwrap(), effort);
+    }
 }
 
 #[tokio::test]
@@ -497,6 +461,7 @@ async fn reasoning_effort_persists_in_endpoint_mode() {
         &state(db.clone()),
         SettingsForm {
             model: String::new(),
+            claude_model: String::new(),
             reasoning_effort: "medium".into(),
             provider: id,
         },
@@ -521,7 +486,8 @@ async fn unsupported_effort_is_rejected() {
     let result = save(
         &state,
         SettingsForm {
-            model: "gpt-5.4-mini".into(),
+            model: "gpt-5.5".into(),
+            claude_model: String::new(),
             reasoning_effort: "extreme".into(),
             provider: "pi".into(),
         },
@@ -533,23 +499,231 @@ async fn unsupported_effort_is_rejected() {
 }
 
 #[tokio::test]
-async fn pi_mode_rejects_unsupported_model() {
+async fn pi_mode_rejects_unsupported_model_and_saves_nothing() {
     let db = database().await;
     let state = state(db.clone());
     let result = save(
         &state,
         SettingsForm {
             model: "not-a-real-model".into(),
-            reasoning_effort: String::new(),
+            claude_model: String::new(),
+            reasoning_effort: "max".into(),
             provider: "pi".into(),
         },
     )
     .await;
     assert!(matches!(result, Err(AppError::BadRequest(_))));
+    assert_eq!(selected_effort(&db, "low").await.unwrap(), "low");
     let control = save(&state, settings_form("pi")).await;
     assert!(control.is_ok());
+    assert_eq!(selected_model(&db, "gpt-5.5").await.unwrap(), "gpt-5.5");
+}
+
+#[tokio::test]
+async fn claude_provider_requires_a_claude_credential() {
+    let db = database().await;
+    let state = state(db.clone());
+    let result = save(&state, claude_form("claude-sonnet-5-5")).await;
+    assert!(matches!(result, Err(AppError::BadRequest(_))));
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+
+    // A Codex credential does not authorise Claude.
+    let credential = serde_json::json!({"type":"oauth","access":"a","refresh":"r","expires":1});
+    store_pi_credential(&db, "u1", CODEX_PI_PROVIDER, &credential)
+        .await
+        .unwrap();
+    let result = save(&state, claude_form("claude-sonnet-5-5")).await;
+    assert!(matches!(result, Err(AppError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn credentials_are_stored_per_provider() {
+    let db = database().await;
+    let codex = serde_json::json!({"type":"oauth","access":"codex","refresh":"r","expires":1});
+    let claude =
+        serde_json::json!({"type":"oauth","access":"sk-ant-oat-x","refresh":"r","expires":1});
+    store_pi_credential(&db, "u1", CODEX_PI_PROVIDER, &codex)
+        .await
+        .unwrap();
+    store_pi_credential(&db, "u1", CLAUDE_PI_PROVIDER, &claude)
+        .await
+        .unwrap();
     assert_eq!(
-        selected_model(&db, "gpt-5.4-mini").await.unwrap(),
-        "gpt-5.4-mini"
+        pi_credential(&db, "u1", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["access"],
+        "codex"
     );
+    assert_eq!(
+        pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["access"],
+        "sk-ant-oat-x"
+    );
+}
+
+#[tokio::test]
+async fn claude_model_setting_is_independent_of_the_codex_model() {
+    let db = database().await;
+    let state = state(db.clone());
+    let credential = serde_json::json!({"type":"oauth","access":"a","refresh":"r","expires":1});
+    store_pi_credential(&db, "u1", CLAUDE_PI_PROVIDER, &credential)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected_claude_model(&db).await.unwrap(),
+        "claude-sonnet-5-5"
+    );
+    assert!(save(&state, settings_form("pi")).await.is_ok());
+    assert!(save(&state, claude_form("claude-opus-5-5")).await.is_ok());
+    assert_eq!(ai_provider(&db).await.unwrap(), "claude");
+    assert_eq!(selected_claude_model(&db).await.unwrap(), "claude-opus-5-5");
+    assert_eq!(selected_model(&db, "x").await.unwrap(), "gpt-5.5");
+    // A Codex model is not a valid Claude model.
+    let result = save(&state, claude_form("gpt-5.5")).await;
+    assert!(matches!(result, Err(AppError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn failed_claude_exchange_keeps_the_flow_for_another_paste() {
+    let db = database().await;
+    let state = state(db);
+    state.claude_flows.lock().insert(
+        "flow".into(),
+        ClaudeFlow {
+            user_id: "u1".into(),
+            url: "https://claude.example/authorize".into(),
+            verifier: "verifier".into(),
+            created: Instant::now(),
+        },
+    );
+    // The test state has no helper script, so the exchange fails.
+    let response = authorise_claude_exchange(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Form(ClaudeExchangeForm {
+            flow_id: "flow".into(),
+            code: "not-a-real-code".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(body.contains("name=\"flow_id\" value=\"flow\""), "{body}");
+    assert!(body.contains("class=\"error\""), "{body}");
+    assert!(body.contains("https://claude.example/authorize"), "{body}");
+    assert!(state.claude_flows.lock().contains_key("flow"));
+}
+
+#[tokio::test]
+async fn disconnecting_claude_keeps_codex_and_falls_back_to_it() {
+    let db = database().await;
+    let state = state(db.clone());
+    let codex = serde_json::json!({"type":"oauth","access":"codex","refresh":"r","expires":1});
+    let claude = serde_json::json!({"type":"oauth","access":"claude","refresh":"r","expires":1});
+    store_pi_credential(&db, "u1", CODEX_PI_PROVIDER, &codex)
+        .await
+        .unwrap();
+    store_pi_credential(&db, "u1", CLAUDE_PI_PROVIDER, &claude)
+        .await
+        .unwrap();
+    set_provider(&db, "claude").await;
+
+    let redirect = disconnect_claude(State(state.clone()), AuthUser { id: "u1".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        redirect.into_response().headers()[header::LOCATION],
+        "/settings?notice=disconnected"
+    );
+    assert!(
+        pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        pi_credential(&db, "u1", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .unwrap()["access"],
+        "codex"
+    );
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+}
+
+#[tokio::test]
+async fn disconnecting_active_codex_without_a_fallback_leaves_the_setting() {
+    let db = database().await;
+    let state = state(db.clone());
+    let codex = serde_json::json!({"type":"oauth","access":"codex","refresh":"r","expires":1});
+    let claude = serde_json::json!({"type":"oauth","access":"claude","refresh":"r","expires":1});
+    store_pi_credential(&db, "u1", CODEX_PI_PROVIDER, &codex)
+        .await
+        .unwrap();
+    store_pi_credential(&db, "u1", CLAUDE_PI_PROVIDER, &claude)
+        .await
+        .unwrap();
+    set_provider(&db, "pi").await;
+
+    let redirect = disconnect_codex(State(state.clone()), AuthUser { id: "u1".into() })
+        .await
+        .unwrap();
+    assert_eq!(
+        redirect.into_response().headers()[header::LOCATION],
+        "/settings?notice=disconnected"
+    );
+    assert!(
+        pi_credential(&db, "u1", CODEX_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+}
+
+#[tokio::test]
+async fn empty_claude_code_keeps_the_flow_for_a_retry() {
+    let db = database().await;
+    let state = state(db);
+    state.claude_flows.lock().insert(
+        "flow".into(),
+        ClaudeFlow {
+            user_id: "u1".into(),
+            url: String::new(),
+            verifier: "verifier".into(),
+            created: Instant::now(),
+        },
+    );
+    for code in ["", "   "] {
+        let response = authorise_claude_exchange(
+            State(state.clone()),
+            AuthUser { id: "u1".into() },
+            Form(ClaudeExchangeForm {
+                flow_id: "flow".into(),
+                code: code.into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(location.contains("claude_error=Paste"), "{location}");
+    }
+    assert!(state.claude_flows.lock().contains_key("flow"));
 }

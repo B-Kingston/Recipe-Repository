@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}Add recipe · Kindle Recipes{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Add recipe · Recipe Repository{% endblock %}{% block content %}
 <section class="add-recipe" data-add-recipe>
   <div class="form-intro">
     <p class="eyebrow">Cookbook / Add recipe</p>
@@ -18,8 +18,8 @@
         <h2>Describe the recipe</h2>
         <p class="muted">{{ guidance }}</p>
       </div>
-      {% if prompt_error != "" %}<p class="error">{{ prompt_error }}</p>{% endif %}
-      <form class="panel form-panel add-recipe-form add-recipe-form--prompt" method="post" action="/ai/generate">
+      {% if prompt_error != "" %}<p class="error" role="alert">{{ prompt_error }}</p>{% endif %}
+      <form class="panel form-panel add-recipe-form add-recipe-form--prompt" method="post" action="/ai/generate" data-busy-label="Researching…">
         <label for="recipe-prompt">What should this recipe be based on?<textarea id="recipe-prompt" name="prompt" required maxlength="4000" placeholder="A dish, loose idea, or recipe URL…">{{ prompt }}</textarea></label>
         <div class="prompt-help">
           <p><strong>You can include:</strong></p>
@@ -41,15 +41,20 @@
         <h2>Generate from video</h2>
         <p class="muted">Use a public Facebook Reel or Instagram post/reel. The server extracts the caption, spoken audio, and on-screen text before preparing a draft.</p>
       </div>
-      {% if video_error != "" %}<p class="error">{{ video_error }}</p>{% endif %}
-      <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import">
+      {% if video_error != "" %}<p class="error" role="alert">{{ video_error }}</p>{% endif %}
+      {% if gateway_configured %}
+      <p class="notice">The video cleaner is connected and ready.</p>
+      {% else %}
+      <p class="muted"><strong>The video cleaner is not connected yet.</strong> <a href="/settings">Connect it in Settings</a> before importing a video.</p>
+      {% endif %}
+      <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import" data-busy-label="Extracting…">
         <label for="social-url">Facebook or Instagram URL<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/p/..." autocomplete="url"></label>
         <p class="field-help">Supported public links include Facebook Reels and Instagram /p/, /reel/, and /tv/ posts. Private, login-only, or region-blocked posts may need a public link or a local downloader cookie file.</p>
         <fieldset class="media-channels">
           <legend>Evidence sources</legend>
           <label class="check-row"><input type="checkbox" name="use_description"{% if use_description %} checked{% endif %}> Post caption / description<span class="field-help">The text the creator typed under the video. Fastest source; untick to skip the page fetch entirely.</span></label>
-          <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Spoken audio (local Whisper)<span class="field-help">Transcribes spoken ingredients and steps. Slowest stage; untick to skip audio extraction and speech-to-text.</span></label>
-          <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text (local OCR)<span class="field-help">Reads ingredient cards and overlays from sampled video frames; untick to skip frame sampling and OCR.</span></label>
+          <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Spoken audio (transcript)<span class="field-help">Transcribes spoken ingredients and steps. Slowest stage; untick to skip audio extraction and transcription.</span></label>
+          <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text<span class="field-help">Reads ingredient cards and overlays from sampled video frames; untick to skip frame sampling and text reading.</span></label>
           <p class="field-help">Unticked sources are not downloaded, transcribed, or sent to the cleaner. At least one source must stay ticked.</p>
         </fieldset>
         <label for="import-notes">Optional context<textarea id="import-notes" name="notes" maxlength="4000" placeholder="e.g. Keep it vegetarian; the creator says this serves four…">{{ notes }}</textarea></label>
@@ -57,9 +62,9 @@
           <p><strong>What gets combined:</strong></p>
           <ul>
             <li>The post caption or description</li>
-            <li>Spoken instructions and quantities from local Whisper transcription</li>
-            <li>Ingredient cards and other on-screen text from local PaddleOCR</li>
-            <li>A recipe-only AI Gateway pass that removes social chatter before final generation</li>
+            <li>Spoken instructions and quantities from the audio transcript</li>
+            <li>Ingredient cards and other on-screen text read from the video frames</li>
+            <li>A recipe-only pass by the video cleaner that removes social chatter before final generation</li>
           </ul>
           <p class="muted">Only the ticked sources above are combined. The video is temporary and deleted after extraction. You review the complete recipe before saving it.</p>
         </div>
