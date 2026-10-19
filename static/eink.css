@@ -1,0 +1,69 @@
+/* E-ink mode. /display.css imports this after app.css for browsers in e-ink
+   mode (chosen in Settings › Display, or a Kindle browser on Automatic).
+   Pure black on white: cards get black outlines instead of shadows, tints
+   become white, photos turn grey, nothing animates, and the type grows. */
+
+:root {
+  --ground: #ffffff;
+  --card: #ffffff;
+  --soft: #ffffff;
+  --ink: #000000;
+  --ink-strong: #000000;
+  --on-ink: #ffffff;
+  --muted: #000000;
+  --body: #000000;
+  --rule: #000000;
+  --rule-ink: #000000;
+  --lines: #8a8a8a;
+  --chip: #ffffff;
+  --wash: #ffffff;
+  --border: #000000;
+  --focus-ring: 0 0 0 2px #000000;
+  --shadow: none;
+  --shadow-lift: none;
+}
+
+*, *::before, *::after { transition: none !important; animation: none !important; }
+html { scroll-behavior: auto; }
+body { font-size: 18px; }
+img { filter: grayscale(1) contrast(1.1); }
+a:hover { color: #000000; }
+
+.utility-bar { border-bottom: 2px solid #000000; }
+.brand-mark-lines { stroke: #000000; }
+.top-nav a[aria-current="page"] { box-shadow: inset 0 0 0 2px #000000; }
+
+.recipe-card, .recipe-sheet, .block, .panel, .empty-state, .setup-page .setup-card, .letter-nav a {
+  border: 2px solid #000000;
+  box-shadow: none;
+}
+.recipe-card:hover, .recipe-card:focus { box-shadow: none; }
+.block.step-block { border: 0; }
+.card-tab { top: -32px; border: 2px solid #000000; border-bottom: 0; }
+.letter-nav span { color: #8a8a8a; }
+.version-tab { border: 2px solid #000000; border-bottom: 0; }
+.version-tab.is-current { background: #000000; color: #ffffff; }
+.recipe-sheet .form-panel, .edit-form, .add-form, .chart-detail, .prompt-help, .thumb-picker { border: 1px solid #000000; }
+
+.view-toggle, .add-mode-switch { padding: 0; border: 2px solid #000000; border-radius: 10px; overflow: hidden; gap: 0; }
+.view-tab, .add-mode-tab { border-radius: 0; }
+.view-tab.is-active, .add-mode-tab.is-active { background: #000000; color: #ffffff; box-shadow: none; }
+
+.step-ingredient, .chart-additions span { border: 1.5px solid #000000; }
+.codex-status, .codex-status--connected, .codex-status--missing { border: 1.5px solid #000000; background: #ffffff; color: #000000; }
+.notice, .error { border: 2px solid #000000; background: #ffffff; color: #000000; }
+.danger, .button.danger { border-color: #000000; color: #000000; }
+.danger:hover, .button.danger:hover { background: #ffffff; text-decoration: line-through; }
+.import-progress-segment { border: 1.5px solid #000000; }
+.import-progress-segment.is-active { background: #bdbdbd; }
+.import-progress-label > span, .import-stage summary > span { border: 1px solid #000000; }
+.evidence-warning, .debug-warnings { color: #000000; }
+.chart-leaf.is-active { box-shadow: inset 4px 0 #000000; font-weight: 700; }
+
+.recipe-title, .recipe-lines { font-size: 18px; }
+.page-header h1 { font-size: 2.8rem; }
+.page-header .deck, .ingredient-row, .step-block .block-text, .block-index { font-size: 19px; }
+.step-ingredients, .recipe-meta, .step-moment-source { font-size: 14px; }
+.button, button, .top-nav a, .view-tab { font-size: 16px; }
+.button, button { min-height: 48px; }
+.chart-detail h3 { font-size: 1.45rem; }

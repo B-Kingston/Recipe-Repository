@@ -2,6 +2,7 @@ mod ai;
 mod auth;
 mod chart;
 mod config;
+mod display;
 mod media;
 mod moments;
 mod recipes;

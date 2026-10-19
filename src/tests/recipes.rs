@@ -1,7 +1,7 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
-    delete_block, delete_version, find_version, move_block, recipe_versions, record_version,
-    update_block, update_recipe, view_version,
+    LibraryCard, delete_block, delete_version, file_by_letter, find_version, move_block,
+    recipe_versions, record_version, update_block, update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, RecipeForm, stamp};
 use axum::Form;
@@ -313,4 +313,81 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         find_version(&db, "u1", "r", 3).await.unwrap().label,
         "Manual edit"
     );
+}
+
+fn card(title: &str) -> LibraryCard {
+    LibraryCard {
+        id: title.into(),
+        title: title.into(),
+        description: String::new(),
+        servings: None,
+        prep_minutes: None,
+        cook_minutes: None,
+        has_thumbnail: false,
+        letter: String::new(),
+    }
+}
+
+#[test]
+fn library_is_filed_a_to_z_with_one_tab_per_letter() {
+    let mut cards = vec![
+        card("chicken adobo"),
+        card("Banana bread"),
+        card("10-minute soup"),
+        card("Charred corn"),
+        card("Éclairs"),
+    ];
+    let links = file_by_letter(&mut cards);
+    let titles: Vec<&str> = cards.iter().map(|card| card.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "10-minute soup",
+            "Éclairs",
+            "Banana bread",
+            "Charred corn",
+            "chicken adobo"
+        ]
+    );
+    let tabs: Vec<&str> = cards.iter().map(|card| card.letter.as_str()).collect();
+    assert_eq!(tabs, ["#", "", "B", "C", ""]);
+    assert_eq!(cards[0].anchor(), "other");
+    assert_eq!(cards[2].anchor(), "B");
+    assert_eq!(links.len(), 27);
+    assert_eq!(
+        (links[0].letter, links[0].anchor.as_str(), links[0].present),
+        ('#', "other", true)
+    );
+    let present: String = links
+        .iter()
+        .filter(|link| link.present)
+        .map(|link| link.letter)
+        .collect();
+    assert_eq!(present, "#BC");
+}
+
+#[test]
+fn library_strip_leaves_out_other_when_every_title_starts_with_a_letter() {
+    let mut cards = vec![card("Pancakes")];
+    let links = file_by_letter(&mut cards);
+    assert_eq!(links.len(), 26);
+    assert_eq!(links[0].letter, 'A');
+    assert!(links[15].present);
+}
+
+#[test]
+fn library_card_shows_servings_and_total_time() {
+    let mut dal = card("Dal");
+    assert_eq!(dal.serves(), "");
+    assert_eq!(dal.total_time(), "");
+    dal.servings = Some(4);
+    dal.prep_minutes = Some(15);
+    dal.cook_minutes = Some(20);
+    assert_eq!(dal.serves(), "Serves 4");
+    assert_eq!(dal.total_time(), "35 min");
+    dal.cook_minutes = Some(55);
+    assert_eq!(dal.total_time(), "1 h 10 min");
+    dal.prep_minutes = None;
+    dal.cook_minutes = Some(120);
+    assert_eq!(dal.total_time(), "2 h");
 }
