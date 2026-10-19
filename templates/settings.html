@@ -8,47 +8,55 @@
 {% if !notice.is_empty() %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 <div class="compact-panel">
   <div class="block">
-    <h2>AI Provider</h2>
+    <h2>AI provider</h2>
+    {% if claude_connected_notice %}<p class="notice" role="status">Claude connected.</p>{% endif %}
+    {% if claude_error != "" %}<p class="error" role="alert">{{ claude_error }}</p>{% endif %}
     <form method="post" action="/settings">
       <fieldset>
-        <legend class="muted">Active provider</legend>
-        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if codex_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}</label>
-        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}><span>Claude (Pro/Max)</span>{% if claude_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}{% if !claude_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
+        <legend class="muted">Generate recipes with</legend>
+        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if !codex_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
+        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}><span>Claude (Pro/Max)</span>{% if !claude_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
         {% for endpoint in endpoints %}
-        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span>{% if endpoint.selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}<span class="muted">({{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }})</span></label>
+        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span><span class="muted">key {{ endpoint.key_masked }}</span></label>
         {% endfor %}
       </fieldset>
       <div data-model-panel="pi"{% if !codex_selected %} hidden{% endif %}>
-        <label for="model">Codex model</label>
+        {% if codex_authorised %}
+        <label for="model">Model</label>
         <select id="model" name="model">
           {% for option in model_options %}
           <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
           {% endfor %}
         </select>
+        {% else %}
+        <p class="muted">Sign in with your ChatGPT Plus or Pro account to use Codex.</p>
+        <p class="actions"><a class="button primary" href="{{ codex_auth_url }}">Connect ChatGPT</a></p>
+        {% endif %}
       </div>
       <div data-model-panel="claude"{% if !claude_selected %} hidden{% endif %}>
         {% if claude_authorised %}
-        <label for="claude_model">Claude model</label>
+        <label for="claude_model">Model</label>
         <select id="claude_model" name="claude_model">
           {% for option in claude_model_options %}
           <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
           {% endfor %}
         </select>
         {% else %}
-        <p class="muted">Sign in with your Claude Pro or Max account before switching to Claude.</p>
-        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}">Authorise Claude</a></p>
+        <p class="muted">Sign in with your Claude Pro or Max account to use Claude.</p>
+        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}">Connect Claude</a></p>
         {% endif %}
       </div>
       {% for endpoint in endpoints %}
       <div data-model-panel="{{ endpoint.id }}"{% if !endpoint.selected %} hidden{% endif %}>
         <input type="hidden" name="endpoint_model_for" value="{{ endpoint.id }}"{% if !endpoint.selected %} disabled{% endif %}>
-        <label for="endpoint-model-{{ endpoint.id }}">{{ endpoint.name }} model <span class="muted">(blank uses {{ endpoint.default_model }})</span></label>
-        <input type="text" id="endpoint-model-{{ endpoint.id }}" name="endpoint_model" value="{{ endpoint.model }}" placeholder="{{ endpoint.default_model }}" list="endpoint-models-{{ endpoint.id }}" autocomplete="off" autocapitalize="off" spellcheck="false"{% if !endpoint.selected %} disabled{% endif %}>
+        <label for="endpoint-model-{{ endpoint.id }}">Model</label>
+        <input type="text" id="endpoint-model-{{ endpoint.id }}" name="endpoint_model" value="{{ endpoint.model }}" placeholder="{% if endpoint.default_model != "" %}{{ endpoint.default_model }}{% else %}Model name{% endif %}" list="endpoint-models-{{ endpoint.id }}" autocomplete="off" autocapitalize="off" spellcheck="false"{% if !endpoint.selected %} disabled{% endif %}>
         <datalist id="endpoint-models-{{ endpoint.id }}">
           {% for model in endpoint.model_options %}
           <option value="{{ model }}">
           {% endfor %}
         </datalist>
+        {% if !endpoint.web_search %}<p class="muted">Recipes from this provider are written without web research.</p>{% endif %}
       </div>
       {% endfor %}
       <label for="reasoning_effort">Reasoning effort</label>
@@ -57,44 +65,51 @@
         <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
         {% endfor %}
       </select>
-      <p class="muted">Higher effort thinks longer for more careful recipes.</p>
-      <button class="primary" type="submit">Save settings</button>
+      <button class="primary" type="submit">Save</button>
     </form>
-  </div>
-  <div class="block">
-    <h2>API endpoints</h2>
-    <p class="muted block-note">Register OpenAI-spec or Anthropic-spec endpoints with their API keys, then switch between them above.</p>
-    <form method="post" action="/settings/endpoints">
-      <label for="endpoint_name">Name</label>
-      <input type="text" id="endpoint_name" name="name" placeholder="Claude, Local server, …">
-      <label for="endpoint_spec">API spec</label>
-      <select id="endpoint_spec" name="spec">
-        <option value="openai">OpenAI spec</option>
-        <option value="anthropic">Anthropic spec</option>
-      </select>
-      <label for="endpoint_base_url">Base URL</label>
-      <input type="url" id="endpoint_base_url" name="base_url" placeholder="https://api.anthropic.com">
-      <label for="endpoint_model">Model <span class="muted">(optional — blank uses the spec default)</span></label>
-      <input type="text" id="endpoint_model" name="model" placeholder="claude-sonnet-5-5 or gpt-5.6-luna">
-      <label for="endpoint_api_key">API key</label>
-      <input type="password" id="endpoint_api_key" name="api_key" autocomplete="off">
-      <button class="primary" type="submit">Save endpoint</button>
-    </form>
-    {% if has_endpoints %}
-    <ul class="endpoint-list">
-      {% for endpoint in endpoints %}
-      <li class="endpoint-row{% if endpoint.selected %} endpoint-row--active{% endif %}">
-        <div class="endpoint-detail">
-          <strong>{{ endpoint.name }}</strong>
-          <p class="muted">{{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }}</p>
-        </div>
-        <form method="post" action="/settings/endpoints/{{ endpoint.id }}/delete">
-          <button class="button compact" type="submit">Delete</button>
-        </form>
-      </li>
-      {% endfor %}
-    </ul>
+    {% if codex_authorised %}
+    <div class="actions" data-provider-actions="pi"{% if !codex_selected %} hidden{% endif %}>
+      <a class="button compact" href="{{ codex_auth_url }}">Reconnect</a>
+      <form class="inline" method="post" action="/settings/disconnect/codex" data-confirm="Disconnect Codex? Recipes will stop generating with Codex until you reconnect.">
+        <button class="compact" type="submit">Disconnect</button>
+      </form>
+    </div>
     {% endif %}
+    {% if claude_authorised %}
+    <div class="actions" data-provider-actions="claude"{% if !claude_selected %} hidden{% endif %}>
+      <a class="button compact" href="{{ claude_auth_url }}">Reconnect</a>
+      <form class="inline" method="post" action="/settings/disconnect/claude" data-confirm="Disconnect Claude? Recipes will stop generating with Claude until you reconnect.">
+        <button class="compact" type="submit">Disconnect</button>
+      </form>
+    </div>
+    {% endif %}
+    {% for endpoint in endpoints %}
+    <div class="actions" data-provider-actions="{{ endpoint.id }}"{% if !endpoint.selected %} hidden{% endif %}>
+      <form class="inline" method="post" action="/settings/endpoints/{{ endpoint.id }}/delete" data-confirm="Remove {{ endpoint.name }} and its API key?">
+        <button class="compact" type="submit">Remove {{ endpoint.name }}</button>
+      </form>
+    </div>
+    {% endfor %}
+    <details class="add-block">
+      <summary>Add a provider with an API key</summary>
+      <form method="post" action="/settings/endpoints">
+        <label for="add_provider">Provider</label>
+        <select id="add_provider" name="provider">
+          {% for preset in presets %}
+          <option value="{{ preset.key }}" data-custom="{{ preset.custom }}">{{ preset.label }}</option>
+          {% endfor %}
+        </select>
+        <div data-custom-fields>
+          <label for="add_base_url">Server URL <span class="muted">(other servers only)</span></label>
+          <input type="url" id="add_base_url" name="base_url" placeholder="http://localhost:11434/v1">
+          <label for="add_model">Model <span class="muted">(other servers only)</span></label>
+          <input type="text" id="add_model" name="model" placeholder="llama3.3" autocomplete="off" autocapitalize="off" spellcheck="false">
+        </div>
+        <label for="add_api_key">API key</label>
+        <input type="password" id="add_api_key" name="api_key" autocomplete="off">
+        <button class="primary" type="submit">Add and use</button>
+      </form>
+    </details>
   </div>
   <div class="block">
     <h2>Video cleaner <span class="codex-status{% if gateway_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if gateway_configured %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
@@ -115,42 +130,6 @@
       <label><input type="checkbox" name="enabled" value="on"{% if step_moments %} checked{% endif %}> Capture and show video step moments</label>
       <button class="primary" type="submit">Save step moments</button>
     </form>
-  </div>
-  <div class="block">
-    <h2>Codex (ChatGPT) <span class="codex-status{% if codex_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if codex_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
-    <p class="muted block-note">Connect your ChatGPT account to generate recipes with Codex.</p>
-    {% if codex_authorised %}
-    <p class="muted">Connected to ChatGPT Plus/Pro.</p>
-    <div class="actions">
-      <a class="button" href="{{ codex_auth_url }}">Reconnect</a>
-      <form class="inline" method="post" action="/settings/disconnect/codex" data-confirm="Disconnect Codex? Recipes will stop generating with Codex until you reconnect.">
-        <button class="danger" type="submit">Disconnect</button>
-      </form>
-    </div>
-    {% else %}
-    <div class="actions">
-      <a class="button primary" href="{{ codex_auth_url }}">Authorise Codex</a>
-    </div>
-    {% endif %}
-  </div>
-  <div class="block">
-    <h2>Claude (Pro/Max) <span class="codex-status{% if claude_authorised %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if claude_authorised %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
-    <p class="muted block-note">Sign in with your Claude Pro or Max account to generate recipes with Claude.</p>
-    {% if claude_connected_notice %}<p class="notice" role="status">Claude connected.</p>{% endif %}
-    {% if claude_error != "" %}<p class="error" role="alert">{{ claude_error }}</p>{% endif %}
-    {% if claude_authorised %}
-    <p class="muted">Connected to Claude.</p>
-    <div class="actions">
-      <a class="button" href="{{ claude_auth_url }}">Reconnect</a>
-      <form class="inline" method="post" action="/settings/disconnect/claude" data-confirm="Disconnect Claude? Recipes will stop generating with Claude until you reconnect.">
-        <button class="danger" type="submit">Disconnect</button>
-      </form>
-    </div>
-    {% else %}
-    <div class="actions">
-      <a class="button primary" href="{{ claude_auth_url }}">Authorise Claude</a>
-    </div>
-    {% endif %}
   </div>
   <div class="block">
     <h2>Account</h2>
@@ -220,11 +199,27 @@
         // Only the shown panel's fields are submitted.
         Array.prototype.forEach.call(panels[key].querySelectorAll('input, select'), function (field) { field.disabled = hidden; });
       });
+      Array.prototype.forEach.call(document.querySelectorAll('[data-provider-actions]'), function (actions) {
+        actions.hidden = actions.getAttribute('data-provider-actions') !== radio.value;
+      });
       load(radio.value);
     });
   }
   Array.prototype.forEach.call(radios, function (radio) { radio.addEventListener('change', sync); });
   sync();
+  // The server URL and model fields only apply to the "Other server" choices.
+  var picker = document.getElementById('add_provider');
+  var custom = document.querySelector('[data-custom-fields]');
+  function syncCustom() {
+    var chosen = picker.options[picker.selectedIndex];
+    var on = chosen && chosen.getAttribute('data-custom') === 'true';
+    custom.hidden = !on;
+    document.getElementById('add_base_url').required = on;
+  }
+  if (picker && custom) {
+    picker.addEventListener('change', syncCustom);
+    syncCustom();
+  }
 }());
 </script>
 </div>

@@ -323,11 +323,14 @@ h3 { font: 700 1rem/1.2 var(--sans); }
 .recipe-section { width: min(100%, 780px); margin: 30px auto 0; }
 .recipe-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 26px; align-items: start; max-width: 1080px; margin: 0 auto; }
 .recipe-main { min-width: 0; }
-.recipe-layout.has-versions .recipe-main .recipe-section, .recipe-layout.has-versions .recipe-main .thumb-manage, .recipe-layout.has-versions .recipe-main .form-panel, .recipe-layout.has-versions .recipe-main .view-toggle { margin-left: 0; margin-right: 0; }
+.recipe-layout.has-versions .recipe-main .page-header, .recipe-layout.has-versions .recipe-main .recipe-section, .recipe-layout.has-versions .recipe-main .thumb-manage, .recipe-layout.has-versions .recipe-main .form-panel, .recipe-layout.has-versions .recipe-main .view-toggle { margin-left: 0; margin-right: 0; }
+/* On wide screens the rail sits beside the title, so the header's jump link
+   is only needed once the rail drops below the recipe. */
 @media (min-width: 761px) {
   .recipe-layout.has-versions { grid-template-columns: minmax(0, 1fr) 240px; }
+  .versions-jump { display: none; }
 }
-.versions-rail { position: sticky; top: 16px; margin-top: 30px; padding: 14px; border: var(--line) solid var(--ink); background: var(--paper); box-shadow: 2px 2px 0 #aaa; }
+.versions-rail { position: sticky; top: 16px; margin-top: 8px; padding: 14px; border: var(--line) solid var(--ink); background: var(--paper); box-shadow: 2px 2px 0 #aaa; }
 .versions-heading { margin: 0 0 8px; font: 700 12px/1 var(--sans); letter-spacing: .1em; text-transform: uppercase; }
 .versions-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
 .version-item { margin: 0; }
@@ -439,6 +442,8 @@ body.still-viewer-open { overflow: hidden; }
 .check-row input { margin-top: 0; }
 .check-row .field-help { display: block; flex: 1; }
 .evidence-panel { margin: 24px auto 18px; background: #f1f5ee; }
+.evidence-panel > summary { font-size: 1.05rem; }
+.evidence-panel[open] > summary { margin-bottom: 8px; }
 .evidence-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
 .evidence-heading h2 { margin: 0; }
 .evidence-heading a { font-size: 13px; font-weight: 700; }
@@ -479,6 +484,10 @@ body.still-viewer-open { overflow: hidden; }
 .media-channels legend { padding: 0 6px; font: 700 13px/1.3 var(--sans); text-transform: uppercase; letter-spacing: .04em; }
 .media-channels .check-row { display: block; margin: .7rem 0; }
 .media-channels .field-help { display: block; margin-top: 2px; font-weight: 400; }
+.short-textarea { min-height: 4rem; }
+.advanced-options { margin: 1rem 0 0; }
+.advanced-options summary { display: inline-block; cursor: pointer; font: 700 13px/1.3 var(--sans); text-decoration: underline; }
+.advanced-options[open] summary { margin-bottom: .2rem; }
 
 label { display: block; margin: .75rem 0 .3rem; font: 700 14px/1.25 var(--sans); }
 select { width: 100%; margin-top: 6px; padding: .65rem; border: var(--line) solid var(--ink); border-radius: 0; background: var(--paper); font: 17px/1.4 var(--sans); }
@@ -556,6 +565,8 @@ input[type=radio] { border: 0; accent-color: var(--ink); }
   .form-panel { padding: 16px; }
   .import-progress-heading { align-items: flex-start; flex-direction: column; }
   .import-progress-heading .muted { text-align: left; }
+  .import-found { grid-template-columns: 1fr; }
+  .import-found li { grid-template-columns: 1fr auto; }
   .source-popover { position: relative; width: min(430px, calc(100vw - 28px)); }
   .ingredients-box { padding: 12px 16px; }
   .step-ingredients { max-width: calc(100% - 16px); }
@@ -595,11 +606,21 @@ input[type=radio] { border: 0; accent-color: var(--ink); }
 .import-progress-label > span { grid-row: span 2; display: inline-grid; place-items: center; width: 19px; height: 19px; border: 1px solid var(--ink); font: 700 11px/1 var(--sans); }
 .import-progress-label strong { overflow-wrap: anywhere; font: 700 12px/1.2 var(--sans); }
 .import-progress-label em { grid-column: 2; color: var(--mid); font: 700 10px/1.2 var(--sans); letter-spacing: .04em; text-transform: uppercase; }
-.import-overall { margin-bottom: 18px; padding: 16px 18px; }
-.import-overall p { margin-bottom: 8px; }
 .import-overall-status { margin-left: 4px; text-transform: none; }
-.import-source-url { overflow-wrap: anywhere; }
-.import-ready { align-items: center; margin-bottom: 0; }
+.import-source-url { overflow-wrap: anywhere; font-size: .9rem; }
+.import-found { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin: 14px 0 0; padding: 0; list-style: none; }
+.import-found li { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--ink); font-size: 13px; }
+.import-found strong { font: 700 13px/1.2 var(--sans); }
+.import-found span { color: var(--mid); }
+.import-found .is-found span { color: var(--ink); font-weight: 700; }
+.import-found .is-skipped, .import-found .is-none { border-style: dashed; }
+.import-progress .error { margin: 14px 0 0; }
+.import-ready, .import-retry { align-items: center; margin: 14px 0 0; }
+.import-details { margin: 0 0 18px; }
+.import-details > summary { cursor: pointer; font: 700 14px/1.3 var(--sans); }
+.import-details[open] > summary { margin-bottom: 10px; }
+.import-details > p { margin-bottom: 8px; }
+.import-leave { text-align: center; }
 .import-stage-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
 .import-stage { margin: 0; padding: 0; overflow: hidden; }
 .import-stage summary { display: flex; align-items: center; gap: 9px; padding: 13px 15px; cursor: pointer; font-weight: 700; list-style: none; }

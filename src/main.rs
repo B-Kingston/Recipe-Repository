@@ -535,6 +535,19 @@ struct MediaImportRunTemplate {
     use_audio: bool,
     use_ocr: bool,
     evidence: DebugUrlView,
+    /// What each evidence source found so far, in plain words.
+    sources: Vec<ImportSourceView>,
+    /// The add page with this URL and its sources filled in, for a retry.
+    retry_url: String,
+}
+/// One evidence source on the import progress page.
+pub(crate) struct ImportSourceView {
+    /// Event channel name the page script updates: description, audio, ocr.
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    /// waiting, found, none, or skipped.
+    pub(crate) state: &'static str,
+    pub(crate) detail: String,
 }
 #[derive(Template)]
 #[template(path = "draft.html")]
@@ -564,8 +577,9 @@ struct SettingsTemplate {
     claude_selected: bool,
     claude_connected_notice: bool,
     claude_error: String,
-    has_endpoints: bool,
     endpoints: Vec<EndpointRow>,
+    /// The "Add a provider" choices.
+    presets: &'static [ProviderPreset],
     gateway_configured: bool,
     gateway_key_masked: String,
     gateway_base_url: String,
@@ -581,14 +595,14 @@ struct SelectOption {
     value: String,
     selected: bool,
 }
-/// One saved AI endpoint as shown in Settings: spec, base URL, masked key,
-/// and model. The raw key never reaches the template.
+/// One saved AI endpoint as shown in Settings: name, masked key, and model.
+/// The raw key never reaches the template.
 struct EndpointRow {
     id: String,
     name: String,
-    spec: String,
-    base_url: String,
     key_masked: String,
+    /// Whether recipes from this endpoint can be researched on the web.
+    web_search: bool,
     model: String,
     /// The spec default the endpoint runs when no model is stored.
     default_model: String,
@@ -799,12 +813,13 @@ struct SettingsForm {
 }
 #[derive(Deserialize)]
 struct EndpointForm {
-    name: String,
-    spec: String,
-    base_url: String,
-    api_key: String,
+    provider: String, // a PROVIDER_PRESETS key
     #[serde(default)]
-    model: String,
+    base_url: String, // custom servers only
+    #[serde(default)]
+    api_key: String, // optional only for a custom OpenAI-compatible server
+    #[serde(default)]
+    model: String, // custom servers only; blank uses the preset default
 }
 /// Settings form for the video step-moments switch: the checkbox is absent
 /// when unticked.
@@ -836,6 +851,8 @@ struct RecipeQuery {
 #[derive(Deserialize)]
 struct AddRecipeQuery {
     mode: Option<String>,
+    /// Prefills the video URL (the retry link of a stopped import).
+    url: Option<String>,
 }
 
 #[tokio::main]
@@ -1188,6 +1205,104 @@ pub(crate) const CODEX_PI_PROVIDER: &str = "openai-codex";
 pub(crate) const CLAUDE_PI_PROVIDER: &str = "anthropic";
 const OPENAI_SPEC: &str = "openai";
 const ANTHROPIC_SPEC: &str = "anthropic";
+/// A custom server speaking OpenAI Chat Completions, run through pi-ai.
+const OPENAI_COMPATIBLE_SPEC: &str = "openai-compatible";
+
+/// One choice in the Settings "Add a provider" picker. `spec` is what the
+/// worker dispatches on: "openai" and "anthropic" run its native Responses and
+/// Messages code (with web search); every other spec is a pi-ai provider id,
+/// or "openai-compatible" for a custom server. pi-ai providers keep their own
+/// base URL, so only the native and custom choices store one.
+pub(crate) struct ProviderPreset {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) spec: &'static str,
+    /// The native base URL; empty when pi-ai knows it or the user enters it.
+    pub(crate) base_url: &'static str,
+    /// Empty when the user must name the model.
+    pub(crate) default_model: &'static str,
+    /// Whether the user enters the base URL (and may enter a model).
+    pub(crate) custom: bool,
+}
+
+const fn preset(
+    key: &'static str,
+    label: &'static str,
+    default_model: &'static str,
+) -> ProviderPreset {
+    ProviderPreset {
+        key,
+        label,
+        spec: key,
+        base_url: "",
+        default_model,
+        custom: false,
+    }
+}
+
+pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        key: OPENAI_SPEC,
+        label: "OpenAI",
+        spec: OPENAI_SPEC,
+        base_url: "https://api.openai.com/v1",
+        default_model: DEFAULT_OPENAI_MODEL,
+        custom: false,
+    },
+    ProviderPreset {
+        key: ANTHROPIC_SPEC,
+        label: "Anthropic",
+        spec: ANTHROPIC_SPEC,
+        base_url: "https://api.anthropic.com",
+        default_model: DEFAULT_ANTHROPIC_MODEL,
+        custom: false,
+    },
+    preset("google", "Google Gemini", "gemini-3.8-flash"),
+    preset("mistral", "Mistral", "mistral-large-latest"),
+    preset("xai", "xAI (Grok)", "grok-4.7"),
+    preset("deepseek", "DeepSeek", "deepseek-v4-pro"),
+    preset("openrouter", "OpenRouter", "anthropic/claude-sonnet-5.5"),
+    preset("groq", "Groq", "openai/gpt-oss-120b"),
+    preset(
+        "together",
+        "Together AI",
+        "deepseek-ai/DeepSeek-V4-Pro-0813",
+    ),
+    preset(
+        "fireworks",
+        "Fireworks",
+        "accounts/fireworks/models/kimi-k3",
+    ),
+    preset("cerebras", "Cerebras", "gpt-oss-120b"),
+    ProviderPreset {
+        key: "custom-openai",
+        label: "Other server (OpenAI-compatible)",
+        spec: OPENAI_COMPATIBLE_SPEC,
+        base_url: "",
+        default_model: "",
+        custom: true,
+    },
+    ProviderPreset {
+        key: "custom-anthropic",
+        label: "Other server (Anthropic-compatible)",
+        spec: ANTHROPIC_SPEC,
+        base_url: "",
+        default_model: DEFAULT_ANTHROPIC_MODEL,
+        custom: true,
+    },
+];
+
+/// The preset a stored spec belongs to; the native preset wins over the
+/// custom one that shares its spec.
+fn preset_for_spec(spec: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|preset| preset.spec == spec)
+}
+
+/// Whether endpoints of this spec can run web search: only the worker's
+/// native OpenAI and Anthropic paths attach the provider's search tool.
+pub(crate) fn spec_has_web_search(spec: &str) -> bool {
+    spec == OPENAI_SPEC || spec == ANTHROPIC_SPEC
+}
 
 /// Maps an `ai_provider` value to its Pi SDK provider id; None for API endpoints.
 pub(crate) fn pi_provider_for(provider: &str) -> Option<&'static str> {
@@ -1303,12 +1418,10 @@ pub(crate) async fn list_endpoints(db: &SqlitePool, user_id: &str) -> Result<Vec
     .await?)
 }
 
-/// The model an endpoint spec runs when the endpoint stores none.
+/// The model an endpoint spec runs when the endpoint stores none; empty for a
+/// custom OpenAI-compatible server, which has no sensible default.
 fn spec_default_model(spec: &str) -> &'static str {
-    match spec {
-        ANTHROPIC_SPEC => DEFAULT_ANTHROPIC_MODEL,
-        _ => DEFAULT_OPENAI_MODEL,
-    }
+    preset_for_spec(spec).map_or("", |preset| preset.default_model)
 }
 
 /// The model an endpoint runs: its stored model, or the spec default when
@@ -1496,15 +1609,13 @@ async fn settings_page(
             selected: endpoint.id == provider,
             key_masked: mask_key(&endpoint.api_key),
             default_model: spec_default_model(&endpoint.spec).to_string(),
+            web_search: spec_has_web_search(&endpoint.spec),
             model_options: cached_model_catalogue(&s, &endpoint.id),
             id: endpoint.id,
             name: endpoint.name,
-            spec: endpoint.spec,
-            base_url: endpoint.base_url,
             model: endpoint.model,
         })
         .collect::<Vec<_>>();
-    let has_endpoints = !endpoints.is_empty();
     let gateway = ai_gateway_credential(&s.db, &user.id).await?;
     let gateway_configured = gateway.is_some();
     let gateway_key_masked = gateway
@@ -1541,8 +1652,8 @@ async fn settings_page(
         claude_selected,
         claude_connected_notice: query.claude == "connected",
         claude_error: query.claude_error,
-        has_endpoints,
         endpoints,
+        presets: PROVIDER_PRESETS,
         gateway_configured,
         gateway_key_masked,
         gateway_base_url,
@@ -1677,7 +1788,7 @@ async fn update_settings(
     } else {
         crate::find_endpoint(&s.db, &user.id, &provider)
             .await?
-            .filter(|endpoint| endpoint.spec == OPENAI_SPEC || endpoint.spec == ANTHROPIC_SPEC)
+            .filter(|endpoint| preset_for_spec(&endpoint.spec).is_some())
             .ok_or_else(|| AppError::BadRequest("Choose a saved API endpoint.".into()))?;
         // The model field belongs to the endpoint that was shown; without the
         // page script a different radio may have been picked meanwhile. Any
@@ -1773,26 +1884,73 @@ fn normalise_url(raw: &str, name: &str) -> Result<String> {
     Ok(url.trim_end_matches('/').to_string())
 }
 
-/// Registers a new AI endpoint (OpenAI-spec or Anthropic-spec) with its API
-/// key. The key is stored in the database, never in a config file, and only
-/// its masked tail is ever rendered back to the page.
+/// Adds an AI provider from the Settings picker and makes it the active one,
+/// so adding a key is all it takes to start generating with it. A named
+/// provider needs only its key; a custom server also needs its base URL. The
+/// key is stored in the database, never in a config file, and only its masked
+/// tail is ever rendered back to the page.
 async fn add_endpoint(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<EndpointForm>,
 ) -> Result<Redirect> {
-    let name = required(&form.name, "Endpoint name")?;
-    let spec = required(&form.spec, "API spec")?;
-    if spec != OPENAI_SPEC && spec != ANTHROPIC_SPEC {
-        return Err(AppError::BadRequest(
-            "API spec must be openai or anthropic.".into(),
-        ));
+    let preset = PROVIDER_PRESETS
+        .iter()
+        .find(|preset| preset.key == form.provider.trim())
+        .ok_or_else(|| AppError::BadRequest("Choose an AI provider.".into()))?;
+    let (base_url, model) = if preset.custom {
+        (
+            normalise_url(&form.base_url, "Server URL")?,
+            trim(&form.model),
+        )
+    } else {
+        (preset.base_url.to_string(), String::new())
+    };
+    let api_key = trim(&form.api_key);
+    if api_key.is_empty() && preset.spec != OPENAI_COMPATIBLE_SPEC {
+        return Err(AppError::BadRequest("Enter the API key.".into()));
     }
-    let base_url = normalise_url(&form.base_url, "API base URL")?;
-    let api_key = required(&form.api_key, "API key")?;
-    let model = trim(&form.model);
-    crate::insert_endpoint(&s.db, &user.id, &name, &spec, &base_url, &api_key, &model).await?;
-    Ok(Redirect::to("/settings"))
+    let name = endpoint_name(&s.db, &user.id, preset, &base_url).await?;
+    let id = crate::insert_endpoint(
+        &s.db,
+        &user.id,
+        &name,
+        preset.spec,
+        &base_url,
+        &api_key,
+        &model,
+    )
+    .await?;
+    set_app_setting(&s.db, "ai_provider", &id).await?;
+    Ok(Redirect::to("/settings?saved=1"))
+}
+
+/// A display name for a new endpoint: the provider's label, or a custom
+/// server's host, numbered when the user already has one by that name.
+async fn endpoint_name(
+    db: &SqlitePool,
+    user_id: &str,
+    preset: &ProviderPreset,
+    base_url: &str,
+) -> Result<String> {
+    let base = if preset.custom {
+        let host = base_url.split("://").nth(1).unwrap_or(base_url);
+        host.split('/').next().unwrap_or(host).to_string()
+    } else {
+        preset.label.to_string()
+    };
+    let taken: Vec<String> = list_endpoints(db, user_id)
+        .await?
+        .into_iter()
+        .map(|endpoint| endpoint.name)
+        .collect();
+    let mut name = base.clone();
+    let mut n = 2;
+    while taken.contains(&name) {
+        name = format!("{base} {n}");
+        n += 1;
+    }
+    Ok(name)
 }
 
 /// Removes a saved endpoint. If it was the active provider, generation falls

@@ -55,6 +55,19 @@ pub(crate) async fn generate_recipe(
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
+    // A reel link cannot be researched on the web, so it takes the video
+    // import path with every source on; the rest of the text becomes notes.
+    if let Some((url, notes)) = social_video_in_prompt(&prompt) {
+        let on = || Some("on".to_string());
+        let form = MediaImportForm {
+            url,
+            notes,
+            use_description: on(),
+            use_audio: on(),
+            use_ocr: on(),
+        };
+        return import_recipe(State(s), user, Form(form)).await;
+    }
     match create_draft(
         &s,
         &user,
@@ -88,6 +101,27 @@ pub(crate) async fn generate_recipe(
         .map(IntoResponse::into_response),
     }
 }
+/// The single Facebook or Instagram video link in a research prompt, with
+/// the remaining text as import notes. A prompt with any other link, or more
+/// than one, stays a research request.
+pub(crate) fn social_video_in_prompt(prompt: &str) -> Option<(String, String)> {
+    let mut links = prompt
+        .split_whitespace()
+        .filter(|word| word.starts_with("http://") || word.starts_with("https://"));
+    let link = links.next()?;
+    if links.next().is_some() {
+        return None;
+    }
+    let url = link.trim_end_matches([',', '.', ')', ';']);
+    canonical_social_url(url).ok()?;
+    let notes = prompt
+        .split_whitespace()
+        .filter(|word| *word != link)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some((url.to_string(), notes))
+}
+
 pub(crate) async fn import_page() -> Redirect {
     Redirect::to("/recipes/new?mode=video")
 }
@@ -163,7 +197,7 @@ pub(crate) async fn import_recipe(
     }
     if !channels.any() {
         return Ok(render_import_error(
-            "Tick at least one evidence source: caption, audio transcription, or on-screen text.",
+            "Tick at least one source under Advanced options: caption, speech, or on-screen text.",
             &raw_url,
             &notes,
             channels,
@@ -1201,7 +1235,33 @@ async fn pi_recipe(
             (RecipeBackend::Endpoint(endpoint), model)
         }
     };
-    request_recipe(state, &backend, &model, prompt, search_mode).await
+    request_recipe(
+        state,
+        &backend,
+        &model,
+        prompt,
+        backend_search_mode(&backend, search_mode),
+    )
+    .await
+}
+
+/// The search posture a backend can honour. Endpoints run through pi-ai have
+/// no web search tool, so a grounded request generates without research
+/// instead of failing for want of sources. Gap-fill keeps its evidence prompt:
+/// its sources are optional, and the worker sends no search tool.
+fn backend_search_mode(backend: &RecipeBackend<'_>, search_mode: SearchMode) -> SearchMode {
+    match backend {
+        RecipeBackend::Endpoint(endpoint) => endpoint_search_mode(&endpoint.spec, search_mode),
+        RecipeBackend::Subscription { .. } => search_mode,
+    }
+}
+
+pub(crate) fn endpoint_search_mode(spec: &str, search_mode: SearchMode) -> SearchMode {
+    if search_mode == SearchMode::Grounded && !crate::spec_has_web_search(spec) {
+        SearchMode::Off
+    } else {
+        search_mode
+    }
 }
 
 /// Generates a recipe through one backend. A second attempt, re-prompted with
@@ -1932,6 +1992,11 @@ pub(crate) struct DebugUrlState {
     pub(crate) captures: Vec<DebugCaptureRow>,
     pub(crate) cards: Vec<DebugCardRow>,
     pub(crate) error_message: String,
+    /// Each lane's result event has arrived, so empty text means "none found"
+    /// rather than "still working".
+    pub(crate) description_read: bool,
+    pub(crate) audio_read: bool,
+    pub(crate) ocr_read: bool,
 }
 
 #[derive(Clone)]
@@ -2101,6 +2166,7 @@ pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
                 .unwrap_or_default()
                 .to_string();
             state.duration_seconds = event.get("durationSeconds").and_then(Value::as_u64);
+            state.description_read = true;
         }
         Some("audio") => {
             state.transcript = event
@@ -2108,6 +2174,7 @@ pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            state.audio_read = true;
         }
         Some("cleaned") => {
             state.cleaned_recipe_text = event
@@ -2179,6 +2246,7 @@ pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
                         .collect()
                 })
                 .unwrap_or_default();
+            state.ocr_read = true;
         }
         Some("status") => {
             state.status = event
@@ -2459,15 +2527,115 @@ pub(crate) async fn import_run_page(
         .lock()
         .as_ref()
         .map(|id| format!("/ai/drafts/{id}"));
+    let finished = run.finished();
+    let sources = import_sources(&run.urls[0].lock(), run.channels, finished);
     render(MediaImportRunTemplate {
         run_id,
-        finished: run.finished(),
+        finished,
         draft_url,
         use_description: run.channels.description,
         use_audio: run.channels.audio,
         use_ocr: run.channels.ocr,
+        retry_url: retry_url(&evidence.source_url),
         evidence,
+        sources,
     })
+}
+
+/// The add page in video mode with `source_url` filled in.
+fn retry_url(source_url: &str) -> String {
+    let mut url = reqwest::Url::parse("http://local/recipes/new").expect("static URL");
+    url.query_pairs_mut()
+        .append_pair("mode", "video")
+        .append_pair("url", source_url);
+    format!("{}?{}", url.path(), url.query().unwrap_or_default())
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What each evidence source of an import has found, worded for the reader.
+/// `stopped` turns a lane that never reported into "not read". The page
+/// script words its live updates the same way.
+pub(crate) fn import_sources(
+    state: &DebugUrlState,
+    channels: MediaChannels,
+    stopped: bool,
+) -> Vec<crate::ImportSourceView> {
+    let lane = |key,
+                label,
+                enabled: bool,
+                read: bool,
+                found: Option<String>,
+                none: &str,
+                waiting: &str| {
+        let (state, detail) = if !enabled {
+            ("skipped", "Skipped".to_string())
+        } else if let Some(detail) = found.filter(|_| read) {
+            ("found", detail)
+        } else if read {
+            ("none", none.to_string())
+        } else if stopped {
+            ("none", "Not read".to_string())
+        } else {
+            ("waiting", waiting.to_string())
+        };
+        crate::ImportSourceView {
+            key,
+            label,
+            state,
+            detail,
+        }
+    };
+    let caption_words = state.description.split_whitespace().count();
+    let caption = if caption_words > 0 {
+        Some(count(caption_words, "word", "words"))
+    } else if !state.title.trim().is_empty() {
+        Some("Title only".to_string())
+    } else {
+        None
+    };
+    let speech_words = state.transcript.split_whitespace().count();
+    let kept_cards = state.cards.iter().filter(|card| card.kept).count();
+    let cards = if kept_cards > 0 {
+        kept_cards
+    } else {
+        state
+            .captures
+            .iter()
+            .filter(|capture| capture.cleaned.is_some())
+            .count()
+    };
+    vec![
+        lane(
+            "description",
+            "Caption",
+            channels.description,
+            state.description_read,
+            caption,
+            "No caption",
+            "Reading…",
+        ),
+        lane(
+            "audio",
+            "Speech",
+            channels.audio,
+            state.audio_read,
+            (speech_words > 0).then(|| count(speech_words, "word", "words")),
+            "No speech",
+            "Listening…",
+        ),
+        lane(
+            "ocr",
+            "On-screen text",
+            channels.ocr,
+            state.ocr_read,
+            (cards > 0).then(|| count(cards, "card", "cards")),
+            "No text found",
+            "Reading frames…",
+        ),
+    ]
 }
 
 pub(crate) async fn media_debug_run_page(

@@ -333,77 +333,115 @@ async fn unknown_or_foreign_provider_is_rejected() {
     }
 }
 
-#[tokio::test]
-async fn add_endpoint_registers_the_combo_with_its_key() {
-    let db = database().await;
-    let state = state(db.clone());
-    let result = add_endpoint(
-        State(state),
+fn endpoint_form(provider: &str, base_url: &str, api_key: &str, model: &str) -> EndpointForm {
+    EndpointForm {
+        provider: provider.into(),
+        base_url: base_url.into(),
+        api_key: api_key.into(),
+        model: model.into(),
+    }
+}
+
+async fn add_from_form(state: &Arc<AppState>, form: EndpointForm) -> Result<(), AppError> {
+    add_endpoint(
+        State(state.clone()),
         AuthUser { id: "u1".into() },
-        Form(EndpointForm {
-            name: "Local".into(),
-            spec: "openai".into(),
-            base_url: "http://127.0.0.1:8080/v1/".into(),
-            api_key: "sk-local".into(),
-            model: "gpt-5.5".into(),
-        }),
+        Form(form),
     )
-    .await;
-    assert!(result.is_ok());
-    let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
-    assert_eq!(endpoint.name, "Local");
-    assert_eq!(endpoint.spec, "openai");
-    assert_eq!(endpoint.base_url, "http://127.0.0.1:8080/v1");
-    assert_eq!(endpoint.api_key, "sk-local");
-    assert_eq!(endpoint.model, "gpt-5.5");
-    // Registering a combo never activates it.
-    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+    .await
+    .map(|_| ())
 }
 
 #[tokio::test]
-async fn add_endpoint_rejects_blank_fields_bad_spec_and_bad_url() {
+async fn adding_a_named_provider_needs_only_its_key_and_makes_it_active() {
+    let db = database().await;
+    let state = state(db.clone());
+    // A stray URL or model from the hidden custom fields is ignored.
+    add_from_form(
+        &state,
+        endpoint_form("google", "https://evil.example", "AIza-key", "x"),
+    )
+    .await
+    .unwrap();
+    let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
+    assert_eq!(endpoint.name, "Google Gemini");
+    assert_eq!(endpoint.spec, "google");
+    // pi-ai knows the provider's own base URL.
+    assert_eq!(endpoint.base_url, "");
+    assert_eq!(endpoint.api_key, "AIza-key");
+    assert_eq!(endpoint.model, "");
+    assert_eq!(crate::endpoint_model(&endpoint), "gemini-3.8-flash");
+    assert_eq!(ai_provider(&db).await.unwrap(), endpoint.id);
+}
+
+#[tokio::test]
+async fn adding_native_providers_stores_their_base_url_and_numbers_repeats() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_from_form(&state, endpoint_form("anthropic", "", "sk-ant-1", ""))
+        .await
+        .unwrap();
+    add_from_form(&state, endpoint_form("anthropic", "", "sk-ant-2", ""))
+        .await
+        .unwrap();
+    let endpoints = list_endpoints(&db, "u1").await.unwrap();
+    let names: Vec<_> = endpoints
+        .iter()
+        .map(|endpoint| endpoint.name.as_str())
+        .collect();
+    assert_eq!(names, ["Anthropic", "Anthropic 2"]);
+    assert!(
+        endpoints
+            .iter()
+            .all(|endpoint| endpoint.base_url == "https://api.anthropic.com")
+    );
+}
+
+#[tokio::test]
+async fn adding_a_custom_server_takes_its_url_and_model_and_allows_no_key() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_from_form(
+        &state,
+        endpoint_form("custom-openai", "http://ollama:11434/v1/", "", "llama3.3"),
+    )
+    .await
+    .unwrap();
+    let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
+    assert_eq!(endpoint.name, "ollama:11434");
+    assert_eq!(endpoint.spec, "openai-compatible");
+    assert_eq!(endpoint.base_url, "http://ollama:11434/v1");
+    assert_eq!(endpoint.api_key, "");
+    assert_eq!(endpoint.model, "llama3.3");
+}
+
+#[tokio::test]
+async fn adding_a_provider_rejects_unknown_choices_missing_keys_and_bad_urls() {
     let db = database().await;
     let state = state(db.clone());
     let cases = [
-        EndpointForm {
-            name: String::new(),
-            spec: "openai".into(),
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "sk-test".into(),
-            model: String::new(),
-        },
-        EndpointForm {
-            name: "X".into(),
-            spec: "google".into(),
-            base_url: "https://api.example.com/v1".into(),
-            api_key: "sk-test".into(),
-            model: String::new(),
-        },
-        EndpointForm {
-            name: "X".into(),
-            spec: "openai".into(),
-            base_url: "api.example.com/v1".into(),
-            api_key: "sk-test".into(),
-            model: String::new(),
-        },
-        EndpointForm {
-            name: "X".into(),
-            spec: "openai".into(),
-            base_url: "https://api.example.com/v1".into(),
-            api_key: String::new(),
-            model: String::new(),
-        },
+        endpoint_form("", "", "sk-test", ""),
+        endpoint_form("not-a-provider", "", "sk-test", ""),
+        endpoint_form("openai", "", "", ""),
+        endpoint_form("custom-anthropic", "", "sk-test", ""),
+        endpoint_form("custom-anthropic", "api.example.com/v1", "sk-test", ""),
+        endpoint_form("custom-anthropic", "https://api.example.com", "", ""),
     ];
     for form in cases {
-        let result = add_endpoint(
-            State(state.clone()),
-            AuthUser { id: "u1".into() },
-            Form(form),
-        )
-        .await;
+        let result = add_from_form(&state, form).await;
         assert!(matches!(result, Err(AppError::BadRequest(_))));
     }
     assert!(list_endpoints(&db, "u1").await.unwrap().is_empty());
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
+}
+
+#[test]
+fn only_native_specs_keep_grounded_search() {
+    use crate::ai::{SearchMode, endpoint_search_mode};
+    assert!(endpoint_search_mode("openai", SearchMode::Grounded) == SearchMode::Grounded);
+    assert!(endpoint_search_mode("anthropic", SearchMode::Grounded) == SearchMode::Grounded);
+    assert!(endpoint_search_mode("google", SearchMode::Grounded) == SearchMode::Off);
+    assert!(endpoint_search_mode("openai-compatible", SearchMode::GapFill) == SearchMode::GapFill);
 }
 
 #[tokio::test]

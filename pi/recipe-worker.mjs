@@ -6,6 +6,9 @@ import {
   ModelRuntime,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { createProvider } from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import {
   anthropicSearchPayload,
   createNativeSearchObserver,
@@ -98,9 +101,70 @@ export function parseRequest(input) {
   return request;
 }
 
+/** Endpoint specs the worker calls with its own Responses/Messages code, which
+ *  supports native web search. Every other spec runs through pi-ai. */
+const NATIVE_SPECS = new Set(["openai", "anthropic"]);
+/** A self-hosted or third-party server speaking OpenAI Chat Completions
+ *  (Ollama, llama.cpp, vLLM, LM Studio, LiteLLM, …). */
+const OPENAI_COMPATIBLE_SPEC = "openai-compatible";
+
 /** Whether a request targets a registered API endpoint rather than a subscription. */
 function isEndpointRequest(request) {
-  return request.provider === "openai" || request.provider === "anthropic";
+  return nonBlank(request.provider) !== null;
+}
+
+/** Whether an endpoint spec runs through pi-ai rather than the native paths. */
+export function isPiAiSpec(spec) {
+  return !NATIVE_SPECS.has(spec);
+}
+
+/** A pi-ai model collection holding every built-in provider, plus a keyless-
+ *  capable "openai-compatible" provider for custom Chat Completions servers. */
+export function piAiModels() {
+  const models = builtinModels();
+  models.setProvider(createProvider({
+    id: OPENAI_COMPATIBLE_SPEC,
+    name: "OpenAI-compatible",
+    auth: { apiKey: { name: "OpenAI-compatible", resolve: async () => ({ auth: {} }) } },
+    models: [],
+    api: openAICompletionsApi(),
+  }));
+  return models;
+}
+
+/** The pi-ai chat model an endpoint runs. A built-in provider's catalogue
+ *  entry carries its real limits and thinking controls; a model id the
+ *  catalogue does not know yet borrows the shape of one of the provider's
+ *  models. A custom server gets a conservative Chat Completions model, since
+ *  many such servers reject the developer role, reasoning_effort, and store. */
+export function piAiModel(models, spec, modelId, apiBaseUrl) {
+  if (spec === OPENAI_COMPATIBLE_SPEC) {
+    if (!apiBaseUrl) throw new WorkerError("configuration", "Missing base URL for the OpenAI-compatible server.");
+    return {
+      id: modelId,
+      name: modelId,
+      api: "openai-completions",
+      provider: OPENAI_COMPATIBLE_SPEC,
+      baseUrl: apiBaseUrl.replace(/\/+$/, ""),
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 16_384,
+      compat: { supportsDeveloperRole: false, supportsReasoningEffort: false, supportsStore: false },
+    };
+  }
+  const catalogue = models.getModels(spec).filter((model) => !model.type || model.type === "chat");
+  if (catalogue.length === 0) {
+    throw new WorkerError("configuration", `Unsupported AI provider: ${spec}`);
+  }
+  const known = catalogue.find((model) => model.id === modelId);
+  const shape = known
+    ?? catalogue.find((model) => model.api === "openai-completions")
+    ?? catalogue[0];
+  const model = known ? { ...shape } : { ...shape, id: modelId, name: modelId };
+  if (apiBaseUrl) model.baseUrl = apiBaseUrl.replace(/\/+$/, "");
+  return model;
 }
 
 /**
@@ -593,9 +657,16 @@ export function parseAnthropicOutput(data) {
  *  lists are paginated and already newest first; OpenAI-spec lists are sorted
  *  newest first by their created timestamp. */
 export async function listEndpointModels(request, fetchImpl = fetch) {
+  const spec = nonBlank(request.provider);
   const apiBaseUrl = nonBlank(request.apiBaseUrl);
   const apiKey = nonBlank(request.apiKey);
-  if (!apiBaseUrl || !apiKey) {
+  // A built-in pi-ai provider lists its own catalogue, which needs no network.
+  if (isPiAiSpec(spec) && spec !== OPENAI_COMPATIBLE_SPEC) {
+    const models = piAiModels().getModels(spec).filter((model) => !model.type || model.type === "chat");
+    return catalogModelIds(models);
+  }
+  // A custom server may be keyless (a local Ollama or llama.cpp).
+  if (!apiBaseUrl || (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC)) {
     throw new WorkerError("input", "Missing apiBaseUrl or apiKey for model discovery.");
   }
   if (request.provider === "anthropic") {
@@ -614,7 +685,7 @@ export async function listEndpointModels(request, fetchImpl = fetch) {
   }
   const body = await fetchJson(
     `${apiBaseUrl.replace(/\/+$/, "")}/models`,
-    { Authorization: `Bearer ${apiKey}` },
+    apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     undefined,
     fetchImpl,
     MODEL_LIST_TIMEOUT_MS,
@@ -691,6 +762,7 @@ async function cleanMedia(request) {
 /** Recipe generation against an OpenAI- or Anthropic-spec endpoint. The base
  * URL and key come from the host and are never logged. */
 async function generateViaEndpoint(request, searchMode, reasoningEffort) {
+  if (isPiAiSpec(request.provider)) return generateViaPiAi(request, reasoningEffort);
   const apiBaseUrl = nonBlank(request.apiBaseUrl);
   const apiKey = nonBlank(request.apiKey);
   const model = nonBlank(request.model);
@@ -715,6 +787,43 @@ async function generateViaEndpoint(request, searchMode, reasoningEffort) {
   const { text, searched, refused, citations } = parseResponsesOutput(data);
   if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
   return finishRecipe({ label: "OpenAI", text, citations, searched, searchMode, acceptUnverifiable });
+}
+
+/** Recipe generation through any pi-ai provider (Google, Mistral, Groq,
+ * OpenRouter, a custom Chat Completions server, …) with the endpoint's own
+ * key. These providers have no native web search here, so the host sends
+ * searchMode "off" and the recipe carries no sources. A blank key is only
+ * valid for a custom server. */
+export async function generateViaPiAi(request, reasoningEffort, models = piAiModels(), fetchImpl = undefined) {
+  const spec = nonBlank(request.provider);
+  const apiKey = nonBlank(request.apiKey);
+  const modelId = nonBlank(request.model);
+  if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
+  if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
+    throw new WorkerError("configuration", "Missing API key for this AI provider.");
+  }
+  const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
+  const response = await models.completeSimple(model, completionContext(request, "off"), {
+    apiKey: apiKey ?? "none",
+    reasoning: reasoningEffort,
+    maxRetries: 1,
+    signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
+    ...(fetchImpl ? { fetch: fetchImpl } : {}),
+  });
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new WorkerError("worker", response.errorMessage || "AI provider request failed.", { retryable: true });
+  }
+  if (response.stopReason === "length") {
+    throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
+  }
+  return finishRecipe({
+    label: model.provider,
+    text: assistantText(response),
+    citations: new Map(),
+    searched: false,
+    searchMode: "off",
+    acceptUnverifiable: false,
+  });
 }
 
 /** Recipe generation through a pi subscription (ChatGPT for Codex, Claude Pro/Max). */

@@ -244,16 +244,21 @@
 
 /* From Video import: replay the bounded run feed, then poll for new events.
  * The background job survives navigation and each raw channel is replaced
- * atomically when its backend stage reports, avoiding partial or unsafe HTML. */
+ * atomically when its backend stage reports, avoiding partial or unsafe HTML.
+ * The plain summary words each source like `import_sources` in ai.rs. The
+ * technical details remember whether they were left open, and while they
+ * are closed a finished import opens its draft by itself. */
 (function () {
   var root = document.querySelector('[data-import-root]');
   if (!root) return;
-  var READING = 'Reading the video…';
-  var CLEANING = 'Cleaning the video evidence…';
-  var PREPARING = 'Preparing the recipe draft…';
-  var DRAFTING = 'Building the recipe draft…';
-  var READY = 'Recipe draft ready.';
-  var OCR_COPY = 'Reading on-screen text…';
+  var READING = 'Watching the video…';
+  var CLEANING = 'Picking out the recipe…';
+  var PREPARING = 'Writing the draft…';
+  var DRAFTING = 'Writing the draft…';
+  var READY = 'Done.';
+  var DETAILS_KEY = 'recipe-import-details';
+  var OPEN_DELAY_MS = 1200;
+  var OCR_COPY = 'Reading the text on screen…';
   var MAX_FAILURES = 4;
   var RETRY_MS = 3500;
   var finished = root.getAttribute('data-import-finished') === '1';
@@ -265,6 +270,11 @@
   var ready = root.querySelector('[data-import-ready]');
   var draftLink = root.querySelector('[data-import-draft]');
   var draftCopy = root.querySelector('[data-import-draft-copy]');
+  var heading = root.querySelector('[data-import-heading]');
+  var retryBox = root.querySelector('[data-import-retry]');
+  var readyCopy = root.querySelector('[data-import-ready-copy]');
+  var details = root.querySelector('[data-import-details]');
+  var notesCount = root.querySelector('[data-import-notes-count]');
   var progressBar = root.querySelector('[data-import-progressbar]');
   var progressCopy = root.querySelector('[data-import-progress-copy]');
   var progressNames = ['extract', 'clean', 'generate'];
@@ -391,10 +401,78 @@
   function lanesCopy() {
     var audioPending = stage('audio').enabled && !lanesDone.audio;
     var ocrPending = stage('ocr').enabled && !lanesDone.ocr;
-    if (audioPending && ocrPending) return 'Transcribing audio and reading on-screen text…';
-    if (audioPending) return 'Transcribing spoken audio…';
+    if (audioPending && ocrPending) return 'Listening and reading the text on screen…';
+    if (audioPending) return 'Listening to the video…';
     if (ocrPending) return OCR_COPY;
     return READING;
+  }
+  function count(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  function words(text) {
+    var trimmed = (text || '').replace(/^\s+|\s+$/g, '');
+    return trimmed ? trimmed.split(/\s+/).length : 0;
+  }
+  function setFound(key, state, detail) {
+    var item = root.querySelector('[data-found="' + key + '"]');
+    if (!item || item.className === 'is-skipped') return;
+    item.className = 'is-' + state;
+    var holder = item.querySelector('[data-found-detail]');
+    if (holder) holder.textContent = detail;
+  }
+  function foundDescription(event) {
+    var n = words(event.description);
+    if (n) setFound('description', 'found', count(n, 'word', 'words'));
+    else if (event.title) setFound('description', 'found', 'Title only');
+    else setFound('description', 'none', 'No caption');
+  }
+  function foundAudio(event) {
+    var n = words(event.transcript);
+    if (n) setFound('audio', 'found', count(n, 'word', 'words'));
+    else setFound('audio', 'none', 'No speech');
+  }
+  function foundOcr(event) {
+    var cards = event.cards || [];
+    var captures = event.captures || [];
+    var n = 0;
+    var index;
+    for (index = 0; index < cards.length; index += 1) if (cards[index].kept) n += 1;
+    if (!n) {
+      for (index = 0; index < captures.length; index += 1) {
+        if (captures[index].text !== undefined && captures[index].text !== null) n += 1;
+      }
+    }
+    if (n) setFound('ocr', 'found', count(n, 'card', 'cards'));
+    else setFound('ocr', 'none', 'No text found');
+  }
+  function unreadFound() {
+    var items = root.querySelectorAll('[data-found]');
+    for (var index = 0; index < items.length; index += 1) {
+      if (items[index].className === 'is-waiting') setFound(items[index].getAttribute('data-found'), 'none', 'Not read');
+    }
+  }
+  function countNotes() {
+    if (!notesCount || !warnings) return;
+    var n = warnings.getElementsByTagName('li').length;
+    notesCount.textContent = n ? '\u00b7 ' + count(n, 'note', 'notes') : '';
+  }
+  function rememberDetails() {
+    try { window.localStorage.setItem(DETAILS_KEY, details.open ? '1' : '0'); } catch (ignored) { /* private mode */ }
+  }
+  function restoreDetails() {
+    if (!details) return;
+    try { if (window.localStorage.getItem(DETAILS_KEY) === '1') details.open = true; } catch (ignored) { /* private mode */ }
+    var summary = details.getElementsByTagName('summary')[0];
+    if (summary) summary.addEventListener('click', function () { window.setTimeout(rememberDetails, 0); });
+  }
+  function openDraft(url) {
+    if (!url || (details && details.open)) {
+      if (readyCopy) readyCopy.textContent = '';
+      return;
+    }
+    if (readyCopy) readyCopy.textContent = 'Opening it now…';
+    window.setTimeout(function () {
+      if (!details || !details.open) window.location.href = url;
+      else if (readyCopy) readyCopy.textContent = '';
+    }, OPEN_DELAY_MS);
   }
   function stage(name) {
     if (!stages[name]) {
@@ -485,27 +563,33 @@
     } else if (event.kind === 'phase') {
       stageStatus(event.phase, event.state || 'working');
     } else if (event.kind === 'description') {
+      if (stage('description').enabled) foundDescription(event);
       setDescription(event);
     } else if (event.kind === 'audio') {
+      if (stage('audio').enabled) foundAudio(event);
       setAudio(event);
     } else if (event.kind === 'ocr-plan') {
       stageStatus('ocr', 'reading ' + event.planned + ' frames');
     } else if (event.kind === 'ocr-captures') {
+      if (stage('ocr').enabled) foundOcr(event);
       setOcr(event);
     } else if (event.kind === 'cleaned') {
       setRaw(root.querySelector('[data-import-cleaner]'), event.text || '', 'The cleaner returned no recipe facts.');
       stageStatus('cleaner', 'done');
     } else if (event.kind === 'warning' && event.message && warnings) {
       warnings.appendChild(el('li', null, event.message));
+      countNotes();
     } else if (event.kind === 'result') {
       if (status) {
         status.textContent = 'ready';
         status.className = 'codex-status codex-status--connected import-overall-status';
       }
       stageStatus('draft', 'done');
+      if (heading) heading.textContent = 'Your recipe is ready';
       if (event.draftUrl && draftLink) draftLink.href = event.draftUrl;
       if (ready) ready.hidden = false;
       if (draftCopy) draftCopy.textContent = 'Ready for your review.';
+      openDraft(event.draftUrl);
     } else if (event.kind === 'error') {
       if (status) {
         status.textContent = 'failed';
@@ -515,6 +599,9 @@
         errorBox.textContent = event.message || 'The video import failed.';
         errorBox.hidden = false;
       }
+      if (heading) heading.textContent = 'Import stopped';
+      if (retryBox) retryBox.hidden = false;
+      unreadFound();
     }
   }
   function giveUp() {
@@ -525,13 +612,11 @@
       status.className = 'codex-status codex-status--missing import-overall-status';
     }
     if (errorBox) {
-      clear(errorBox);
-      errorBox.appendChild(document.createTextNode('We lost touch with this import, so it may have expired. '));
-      var link = el('a', null, 'Import another video');
-      link.href = '/recipes/new?mode=video';
-      errorBox.appendChild(link);
+      errorBox.textContent = 'We lost touch with this import, so it may have expired.';
       errorBox.hidden = false;
     }
+    if (heading) heading.textContent = 'Import stopped';
+    if (retryBox) retryBox.hidden = false;
   }
   function retry() {
     failures += 1;
@@ -550,7 +635,7 @@
       }
       if (!payload) { retry(); return; }
       failures = 0;
-      if (!replayed) { clear(warnings); replayed = true; }
+      if (!replayed) { clear(warnings); countNotes(); replayed = true; }
       try { (payload.events || []).forEach(apply); } catch (ignored) { /* keep polling */ }
       since = payload.next || since;
       if (payload.done) { stopped = true; return; }
@@ -558,6 +643,7 @@
     };
     request.send();
   }
+  restoreDetails();
   initialiseProgress();
   if (!finished) poll();
 }());

@@ -11,12 +11,16 @@ import {
   catalogModelIds,
   completionContext,
   formatRecipeEvidence,
+  generateViaPiAi,
+  isPiAiSpec,
   normalizeEffort,
   openaiResponse,
   parseAiGatewayCleaner,
   parseAnthropicOutput,
   parseRequest,
   parseResponsesOutput,
+  piAiModel,
+  piAiModels,
   recipePrompt,
   searchModeOf,
   subscriptionOf,
@@ -608,4 +612,109 @@ test("verifiedSources rejects unverifiable claims when the fallback is disabled"
     false,
   );
   assert.deepEqual(sources, []);
+});
+
+/** A Chat Completions SSE stream that streams one assistant text reply. */
+function chatCompletionStream(text) {
+  const chunks = [
+    { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
+    { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+  ];
+  const body = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n";
+  return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+}
+
+const RECIPE_REPLY = JSON.stringify({ recipe: { title: "Toast" }, sources: [{ title: "x", url: "https://x.example" }] });
+
+test("isPiAiSpec keeps OpenAI and Anthropic on the native search paths", () => {
+  assert.equal(isPiAiSpec("openai"), false);
+  assert.equal(isPiAiSpec("anthropic"), false);
+  assert.equal(isPiAiSpec("google"), true);
+  assert.equal(isPiAiSpec("openai-compatible"), true);
+});
+
+test("piAiModel uses the catalogue entry, borrows a shape for unknown ids, and rejects unknown providers", () => {
+  const models = piAiModels();
+  const known = models.getModels("groq")[0];
+  assert.equal(piAiModel(models, "groq", known.id).contextWindow, known.contextWindow);
+  const unknown = piAiModel(models, "groq", "brand-new-model");
+  assert.equal(unknown.id, "brand-new-model");
+  assert.equal(unknown.provider, "groq");
+  assert.throws(() => piAiModel(models, "no-such-provider", "m"), (error) => error.code === "configuration");
+  const custom = piAiModel(models, "openai-compatible", "llama3", "http://ollama:11434/v1/");
+  assert.equal(custom.baseUrl, "http://ollama:11434/v1");
+  assert.equal(custom.compat.supportsDeveloperRole, false);
+  assert.throws(() => piAiModel(models, "openai-compatible", "llama3"), (error) => error.code === "configuration");
+});
+
+test("generateViaPiAi sends the key to a built-in provider and drops unverifiable sources", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
+    return chatCompletionStream(RECIPE_REPLY);
+  };
+  const result = await generateViaPiAi(
+    { provider: "groq", apiKey: "gsk-test", model: "llama-3.3-70b-versatile", prompt: "Toast", systemPrompt: "Cook." },
+    "low",
+    piAiModels(),
+    fetchImpl,
+  );
+  assert.deepEqual(result, { recipe: { title: "Toast" }, sources: [] });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.groq.com/openai/v1/chat/completions");
+  assert.equal(calls[0].headers.get("authorization"), "Bearer gsk-test");
+  assert.equal(calls[0].body.model, "llama-3.3-70b-versatile");
+  assert.match(JSON.stringify(calls[0].body.messages), /Use an empty sources array/);
+});
+
+test("generateViaPiAi reaches a keyless custom server at its own base URL", async () => {
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(String(url));
+    return chatCompletionStream(RECIPE_REPLY);
+  };
+  const result = await generateViaPiAi(
+    { provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1", apiKey: "", model: "llama3", prompt: "Toast", systemPrompt: "Cook." },
+    "low",
+    piAiModels(),
+    fetchImpl,
+  );
+  assert.equal(result.recipe.title, "Toast");
+  assert.deepEqual(urls, ["http://ollama:11434/v1/chat/completions"]);
+});
+
+test("generateViaPiAi requires a model, and a key for built-in providers", async () => {
+  await assert.rejects(
+    generateViaPiAi({ provider: "groq", apiKey: "k", model: "", prompt: "p", systemPrompt: "s" }, "low"),
+    (error) => error.code === "configuration",
+  );
+  await assert.rejects(
+    generateViaPiAi({ provider: "groq", apiKey: "", model: "m", prompt: "p", systemPrompt: "s" }, "low"),
+    (error) => error.code === "configuration",
+  );
+});
+
+test("generateViaPiAi maps a provider error to a retryable WorkerError", async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503, headers: { "Content-Type": "application/json" } });
+  await assert.rejects(
+    generateViaPiAi({ provider: "groq", apiKey: "k", model: "llama-3.3-70b-versatile", prompt: "p", systemPrompt: "s" }, "low", piAiModels(), fetchImpl),
+    (error) => error instanceof WorkerError && error.code === "worker" && error.retryable,
+  );
+});
+
+test("listEndpointModels reads a built-in provider's catalogue without a request", async () => {
+  const fetchImpl = async () => { throw new Error("no network expected"); };
+  const models = await listEndpointModels({ provider: "groq", apiKey: "k" }, fetchImpl);
+  assert.ok(models.includes("llama-3.3-70b-versatile"));
+});
+
+test("listEndpointModels lists a keyless custom server without an Authorization header", async () => {
+  let headers;
+  const fetchImpl = async (url, init) => {
+    headers = init.headers;
+    return new Response(JSON.stringify({ data: [{ id: "llama3" }] }), { status: 200 });
+  };
+  const models = await listEndpointModels({ provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1" }, fetchImpl);
+  assert.deepEqual(models, ["llama3"]);
+  assert.equal(headers.Authorization, undefined);
 });

@@ -1,7 +1,8 @@
 use crate::ai::{
-    SearchMode, apply_draft, cancel_draft, dedupe_sources, draft_page, draft_thumbnail,
-    import_recipe, normalize_generated, parse_pi_response, recipe_schema, retry_guidance,
-    strip_markdown_links, system_recipe_prompt, validate_generated,
+    DebugCardRow, DebugUrlState, SearchMode, apply_draft, cancel_draft, dedupe_sources, draft_page,
+    draft_thumbnail, generate_recipe, import_recipe, import_sources, normalize_generated,
+    parse_pi_response, recipe_schema, retry_guidance, social_video_in_prompt, strip_markdown_links,
+    system_recipe_prompt, validate_generated,
 };
 use crate::auth::setup_create;
 use crate::media::MediaChannels;
@@ -11,7 +12,7 @@ use crate::recipes::{
 };
 use crate::{
     AppError, AppState, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient,
-    IngredientUse, MediaImportForm, SetupForm, Source, ThumbnailPickForm, stamp,
+    IngredientUse, MediaImportForm, PromptForm, SetupForm, Source, ThumbnailPickForm, stamp,
 };
 use axum::{
     Form,
@@ -310,7 +311,7 @@ async fn import_requires_a_ticked_evidence_source() {
     .unwrap();
     let body = response_body(response).await;
     assert!(
-        body.contains("Tick at least one evidence source"),
+        body.contains("Tick at least one source"),
         "expected the all-sources-unticked error, got: {body}"
     );
     // The failed submission keeps the pasted URL and the (unticked) boxes.
@@ -331,10 +332,119 @@ async fn import_requires_a_ticked_evidence_source() {
         .unwrap();
         let body = response_body(response).await;
         assert!(
-            !body.contains("Tick at least one evidence source"),
+            !body.contains("Tick at least one source"),
             "single ticked source must be accepted"
         );
     }
+}
+
+#[test]
+fn a_reel_link_in_a_research_prompt_becomes_an_import() {
+    assert_eq!(
+        social_video_in_prompt("make it vegan https://www.instagram.com/reel/AbC123/, please"),
+        Some((
+            "https://www.instagram.com/reel/AbC123/".into(),
+            "make it vegan please".into()
+        ))
+    );
+    assert_eq!(
+        social_video_in_prompt("https://www.facebook.com/reel/42"),
+        Some(("https://www.facebook.com/reel/42".into(), String::new()))
+    );
+    // Ordinary recipe links, two links, or no link stay research prompts.
+    assert_eq!(
+        social_video_in_prompt("https://example.com/miso-pasta"),
+        None
+    );
+    assert_eq!(
+        social_video_in_prompt(
+            "https://www.instagram.com/reel/AbC123/ https://example.com/miso-pasta"
+        ),
+        None
+    );
+    assert_eq!(social_video_in_prompt("spicy miso mushroom pasta"), None);
+}
+
+#[tokio::test]
+async fn research_form_sends_a_reel_link_to_the_video_import() {
+    let state = state(database().await);
+    let response = generate_recipe(
+        State(state),
+        AuthUser { id: "u1".into() },
+        Form(PromptForm {
+            prompt: "serves four https://www.instagram.com/reel/AbC123/".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    let body = response_body(response).await;
+    // No video cleaner is connected in tests, so the import stops on the
+    // video tab with the link and the remaining text kept.
+    assert!(body.contains(r#"id="add-video-panel" class="add-recipe-panel" data-add-panel="video" role="tabpanel" aria-labelledby="add-mode-video">"#));
+    assert!(body.contains(r#"value="https://www.instagram.com/reel/AbC123/""#));
+    assert!(body.contains(">serves four</textarea>"));
+}
+
+#[test]
+fn import_sources_word_each_lane_for_the_reader() {
+    let channels = MediaChannels {
+        description: true,
+        audio: true,
+        ocr: false,
+    };
+    let mut lane = DebugUrlState::default();
+    let words = |state: &DebugUrlState, stopped| {
+        import_sources(state, channels, stopped)
+            .into_iter()
+            .map(|source| (source.state, source.detail))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        words(&lane, false),
+        [
+            ("waiting", "Reading…".to_string()),
+            ("waiting", "Listening…".to_string()),
+            ("skipped", "Skipped".to_string()),
+        ]
+    );
+
+    lane.description = "Two eggs, one pan".into();
+    lane.description_read = true;
+    lane.audio_read = true;
+    assert_eq!(
+        words(&lane, false)[..2],
+        [
+            ("found", "4 words".to_string()),
+            ("none", "No speech".to_string()),
+        ]
+    );
+
+    // A stopped run never leaves a lane waiting.
+    let stalled = DebugUrlState::default();
+    assert_eq!(words(&stalled, true)[1], ("none", "Not read".to_string()));
+
+    let mut ocr = DebugUrlState {
+        ocr_read: true,
+        ..DebugUrlState::default()
+    };
+    ocr.cards = vec![
+        DebugCardRow {
+            seconds: 1,
+            text: "200g pasta".into(),
+            kept: true,
+        },
+        DebugCardRow {
+            seconds: 3,
+            text: "follow me".into(),
+            kept: false,
+        },
+    ];
+    let all = MediaChannels::default();
+    let sources = import_sources(&ocr, all, false);
+    assert_eq!(
+        (sources[2].state, sources[2].detail.as_str()),
+        ("found", "1 card")
+    );
 }
 
 async fn insert_draft(
@@ -477,7 +587,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
         1,
         "only step 2 has a moment"
     );
-    assert!(preview.contains("0:06 · Matched to the narration"));
+    assert!(preview.contains(r#"title="Matched to the narration">0:06 in the video"#));
     // An audio moment shows stills spread over its 12 s window.
     for seconds in [8, 12, 16] {
         assert!(preview.contains(&format!("/ai/drafts/tm1/stills/{seconds}\"")));
@@ -540,7 +650,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
     .await
     .unwrap()
     .0;
-    assert!(page.contains("0:06 · Matched to the narration"));
+    assert!(page.contains(r#"title="Matched to the narration">0:06 in the video"#));
     assert!(page.contains(&format!("/recipes/{recipe_id}/stills/12\"")));
 
     let still = recipe_still(

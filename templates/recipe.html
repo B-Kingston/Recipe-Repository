@@ -1,4 +1,6 @@
 {% extends "base.html" %}{% block title %}{{ recipe.title }} · Recipe Repository{% endblock %}{% block content %}
+<div class="recipe-layout{% if versions.len() > 0 %} has-versions{% endif %}">
+<div class="recipe-main">
 <header class="page-header">
   <div class="page-header-copy">
     <p class="breadcrumb"><a href="/">Library</a> / Recipe card</p>
@@ -13,7 +15,7 @@
       <div class="actions page-actions">
         <a class="button primary" href="/recipes/{{ recipe.id }}/ai/alter">Alter with AI</a>
         <a class="button" href="/recipes/{{ recipe.id }}?edit_meta=1#recipe-details">Edit</a>
-        {% if versions.len() > 0 %}<a class="button" href="#version-history">Version history</a>{% endif %}
+        {% if versions.len() > 0 %}<a class="button versions-jump" href="#version-history">Version history</a>{% endif %}
         <a class="button" href="/recipes/{{ recipe.id }}/delete">Delete</a>
       </div>
     </div>
@@ -30,8 +32,6 @@
   </div>
 </header>
 
-<div class="recipe-layout{% if versions.len() > 0 %} has-versions{% endif %}">
-<div class="recipe-main">
 <nav class="view-toggle" aria-label="Recipe view">
   <a class="button compact{% if !chart_view %} primary{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}">Standard</a>
   <a class="button compact{% if chart_view %} primary{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart">Chart</a>

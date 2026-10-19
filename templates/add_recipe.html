@@ -3,12 +3,12 @@
   <div class="form-intro">
     <p class="eyebrow">Cookbook / Add recipe</p>
     <h1>Add recipe</h1>
-    <p class="deck">Choose a starting point. Research an idea or turn a recipe video into a draft.</p>
+    <p class="deck">Research an idea or import a recipe video. You review every draft before it is saved.</p>
   </div>
 
   <div class="add-mode-switch" role="tablist" aria-label="Recipe source">
     <a id="add-mode-prompt" class="add-mode-tab{% if !video_mode %} is-active{% endif %}" href="/recipes/new" role="tab" aria-controls="add-prompt-panel" aria-selected="{% if !video_mode %}true{% else %}false{% endif %}" data-add-mode="prompt">Research a recipe</a>
-    <a id="add-mode-video" class="add-mode-tab{% if video_mode %} is-active{% endif %}" href="/recipes/new?mode=video" role="tab" aria-controls="add-video-panel" aria-selected="{% if video_mode %}true{% else %}false{% endif %}" data-add-mode="video">Generate from video</a>
+    <a id="add-mode-video" class="add-mode-tab{% if video_mode %} is-active{% endif %}" href="/recipes/new?mode=video" role="tab" aria-controls="add-video-panel" aria-selected="{% if video_mode %}true{% else %}false{% endif %}" data-add-mode="video">Import a video</a>
   </div>
 
   <div class="add-recipe-panels">
@@ -28,9 +28,9 @@
             <li>A known recipe — “Ottolenghi’s confit tandoori chickpeas”</li>
             <li>One or more recipe URLs to study and recreate</li>
             <li>Constraints, substitutions, equipment, or serving size</li>
+            <li>An Instagram or Facebook reel link: it is imported from the video</li>
           </ul>
         </div>
-        <p class="muted">The web and any links are researched first. You review the complete recipe before it is saved.</p>
         <p class="actions form-actions"><a class="button" href="/">Cancel</a><button class="primary" type="submit">Research &amp; generate</button></p>
       </form>
     </section>
@@ -38,37 +38,26 @@
     <section id="add-video-panel" class="add-recipe-panel" data-add-panel="video" role="tabpanel" aria-labelledby="add-mode-video"{% if !video_mode %} hidden{% endif %}>
       <div class="add-recipe-panel-heading">
         <p class="eyebrow">Recipe video import</p>
-        <h2>Generate from video</h2>
-        <p class="muted">Use a public Facebook Reel or Instagram post/reel. The server extracts the caption, spoken audio, and on-screen text before preparing a draft.</p>
+        <h2>Import a video</h2>
+        <p class="muted">Paste a public Instagram or Facebook reel. The recipe is read from the caption, what is said, and the text on screen.</p>
       </div>
       {% if video_error != "" %}<p class="error" role="alert">{{ video_error }}</p>{% endif %}
-      {% if gateway_configured %}
-      <p class="notice">The video cleaner is connected and ready.</p>
-      {% else %}
-      <p class="muted"><strong>The video cleaner is not connected yet.</strong> <a href="/settings">Connect it in Settings</a> before importing a video.</p>
-      {% endif %}
-      <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import" data-busy-label="Extracting…">
-        <label for="social-url">Facebook or Instagram URL<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/p/..." autocomplete="url"></label>
-        <p class="field-help">Supported public links include Facebook Reels and Instagram /p/, /reel/, and /tv/ posts. Private, login-only, or region-blocked posts may need a public link or a local downloader cookie file.</p>
-        <fieldset class="media-channels">
-          <legend>Evidence sources</legend>
-          <label class="check-row"><input type="checkbox" name="use_description"{% if use_description %} checked{% endif %}> Post caption / description<span class="field-help">The text the creator typed under the video. Fastest source; untick to skip the page fetch entirely.</span></label>
-          <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Spoken audio (transcript)<span class="field-help">Transcribes spoken ingredients and steps. Slowest stage; untick to skip audio extraction and transcription.</span></label>
-          <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text<span class="field-help">Reads ingredient cards and overlays from sampled video frames; untick to skip frame sampling and text reading.</span></label>
-          <p class="field-help">Unticked sources are not downloaded, transcribed, or sent to the cleaner. At least one source must stay ticked.</p>
-        </fieldset>
-        <label for="import-notes">Optional context<textarea id="import-notes" name="notes" maxlength="4000" placeholder="e.g. Keep it vegetarian; the creator says this serves four…">{{ notes }}</textarea></label>
-        <div class="prompt-help">
-          <p><strong>What gets combined:</strong></p>
-          <ul>
-            <li>The post caption or description</li>
-            <li>Spoken instructions and quantities from the audio transcript</li>
-            <li>Ingredient cards and other on-screen text read from the video frames</li>
-            <li>A recipe-only pass by the video cleaner that removes social chatter before final generation</li>
-          </ul>
-          <p class="muted">Only the ticked sources above are combined. The video is temporary and deleted after extraction. You review the complete recipe before saving it.</p>
-        </div>
-        <p class="actions form-actions"><a class="button" href="/">Cancel</a><button class="primary" type="submit">Extract &amp; prepare draft</button></p>
+      {% if !gateway_configured %}<p class="error">Video import needs the video cleaner. <a href="/settings">Connect it in Settings</a> first.</p>{% endif %}
+      <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import" data-busy-label="Starting…">
+        <label for="social-url">Reel or post link<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/reel/…" autocomplete="url"></label>
+        <label for="import-notes">Anything to change? <span class="field-help">Optional</span><textarea id="import-notes" class="short-textarea" name="notes" maxlength="4000" placeholder="e.g. make it vegetarian, it serves four…">{{ notes }}</textarea></label>
+        <details class="advanced-options"{% if !use_description || !use_audio || !use_ocr %} open{% endif %}>
+          <summary>Advanced options</summary>
+          <fieldset class="media-channels">
+            <legend>Read the recipe from</legend>
+            <label class="check-row"><input type="checkbox" name="use_description"{% if use_description %} checked{% endif %}> Caption<span class="field-help">The text under the post. Quickest.</span></label>
+            <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Speech<span class="field-help">A transcript of what is said. Slowest.</span></label>
+            <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text<span class="field-help">Ingredient cards and captions read from the frames.</span></label>
+            <p class="field-help">Unticked sources are not downloaded or read. Keep at least one.</p>
+          </fieldset>
+          <p class="field-help">Private, login-only, or region-blocked posts may not download. The video is processed on this server and deleted afterwards.</p>
+        </details>
+        <p class="actions form-actions"><a class="button" href="/">Cancel</a><button class="primary" type="submit">Import recipe</button></p>
       </form>
     </section>
   </div>

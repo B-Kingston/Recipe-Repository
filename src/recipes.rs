@@ -239,7 +239,7 @@ pub(crate) async fn new_recipe(
         guidance: generate_guidance(state.search_grounding).into(),
         prompt: String::new(),
         video_error: String::new(),
-        url: String::new(),
+        url: query.url.unwrap_or_default(),
         notes: String::new(),
         use_description: true,
         use_audio: true,
