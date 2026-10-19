@@ -1,5 +1,5 @@
 use crate::media::probe_video;
-use crate::thumbs::{MAX_THUMBNAILS, ThumbCandidate, extract_thumbnails};
+use crate::thumbs::{MAX_THUMBNAILS, ThumbCandidate, extract_thumbnails, order_by_dish_margin};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -45,6 +45,26 @@ fn scratch_dir() -> std::path::PathBuf {
     dir
 }
 
+fn unit(values: &[f32]) -> Vec<f32> {
+    let mut vector = values.to_vec();
+    crate::embeddings::normalize(&mut vector);
+    vector
+}
+
+/// A frame that looks like everything at once (high similarity to both the
+/// dish and the talking-head prompt) must lose to a frame that is clearly a
+/// dish, even though its raw dish similarity is higher.
+#[test]
+fn dish_margin_prefers_clear_dish_shots_over_generic_frames() {
+    let dish = vec![unit(&[1.0, 0.0, 0.0])];
+    let other = vec![unit(&[0.0, 1.0, 0.0])];
+    let generic = unit(&[0.8, 0.6, 0.0]);
+    let talking = unit(&[0.1, 0.9, 0.4]);
+    let plated = unit(&[0.7, 0.1, 0.7]);
+    let order = order_by_dish_margin(&[generic, talking, plated], &dish, &other);
+    assert_eq!(order, vec![2, 0, 1]);
+}
+
 /// End-to-end run over a real ffmpeg-encoded clip.
 #[test]
 fn real_video_yields_diverse_decodable_candidates() {
@@ -60,8 +80,17 @@ fn real_video_yields_diverse_decodable_candidates() {
     let deadline = Instant::now() + Duration::from_secs(120);
     let probe = probe_video(&video).expect("the fixture should probe");
     assert_eq!((probe.width, probe.height), (640, 360));
-    let candidates: Vec<ThumbCandidate> =
-        extract_thumbnails(&video, &probe, &dir, &[], Some(12), &mut warnings, deadline);
+    let candidates: Vec<ThumbCandidate> = extract_thumbnails(
+        &video,
+        &probe,
+        &dir,
+        &[],
+        Some(12),
+        "",
+        None,
+        &mut warnings,
+        deadline,
+    );
     assert!(!candidates.is_empty(), "no candidates: {warnings:?}");
     assert!(candidates.len() <= MAX_THUMBNAILS);
     for pair in candidates.windows(2) {
@@ -113,6 +142,8 @@ fn rotated_phone_video_is_cropped_in_display_orientation() {
         &dir,
         &[],
         Some(12),
+        "",
+        None,
         &mut warnings,
         deadline,
     );

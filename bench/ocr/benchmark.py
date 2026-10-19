@@ -259,6 +259,7 @@ def main() -> None:
             {
                 "model": paddle_result.get("model", "PP-OCRv6_small"),
                 "lang": paddle_result.get("lang", os.environ.get("MEDIA_OCR_LANG", "en")),
+                "gate": paddle_result.get("gate"),
             },
         ),
     }

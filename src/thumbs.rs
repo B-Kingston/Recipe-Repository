@@ -3,11 +3,17 @@
 //! While the downloaded video file still exists in the extraction work
 //! directory, this module runs one cheap ffmpeg pass that emits small RGB
 //! samples, scores every sample with pixel heuristics for "how much dish is
-//! visible", picks up to four diverse winners, and crops each winner into a
-//! square around the saliency centroid with one precise ffmpeg seek. No cloud
-//! service, model download, or new dependency is involved: ffmpeg is already
-//! a hard requirement of the media importer.
+//! visible", picks diverse winners, and crops each winner into a square
+//! around the saliency centroid with one precise ffmpeg seek.
+//!
+//! When the EmbeddingGemma 2 sidecar is configured, the heuristics nominate
+//! a wider pool of [`RANKING_POOL`] crops and the sidecar ranks them: each
+//! crop is compared with "finished plated dish" prompts and with prompts for
+//! the usual non-dish shots (a person talking, raw ingredients, text cards,
+//! utensils), and the crops with the largest dish margin win. Both paths run
+//! locally; the frames never leave the host.
 
+use crate::embeddings::{self, BlockingEmbedder, Input};
 use crate::media::{
     VideoProbe, create_private_dir, env_flag, env_path, remaining_timeout, run_tool,
 };
@@ -17,6 +23,17 @@ use tracing::{info, warn};
 
 /// Upper bound on offered choices; the best-scoring candidate is first.
 pub(crate) const MAX_THUMBNAILS: usize = 4;
+/// Heuristic nominees cropped for embedding-based ranking.
+const RANKING_POOL: usize = 12;
+/// Prompts for the dish margin, checked on cooking reels: finished plates
+/// scored highest, the cook talking to camera and caption cards lowest.
+const DISH_PROMPTS: [&str; 1] = ["a finished, plated dish of food ready to eat"];
+const NON_DISH_PROMPTS: [&str; 4] = [
+    "a person talking to the camera",
+    "raw ingredients and packaging on a kitchen counter",
+    "text and captions on a plain screen",
+    "an empty kitchen or cooking utensils",
+];
 
 /// Width of every analysed sample. Small enough that hundreds of samples
 /// stay trivially cheap, large enough for stable blur and colour statistics.
@@ -72,14 +89,19 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Extracts up to [`MAX_THUMBNAILS`] cropped dish-photo candidates from
-/// `video_path`. Failures degrade to an empty list plus a warning string; a
-/// missing thumbnail must never fail the recipe import itself.
+/// `video_path`, best first. `dish_hint` (a saved recipe's title; empty
+/// during an import) adds a dish-specific prompt when `embedder` ranks the
+/// crops. Failures degrade to an empty list plus a warning string; a missing
+/// thumbnail must never fail the recipe import itself.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_thumbnails(
     video_path: &Path,
     probe: &VideoProbe,
     workdir: &Path,
     ocr_seconds: &[u64],
     duration_hint: Option<u64>,
+    dish_hint: &str,
+    embedder: Option<&BlockingEmbedder>,
     warnings: &mut Vec<String>,
     deadline: Instant,
 ) -> Vec<ThumbCandidate> {
@@ -147,7 +169,12 @@ pub(crate) fn extract_thumbnails(
         .filter(|duration| *duration >= 1.0)
         .unwrap_or(span.max(4.0));
     let min_gap = (basis * 0.08).clamp(2.5, 20.0);
-    let picked = select_diverse(scored, MAX_THUMBNAILS, min_gap);
+    let nominees = if embedder.is_some() {
+        RANKING_POOL
+    } else {
+        MAX_THUMBNAILS
+    };
+    let picked = select_diverse(scored, nominees, min_gap);
     if picked.is_empty() {
         warnings.push("No suitable dish-photo frame was found.".into());
         return Vec::new();
@@ -204,14 +231,80 @@ pub(crate) fn extract_thumbnails(
         }
         let _ = std::fs::remove_file(&out_path);
     }
+    if let Some(embedder) = embedder
+        && candidates.len() > 1
+    {
+        match rank_by_dish_margin(&candidates, dish_hint, embedder) {
+            Ok(order) => {
+                let mut slots: Vec<Option<ThumbCandidate>> =
+                    candidates.into_iter().map(Some).collect();
+                candidates = order.into_iter().filter_map(|i| slots[i].take()).collect();
+            }
+            Err(error) => warnings.push(format!("Dish photos were not ranked: {error}")),
+        }
+    }
+    candidates.truncate(MAX_THUMBNAILS);
     let best = candidates.first().map(|candidate| candidate.score);
     info!(
         samples = frames,
         candidates = candidates.len(),
+        ranked = embedder.is_some(),
         best_score = best.unwrap_or(0.0),
         "Dish thumbnail candidates selected"
     );
     candidates
+}
+
+/// Embeds the crops and the prompts, and orders the crops by dish margin.
+fn rank_by_dish_margin(
+    candidates: &[ThumbCandidate],
+    dish_hint: &str,
+    embedder: &BlockingEmbedder,
+) -> Result<Vec<usize>, String> {
+    let mut dish: Vec<String> = DISH_PROMPTS.iter().map(|p| embeddings::query(p)).collect();
+    let hint = dish_hint.trim();
+    if !hint.is_empty() {
+        dish.push(embeddings::query(&format!(
+            "a finished plate of {}",
+            hint.chars().take(120).collect::<String>()
+        )));
+    }
+    let other: Vec<String> = NON_DISH_PROMPTS
+        .iter()
+        .map(|p| embeddings::query(p))
+        .collect();
+    let inputs: Vec<Input> = dish
+        .iter()
+        .chain(&other)
+        .map(|prompt| Input::Text(prompt.clone()))
+        .chain(candidates.iter().map(|c| Input::Image(c.jpeg.clone())))
+        .collect();
+    let vectors = embedder.embed(&inputs)?;
+    let (prompts, images) = vectors.split_at(dish.len() + other.len());
+    let (dish, other) = prompts.split_at(dish.len());
+    Ok(order_by_dish_margin(images, dish, other))
+}
+
+/// Image indices sorted by (best dish-prompt similarity minus best
+/// non-dish-prompt similarity), largest first; ties keep heuristic order.
+pub(crate) fn order_by_dish_margin(
+    images: &[Vec<f32>],
+    dish: &[Vec<f32>],
+    other: &[Vec<f32>],
+) -> Vec<usize> {
+    let best = |image: &[f32], prompts: &[Vec<f32>]| {
+        prompts
+            .iter()
+            .map(|prompt| embeddings::dot(image, prompt))
+            .fold(f32::MIN, f32::max)
+    };
+    let margins: Vec<f32> = images
+        .iter()
+        .map(|image| best(image, dish) - best(image, other))
+        .collect();
+    let mut order: Vec<usize> = (0..images.len()).collect();
+    order.sort_by(|&a, &b| margins[b].total_cmp(&margins[a]));
+    order
 }
 
 /// Per-sample raw measurements, before cross-video normalisation.

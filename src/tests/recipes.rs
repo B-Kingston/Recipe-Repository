@@ -49,6 +49,8 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
+        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
+        embedder: None,
     })
 }
 

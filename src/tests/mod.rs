@@ -3,6 +3,8 @@ mod auth;
 mod chart;
 mod config;
 mod media;
+mod moments;
 mod recipes;
+mod search;
 mod settings;
 mod thumbs;

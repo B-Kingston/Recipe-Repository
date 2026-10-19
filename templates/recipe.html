@@ -147,8 +147,17 @@
       {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
     </div>
     {% endif %}
+    {% match step.moment %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
   </div>
   {% endfor %}
+  {% if moments_pending %}
+  <p class="muted step-moments-note" data-moments-pending="{{ recipe.id }}">Finding step moments in the video… <a href="/recipes/{{ recipe.id }}">Check again</a></p>
+  {% else if can_find_moments %}
+  <form class="step-moments-note" method="post" action="/recipes/{{ recipe.id }}/moments/capture" data-busy-label="Starting…">
+    <p class="muted">This recipe has no video step moments yet.</p>
+    <button class="compact">Find step moments in the video</button>
+  </form>
+  {% endif %}
   <details class="add-block"{% if steps.is_empty() %} open{% endif %}>
     <summary>Add step</summary>
     <form class="add-form" method="post" action="/recipes/{{ recipe.id }}/blocks" data-busy-label="Adding…">
@@ -191,6 +200,7 @@
     <p class="eyebrow">Step {{ detail.step }}</p>
     <h3>{{ detail.text }}</h3>
     {% if detail.additions.len() > 0 %}<p class="chart-additions"><strong>Add:</strong>{% for item in detail.additions %} <span>{{ item }}</span>{% endfor %}</p>{% endif %}
+    {% match detail.moment %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
     {% if detail.timer_seconds > 0 %}<p class="chart-timer"><span data-timer-value>{{ detail.timer_seconds / 60 }}:{% if detail.timer_seconds % 60 < 10 %}0{% endif %}{{ detail.timer_seconds % 60 }}</span> timer</p>{% endif %}
     <p class="visually-hidden" aria-live="polite" data-timer-announce></p>
     <p class="chart-controls">

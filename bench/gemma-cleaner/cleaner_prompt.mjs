@@ -20,17 +20,27 @@ export function cleanerPrompt(evidence) {
   prompt += evidence.title.trim() === "" ? "[none]" : evidence.title.trim();
   prompt += "\n\nPOST DESCRIPTION (untrusted):\n";
   prompt += evidence.description.trim() === "" ? "[none]" : evidence.description.trim();
-  prompt += "\n\nSPOKEN AUDIO TRANSCRIPT (untrusted Whisper output):\n";
-  prompt += evidence.audio_transcript.trim() === "" ? "[none]" : evidence.audio_transcript.trim();
-  prompt += "\n\nON-SCREEN OCR (untrusted PaddleOCR output):\n";
-  if (evidence.ocr.length === 0) {
-    prompt += "[none]";
-  } else {
-    for (const snippet of evidence.ocr) {
-      prompt += `[${snippet.timestamp_seconds}s] ${snippet.text}\n`;
-    }
-  }
+  const timed = timedTranscript(evidence.audio_segments);
+  prompt += "\n\nSPOKEN AUDIO TRANSCRIPT (untrusted Whisper output";
+  prompt += timed === null ? "" : "; each [Ns] line starts N seconds into the video";
+  prompt += "):\n";
+  prompt +=
+    timed ?? (evidence.audio_transcript.trim() === "" ? "[none]" : evidence.audio_transcript.trim());
+  prompt +=
+    '\n\nON-SCREEN OCR (untrusted local OCR output; each [Ns] entry is one on-screen card first seen N seconds into the video, and " / " separates the lines of one card):\n';
+  prompt +=
+    evidence.ocr.length === 0
+      ? "[none]"
+      : evidence.ocr.map((snippet) => `[${snippet.timestamp_seconds}s] ${snippet.text}`).join("\n");
   return prompt;
+}
+
+/** One `[Ns] text` line per spoken segment, or null when there is none to show. */
+function timedTranscript(segments) {
+  const lines = (segments ?? [])
+    .filter((segment) => segment.text.trim() !== "")
+    .map((segment) => `[${Math.floor(Math.max(segment.start_seconds, 0))}s] ${segment.text.trim()}`);
+  return lines.length === 0 ? null : lines.join("\n");
 }
 
 // Baseline system prompt, before the rules in IMPROVED_SYSTEM_PROMPT were adopted.

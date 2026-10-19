@@ -227,6 +227,7 @@ pub(crate) fn build_chart(
         next_href: format!("/recipes/{}?view=chart&step={}", recipe.id, step + 2),
         has_previous: step > 0,
         has_next: step + 1 < flow.len(),
+        moment: steps[step].moment.clone(),
     });
     ChartView {
         cells,

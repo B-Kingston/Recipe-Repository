@@ -1,11 +1,13 @@
 use crate::chart::{build_chart, infer_step_ingredients};
+use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
+use crate::search::{self, Indexed, Outcome};
 use crate::thumbs::{self, ThumbCandidate};
 use crate::{
     AddRecipeQuery, AddRecipeTemplate, AppError, AppState, AuthUser, Block, BlockForm,
-    DeleteTemplate, Draft, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeSnapshot,
-    RecipeTemplate, Result, SnapshotIngredient, SnapshotStep, Source, VersionTemplate, ViewBlock,
-    ViewStep, display_timestamp, generate_guidance, number, option_number, render, required, stamp,
-    trim,
+    DeleteTemplate, Draft, HomeQuery, HomeTemplate, Recipe, RecipeForm, RecipeQuery,
+    RecipeSnapshot, RecipeTemplate, Result, SnapshotIngredient, SnapshotStep, Source,
+    VersionTemplate, ViewBlock, ViewStep, display_timestamp, generate_guidance, number,
+    option_number, render, required, stamp, trim,
 };
 use axum::{
     Form,
@@ -27,18 +29,52 @@ fn block_label(section: &str, action: &str) -> String {
     format!("{noun} {action}")
 }
 
+/// The library page. Without `?q=` it lists every recipe; with it, the
+/// recipes ranked by embedding similarity, or the full list plus a notice
+/// when the embedding service is missing or down.
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    Query(params): Query<HomeQuery>,
 ) -> Result<Html<String>> {
+    let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
+    let cards: Vec<LibraryCard> = sqlx::query_as(
+        "SELECT id,title,description,thumbnail_jpeg IS NOT NULL AS has_thumbnail
+         FROM recipes WHERE user_id=? ORDER BY updated_at DESC",
+    )
+    .bind(&user.id)
+    .fetch_all(&state.db)
+    .await?;
+    if query.is_empty() {
+        return render(HomeTemplate {
+            recipes: cards,
+            query,
+            results: false,
+            notice: String::new(),
+        });
+    }
+    let (recipes, results, notice) = match search::search(&state, &user.id, &query).await {
+        Outcome::Ranked { ids, indexing } => {
+            let mut by_id: HashMap<String, LibraryCard> = cards
+                .into_iter()
+                .map(|card| (card.id.clone(), card))
+                .collect();
+            let found = ids.iter().filter_map(|id| by_id.remove(id)).collect();
+            let notice = if indexing > 0 {
+                search::indexing_note(indexing)
+            } else {
+                String::new()
+            };
+            (found, true, notice)
+        }
+        Outcome::NotConfigured => (cards, false, search::NOT_CONFIGURED.to_owned()),
+        Outcome::Unavailable => (cards, false, search::UNAVAILABLE.to_owned()),
+    };
     render(HomeTemplate {
-        recipes: sqlx::query_as(
-            "SELECT id,title,description,thumbnail_jpeg IS NOT NULL AS has_thumbnail
-             FROM recipes WHERE user_id=? ORDER BY updated_at DESC",
-        )
-        .bind(&user.id)
-        .fetch_all(&state.db)
-        .await?,
+        recipes,
+        query,
+        results,
+        notice,
     })
 }
 
@@ -50,6 +86,135 @@ pub(crate) struct LibraryCard {
     pub(crate) title: String,
     pub(crate) description: String,
     pub(crate) has_thumbnail: bool,
+}
+
+/// A recipe with its blocks, loaded to build its search document.
+pub(crate) struct IndexSource {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) blocks: Vec<Block>,
+}
+
+#[derive(FromRow)]
+struct IndexSourceRow {
+    id: String,
+    title: String,
+    description: String,
+}
+
+#[derive(FromRow)]
+struct IndexBlockRow {
+    recipe_id: String,
+    #[sqlx(flatten)]
+    block: Block,
+}
+
+/// Every recipe of `user_id` (or of all users when `None`) with all its
+/// blocks, newest edit first. Two queries regardless of library size.
+pub(crate) async fn index_sources(
+    db: &SqlitePool,
+    user_id: Option<&str>,
+) -> Result<Vec<IndexSource>> {
+    let rows: Vec<IndexSourceRow> = sqlx::query_as(
+        "SELECT id,title,description FROM recipes
+         WHERE (? IS NULL OR user_id=?) ORDER BY updated_at DESC, id",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    let block_rows: Vec<IndexBlockRow> = sqlx::query_as(
+        "SELECT recipe_id,id,section,position,text,quantity,unit,optional FROM recipe_blocks
+         WHERE recipe_id IN (SELECT id FROM recipes WHERE (? IS NULL OR user_id=?))
+         ORDER BY recipe_id, section, position",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    let mut blocks: HashMap<String, Vec<Block>> = HashMap::new();
+    for row in block_rows {
+        blocks.entry(row.recipe_id).or_default().push(row.block);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| IndexSource {
+            blocks: blocks.remove(&row.id).unwrap_or_default(),
+            id: row.id,
+            title: row.title,
+            description: row.description,
+        })
+        .collect())
+}
+
+/// The embedded document stored for each recipe of `user_id` (or of all
+/// users when `None`), keyed by recipe id.
+pub(crate) async fn stored_documents(
+    db: &SqlitePool,
+    user_id: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.recipe_id, e.document FROM recipe_embeddings e
+         JOIN recipes r ON r.id = e.recipe_id WHERE (? IS NULL OR r.user_id=?)",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Stores (or replaces) a recipe's document vector. A recipe deleted since
+/// its document was built is skipped instead of failing the whole refresh.
+pub(crate) async fn store_embedding(
+    db: &SqlitePool,
+    recipe_id: &str,
+    document: &str,
+    vector: &[f32],
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO recipe_embeddings(recipe_id,document,vector,updated_at)
+         SELECT ?1,?2,?3,?4 WHERE EXISTS (SELECT 1 FROM recipes WHERE id=?1)
+         ON CONFLICT(recipe_id) DO UPDATE SET
+           document=excluded.document, vector=excluded.vector, updated_at=excluded.updated_at",
+    )
+    .bind(recipe_id)
+    .bind(document)
+    .bind(crate::embeddings::to_blob(vector))
+    .bind(stamp())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+#[derive(FromRow)]
+struct IndexedRow {
+    id: String,
+    title: String,
+    vector: Vec<u8>,
+}
+
+/// Id, title and vector of each of `user_id`'s indexed recipes; rows whose
+/// stored vector is not a full vector are skipped.
+pub(crate) async fn indexed_recipes(db: &SqlitePool, user_id: &str) -> Result<Vec<Indexed>> {
+    let rows: Vec<IndexedRow> = sqlx::query_as(
+        "SELECT r.id, r.title, e.vector FROM recipe_embeddings e
+         JOIN recipes r ON r.id = e.recipe_id WHERE r.user_id=?",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(Indexed {
+                vector: crate::embeddings::from_blob(&row.vector)?,
+                id: row.id,
+                title: row.title,
+            })
+        })
+        .collect())
 }
 
 /// Streams a recipe's chosen dish photo to its owning user only.
@@ -104,6 +269,25 @@ pub(crate) async fn recipe_page(
         .map(|block| ViewBlock::from_block(block, edit))
         .collect();
     let mut uses = step_ingredients_by_step(&state.db, &id).await?;
+    let recipe_sources = sources(&state.db, &user.id, &id).await?;
+    let video_url = social_source_url(&recipe_sources);
+    let moments_shown = video_url.is_some() && crate::step_moments_enabled(&state.db).await?;
+    let mut step_moments = if moments_shown {
+        recipe_step_moments(&state.db, &id).await?
+    } else {
+        HashMap::new()
+    };
+    let moments_pending = moments_shown && state.moment_jobs.lock().contains(&id);
+    let can_find_moments = moments_shown
+        && state.embedder.is_some()
+        && !moments_pending
+        && !recipe_has_moment_pool(&state.db, &id).await?;
+    let still_seconds = if step_moments.is_empty() {
+        Vec::new()
+    } else {
+        recipe_still_seconds(&state.db, &id).await?
+    };
+    let still_base = format!("/recipes/{id}/stills");
     let steps = step_blocks
         .into_iter()
         .map(|block| {
@@ -111,10 +295,14 @@ pub(crate) async fn recipe_page(
             if used.is_empty() {
                 used = infer_step_ingredients(&block.text, &ingredient_blocks);
             }
+            let moment = step_moments
+                .remove(&block.id)
+                .map(|moment| moments::view(&moment, &still_seconds, &still_base));
             ViewStep {
                 ingredients_text: used.join("\n"),
                 ingredients: used,
                 block: ViewBlock::from_block(block, edit),
+                moment,
             }
         })
         .collect::<Vec<_>>();
@@ -144,8 +332,7 @@ pub(crate) async fn recipe_page(
     } else {
         "idle"
     };
-    let recipe_sources = sources(&state.db, &user.id, &id).await?;
-    let can_pick_video_frames = thumbs::enabled() && social_source_url(&recipe_sources).is_some();
+    let can_pick_video_frames = thumbs::enabled() && video_url.is_some();
     let versions = recipe_versions(&state.db, &user.id, &id).await?;
     render(RecipeTemplate {
         servings_value: option_number(recipe.servings),
@@ -156,6 +343,8 @@ pub(crate) async fn recipe_page(
         steps,
         sources: recipe_sources,
         can_pick_video_frames,
+        moments_pending,
+        can_find_moments,
         chart,
         chart_view,
         edit_meta: query.edit_meta.is_some(),
@@ -456,6 +645,7 @@ pub(crate) async fn add_block(
     invalidate_chart(&mut tx, &id).await?;
     record_version(&mut tx, &user.id, &id, &block_label(section, "added")).await?;
     tx.commit().await?;
+    moments::spawn_recipe_refresh(&state, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -470,6 +660,7 @@ pub(crate) async fn update_block(
     let mut tx = state.db.begin().await?;
     save_block_edit(&mut tx, &user.id, &id, &block, &text, &form).await?;
     tx.commit().await?;
+    moments::spawn_recipe_refresh(&state, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -625,6 +816,7 @@ pub(crate) async fn move_block(
         }
     }
     tx.commit().await?;
+    moments::spawn_recipe_refresh(&state, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -655,6 +847,7 @@ pub(crate) async fn delete_block(
     )
     .await?;
     tx.commit().await?;
+    moments::spawn_recipe_refresh(&state, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -768,7 +961,7 @@ async fn invalidate_chart(
     Ok(())
 }
 
-async fn sources(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Source>> {
+pub(crate) async fn sources(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Source>> {
     Ok(sqlx::query_as(
         "SELECT s.id,s.recipe_id,s.position,s.title,s.url
          FROM recipe_sources s
@@ -1197,7 +1390,7 @@ pub(crate) async fn start_thumbnail_recompute(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    find_recipe(&state.db, &user.id, &id).await?;
+    let recipe = find_recipe(&state.db, &user.id, &id).await?;
     if !thumbs::enabled() {
         return Err(AppError::BadRequest(
             "Dish-photo frame picking is disabled on this server.".into(),
@@ -1215,14 +1408,492 @@ pub(crate) async fn start_thumbnail_recompute(
     let db = state.db.clone();
     let jobs = state.thumbnail_jobs.clone();
     let job_recipe_id = id.clone();
+    let embedder = state.embedder.clone();
     tokio::spawn(async move {
-        if let Ok(candidates) = crate::media::extract_fresh_thumbnail_candidates(&video_url).await {
+        if let Ok(candidates) =
+            crate::media::extract_fresh_thumbnail_candidates(&video_url, recipe.title, embedder)
+                .await
+        {
             let _ = store_recipe_thumbnails(&db, &job_recipe_id, &candidates).await;
         }
         // A failed or empty run simply returns the page to its idle state.
         jobs.lock().remove(&job_recipe_id);
     });
     Ok(redirect_recipe(&id))
+}
+
+/// Builds the step-moment pool of a recipe saved without one (a recipe from
+/// before video imports kept a pool). Runs in the background: it downloads
+/// the social video again, stores the pool, and matches the steps. The page
+/// shows a pending note until the run ends; a failed run logs a warning and
+/// returns the page to its idle state.
+pub(crate) async fn start_moment_capture(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    find_recipe(&state.db, &user.id, &id).await?;
+    let Some(embedder) = state.embedder.clone() else {
+        return Err(AppError::BadRequest(
+            "Video step moments need the embedding service (EMBEDDING_URL).".into(),
+        ));
+    };
+    if !crate::step_moments_enabled(&state.db).await? {
+        return Err(AppError::BadRequest(
+            "Video step moments are turned off in Settings.".into(),
+        ));
+    }
+    let recipe_sources = sources(&state.db, &user.id, &id).await?;
+    let video_url = social_source_url(&recipe_sources).ok_or_else(|| {
+        AppError::BadRequest(
+            "This recipe has no social-video source to find step moments in.".into(),
+        )
+    })?;
+    if !state.moment_jobs.lock().insert(id.clone()) {
+        return Ok(redirect_recipe(&id));
+    }
+    let job_state = state.clone();
+    let recipe_id = id.clone();
+    tokio::spawn(async move {
+        let outcome: Result<usize> = async {
+            let pool = crate::media::extract_fresh_moment_pool(&video_url, &embedder).await?;
+            if pool.vectors.is_empty() {
+                return Ok(0);
+            }
+            store_recipe_moment_pool(&job_state.db, &recipe_id, &pool).await?;
+            moments::refresh_recipe(&job_state, &recipe_id).await?;
+            Ok(pool.vectors.len())
+        }
+        .await;
+        match outcome {
+            Ok(0) => tracing::warn!(%recipe_id, "The video gave no step-moment vectors"),
+            Ok(vectors) => tracing::info!(%recipe_id, vectors, "Step moments captured"),
+            Err(error) => tracing::warn!(%recipe_id, %error, "Step moments were not captured"),
+        }
+        job_state.moment_jobs.lock().remove(&recipe_id);
+    });
+    Ok(redirect_recipe(&id))
+}
+
+// ---- Video step moments ----
+
+/// One stored moment vector row (draft or recipe scope).
+#[derive(FromRow)]
+struct MomentVectorRow {
+    kind: String,
+    seconds: f64,
+    vector: Vec<u8>,
+}
+
+fn moment_vectors(rows: Vec<MomentVectorRow>) -> Vec<MomentVector> {
+    rows.into_iter()
+        .filter_map(|row| {
+            Some(MomentVector {
+                kind: MomentKind::parse(&row.kind)?,
+                seconds: row.seconds,
+                vector: crate::embeddings::from_blob(&row.vector)?,
+            })
+        })
+        .collect()
+}
+
+/// Stores a video import's moment pool with its draft.
+pub(crate) async fn store_draft_moment_pool(
+    db: &SqlitePool,
+    draft_id: &str,
+    pool: &MomentPool,
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    for vector in &pool.vectors {
+        sqlx::query(
+            "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector)VALUES(?,?,?,?)",
+        )
+        .bind(draft_id)
+        .bind(vector.kind.as_str())
+        .bind(vector.seconds)
+        .bind(crate::embeddings::to_blob(&vector.vector))
+        .execute(&mut *tx)
+        .await?;
+    }
+    for still in &pool.stills {
+        sqlx::query(
+            "INSERT OR REPLACE INTO draft_moment_stills(draft_id,seconds,jpeg)VALUES(?,?,?)",
+        )
+        .bind(draft_id)
+        .bind(still.seconds as i64)
+        .bind(&still.jpeg)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Carries a draft's moment pool to the next draft of its alteration chain.
+pub(crate) async fn copy_draft_moment_pool(
+    db: &SqlitePool,
+    from_draft_id: &str,
+    to_draft_id: &str,
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector) SELECT ?,kind,seconds,vector FROM draft_moment_vectors WHERE draft_id=?")
+        .bind(to_draft_id)
+        .bind(from_draft_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT OR REPLACE INTO draft_moment_stills(draft_id,seconds,jpeg) SELECT ?,seconds,jpeg FROM draft_moment_stills WHERE draft_id=?")
+        .bind(to_draft_id)
+        .bind(from_draft_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The pool a draft's steps are matched against: the draft's own pool (a
+/// video import), else the pool of the recipe it alters.
+pub(crate) async fn draft_moment_vectors(
+    db: &SqlitePool,
+    draft_id: &str,
+    recipe_id: Option<&str>,
+) -> Result<Vec<MomentVector>> {
+    let rows: Vec<MomentVectorRow> = sqlx::query_as(
+        "SELECT kind,seconds,vector FROM draft_moment_vectors WHERE draft_id=? ORDER BY seconds",
+    )
+    .bind(draft_id)
+    .fetch_all(db)
+    .await?;
+    if !rows.is_empty() {
+        return Ok(moment_vectors(rows));
+    }
+    match recipe_id {
+        Some(recipe_id) => recipe_moment_vectors(db, recipe_id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+pub(crate) async fn recipe_moment_vectors(
+    db: &SqlitePool,
+    recipe_id: &str,
+) -> Result<Vec<MomentVector>> {
+    let rows: Vec<MomentVectorRow> = sqlx::query_as(
+        "SELECT kind,seconds,vector FROM recipe_moment_vectors WHERE recipe_id=? ORDER BY seconds",
+    )
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?;
+    Ok(moment_vectors(rows))
+}
+
+/// True when the recipe has a moment pool to match its steps against.
+pub(crate) async fn recipe_has_moment_pool(db: &SqlitePool, recipe_id: &str) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM recipe_moment_vectors WHERE recipe_id=?)")
+            .bind(recipe_id)
+            .fetch_one(db)
+            .await?,
+    )
+}
+
+/// Replaces a saved recipe's moment pool with a freshly captured one.
+pub(crate) async fn store_recipe_moment_pool(
+    db: &SqlitePool,
+    recipe_id: &str,
+    pool: &MomentPool,
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    for statement in [
+        "DELETE FROM recipe_moment_vectors WHERE recipe_id=?",
+        "DELETE FROM recipe_moment_stills WHERE recipe_id=?",
+    ] {
+        sqlx::query(statement)
+            .bind(recipe_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for vector in &pool.vectors {
+        sqlx::query(
+            "INSERT INTO recipe_moment_vectors(recipe_id,kind,seconds,vector)VALUES(?,?,?,?)",
+        )
+        .bind(recipe_id)
+        .bind(vector.kind.as_str())
+        .bind(vector.seconds)
+        .bind(crate::embeddings::to_blob(&vector.vector))
+        .execute(&mut *tx)
+        .await?;
+    }
+    for still in &pool.stills {
+        sqlx::query(
+            "INSERT OR REPLACE INTO recipe_moment_stills(recipe_id,seconds,jpeg)VALUES(?,?,?)",
+        )
+        .bind(recipe_id)
+        .bind(still.seconds as i64)
+        .bind(&still.jpeg)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replaces the matched moments of a draft's steps.
+pub(crate) async fn replace_draft_step_moments(
+    db: &SqlitePool,
+    draft_id: &str,
+    moments: &[StepMoment],
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("DELETE FROM draft_step_moments WHERE draft_id=?")
+        .bind(draft_id)
+        .execute(&mut *tx)
+        .await?;
+    for moment in moments {
+        sqlx::query(
+            "INSERT INTO draft_step_moments(draft_id,step_index,seconds,source)VALUES(?,?,?,?)",
+        )
+        .bind(draft_id)
+        .bind(moment.step_index as i64)
+        .bind(moment.seconds as i64)
+        .bind(moment.source.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn draft_step_moments(db: &SqlitePool, draft_id: &str) -> Result<Vec<StepMoment>> {
+    let rows: Vec<(i64, i64, String)> = sqlx::query_as(
+        "SELECT step_index,seconds,source FROM draft_step_moments WHERE draft_id=? ORDER BY step_index",
+    )
+    .bind(draft_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(step_index, seconds, source)| {
+            Some(StepMoment {
+                step_index: usize::try_from(step_index).ok()?,
+                seconds: u64::try_from(seconds).ok()?,
+                source: MomentKind::parse(&source)?,
+            })
+        })
+        .collect())
+}
+
+/// Seconds of the stills a draft can show: its own, else its recipe's.
+pub(crate) async fn draft_still_seconds(
+    db: &SqlitePool,
+    draft_id: &str,
+    recipe_id: Option<&str>,
+) -> Result<Vec<u64>> {
+    let own: Vec<i64> = sqlx::query_scalar(
+        "SELECT seconds FROM draft_moment_stills WHERE draft_id=? ORDER BY seconds",
+    )
+    .bind(draft_id)
+    .fetch_all(db)
+    .await?;
+    if !own.is_empty() {
+        return Ok(own.into_iter().map(|s| s.max(0) as u64).collect());
+    }
+    match recipe_id {
+        Some(recipe_id) => recipe_still_seconds(db, recipe_id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
+pub(crate) async fn recipe_still_seconds(db: &SqlitePool, recipe_id: &str) -> Result<Vec<u64>> {
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT seconds FROM recipe_moment_stills WHERE recipe_id=? ORDER BY seconds",
+    )
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|s| s.max(0) as u64).collect())
+}
+
+/// One still for a live draft of this user: from the draft's pool, else from
+/// the pool of the recipe the draft alters.
+pub(crate) async fn find_draft_still(
+    db: &SqlitePool,
+    user_id: &str,
+    draft_id: &str,
+    seconds: i64,
+) -> Result<Option<Vec<u8>>> {
+    let now = Utc::now().to_rfc3339();
+    let own: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT s.jpeg FROM draft_moment_stills s JOIN ai_drafts d ON d.id=s.draft_id
+         WHERE d.id=? AND d.user_id=? AND d.expires_at >= ? AND s.seconds=?",
+    )
+    .bind(draft_id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(seconds)
+    .fetch_optional(db)
+    .await?;
+    if own.is_some() {
+        return Ok(own);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT s.jpeg FROM recipe_moment_stills s JOIN ai_drafts d ON d.recipe_id=s.recipe_id
+         WHERE d.id=? AND d.user_id=? AND d.expires_at >= ? AND s.seconds=?",
+    )
+    .bind(draft_id)
+    .bind(user_id)
+    .bind(&now)
+    .bind(seconds)
+    .fetch_optional(db)
+    .await?)
+}
+
+pub(crate) async fn find_recipe_still(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    seconds: i64,
+) -> Result<Option<Vec<u8>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT s.jpeg FROM recipe_moment_stills s JOIN recipes r ON r.id=s.recipe_id
+         WHERE r.id=? AND r.user_id=? AND s.seconds=?",
+    )
+    .bind(recipe_id)
+    .bind(user_id)
+    .bind(seconds)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Inside `apply_draft`'s transaction: a video draft's pool replaces the
+/// recipe's pool, and each draft step moment is attached to the step block
+/// inserted for it (`step_ids[step_index]`).
+pub(crate) async fn apply_draft_moments(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    draft_id: &str,
+    recipe_id: &str,
+    step_ids: &[String],
+) -> Result<()> {
+    let has_pool: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM draft_moment_vectors WHERE draft_id=?) OR EXISTS(SELECT 1 FROM draft_moment_stills WHERE draft_id=?)")
+            .bind(draft_id)
+            .bind(draft_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if has_pool {
+        for statement in [
+            "DELETE FROM recipe_moment_vectors WHERE recipe_id=?",
+            "DELETE FROM recipe_moment_stills WHERE recipe_id=?",
+        ] {
+            sqlx::query(statement)
+                .bind(recipe_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        sqlx::query("INSERT INTO recipe_moment_vectors(recipe_id,kind,seconds,vector) SELECT ?,kind,seconds,vector FROM draft_moment_vectors WHERE draft_id=?")
+            .bind(recipe_id)
+            .bind(draft_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("INSERT INTO recipe_moment_stills(recipe_id,seconds,jpeg) SELECT ?,seconds,jpeg FROM draft_moment_stills WHERE draft_id=?")
+            .bind(recipe_id)
+            .bind(draft_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    let moments: Vec<(i64, i64, String)> =
+        sqlx::query_as("SELECT step_index,seconds,source FROM draft_step_moments WHERE draft_id=?")
+            .bind(draft_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    for (step_index, seconds, source) in moments {
+        let Some(step_id) = usize::try_from(step_index)
+            .ok()
+            .and_then(|i| step_ids.get(i))
+        else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT OR REPLACE INTO recipe_step_moments(step_id,seconds,source)VALUES(?,?,?)",
+        )
+        .bind(step_id)
+        .bind(seconds)
+        .bind(source)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The recipe's step blocks in order: `(block id, text)`.
+pub(crate) async fn recipe_step_texts(
+    db: &SqlitePool,
+    recipe_id: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id,text FROM recipe_blocks WHERE recipe_id=? AND section='step' ORDER BY position",
+    )
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Replaces the matched moments of every step of a recipe.
+pub(crate) async fn replace_recipe_step_moments(
+    db: &SqlitePool,
+    recipe_id: &str,
+    moments: &[(String, StepMoment)],
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("DELETE FROM recipe_step_moments WHERE step_id IN (SELECT id FROM recipe_blocks WHERE recipe_id=?)")
+        .bind(recipe_id)
+        .execute(&mut *tx)
+        .await?;
+    for (step_id, moment) in moments {
+        sqlx::query("INSERT INTO recipe_step_moments(step_id,seconds,source)VALUES(?,?,?)")
+            .bind(step_id)
+            .bind(moment.seconds as i64)
+            .bind(moment.source.as_str())
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Matched moments of a recipe's steps, keyed by step block id.
+pub(crate) async fn recipe_step_moments(
+    db: &SqlitePool,
+    recipe_id: &str,
+) -> Result<HashMap<String, StepMoment>> {
+    let rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT m.step_id,b.position,m.seconds,m.source FROM recipe_step_moments m
+         JOIN recipe_blocks b ON b.id=m.step_id WHERE b.recipe_id=?",
+    )
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(step_id, position, seconds, source)| {
+            let moment = StepMoment {
+                step_index: usize::try_from(position).ok()?,
+                seconds: u64::try_from(seconds).ok()?,
+                source: MomentKind::parse(&source)?,
+            };
+            Some((step_id, moment))
+        })
+        .collect())
+}
+
+/// Serves one still of a recipe's moment pool to its owner.
+pub(crate) async fn recipe_still(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, seconds)): Path<(String, i64)>,
+) -> Result<Response> {
+    let jpeg = find_recipe_still(&state.db, &user.id, &id, seconds)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(crate::image_response(jpeg))
 }
 
 #[cfg(test)]

@@ -98,6 +98,11 @@ export function parseRequest(input) {
   return request;
 }
 
+/** Whether a request targets a registered API endpoint rather than a subscription. */
+function isEndpointRequest(request) {
+  return request.provider === "openai" || request.provider === "anthropic";
+}
+
 /**
  * Reduce a provider's model catalogue to sorted, de-duplicated model ids,
  * newest first so the current generation (e.g. the 5.6 range) sits on top.
@@ -193,7 +198,7 @@ export function recipePrompt(systemPrompt, searchMode = "off") {
     return `${systemPrompt}\n\nThe native web_search tool is available but not required for this request. The material you are given comes from an imported social video and can be incomplete, garbled, or misleading; use web_search when it is needed to fill gaps or resolve contradictions, then list every source that materially informed the recipe.\n\n${output}`;
   }
   if (searchMode === "grounded") {
-    return `${systemPrompt}\n\nOpenAI's native web_search tool is enabled for this request. Research before preparing the recipe. Use only URLs cited by the native search response in sources; list every source that materially informed the recipe.\n\n${output}`;
+    return `${systemPrompt}\n\nThe native web_search tool is enabled for this request. Research before preparing the recipe. Use only URLs cited by the native search response in sources; list every source that materially informed the recipe.\n\n${output}`;
   }
   return `${systemPrompt}\n\n${output}\nUse an empty sources array.`;
 }
@@ -222,15 +227,18 @@ async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPO
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchImpl(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...headers,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    // No body means a GET, as used by model discovery.
+    const response = await fetchImpl(url, body === undefined
+      ? { method: "GET", headers, signal: controller.signal }
+      : {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       const status = Number(response.status);
@@ -432,43 +440,124 @@ export function parseResponsesOutput(data) {
 }
 
 const ANTHROPIC_VERSION = "2023-06-01";
-const ANTHROPIC_WEB_SEARCH_TOOL = "web_search_20250305";
-/** Thinking budget tokens per reasoning effort; max_tokens must exceed it.
- * Anthropic has no xhigh/max tiers, so those shared settings are capped at
- * its highest available budget rather than silently falling back to low. */
+/** The basic server-side web search tool. The dynamic-filtering versions
+ *  (web_search_20260209 and later) route results through code execution, which
+ *  Google Cloud, Azure-hosted Foundry and most proxies do not offer, and which
+ *  keeps results out of the web_search_tool_result blocks the sources are
+ *  verified against. */
+const ANTHROPIC_WEB_SEARCH_TOOL = { type: "web_search_20250305", name: "web_search" };
+/** A long server-side search turn stops with stop_reason "pause_turn"; the
+ *  paused content is sent back unchanged so the model can finish. */
+const ANTHROPIC_MAX_CONTINUATIONS = 5;
+/** Extended-thinking budgets for models before the 4.6 generation, which have
+ *  no adaptive thinking. They have no xhigh/max tiers, so those settings are
+ *  capped at the highest budget rather than silently falling back to low. */
 const ANTHROPIC_THINKING_BUDGETS = { low: 1024, medium: 4096, high: 8192, xhigh: 8192, max: 8192 };
 /** Output headroom added to the thinking budget for max_tokens. */
 const ANTHROPIC_OUTPUT_HEADROOM = 8192;
+/** max_tokens for adaptive-thinking models: a hard cap on thinking plus answer. */
+const ANTHROPIC_ADAPTIVE_MAX_TOKENS = 32_000;
+/** A 5-minute prompt-cache breakpoint. */
+const ANTHROPIC_CACHE_CONTROL = { type: "ephemeral" };
+const MODEL_LIST_TIMEOUT_MS = 30_000;
+const MODEL_LIST_MAX_PAGES = 20;
 
-export function thinkingBudget(reasoningEffort) {
-  return ANTHROPIC_THINKING_BUDGETS[normalizeEffort(reasoningEffort)];
+/** The Claude generation of a model id as { major, minor }, or null when the
+ *  id is not a recognisable Claude id (for example a proxy alias). Reads both
+ *  "claude-sonnet-5-5" / "claude-opus-4-5-20251101" and the older
+ *  "claude-3-7-sonnet-20250219" order, with or without a platform prefix. */
+export function claudeGeneration(modelId) {
+  const id = String(modelId ?? "").toLowerCase();
+  const match = id.match(/claude-[a-z]+-(\d+)(?:-(\d)(?=$|[-@.:]))?/) ?? id.match(/claude-(\d+)(?:-(\d))?-[a-z]/);
+  return match ? { major: Number(match[1]), minor: Number(match[2] ?? 0) } : null;
 }
 
-/** The Messages API path for a stored base URL: append /v1/messages, unless
- *  the base already ends in /v1, then append /messages. */
-export function anthropicUrl(baseUrl) {
+/** The thinking fields of a Messages API request. Claude 4.6 and later use
+ *  adaptive thinking steered by output_config.effort; manual budget_tokens is
+ *  rejected from Opus 4.7 on. Earlier models keep effort-scaled budgets. An
+ *  unrecognised id is treated as current. The 4.6 models have no xhigh effort,
+ *  so xhigh runs as max there. */
+export function anthropicThinking(modelId, reasoningEffort) {
+  const effort = normalizeEffort(reasoningEffort);
+  const generation = claudeGeneration(modelId);
+  const adaptive = !generation || generation.major > 4 || (generation.major === 4 && generation.minor >= 6);
+  if (adaptive) {
+    const noXhigh = generation?.major === 4 && generation.minor === 6;
+    return {
+      max_tokens: ANTHROPIC_ADAPTIVE_MAX_TOKENS,
+      thinking: { type: "adaptive" },
+      output_config: { effort: effort === "xhigh" && noXhigh ? "max" : effort },
+    };
+  }
+  const budget = ANTHROPIC_THINKING_BUDGETS[effort];
+  return {
+    max_tokens: budget + ANTHROPIC_OUTPUT_HEADROOM,
+    thinking: { type: "enabled", budget_tokens: budget },
+  };
+}
+
+/** A Messages API URL for a stored base URL: append /v1/<path>, unless the
+ *  base already ends in /v1, then append /<path>. */
+export function anthropicUrl(baseUrl, path = "messages") {
   const base = baseUrl.replace(/\/+$/, "");
-  return /\/v1$/i.test(base) ? `${base}/messages` : `${base}/v1/messages`;
+  return /\/v1$/i.test(base) ? `${base}/${path}` : `${base}/v1/${path}`;
 }
 
-/** POST {base}/v1/messages with x-api-key auth. Extended thinking is always
- *  enabled with an effort-scaled budget; the web_search tool is attached unless
- *  searchMode is "off". max_tokens covers the budget plus output headroom.
- *  Returns the parsed JSON body with the same error mapping as openaiResponse. */
+function anthropicHeaders(apiKey) {
+  return { "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION };
+}
+
+/** POST {base}/v1/messages with x-api-key auth and returns the parsed body,
+ *  with the same error mapping as openaiResponse. The system prompt carries a
+ *  prompt-cache breakpoint: it is identical for every recipe, so tools and
+ *  system are read from the cache on later calls, including the host's retry
+ *  and pause_turn continuations. A block-level breakpoint is used rather than
+ *  the top-level automatic one because some Anthropic-spec hosts reject a
+ *  top-level cache_control. */
 export async function anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort = "low", searchMode = "off", fetchImpl = fetch) {
-  const budget = thinkingBudget(reasoningEffort);
   const body = {
     model: modelId,
-    max_tokens: budget + ANTHROPIC_OUTPUT_HEADROOM,
-    system: systemPrompt,
+    ...anthropicThinking(modelId, reasoningEffort),
+    system: [{ type: "text", text: systemPrompt, cache_control: ANTHROPIC_CACHE_CONTROL }],
     messages,
-    thinking: { type: "enabled", budget_tokens: budget },
-    ...(searchMode !== "off" ? { tools: [{ type: ANTHROPIC_WEB_SEARCH_TOOL }] } : {}),
+    ...(searchMode !== "off" ? { tools: [ANTHROPIC_WEB_SEARCH_TOOL] } : {}),
   };
-  return fetchJson(anthropicUrl(apiBaseUrl), {
-    "x-api-key": apiKey,
-    "anthropic-version": ANTHROPIC_VERSION,
-  }, body, fetchImpl);
+  return fetchJson(anthropicUrl(apiBaseUrl), anthropicHeaders(apiKey), body, fetchImpl);
+}
+
+/** Runs one Messages API turn to completion. A "pause_turn" stop is continued
+ *  by sending the paused assistant content back unchanged; the content of all
+ *  calls is returned in order, with the final stop_reason. Cache usage goes to
+ *  stderr, which the host logs. */
+export async function anthropicTurn(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, reasoningEffort = "low", searchMode = "off", fetchImpl = fetch) {
+  const assistant = { role: "assistant", content: [] };
+  const messages = [{ role: "user", content: prompt }];
+  for (let call = 0; ; call += 1) {
+    const data = await anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort, searchMode, fetchImpl);
+    logAnthropicUsage(modelId, call, data?.usage);
+    const content = Array.isArray(data?.content) ? data.content : [];
+    assistant.content.push(...content);
+    if (data?.stop_reason !== "pause_turn") {
+      return { content: assistant.content, stop_reason: data?.stop_reason };
+    }
+    if (call === ANTHROPIC_MAX_CONTINUATIONS) {
+      throw new WorkerError("worker", "Anthropic web search did not finish its turn.", { retryable: true });
+    }
+    if (messages.length === 1) messages.push(assistant);
+  }
+}
+
+function logAnthropicUsage(model, call, usage) {
+  if (!usage || typeof usage !== "object") return;
+  console.error(JSON.stringify({
+    event: "anthropicUsage",
+    model,
+    call,
+    inputTokens: usage.input_tokens ?? 0,
+    cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+    cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+    outputTokens: usage.output_tokens ?? 0,
+  }));
 }
 
 /** Reduces a Messages API body to what the worker needs. Web search results
@@ -500,6 +589,46 @@ export function parseAnthropicOutput(data) {
   return { text: texts.join(""), searched, refused: data?.stop_reason === "refusal", citations };
 }
 
+/** Model ids an API endpoint serves, from its models list. Anthropic-spec
+ *  lists are paginated and already newest first; OpenAI-spec lists are sorted
+ *  newest first by their created timestamp. */
+export async function listEndpointModels(request, fetchImpl = fetch) {
+  const apiBaseUrl = nonBlank(request.apiBaseUrl);
+  const apiKey = nonBlank(request.apiKey);
+  if (!apiBaseUrl || !apiKey) {
+    throw new WorkerError("input", "Missing apiBaseUrl or apiKey for model discovery.");
+  }
+  if (request.provider === "anthropic") {
+    const models = [];
+    let afterId;
+    for (let page = 0; page < MODEL_LIST_MAX_PAGES; page += 1) {
+      const url = new URL(anthropicUrl(apiBaseUrl, "models"));
+      url.searchParams.set("limit", "1000");
+      if (afterId) url.searchParams.set("after_id", afterId);
+      const body = await fetchJson(url.toString(), anthropicHeaders(apiKey), undefined, fetchImpl, MODEL_LIST_TIMEOUT_MS);
+      if (Array.isArray(body?.data)) models.push(...body.data);
+      afterId = body?.has_more === true && typeof body.last_id === "string" ? body.last_id : undefined;
+      if (!afterId) break;
+    }
+    return uniqueModelIds(models);
+  }
+  const body = await fetchJson(
+    `${apiBaseUrl.replace(/\/+$/, "")}/models`,
+    { Authorization: `Bearer ${apiKey}` },
+    undefined,
+    fetchImpl,
+    MODEL_LIST_TIMEOUT_MS,
+  );
+  const models = Array.isArray(body?.data) ? [...body.data] : [];
+  const created = (model) => (typeof model?.created === "number" ? model.created : 0);
+  models.sort((a, b) => created(b) - created(a) || String(a?.id).localeCompare(String(b?.id)));
+  return uniqueModelIds(models);
+}
+
+function uniqueModelIds(models) {
+  return [...new Set(models.map((model) => model?.id).filter((id) => typeof id === "string" && id.trim() !== ""))];
+}
+
 /** Checks a generated recipe against the search posture and returns it with
  * its verified sources. `citations` maps URL to title from the provider. */
 function finishRecipe({ label, text, citations, searched, searchMode, acceptUnverifiable }) {
@@ -515,13 +644,19 @@ function finishRecipe({ label, text, citations, searched, searchMode, acceptUnve
 }
 
 /**
- * Refreshes the subscription provider's catalogue from pi.dev (the same source
- * `pi update --models` uses) and returns the current model ids, newest first.
- * The refresh is credential-gated: the host materialises the database-backed
- * OAuth credential at `authPath`; an expired token is refreshed in place in
- * that file, so the host reads it back to persist the refresh.
+ * Returns the current model ids, newest first. An API endpoint request
+ * (provider "openai" or "anthropic") reads the endpoint's own models list.
+ * A subscription request refreshes the provider's catalogue from pi.dev (the
+ * same source `pi update --models` uses). That refresh is credential-gated:
+ * the host materialises the database-backed OAuth credential at `authPath`;
+ * an expired token is refreshed in place in that file, so the host reads it
+ * back to persist the refresh.
  */
 async function listModels(request) {
+  if (isEndpointRequest(request)) {
+    outputJson({ models: await listEndpointModels(request) });
+    return;
+  }
   const subscription = subscriptionOf(request);
   const modelRuntime = await subscriptionRuntime(request);
   await modelRuntime.refresh({ allowNetwork: true, force: true, signal: AbortSignal.timeout(20_000) });
@@ -565,15 +700,7 @@ async function generateViaEndpoint(request, searchMode, reasoningEffort) {
   const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
   const acceptUnverifiable = searchMode === "gapfill";
   if (request.provider === "anthropic") {
-    const data = await anthropicMessages(
-      apiBaseUrl,
-      apiKey,
-      model,
-      systemPrompt,
-      [{ role: "user", content: request.prompt }],
-      reasoningEffort,
-      searchMode,
-    );
+    const data = await anthropicTurn(apiBaseUrl, apiKey, model, systemPrompt, request.prompt, reasoningEffort, searchMode);
     if (data.stop_reason === "max_tokens") {
       throw new WorkerError("worker", "Anthropic response was truncated by max_tokens.");
     }
@@ -631,8 +758,7 @@ async function main() {
   if (request.command === "cleanMedia") return cleanMedia(request);
   const searchMode = searchModeOf(request);
   const reasoningEffort = normalizeEffort(request.reasoningEffort);
-  const endpoint = request.provider === "openai" || request.provider === "anthropic";
-  outputJson(endpoint
+  outputJson(isEndpointRequest(request)
     ? await generateViaEndpoint(request, searchMode, reasoningEffort)
     : await generateViaSubscription(request, searchMode, reasoningEffort));
 }

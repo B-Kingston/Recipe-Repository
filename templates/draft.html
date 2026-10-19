@@ -65,6 +65,7 @@
       {% if step.ingredients.len() > 0 %}
       <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}"><span class="step-ingredients-label">Add</span>{% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}</div>
       {% endif %}
+      {% match step_moments[loop.index0] %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
     </div>
     {% endfor %}
   </section>

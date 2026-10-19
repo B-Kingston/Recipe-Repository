@@ -89,6 +89,7 @@ fn chart_layout_merges_steps() {
         },
         ingredients: vec![],
         ingredients_text: String::new(),
+        moment: None,
     };
     let chart = build_chart(
         &recipe,

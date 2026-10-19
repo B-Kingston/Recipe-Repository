@@ -4,7 +4,10 @@ import {
   WorkerError,
   aiGatewayChatCompletion,
   anthropicMessages,
+  anthropicThinking,
+  anthropicTurn,
   anthropicUrl,
+  claudeGeneration,
   catalogModelIds,
   completionContext,
   formatRecipeEvidence,
@@ -17,7 +20,7 @@ import {
   recipePrompt,
   searchModeOf,
   subscriptionOf,
-  thinkingBudget,
+  listEndpointModels,
   verifiedSources,
 } from "./recipe-worker.mjs";
 
@@ -285,14 +288,15 @@ test("formatRecipeEvidence rejects cleaner output without ingredients or steps",
   });
 });
 
-test("anthropicUrl maps base URLs to the Messages endpoint", () => {
+test("anthropicUrl maps base URLs to the Messages API paths", () => {
   assert.equal(anthropicUrl("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
   assert.equal(anthropicUrl("https://api.anthropic.com/"), "https://api.anthropic.com/v1/messages");
   assert.equal(anthropicUrl("https://api.anthropic.com/v1"), "https://api.anthropic.com/v1/messages");
   assert.equal(anthropicUrl("https://proxy.example.com/anthropic/v1/"), "https://proxy.example.com/anthropic/v1/messages");
+  assert.equal(anthropicUrl("https://api.anthropic.com", "models"), "https://api.anthropic.com/v1/models");
 });
 
-test("anthropicMessages posts to /v1/messages with x-api-key auth", async () => {
+test("anthropicMessages posts to /v1/messages with a cached system prompt and a named web_search tool", async () => {
   let capturedUrl;
   let capturedInit;
   const fetchImpl = async (url, init) => {
@@ -303,7 +307,7 @@ test("anthropicMessages posts to /v1/messages with x-api-key auth", async () => 
   const body = await anthropicMessages(
     "https://api.anthropic.com",
     "sk-ant-test",
-    "claude-sonnet-4-5",
+    "claude-sonnet-5-5",
     "sys",
     [{ role: "user", content: "prompt" }],
     "medium",
@@ -316,37 +320,113 @@ test("anthropicMessages posts to /v1/messages with x-api-key auth", async () => 
   assert.equal(capturedInit.headers["x-api-key"], "sk-ant-test");
   assert.equal(capturedInit.headers["anthropic-version"], "2023-06-01");
   const sent = JSON.parse(capturedInit.body);
-  assert.equal(sent.model, "claude-sonnet-4-5");
-  assert.equal(sent.system, "sys");
+  assert.equal(sent.model, "claude-sonnet-5-5");
+  assert.deepEqual(sent.system, [{ type: "text", text: "sys", cache_control: { type: "ephemeral" } }]);
+  assert.ok(!("cache_control" in sent));
   assert.deepEqual(sent.messages, [{ role: "user", content: "prompt" }]);
-  assert.deepEqual(sent.tools, [{ type: "web_search_20250305" }]);
+  assert.deepEqual(sent.tools, [{ type: "web_search_20250305", name: "web_search" }]);
+  assert.deepEqual(sent.thinking, { type: "adaptive" });
+  assert.deepEqual(sent.output_config, { effort: "medium" });
   assert.deepEqual(body, { type: "message", content: [] });
 });
 
-test("anthropicMessages scales the thinking budget with effort and covers it in max_tokens", async () => {
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
-    capturedInit = init;
-    return { ok: true, json: async () => ({}) };
-  };
-  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "low", "off", fetchImpl);
-  let sent = JSON.parse(capturedInit.body);
-  assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 1024 });
-  assert.equal(sent.max_tokens, 1024 + 8192);
-  await anthropicMessages("https://api.anthropic.com", "k", "m", "s", [{ role: "user", content: "p" }], "max", "off", fetchImpl);
-  sent = JSON.parse(capturedInit.body);
-  assert.deepEqual(sent.thinking, { type: "enabled", budget_tokens: 8192 });
-  assert.equal(sent.max_tokens, 8192 + 8192);
-  assert.ok(!("tools" in sent));
+test("claudeGeneration reads both model id orders and platform prefixes", () => {
+  assert.deepEqual(claudeGeneration("claude-sonnet-5-5"), { major: 5, minor: 5 });
+  assert.deepEqual(claudeGeneration("claude-opus-4-5-20251101"), { major: 4, minor: 5 });
+  assert.deepEqual(claudeGeneration("claude-opus-4-20250514"), { major: 4, minor: 0 });
+  assert.deepEqual(claudeGeneration("claude-3-7-sonnet-20250219"), { major: 3, minor: 7 });
+  assert.deepEqual(claudeGeneration("anthropic.claude-sonnet-4-6"), { major: 4, minor: 6 });
+  assert.equal(claudeGeneration("my-proxy-alias"), null);
 });
 
-test("thinkingBudget maps each effort to its budget and treats blank as low", () => {
-  assert.equal(thinkingBudget(undefined), 1024);
-  assert.equal(thinkingBudget(""), 1024);
-  assert.equal(thinkingBudget("medium"), 4096);
-  assert.equal(thinkingBudget("high"), 8192);
-  assert.equal(thinkingBudget("xhigh"), 8192);
-  assert.equal(thinkingBudget("max"), 8192);
+test("anthropicThinking uses adaptive effort from 4.6 on and budgets before it", () => {
+  assert.deepEqual(anthropicThinking("claude-opus-5-5", "xhigh"), {
+    max_tokens: 32_000,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "xhigh" },
+  });
+  // The 4.6 models have no xhigh effort.
+  assert.deepEqual(anthropicThinking("claude-sonnet-4-6", "xhigh").output_config, { effort: "max" });
+  // An unrecognised id is treated as a current model.
+  assert.deepEqual(anthropicThinking("proxy-model", "").output_config, { effort: "low" });
+  assert.deepEqual(anthropicThinking("claude-haiku-4-5", "low"), {
+    max_tokens: 1024 + 8192,
+    thinking: { type: "enabled", budget_tokens: 1024 },
+  });
+  assert.deepEqual(anthropicThinking("claude-sonnet-4-5-20250929", "max").thinking, { type: "enabled", budget_tokens: 8192 });
+});
+
+test("anthropicTurn continues a pause_turn with the paused content and joins all content", async () => {
+  const sent = [];
+  const replies = [
+    { stop_reason: "pause_turn", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: {} }] },
+    { stop_reason: "pause_turn", content: [{ type: "web_search_tool_result", tool_use_id: "s1", content: [] }] },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] },
+  ];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => replies[sent.length - 1] };
+  };
+  const result = await anthropicTurn("https://api.anthropic.com", "k", "claude-opus-5-5", "s", "p", "low", "grounded", fetchImpl);
+  assert.equal(sent.length, 3);
+  assert.deepEqual(sent[0].messages, [{ role: "user", content: "p" }]);
+  assert.deepEqual(sent[2].messages, [
+    { role: "user", content: "p" },
+    { role: "assistant", content: [...replies[0].content, ...replies[1].content] },
+  ]);
+  assert.equal(result.stop_reason, "end_turn");
+  assert.deepEqual(result.content, [...replies[0].content, ...replies[1].content, ...replies[2].content]);
+});
+
+test("anthropicTurn gives up on a turn that keeps pausing", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    return { ok: true, json: async () => ({ stop_reason: "pause_turn", content: [] }) };
+  };
+  await assert.rejects(
+    anthropicTurn("https://api.anthropic.com", "k", "claude-opus-5-5", "s", "p", "low", "grounded", fetchImpl),
+    (error) => error instanceof WorkerError && error.retryable,
+  );
+  assert.equal(calls, 6);
+});
+
+test("listEndpointModels follows Anthropic pagination and keeps its newest-first order", async () => {
+  const urls = [];
+  const pages = [
+    { data: [{ id: "claude-opus-5-5" }, { id: "claude-sonnet-5-5" }], has_more: true, last_id: "claude-sonnet-5-5" },
+    { data: [{ id: "claude-haiku-4-5" }], has_more: false, last_id: "claude-haiku-4-5" },
+  ];
+  const fetchImpl = async (url, init) => {
+    urls.push(url);
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers["x-api-key"], "k");
+    assert.equal(init.headers["anthropic-version"], "2023-06-01");
+    return { ok: true, json: async () => pages[urls.length - 1] };
+  };
+  const models = await listEndpointModels({ provider: "anthropic", apiBaseUrl: "https://api.anthropic.com/", apiKey: "k" }, fetchImpl);
+  assert.deepEqual(models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]);
+  assert.equal(urls[0], "https://api.anthropic.com/v1/models?limit=1000");
+  assert.equal(urls[1], "https://api.anthropic.com/v1/models?limit=1000&after_id=claude-sonnet-5-5");
+});
+
+test("listEndpointModels sorts an OpenAI-spec list newest first", async () => {
+  let captured;
+  const fetchImpl = async (url, init) => {
+    captured = { url, init };
+    return {
+      ok: true,
+      json: async () => ({ data: [{ id: "old", created: 1 }, { id: "new", created: 3 }, { id: "mid", created: 2 }, { id: "new", created: 3 }] }),
+    };
+  };
+  const models = await listEndpointModels({ provider: "openai", apiBaseUrl: "https://api.openai.com/v1", apiKey: "sk" }, fetchImpl);
+  assert.deepEqual(models, ["new", "mid", "old"]);
+  assert.equal(captured.url, "https://api.openai.com/v1/models");
+  assert.equal(captured.init.headers.Authorization, "Bearer sk");
+});
+
+test("listEndpointModels requires a base URL and key", async () => {
+  await assert.rejects(listEndpointModels({ provider: "openai", apiKey: "sk" }), (error) => error.code === "input");
 });
 
 test("parseAnthropicOutput reads web_search_result items and text citations", () => {

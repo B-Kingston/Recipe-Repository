@@ -8,6 +8,9 @@ services:
         required: false
     environment:
       DATABASE_URL: sqlite:/data/recipes.sqlite3
+      EMBEDDING_URL: ${EMBEDDING_URL-http://embeddings:8080}
+    depends_on:
+      - embeddings
     volumes:
       - recipe-data:/data
     restart: unless-stopped
@@ -18,5 +21,40 @@ services:
       retries: 3
       start_period: 5s
 
+  # EmbeddingGemma 2 (Q8_0 text model + vision/audio projector) behind
+  # llama.cpp's OpenAI-style /v1/embeddings. The first start downloads about
+  # 870 MB from Hugging Face into the embedding-models volume. Every image is
+  # embedded at 70 vision tokens, the cheapest budget.
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server-b11706
+    command:
+      - -hf
+      - ggml-org/embeddinggemma-2-GGUF:Q8_0
+      - --embeddings
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --threads
+      - "6"
+      - --ctx-size
+      - "8192"
+      - --batch-size
+      - "8192"
+      - --ubatch-size
+      - "8192"
+      - --parallel
+      - "1"
+      - --image-min-tokens
+      - "70"
+      - --image-max-tokens
+      - "70"
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - embedding-models:/models
+    restart: unless-stopped
+
 volumes:
   recipe-data:
+  embedding-models:

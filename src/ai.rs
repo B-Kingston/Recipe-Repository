@@ -1,12 +1,13 @@
 use crate::media::{
     MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaChannels,
-    MediaDebug, MediaEvidence, canonical_social_url, cleaner_prompt, extract_social_evidence_debug,
-    recipe_prompt as media_recipe_prompt,
+    MediaDebug, MediaEvidence, VideoExtras, canonical_social_url, cleaner_prompt,
+    extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{
-    copy_draft_thumbnails, delete_draft_thumbnails, delete_expired_draft_thumbnails, find_draft,
-    find_draft_thumbnail_jpeg, find_draft_thumbnails, find_recipe, recipe_snapshot,
-    store_draft_thumbnails,
+    apply_draft_moments, copy_draft_moment_pool, copy_draft_thumbnails, delete_draft_thumbnails,
+    delete_expired_draft_thumbnails, draft_step_moments, draft_still_seconds, find_draft,
+    find_draft_still, find_draft_thumbnail_jpeg, find_draft_thumbnails, find_recipe,
+    recipe_snapshot, social_source_url, store_draft_moment_pool, store_draft_thumbnails,
 };
 use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
@@ -261,8 +262,21 @@ async fn run_media_import(
             Arc::new(move |event| sink.record_event(event))
         };
         let observer = Arc::new(MediaDebug::new(0, frames_dir, emitter));
-        let (extracted, thumbnail_candidates) =
-            extract_social_evidence_debug(&source_url, channels, observer, true).await?;
+        let extras = VideoExtras {
+            thumbnails: true,
+            moments: state.embedder.is_some() && crate::step_moments_enabled(&state.db).await?,
+            embedder: state.embedder.clone(),
+        };
+        // Evidence comes back as soon as transcription and OCR finish. Dish
+        // photos and the moment pool keep working on the downloaded video
+        // while the cleaner and the draft call run; `pending` is awaited only
+        // where they are stored. Any early `?` below drops it, which stops
+        // the background work, removes the work directory, and frees the
+        // media slot.
+        let extraction =
+            extract_social_evidence_debug(&source_url, channels, observer, extras).await?;
+        let extracted = extraction.evidence;
+        let pending = extraction.extras;
 
         run.record_event(json!({ "url": 0, "kind": "status", "state": "cleaning evidence" }));
         run.record_event(json!({
@@ -300,13 +314,25 @@ async fn run_media_import(
             },
         )
         .await?;
-        if !thumbnail_candidates.is_empty() {
-            store_draft_thumbnails(&state.db, &id, &thumbnail_candidates).await?;
+        if !pending.is_finished() {
+            run.record_event(json!({
+                "url": 0,
+                "kind": "status",
+                "state": "adding dish photos and video moments",
+            }));
+        }
+        let extras = pending.finish().await;
+        if !extras.thumbnails.is_empty() {
+            store_draft_thumbnails(&state.db, &id, &extras.thumbnails).await?;
             run.record_event(json!({
                 "url": 0,
                 "kind": "thumbnails",
-                "count": thumbnail_candidates.len(),
+                "count": extras.thumbnails.len(),
             }));
+        }
+        if !extras.moments.vectors.is_empty() {
+            store_draft_moment_pool(&state.db, &id, &extras.moments).await?;
+            match_new_draft(&state, &user, &id).await;
         }
         Ok(id)
     }
@@ -583,7 +609,10 @@ pub(crate) async fn alter_recipe(
     )
     .await
     {
-        Ok(draft) => Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response()),
+        Ok(draft) => {
+            match_new_draft(&s, &user, &draft).await;
+            Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response())
+        }
         Err(e) => render(crate::AiFormTemplate {
             heading: "Alter with AI".into(),
             guidance: "Tell the assistant what should change.".into(),
@@ -657,8 +686,11 @@ pub(crate) async fn alter_draft(
     .await
     {
         Ok(new_id) => {
-            // Keep the dish-photo picker available while the chain runs.
+            // Keep the dish-photo picker and the video moments available
+            // while the chain runs.
             copy_draft_thumbnails(&s.db, &id, &new_id).await?;
+            copy_draft_moment_pool(&s.db, &id, &new_id).await?;
+            match_new_draft(&s, &user, &new_id).await;
             Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response())
         }
         Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
@@ -701,17 +733,78 @@ async fn render_draft_page(
             seconds: thumb.seconds.max(0) as u64,
         })
         .collect();
+    let sources: Vec<Source> =
+        serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?;
+    let step_moments =
+        draft_moment_views(state, user, id, &draft, &sources, recipe.steps.len()).await?;
     render(DraftTemplate {
         id: id.to_string(),
         recipe,
-        sources: serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?,
+        sources,
         suggestions: draft.search_suggestions,
         evidence,
         thumbs,
+        step_moments,
         error: error.to_string(),
         prompt: prompt.to_string(),
     })
     .map(IntoResponse::into_response)
+}
+
+/// One entry per draft step: its matched video moment, if any. The video is
+/// the draft's social source, else the social source of the recipe it alters.
+async fn draft_moment_views(
+    state: &AppState,
+    user: &AuthUser,
+    id: &str,
+    draft: &crate::Draft,
+    sources: &[Source],
+    step_count: usize,
+) -> Result<Vec<Option<crate::MomentView>>> {
+    let mut views = vec![None; step_count];
+    if !crate::step_moments_enabled(&state.db).await? {
+        return Ok(views);
+    }
+    let moments = draft_step_moments(&state.db, id).await?;
+    if moments.is_empty() {
+        return Ok(views);
+    }
+    // Moments show only for drafts that come from a social video.
+    let has_video = match (social_source_url(sources), draft.recipe_id.as_deref()) {
+        (Some(_), _) => true,
+        (None, Some(recipe_id)) => {
+            social_source_url(&crate::recipes::sources(&state.db, &user.id, recipe_id).await?)
+                .is_some()
+        }
+        (None, None) => false,
+    };
+    if !has_video {
+        return Ok(views);
+    }
+    let stills = draft_still_seconds(&state.db, id, draft.recipe_id.as_deref()).await?;
+    let still_base = format!("/ai/drafts/{id}/stills");
+    for moment in moments {
+        if let Some(slot) = views.get_mut(moment.step_index) {
+            *slot = Some(crate::moments::view(&moment, &stills, &still_base));
+        }
+    }
+    Ok(views)
+}
+
+/// Matches a freshly created draft's steps to its video moment pool. A
+/// failure only costs the moments, never the draft.
+async fn match_new_draft(state: &AppState, user: &AuthUser, draft_id: &str) {
+    let result = async {
+        let draft = find_draft(&state.db, &user.id, draft_id).await?;
+        let mut recipe: GeneratedRecipe =
+            serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
+        normalize_generated(&mut recipe)?;
+        crate::moments::match_draft(state, draft_id, draft.recipe_id.as_deref(), &recipe).await
+    }
+    .await;
+    if let Err(error) = result {
+        warn!(%draft_id, %error, "Step moments were not matched");
+    }
 }
 
 const STALE_BASE_MESSAGE: &str =
@@ -797,8 +890,10 @@ pub(crate) async fn apply_draft(
             .execute(&mut *tx)
             .await?;
     }
+    let mut step_ids = Vec::with_capacity(recipe.steps.len());
     for (position, step) in recipe.steps.iter().enumerate() {
         let step_id = Uuid::new_v4().to_string();
+        step_ids.push(step_id.clone());
         sqlx::query(
             "INSERT INTO recipe_blocks(id,recipe_id,section,position,text)VALUES(?,?,?,?,?)",
         )
@@ -863,6 +958,8 @@ pub(crate) async fn apply_draft(
         "Recipe created with AI"
     };
     crate::recipes::record_version(&mut tx, &user.id, &recipe_id, label).await?;
+    // Before the draft row goes: deleting it cascades its moment pool.
+    apply_draft_moments(&mut tx, &id, &recipe_id, &step_ids).await?;
     sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
         .bind(&id)
         .execute(&mut *tx)
@@ -886,6 +983,19 @@ pub(crate) async fn draft_thumbnail(
 ) -> Result<Response> {
     find_draft(&s.db, &user.id, &id).await?;
     let jpeg = find_draft_thumbnail_jpeg(&s.db, &user.id, &id, idx as i64)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(crate::image_response(jpeg))
+}
+
+/// Serves one moment still for a live draft: from the draft's own pool, or
+/// from the pool of the recipe the draft alters.
+pub(crate) async fn draft_still(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, seconds)): Path<(String, i64)>,
+) -> Result<Response> {
+    let jpeg = find_draft_still(&s.db, &user.id, &id, seconds)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(crate::image_response(jpeg))
@@ -938,6 +1048,14 @@ impl SearchMode {
         matches!(self, SearchMode::Grounded)
     }
 }
+
+/// Field formats shared by every generation prompt. The recipe card renders
+/// `quantity unit name` and the description as plain text.
+const RECIPE_FIELD_RULES: &str = r#"Field formats:
+- Ingredient unit: only the measure (g, ml, tsp, tbsp, cup, clove, head, can, pinch), or empty for counted items. Put size and preparation in the name. Never repeat the name in the unit. Examples: quantity "6", unit "", name "medium tomatoes"; quantity "1", unit "head", name "garlic, cloves separated and peeled"; quantity "1", unit "", name "medium onion, diced".
+- ingredientUses amount: the quantity and unit only, never the ingredient name (e.g. "3" or "1 tbsp").
+- Description: one or two sentences about the dish for the cook. Do not describe your edits, the user's request, or your reasoning.
+- Every text field is plain text: no Markdown, links, URLs, or citation markers. Put cited pages only in sources."#;
 
 /// System prompt matching each search posture.
 pub(crate) fn system_recipe_prompt(search_mode: SearchMode) -> &'static str {
@@ -1079,14 +1197,7 @@ async fn pi_recipe(
             let endpoint = crate::find_endpoint(&state.db, &user.id, &provider)
                 .await?
                 .ok_or(AppError::AiNotConfigured)?;
-            let model = if endpoint.model.trim().is_empty() {
-                match endpoint.spec.as_str() {
-                    crate::ANTHROPIC_SPEC => crate::DEFAULT_ANTHROPIC_MODEL.to_string(),
-                    _ => crate::DEFAULT_OPENAI_MODEL.to_string(),
-                }
-            } else {
-                endpoint.model.clone()
-            };
+            let model = crate::endpoint_model(&endpoint);
             (RecipeBackend::Endpoint(endpoint), model)
         }
     };
@@ -1105,8 +1216,9 @@ async fn request_recipe(
 ) -> Result<(GeneratedRecipe, Vec<Source>)> {
     let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
     let system_prompt = format!(
-        "{}\n\nRecipe JSON schema:\n{}",
+        "{}\n\n{}\n\nRecipe JSON schema:\n{}",
         system_recipe_prompt(search_mode),
+        RECIPE_FIELD_RULES,
         recipe_schema()
     );
     let provider = backend.label();
@@ -1392,28 +1504,62 @@ async fn run_subscription_worker(
     output
 }
 
-/// Asks the Pi worker (`listModels`) for the models a subscription provider
-/// offers, newest first. Empty when there is no credential or discovery fails.
-async fn fetch_pi_models(
-    state: &AppState,
-    user_id: &str,
-    pi_provider: &str,
-) -> Result<Vec<String>> {
-    let output = match run_subscription_worker(
-        state,
-        user_id,
-        pi_provider,
-        json!({ "command": "listModels" }),
-        MODEL_LIST_TIMEOUT,
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(AppError::AiNotConfigured) => return Ok(Vec::new()),
-        Err(error) => return Err(error),
+/// Where a model list comes from: a subscription's pi catalogue or a
+/// registered API endpoint's own models list.
+pub(crate) enum ModelSource<'a> {
+    Subscription {
+        user_id: &'a str,
+        pi_provider: &'a str,
+    },
+    Endpoint(&'a crate::Endpoint),
+}
+
+impl ModelSource<'_> {
+    /// The catalogue cache key: the pi provider id, or the endpoint row id.
+    /// Endpoint ids are UUIDs, so they never collide with a provider id.
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Subscription { pi_provider, .. } => pi_provider,
+            Self::Endpoint(endpoint) => &endpoint.id,
+        }
+    }
+}
+
+/// Asks the Pi worker (`listModels`) for the models a source offers, newest
+/// first. A subscription is listed from the pi catalogue under its stored
+/// credential; an endpoint from its own models API with its stored key. Empty
+/// when there is no credential or discovery fails.
+async fn fetch_models(state: &AppState, source: &ModelSource<'_>) -> Result<Vec<String>> {
+    let output = match source {
+        ModelSource::Subscription {
+            user_id,
+            pi_provider,
+        } => match run_subscription_worker(
+            state,
+            user_id,
+            pi_provider,
+            json!({ "command": "listModels" }),
+            MODEL_LIST_TIMEOUT,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(AppError::AiNotConfigured) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        },
+        ModelSource::Endpoint(endpoint) => {
+            let payload = serde_json::to_vec(&json!({
+                "command": "listModels",
+                "provider": endpoint.spec,
+                "apiBaseUrl": endpoint.base_url,
+                "apiKey": endpoint.api_key,
+            }))
+            .map_err(|_| AppError::Ai)?;
+            run_worker(state, payload, MODEL_LIST_TIMEOUT, None).await?
+        }
     };
     if !output.status.success() {
-        error!(status = %output.status, pi_provider, "Model discovery failed");
+        error!(status = %output.status, source = source.key(), "Model discovery failed");
         return Ok(Vec::new());
     }
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
@@ -1432,69 +1578,69 @@ async fn fetch_pi_models(
 /// triggers another discovery.
 const MODEL_CATALOGUE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// The last discovered catalogue for a Pi provider, stale or not. Never starts
+/// The last discovered catalogue for a source key, stale or not. Never starts
 /// discovery, so Settings renders stay fast.
-pub(crate) fn cached_model_catalogue(state: &AppState, pi_provider: &str) -> Vec<String> {
+pub(crate) fn cached_model_catalogue(state: &AppState, key: &str) -> Vec<String> {
     state
         .model_catalogue
         .lock()
-        .get(pi_provider)
+        .get(key)
         .map(|catalogue| catalogue.models.clone())
         .unwrap_or_default()
 }
 
-fn fresh_cached_models(state: &AppState, pi_provider: &str) -> Option<Vec<String>> {
+/// Drops a source's cached catalogue, for example when its endpoint is deleted.
+pub(crate) fn forget_model_catalogue(state: &AppState, key: &str) {
+    state.model_catalogue.lock().remove(key);
+}
+
+fn fresh_cached_models(state: &AppState, key: &str) -> Option<Vec<String>> {
     state
         .model_catalogue
         .lock()
-        .get(pi_provider)
+        .get(key)
         .filter(|catalogue| catalogue.refreshed_at.elapsed() < MODEL_CATALOGUE_TTL)
         .map(|catalogue| catalogue.models.clone())
 }
 
-/// One async lock per Pi provider. Concurrent discoveries for a provider queue
+/// One async lock per source key. Concurrent discoveries for a source queue
 /// here, and the cache re-check after acquiring it returns the list the first
 /// one stored instead of starting another worker run.
-fn discovery_lock(pi_provider: &str) -> Arc<tokio::sync::Mutex<()>> {
+fn discovery_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: parking_lot::Mutex<Vec<(String, Arc<tokio::sync::Mutex<()>>)>> =
         parking_lot::Mutex::new(Vec::new());
     let mut locks = LOCKS.lock();
-    if let Some((_, lock)) = locks.iter().find(|(provider, _)| provider == pi_provider) {
+    if let Some((_, lock)) = locks.iter().find(|(existing, _)| existing == key) {
         return lock.clone();
     }
     let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.push((pi_provider.to_string(), lock.clone()));
+    locks.push((key.to_string(), lock.clone()));
     lock
 }
 
-/// Discovers the models for one subscription provider. A fresh cached list is
-/// returned as-is. Otherwise one worker run per provider is in flight at a
-/// time; only non-empty results replace the cache, so a failure keeps the
-/// stale list and retries on the next call.
-pub(crate) async fn discover_models(
-    state: &AppState,
-    user_id: &str,
-    pi_provider: &str,
-) -> Vec<String> {
-    if let Some(models) = fresh_cached_models(state, pi_provider) {
+/// Discovers the models for one source. A fresh cached list is returned
+/// as-is. Otherwise one worker run per source is in flight at a time; only
+/// non-empty results replace the cache, so a failure keeps the stale list and
+/// retries on the next call.
+pub(crate) async fn discover_models(state: &AppState, source: &ModelSource<'_>) -> Vec<String> {
+    let key = source.key();
+    if let Some(models) = fresh_cached_models(state, key) {
         return models;
     }
-    let lock = discovery_lock(pi_provider);
+    let lock = discovery_lock(key);
     let _discovering = lock.lock().await;
-    if let Some(models) = fresh_cached_models(state, pi_provider) {
+    if let Some(models) = fresh_cached_models(state, key) {
         return models;
     }
-    let models = fetch_pi_models(state, user_id, pi_provider)
-        .await
-        .unwrap_or_else(|error| {
-            warn!(%error, pi_provider, "Model discovery failed; keeping cached list");
-            Vec::new()
-        });
+    let models = fetch_models(state, source).await.unwrap_or_else(|error| {
+        warn!(%error, source = key, "Model discovery failed; keeping cached list");
+        Vec::new()
+    });
     if models.is_empty() {
-        return cached_model_catalogue(state, pi_provider);
+        return cached_model_catalogue(state, key);
     }
     state.model_catalogue.lock().insert(
-        pi_provider.to_string(),
+        key.to_string(),
         ModelCatalogue {
             models: models.clone(),
             refreshed_at: Instant::now(),
@@ -1531,6 +1677,10 @@ pub(crate) fn recipe_schema() -> Value {
 }
 
 pub(crate) fn normalize_generated(recipe: &mut GeneratedRecipe) -> Result<()> {
+    recipe.description = strip_markdown_links(&recipe.description);
+    for step in &mut recipe.steps {
+        step.text = strip_markdown_links(&step.text);
+    }
     if recipe
         .steps
         .iter()
@@ -1619,6 +1769,43 @@ fn ingredient_display(ingredient: &Ingredient) -> String {
     } else {
         amount
     }
+}
+
+/// Text fields render as plain text, so Markdown links from web-search
+/// answers become their label, and a parenthesised citation such as
+/// ` ([pbs.org](https://…))` is removed. Sources keep the URLs.
+pub(crate) fn strip_markdown_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let Some((label, url_tail)) = after
+            .find("](")
+            .map(|close| (&after[..close], &after[close + 2..]))
+            .filter(|(label, _)| !label.contains('['))
+        else {
+            out.push_str(&rest[..=open]);
+            rest = after;
+            continue;
+        };
+        let Some(url_end) = url_tail.find(')') else {
+            out.push_str(&rest[..=open]);
+            rest = after;
+            continue;
+        };
+        let before = &rest[..open];
+        let tail = &url_tail[url_end + 1..];
+        if before.ends_with('(') && tail.starts_with(')') {
+            out.push_str(before[..before.len() - 1].trim_end());
+            rest = &tail[1..];
+        } else {
+            out.push_str(before);
+            out.push_str(label);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
@@ -2147,9 +2334,16 @@ pub(crate) async fn media_debug_start(
                 run.dir.join("frames").join(index.to_string()),
                 emitter,
             ));
-            match extract_social_evidence_debug(&url, MediaChannels::default(), debug, false).await
+            match extract_social_evidence_debug(
+                &url,
+                MediaChannels::default(),
+                debug,
+                VideoExtras::default(),
+            )
+            .await
             {
-                Ok((extracted, _)) => {
+                Ok(extraction) => {
+                    let extracted = extraction.evidence;
                     run.record_event(json!({
                         "url": index,
                         "kind": "status",

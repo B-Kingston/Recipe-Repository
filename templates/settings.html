@@ -13,27 +13,44 @@
       <fieldset>
         <legend class="muted">Active provider</legend>
         <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if codex_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}</label>
-        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}{% if !claude_authorised %} disabled{% endif %}><span>Claude (Pro/Max)</span>{% if claude_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}{% if !claude_authorised %}<span class="muted">Connect it below first.</span>{% endif %}</label>
+        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}><span>Claude (Pro/Max)</span>{% if claude_selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}{% if !claude_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
         {% for endpoint in endpoints %}
         <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span>{% if endpoint.selected %}<span class="codex-status codex-status--connected">Active</span>{% endif %}<span class="muted">({{ endpoint.spec }} · {{ endpoint.base_url }}{% if endpoint.model != "" %} · {{ endpoint.model }}{% endif %} · key {{ endpoint.key_masked }})</span></label>
         {% endfor %}
       </fieldset>
-      <div id="model-codex"{% if !codex_selected %} hidden{% endif %}>
+      <div data-model-panel="pi"{% if !codex_selected %} hidden{% endif %}>
         <label for="model">Codex model</label>
-        <select id="model" name="model" data-models-provider="pi">
+        <select id="model" name="model">
           {% for option in model_options %}
           <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
           {% endfor %}
         </select>
       </div>
-      <div id="model-claude"{% if !claude_selected %} hidden{% endif %}>
+      <div data-model-panel="claude"{% if !claude_selected %} hidden{% endif %}>
+        {% if claude_authorised %}
         <label for="claude_model">Claude model</label>
-        <select id="claude_model" name="claude_model" data-models-provider="claude">
+        <select id="claude_model" name="claude_model">
           {% for option in claude_model_options %}
           <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.value }}</option>
           {% endfor %}
         </select>
+        {% else %}
+        <p class="muted">Sign in with your Claude Pro or Max account before switching to Claude.</p>
+        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}">Authorise Claude</a></p>
+        {% endif %}
       </div>
+      {% for endpoint in endpoints %}
+      <div data-model-panel="{{ endpoint.id }}"{% if !endpoint.selected %} hidden{% endif %}>
+        <input type="hidden" name="endpoint_model_for" value="{{ endpoint.id }}"{% if !endpoint.selected %} disabled{% endif %}>
+        <label for="endpoint-model-{{ endpoint.id }}">{{ endpoint.name }} model <span class="muted">(blank uses {{ endpoint.default_model }})</span></label>
+        <input type="text" id="endpoint-model-{{ endpoint.id }}" name="endpoint_model" value="{{ endpoint.model }}" placeholder="{{ endpoint.default_model }}" list="endpoint-models-{{ endpoint.id }}" autocomplete="off" autocapitalize="off" spellcheck="false"{% if !endpoint.selected %} disabled{% endif %}>
+        <datalist id="endpoint-models-{{ endpoint.id }}">
+          {% for model in endpoint.model_options %}
+          <option value="{{ model }}">
+          {% endfor %}
+        </datalist>
+      </div>
+      {% endfor %}
       <label for="reasoning_effort">Reasoning effort</label>
       <select id="reasoning_effort" name="reasoning_effort">
         {% for option in effort_options %}
@@ -58,7 +75,7 @@
       <label for="endpoint_base_url">Base URL</label>
       <input type="url" id="endpoint_base_url" name="base_url" placeholder="https://api.anthropic.com">
       <label for="endpoint_model">Model <span class="muted">(optional — blank uses the spec default)</span></label>
-      <input type="text" id="endpoint_model" name="model" placeholder="claude-sonnet-4-5 or gpt-5.6-luna">
+      <input type="text" id="endpoint_model" name="model" placeholder="claude-sonnet-5-5 or gpt-5.6-luna">
       <label for="endpoint_api_key">API key</label>
       <input type="password" id="endpoint_api_key" name="api_key" autocomplete="off">
       <button class="primary" type="submit">Save endpoint</button>
@@ -88,6 +105,15 @@
       <label for="gateway_api_key">API key{% if gateway_configured %} <span class="muted">(current key {{ gateway_key_masked }} · leave blank to keep it)</span>{% endif %}</label>
       <input type="password" id="gateway_api_key" name="api_key" autocomplete="off"{% if !gateway_configured %} required{% endif %}>
       <button class="primary" type="submit">Save video cleaner</button>
+    </form>
+  </div>
+  <div class="block">
+    <h2>Video step moments <span class="codex-status{% if step_moments && embeddings_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if !embeddings_configured %}Needs embedding service{% else if step_moments %}&#10003; On{% else %}Off{% endif %}</span></h2>
+    <p class="muted block-note">Video imports match each method step to the moment the cook talks about it, or shows it when there is no narration. Each step then shows the time and a few frames from that moment. Off stops new imports from capturing moments and hides them on every recipe.</p>
+    {% if !embeddings_configured %}<p class="muted">The embedding service is not configured (set <code>EMBEDDING_URL</code>).</p>{% endif %}
+    <form method="post" action="/settings/step-moments">
+      <label><input type="checkbox" name="enabled" value="on"{% if step_moments %} checked{% endif %}> Capture and show video step moments</label>
+      <button class="primary" type="submit">Save step moments</button>
     </form>
   </div>
   <div class="block">
@@ -127,9 +153,14 @@
     {% endif %}
   </div>
   <div class="block">
-    <h2>Password</h2>
-    <p class="muted">Set a new password. Your current password is required.</p>
-    <a class="button" href="/settings/password">Reset password</a>
+    <h2>Account</h2>
+    <p class="muted">A new password signs out every other device. Your current password is required.</p>
+    <div class="actions">
+      <a class="button" href="/settings/password">Reset password</a>
+      <form class="inline" method="post" action="/logout">
+        <button type="submit">Sign out</button>
+      </form>
+    </div>
   </div>
   <details class="block developer-tools">
     <summary>Developer tools</summary>
@@ -140,39 +171,55 @@
 <script>
 (function () {
   var radios = document.querySelectorAll('input[name="provider"]');
-  var panels = { pi: document.getElementById('model-codex'), claude: document.getElementById('model-claude') };
+  var panels = {};
+  Array.prototype.forEach.call(document.querySelectorAll('[data-model-panel]'), function (panel) {
+    panels[panel.getAttribute('data-model-panel')] = panel;
+  });
   var loaded = {};
-  function fill(select, data) {
-    var keep = select.value || data.selected;
-    var models = data.models.slice();
-    if (keep && models.indexOf(keep) === -1) { models.unshift(keep); }
-    select.innerHTML = '';
-    models.forEach(function (id) {
-      var option = document.createElement('option');
-      option.value = id;
-      option.textContent = id;
-      if (id === keep) { option.selected = true; }
-      select.appendChild(option);
-    });
+  function option(id, selected) {
+    var element = document.createElement('option');
+    element.value = id;
+    element.textContent = id;
+    if (selected) { element.selected = true; }
+    return element;
+  }
+  function fill(panel, data) {
+    var select = panel.querySelector('select');
+    if (select) {
+      var keep = select.value || data.selected;
+      var models = data.models.slice();
+      if (keep && models.indexOf(keep) === -1) { models.unshift(keep); }
+      select.innerHTML = '';
+      models.forEach(function (id) { select.appendChild(option(id, id === keep)); });
+      return;
+    }
+    var list = panel.querySelector('datalist');
+    if (!list || data.models.length === 0) { return; }
+    list.innerHTML = '';
+    data.models.forEach(function (id) { list.appendChild(option(id, false)); });
   }
   function load(provider) {
     var panel = panels[provider];
     if (!panel || loaded[provider]) { return; }
     loaded[provider] = true;
-    var select = panel.querySelector('select');
     var request = new XMLHttpRequest();
     request.open('GET', '/settings/models?provider=' + encodeURIComponent(provider), true);
     request.onreadystatechange = function () {
       if (request.readyState !== 4) { return; }
       if (request.status !== 200) { loaded[provider] = false; return; }
-      try { fill(select, JSON.parse(request.responseText)); } catch (e) { loaded[provider] = false; }
+      try { fill(panel, JSON.parse(request.responseText)); } catch (e) { loaded[provider] = false; }
     };
     request.send();
   }
   function sync() {
     Array.prototype.forEach.call(radios, function (radio) {
       if (!radio.checked) { return; }
-      Object.keys(panels).forEach(function (key) { if (panels[key]) { panels[key].hidden = key !== radio.value; } });
+      Object.keys(panels).forEach(function (key) {
+        var hidden = key !== radio.value;
+        panels[key].hidden = hidden;
+        // Only the shown panel's fields are submitted.
+        Array.prototype.forEach.call(panels[key].querySelectorAll('input, select'), function (field) { field.disabled = hidden; });
+      });
       load(radio.value);
     });
   }

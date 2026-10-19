@@ -32,32 +32,38 @@ use uuid::Uuid;
 mod ai;
 mod auth;
 mod chart;
+mod embeddings;
 mod media;
+mod media_worker;
+mod moments;
 mod recipes;
+mod search;
 mod thumbs;
 use auth::{
-    AuthUser, auth_middleware, reset_password, reset_password_page, setup_create, setup_page,
+    AuthUser, auth_middleware, login, login_page, logout, reset_password, reset_password_page,
+    setup_create, setup_page,
 };
 
 use ai::{
-    DebugRunMap, alter_draft, alter_page, alter_recipe, apply_draft, cached_model_catalogue,
-    cancel_draft, discover_models, draft_page, draft_thumbnail, generate_page, generate_recipe,
-    import_events, import_frame, import_page, import_recipe, import_run_page, media_debug_frame,
-    media_debug_page, media_debug_run_page, media_debug_start,
+    DebugRunMap, ModelSource, alter_draft, alter_page, alter_recipe, apply_draft,
+    cached_model_catalogue, cancel_draft, discover_models, draft_page, draft_still,
+    draft_thumbnail, forget_model_catalogue, generate_page, generate_recipe, import_events,
+    import_frame, import_page, import_recipe, import_run_page, media_debug_frame, media_debug_page,
+    media_debug_run_page, media_debug_start,
 };
 use media::MediaEvidence;
 use recipes::{
     add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
-    delete_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_thumbnail,
-    remove_thumbnail, start_thumbnail_recompute, update_block, update_recipe, upload_thumbnail,
-    view_version,
+    delete_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_still,
+    recipe_thumbnail, remove_thumbnail, start_moment_capture, start_thumbnail_recompute,
+    update_block, update_recipe, upload_thumbnail, view_version,
 };
 
 const DRAFT_HOURS: i64 = 24;
 const DEFAULT_MODEL: &str = "gpt-6-luna";
 const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
-const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_REASONING_EFFORT: &str = "low";
 const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_PROVIDER: &str = "vercel-ai-gateway";
@@ -103,7 +109,7 @@ Return one complete recipe, not a patch. Before responding, silently audit the r
 /// so an answer drawn purely from sufficient evidence stays valid.
 const EVIDENCE_RECIPE_PROMPT: &str = r#"You are a meticulous recipe assistant working from imported social-video evidence. The evidence was distilled automatically from a social video's caption, spoken audio, and on-screen text, so it can be incomplete, garbled, or one-sided. Treat it as the best available record of the original creator's intent, not as verified fact.
 
-Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge, and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough. Fill every such gap so the finished recipe works end to end, keep it faithful to the ingredients, character, and method shown in the video, and note briefly in the recipe description which parts were filled by research rather than the video. Do not copy expressive prose from researched sources; write original, concise instructions.
+Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge, and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough. Fill every such gap so the finished recipe works end to end, and keep it faithful to the ingredients, character, and method shown in the video. Do not copy expressive prose from researched sources; write original, concise instructions.
 
 Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."#;
 
@@ -124,6 +130,12 @@ struct AppState {
     /// Recipe ids with a dish-photo frame run in flight; in-memory only, so
     /// a restart simply drops any "pending" state back to idle.
     thumbnail_jobs: Arc<Mutex<HashSet<String>>>,
+    /// Recipe ids with a step-moment capture in flight; in-memory only, like
+    /// `thumbnail_jobs`.
+    moment_jobs: Arc<Mutex<HashSet<String>>>,
+    /// EmbeddingGemma 2 sidecar client (`EMBEDDING_URL`); `None` turns off
+    /// library search, video step moments, and dish-photo ranking.
+    embedder: Option<embeddings::Embedder>,
 }
 
 /// Last successfully discovered model catalogue for one Pi provider; reused
@@ -315,6 +327,18 @@ struct ViewStep {
     block: ViewBlock,
     ingredients: Vec<String>,
     ingredients_text: String,
+    /// Where the source video shows or talks about this step.
+    moment: Option<MomentView>,
+}
+/// One step's matched moment in the source video, shown beside the step.
+#[derive(Clone)]
+struct MomentView {
+    /// "m:ss" start of the moment.
+    label: String,
+    /// How the moment was matched, for the reader.
+    source: String,
+    /// Still-image URLs around the moment.
+    stills: Vec<String>,
 }
 #[derive(Clone)]
 struct ChartCell {
@@ -343,6 +367,7 @@ struct ChartDetail {
     next_href: String,
     has_previous: bool,
     has_next: bool,
+    moment: Option<MomentView>,
 }
 #[derive(Clone)]
 struct ChartView {
@@ -353,16 +378,35 @@ struct ChartView {
     step_count: usize,
 }
 
+/// Query string of the library page: `?q=` runs a search.
+#[derive(Default, Deserialize)]
+struct HomeQuery {
+    q: Option<String>,
+}
 #[derive(Template)]
 #[template(path = "home.html")]
 struct HomeTemplate {
     recipes: Vec<crate::recipes::LibraryCard>,
+    /// The trimmed search text (prefills the form); empty when not searching.
+    query: String,
+    /// True when `recipes` are ranked search results rather than the whole library.
+    results: bool,
+    /// Search status shown above the recipes (indexing progress, service problems).
+    notice: String,
 }
 #[derive(Template)]
 #[template(path = "setup.html")]
 struct SetupTemplate {
     error: String,
     username: String,
+}
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTemplate {
+    error: String,
+    username: String,
+    /// Local path to return to after sign-in.
+    next: String,
 }
 #[derive(Template)]
 #[template(path = "password_reset.html")]
@@ -382,6 +426,10 @@ struct RecipeTemplate {
     has_photo: bool,
     thumb_state: String,
     can_pick_video_frames: bool,
+    /// A step-moment capture for this recipe is running.
+    moments_pending: bool,
+    /// The recipe has a video source but no moment pool yet.
+    can_find_moments: bool,
     thumb_options: Vec<DraftThumbView>,
     versions: Vec<recipes::VersionListRow>,
     servings_value: String,
@@ -497,6 +545,8 @@ struct DraftTemplate {
     suggestions: String,
     evidence: Option<MediaEvidence>,
     thumbs: Vec<DraftThumbView>,
+    /// The matched video moment of each step, in step order.
+    step_moments: Vec<Option<MomentView>>,
     error: String,
     prompt: String,
 }
@@ -521,6 +571,10 @@ struct SettingsTemplate {
     gateway_base_url: String,
     saved: bool,
     password_changed: bool,
+    /// Whether video step moments are captured and shown (global setting).
+    step_moments: bool,
+    /// Whether the embedding sidecar is configured (`EMBEDDING_URL`).
+    embeddings_configured: bool,
     notice: String,
 }
 struct SelectOption {
@@ -536,6 +590,10 @@ struct EndpointRow {
     base_url: String,
     key_masked: String,
     model: String,
+    /// The spec default the endpoint runs when no model is stored.
+    default_model: String,
+    /// The last discovered models; the page script refreshes them live.
+    model_options: Vec<String>,
     selected: bool,
 }
 #[derive(Template)]
@@ -655,6 +713,17 @@ struct ResetPasswordForm {
     #[serde(default)]
     confirm_password: String,
 }
+#[derive(Deserialize)]
+pub(crate) struct LoginForm {
+    username: String,
+    password: String,
+    #[serde(default)]
+    next: String,
+}
+#[derive(Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+}
 #[derive(Default, Deserialize)]
 struct BlockForm {
     section: Option<String>,
@@ -688,7 +757,7 @@ pub(crate) struct DraftThumbView {
 }
 
 /// Shared image response for locally produced JPEG bytes. Cache headers stay
-/// private: every thumbnail is behind the single-user Basic auth realm.
+/// private: every thumbnail is behind the single-user sign-in.
 pub(crate) fn image_response(jpeg: Vec<u8>) -> Response {
     (
         [
@@ -716,9 +785,13 @@ struct MediaImportForm {
 #[derive(Deserialize)]
 struct SettingsForm {
     #[serde(default)]
-    model: String, // Codex model; endpoint models are stored per endpoint
+    model: String, // Codex model
     #[serde(default)]
     claude_model: String, // Claude subscription model
+    #[serde(default)]
+    endpoint_model: String, // model for the endpoint named by endpoint_model_for
+    #[serde(default)]
+    endpoint_model_for: String, // the endpoint id whose model field was submitted
     #[serde(default)]
     reasoning_effort: String,
     #[serde(default)]
@@ -732,6 +805,13 @@ struct EndpointForm {
     api_key: String,
     #[serde(default)]
     model: String,
+}
+/// Settings form for the video step-moments switch: the checkbox is absent
+/// when unticked.
+#[derive(Deserialize)]
+struct StepMomentsForm {
+    #[serde(default)]
+    enabled: Option<String>,
 }
 #[derive(Deserialize)]
 struct AiGatewayForm {
@@ -828,7 +908,12 @@ async fn main() -> anyhowless::Result<()> {
         model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
+        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
+        embedder: embeddings::Embedder::from_env(),
     });
+    if state.embedder.is_some() {
+        tokio::spawn(search::backfill(state.clone()));
+    }
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:3000".into())
@@ -892,6 +977,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/ai/drafts/{id}/apply", post(apply_draft))
         .route("/ai/drafts/{id}/cancel", post(cancel_draft))
         .route("/ai/drafts/{id}/thumb/{idx}", get(draft_thumbnail))
+        .route("/ai/drafts/{id}/stills/{seconds}", get(draft_still))
         .route(
             "/recipes/{id}/thumbnail/upload",
             post(upload_thumbnail).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
@@ -903,9 +989,12 @@ fn routes(state: Arc<AppState>) -> Router {
             "/recipes/{id}/thumbnail/recompute",
             post(start_thumbnail_recompute),
         )
+        .route("/recipes/{id}/moments/capture", post(start_moment_capture))
         .route("/recipes/{id}/candidate/{idx}", get(candidate_thumbnail))
+        .route("/recipes/{id}/stills/{seconds}", get(recipe_still))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/settings/vercel-gateway", post(update_ai_gateway))
+        .route("/settings/step-moments", post(update_step_moments))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route("/settings/disconnect/codex", post(disconnect_codex))
@@ -940,6 +1029,8 @@ fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/setup", get(setup_page).post(setup_create))
+        .route("/login", get(login_page).post(login))
+        .route("/logout", post(logout))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
         .with_state(state)
@@ -1183,6 +1274,15 @@ async fn set_app_setting(db: &SqlitePool, key: &str, value: &str) -> Result<()> 
     Ok(())
 }
 
+/// app_settings key of the global "video step moments" switch.
+const STEP_MOMENTS_SETTING: &str = "step_moments";
+
+/// Whether video imports capture, and recipe pages show, step moments.
+/// On unless switched off in Settings.
+pub(crate) async fn step_moments_enabled(db: &SqlitePool) -> Result<bool> {
+    Ok(app_setting(db, STEP_MOMENTS_SETTING).await?.as_deref() != Some("off"))
+}
+
 /// The active AI provider: "pi" (Codex), "claude" (Claude subscription) or an
 /// ai_endpoints row id. Stored app-wide like the model; reconcile_ai_provider
 /// keeps the value valid at startup and the endpoint handlers keep it valid at
@@ -1201,6 +1301,25 @@ pub(crate) async fn list_endpoints(db: &SqlitePool, user_id: &str) -> Result<Vec
     .bind(user_id)
     .fetch_all(db)
     .await?)
+}
+
+/// The model an endpoint spec runs when the endpoint stores none.
+fn spec_default_model(spec: &str) -> &'static str {
+    match spec {
+        ANTHROPIC_SPEC => DEFAULT_ANTHROPIC_MODEL,
+        _ => DEFAULT_OPENAI_MODEL,
+    }
+}
+
+/// The model an endpoint runs: its stored model, or the spec default when
+/// none is stored.
+pub(crate) fn endpoint_model(endpoint: &Endpoint) -> String {
+    let model = endpoint.model.trim();
+    if model.is_empty() {
+        spec_default_model(&endpoint.spec).to_string()
+    } else {
+        model.to_string()
+    }
 }
 
 /// One registered AI endpoint for one user, if it exists.
@@ -1247,6 +1366,23 @@ pub(crate) async fn insert_endpoint(
 
 pub(crate) async fn remove_endpoint(db: &SqlitePool, user_id: &str, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM ai_endpoints WHERE user_id=? AND id=?")
+        .bind(user_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Replaces the model of one user's endpoint.
+pub(crate) async fn update_endpoint_model(
+    db: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    model: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE ai_endpoints SET model=?, updated_at=? WHERE user_id=? AND id=?")
+        .bind(model)
+        .bind(stamp())
         .bind(user_id)
         .bind(id)
         .execute(db)
@@ -1359,6 +1495,8 @@ async fn settings_page(
         .map(|endpoint| EndpointRow {
             selected: endpoint.id == provider,
             key_masked: mask_key(&endpoint.api_key),
+            default_model: spec_default_model(&endpoint.spec).to_string(),
+            model_options: cached_model_catalogue(&s, &endpoint.id),
             id: endpoint.id,
             name: endpoint.name,
             spec: endpoint.spec,
@@ -1410,6 +1548,8 @@ async fn settings_page(
         gateway_base_url,
         saved: query.saved == "1",
         password_changed: query.notice == "password_changed",
+        step_moments: step_moments_enabled(&s.db).await?,
+        embeddings_configured: s.embedder.is_some(),
         notice: if query.notice == "disconnected" {
             "Subscription disconnected.".into()
         } else {
@@ -1453,7 +1593,11 @@ fn effort_options(current: &str) -> Vec<SelectOption> {
 /// Models for one subscription provider: the live catalogue when discovery
 /// yields one, otherwise the provider's built-in fallback list.
 async fn provider_models(s: &Arc<AppState>, user_id: &str, pi_provider: &str) -> Vec<String> {
-    let discovered = discover_models(s, user_id, pi_provider).await;
+    let source = ModelSource::Subscription {
+        user_id,
+        pi_provider,
+    };
+    let discovered = discover_models(s, &source).await;
     if !discovered.is_empty() {
         return discovered;
     }
@@ -1465,19 +1609,32 @@ async fn provider_models(s: &Arc<AppState>, user_id: &str, pi_provider: &str) ->
     fallback.iter().map(|model| (*model).to_string()).collect()
 }
 
-/// JSON model list for the Settings select, awaiting live discovery.
+/// JSON model list for the Settings model fields, awaiting live discovery.
+/// `provider` is "pi", "claude" or one of the user's endpoint ids. An endpoint
+/// has no fallback list: its field accepts any model id, so a failed
+/// discovery returns no suggestions.
 async fn settings_models(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Query(query): Query<ModelsQuery>,
 ) -> Result<Json<Value>> {
-    let pi_provider = pi_provider_for(&query.provider)
-        .ok_or_else(|| AppError::BadRequest("Unknown model provider.".into()))?;
-    let models = provider_models(&s, &user.id, pi_provider).await;
-    let selected = if pi_provider == CLAUDE_PI_PROVIDER {
-        selected_claude_model(&s.db).await?
-    } else {
-        selected_model(&s.db, &s.model).await?
+    let (models, selected) = match pi_provider_for(&query.provider) {
+        Some(pi_provider) => {
+            let models = provider_models(&s, &user.id, pi_provider).await;
+            let selected = if pi_provider == CLAUDE_PI_PROVIDER {
+                selected_claude_model(&s.db).await?
+            } else {
+                selected_model(&s.db, &s.model).await?
+            };
+            (models, selected)
+        }
+        None => {
+            let endpoint = find_endpoint(&s.db, &user.id, &query.provider)
+                .await?
+                .ok_or_else(|| AppError::BadRequest("Unknown model provider.".into()))?;
+            let models = discover_models(&s, &ModelSource::Endpoint(&endpoint)).await;
+            (models, endpoint_model(&endpoint))
+        }
     };
     Ok(Json(json!({ "models": models, "selected": selected })))
 }
@@ -1522,6 +1679,13 @@ async fn update_settings(
             .await?
             .filter(|endpoint| endpoint.spec == OPENAI_SPEC || endpoint.spec == ANTHROPIC_SPEC)
             .ok_or_else(|| AppError::BadRequest("Choose a saved API endpoint.".into()))?;
+        // The model field belongs to the endpoint that was shown; without the
+        // page script a different radio may have been picked meanwhile. Any
+        // model id is accepted: an endpoint may serve models it does not list.
+        let model = trim(&form.endpoint_model);
+        if !model.is_empty() && trim(&form.endpoint_model_for) == provider {
+            update_endpoint_model(&s.db, &user.id, &provider, &model).await?;
+        }
     }
     // Saved only once the provider and model are valid, so a rejected form
     // leaves the previous settings untouched.
@@ -1585,6 +1749,19 @@ async fn update_ai_gateway(
     Ok(Redirect::to("/settings"))
 }
 
+/// Switches video step moments on or off for every user. Off stops new
+/// imports from capturing a moment pool and hides moments on every page;
+/// stored moments stay, so switching back on shows them again.
+async fn update_step_moments(
+    State(s): State<Arc<AppState>>,
+    _user: AuthUser,
+    Form(form): Form<StepMomentsForm>,
+) -> Result<Redirect> {
+    let value = if form.enabled.is_some() { "on" } else { "off" };
+    set_app_setting(&s.db, STEP_MOMENTS_SETTING, value).await?;
+    Ok(Redirect::to("/settings?saved=1"))
+}
+
 /// A required http(s) base URL with any trailing slash removed.
 fn normalise_url(raw: &str, name: &str) -> Result<String> {
     let url = required(raw, name)?;
@@ -1626,6 +1803,7 @@ async fn delete_endpoint(
     Path(id): Path<String>,
 ) -> Result<Redirect> {
     crate::remove_endpoint(&s.db, &user.id, &id).await?;
+    forget_model_catalogue(&s, &id);
     if ai_provider(&s.db).await? == id {
         set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
     }

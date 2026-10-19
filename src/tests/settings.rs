@@ -50,6 +50,8 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
+        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
+        embedder: None,
     })
 }
 
@@ -69,6 +71,8 @@ fn settings_form(provider: &str) -> SettingsForm {
     SettingsForm {
         model: "gpt-5.5".into(),
         claude_model: String::new(),
+        endpoint_model: String::new(),
+        endpoint_model_for: String::new(),
         reasoning_effort: String::new(),
         provider: provider.into(),
     }
@@ -78,6 +82,8 @@ fn claude_form(model: &str) -> SettingsForm {
     SettingsForm {
         model: String::new(),
         claude_model: model.into(),
+        endpoint_model: String::new(),
+        endpoint_model_for: String::new(),
         reasoning_effort: String::new(),
         provider: "claude".into(),
     }
@@ -199,6 +205,8 @@ async fn saving_an_endpoint_switches_the_provider() {
         SettingsForm {
             model: String::new(),
             claude_model: String::new(),
+            endpoint_model: String::new(),
+            endpoint_model_for: String::new(),
             reasoning_effort: String::new(),
             provider: id.clone(),
         },
@@ -213,6 +221,82 @@ async fn saving_an_endpoint_switches_the_provider() {
             .await
             .unwrap();
     assert!(row.is_none());
+}
+
+#[tokio::test]
+async fn saving_an_endpoint_stores_its_model_only_from_its_own_field() {
+    let db = database().await;
+    let shown = add(
+        &db,
+        "Shown",
+        "anthropic",
+        "https://api.anthropic.com",
+        "sk-ant-a",
+    )
+    .await;
+    let picked = add(
+        &db,
+        "Picked",
+        "openai",
+        "https://api.example.com/v1",
+        "sk-b",
+    )
+    .await;
+    let state = state(db.clone());
+    let form = |provider: &str, model: &str, model_for: &str| SettingsForm {
+        model: String::new(),
+        claude_model: String::new(),
+        endpoint_model: model.into(),
+        endpoint_model_for: model_for.into(),
+        reasoning_effort: String::new(),
+        provider: provider.into(),
+    };
+    // Without the page script, the field of the endpoint that was shown is
+    // submitted while another endpoint is picked; it must not move across.
+    assert!(
+        save(&state, form(&picked, "claude-opus-5-5", &shown))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        find_endpoint(&db, "u1", &picked)
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        ""
+    );
+    assert_eq!(
+        find_endpoint(&db, "u1", &shown)
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        ""
+    );
+    assert!(
+        save(&state, form(&shown, " claude-opus-5-5 ", &shown))
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        find_endpoint(&db, "u1", &shown)
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        "claude-opus-5-5"
+    );
+    // A blank field keeps the stored model.
+    assert!(save(&state, form(&shown, "", &shown)).await.is_ok());
+    assert_eq!(
+        find_endpoint(&db, "u1", &shown)
+            .await
+            .unwrap()
+            .unwrap()
+            .model,
+        "claude-opus-5-5"
+    );
 }
 
 #[tokio::test]
@@ -436,6 +520,8 @@ async fn reasoning_effort_persists_in_codex_mode() {
             SettingsForm {
                 model: "gpt-5.5".into(),
                 claude_model: String::new(),
+                endpoint_model: String::new(),
+                endpoint_model_for: String::new(),
                 reasoning_effort: effort.into(),
                 provider: "pi".into(),
             },
@@ -462,6 +548,8 @@ async fn reasoning_effort_persists_in_endpoint_mode() {
         SettingsForm {
             model: String::new(),
             claude_model: String::new(),
+            endpoint_model: String::new(),
+            endpoint_model_for: String::new(),
             reasoning_effort: "medium".into(),
             provider: id,
         },
@@ -488,6 +576,8 @@ async fn unsupported_effort_is_rejected() {
         SettingsForm {
             model: "gpt-5.5".into(),
             claude_model: String::new(),
+            endpoint_model: String::new(),
+            endpoint_model_for: String::new(),
             reasoning_effort: "extreme".into(),
             provider: "pi".into(),
         },
@@ -507,6 +597,8 @@ async fn pi_mode_rejects_unsupported_model_and_saves_nothing() {
         SettingsForm {
             model: "not-a-real-model".into(),
             claude_model: String::new(),
+            endpoint_model: String::new(),
+            endpoint_model_for: String::new(),
             reasoning_effort: "max".into(),
             provider: "pi".into(),
         },

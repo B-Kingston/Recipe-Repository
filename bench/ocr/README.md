@@ -36,3 +36,11 @@ is 0.70; override it with `MEDIA_OCR_SCORE_THRESHOLD` when testing another
 calibration. The `production.invalid_symbol_tokens` and
 `production.digit_soup_tokens` lists are hard checks for random symbols and
 counter-like OCR failures.
+
+The engine envelope follows the app's contract: each frame carries `lines`
+(visual rows, top to bottom, with scores), `text` (the rows joined by newlines),
+and `skipped` (true when the text gate found no text and the frame never
+reached the full reader), and the report's `paddleocr.gate` records how many
+frames the gate checked and skipped. The gate is on by default; run with
+`MEDIA_OCR_TEXT_GATE=false` to benchmark the full reader on every frame, and
+`MEDIA_OCR_GATE_SIDE` to change the detection size.

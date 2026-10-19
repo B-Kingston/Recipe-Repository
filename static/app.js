@@ -38,6 +38,8 @@
   var thumbTimer = null;
   var thumbBusy = false;
   var thumbPolls = 0;
+  var momentsTimer = null;
+  var momentsPolls = 0;
 
   function format(seconds) {
     var minutes = Math.floor(seconds / 60);
@@ -113,9 +115,37 @@
     };
     request.send();
   }
+  function momentsPending() {
+    return document.querySelector('[data-moments-pending]');
+  }
+  function scheduleMoments() {
+    if (momentsTimer || !momentsPending()) return;
+    momentsTimer = window.setTimeout(momentsTick, THUMB_INTERVAL);
+  }
+  // A finished capture changes every step, so the page reloads once the
+  // fetched copy no longer shows the pending note.
+  function momentsTick() {
+    momentsTimer = null;
+    var pending = momentsPending();
+    if (!pending || momentsPolls >= THUMB_LIMIT) return;
+    if (editingNow()) { scheduleMoments(); return; }
+    momentsPolls += 1;
+    var request = new XMLHttpRequest();
+    request.open('GET', '/recipes/' + pending.getAttribute('data-moments-pending'), true);
+    request.onreadystatechange = function () {
+      if (request.readyState !== 4) return;
+      if (request.status >= 200 && request.status < 300 && request.responseText.indexOf('data-moments-pending') === -1) {
+        window.location.reload();
+        return;
+      }
+      scheduleMoments();
+    };
+    request.send();
+  }
   function chartReady() {
     startTimer();
     scheduleThumb();
+    scheduleMoments();
     var selected = document.querySelector('.chart-cell.is-active');
     if (selected && selected.scrollIntoView) selected.scrollIntoView(false);
   }
@@ -239,6 +269,9 @@
   var progressCopy = root.querySelector('[data-import-progress-copy]');
   var progressNames = ['extract', 'clean', 'generate'];
   var progress = { extract: 0, clean: 0, generate: 0 };
+  // Audio transcription and on-screen text run side by side, so the copy
+  // names whichever of the two is still going.
+  var lanesDone = { audio: false, ocr: false };
   var parts = {};
   var stages = {};
   var since = 0;
@@ -328,14 +361,22 @@
       if (event.phase === 'worker') advanceProgress('extract', state.indexOf('wait') !== -1 ? .03 : .06, READING);
       else if (event.phase === 'description') advanceProgress('extract', state === 'done' ? .25 : .12, READING);
       else if (event.phase === 'download') advanceProgress('extract', state === 'done' ? .43 : .34, 'Downloading the video…');
-      else if (event.phase === 'audio') advanceProgress('extract', state === 'done' ? .68 : .54, 'Transcribing spoken audio…');
-      else if (event.phase === 'ocr') advanceProgress('extract', state === 'done' ? .96 : state.indexOf('sampling') !== -1 ? .71 : .79, OCR_COPY);
+      else if (event.phase === 'audio') {
+        if (state === 'done') lanesDone.audio = true;
+        advanceProgress('extract', state === 'done' ? .68 : .54, lanesCopy());
+      } else if (event.phase === 'ocr') {
+        if (state === 'done') lanesDone.ocr = true;
+        advanceProgress('extract', state === 'done' ? .96 : state.indexOf('sampling') !== -1 ? .71 : .79, lanesCopy());
+      }
+      // Dish photos and video moments are computed in the background while
+      // the cleaner and recipe draft run, so they never move the bar or
+      // replace the copy of the stage that is actually running.
       else if (event.phase === 'cleaner') cleaning();
       else if (event.phase === 'draft') drafting();
     } else if (event.kind === 'ocr-plan') {
-      advanceProgress('extract', .82, OCR_COPY);
+      advanceProgress('extract', .82, lanesCopy());
     } else if (event.kind === 'ocr-captures') {
-      advanceProgress('extract', .97, OCR_COPY);
+      advanceProgress('extract', .97, lanesCopy());
     } else if (event.kind === 'cleaned') {
       advanceProgress('extract', 1, PREPARING);
       advanceProgress('clean', 1, PREPARING);
@@ -346,6 +387,14 @@
     } else if (event.kind === 'error' && progressCopy) {
       progressCopy.textContent = 'Import stopped.';
     }
+  }
+  function lanesCopy() {
+    var audioPending = stage('audio').enabled && !lanesDone.audio;
+    var ocrPending = stage('ocr').enabled && !lanesDone.ocr;
+    if (audioPending && ocrPending) return 'Transcribing audio and reading on-screen text…';
+    if (audioPending) return 'Transcribing spoken audio…';
+    if (ocrPending) return OCR_COPY;
+    return READING;
   }
   function stage(name) {
     if (!stages[name]) {
@@ -511,4 +560,98 @@
   }
   initialiseProgress();
   if (!finished) poll();
+}());
+
+/* Step moment stills: one click opens a still in a full-page viewer, with
+ * the other stills of the same step one tap or arrow key away. Escape, the
+ * close button, or a click outside the image closes it. Without JavaScript
+ * the still link opens the image itself. Clicks are delegated, so stills in
+ * a chart step swapped in place work too. */
+(function () {
+  var viewer = null;
+  var image = null;
+  var previousButton = null;
+  var nextButton = null;
+  var closeButton = null;
+  var links = [];
+  var index = 0;
+  var opener = null;
+
+  function stillLink(node) {
+    while (node && node !== document) {
+      if (node.nodeType === 1 && node.hasAttribute('data-still-viewer')) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function button(className, label, text, handler) {
+    var element = document.createElement('button');
+    element.type = 'button';
+    element.className = className;
+    element.setAttribute('aria-label', label);
+    element.textContent = text;
+    element.addEventListener('click', function (event) {
+      event.stopPropagation();
+      handler();
+    });
+    viewer.appendChild(element);
+    return element;
+  }
+  function build() {
+    viewer = document.createElement('div');
+    viewer.className = 'still-viewer';
+    viewer.hidden = true;
+    viewer.setAttribute('role', 'dialog');
+    viewer.setAttribute('aria-modal', 'true');
+    viewer.setAttribute('aria-label', 'Video frame');
+    image = document.createElement('img');
+    image.addEventListener('click', function (event) { event.stopPropagation(); });
+    viewer.appendChild(image);
+    previousButton = button('still-viewer-prev', 'Previous frame', '\u2039', function () { show(index - 1); });
+    nextButton = button('still-viewer-next', 'Next frame', '\u203a', function () { show(index + 1); });
+    closeButton = button('still-viewer-close', 'Close', '\u00d7', close);
+    viewer.addEventListener('click', close);
+    document.body.appendChild(viewer);
+  }
+  function show(next) {
+    if (next < 0 || next >= links.length) return;
+    index = next;
+    var still = links[index].getElementsByTagName('img')[0];
+    image.src = links[index].getAttribute('href');
+    image.alt = still ? still.alt : '';
+    previousButton.hidden = index === 0;
+    nextButton.hidden = index === links.length - 1;
+  }
+  function open(link) {
+    if (!viewer) build();
+    links = Array.prototype.slice.call(link.parentNode.querySelectorAll('[data-still-viewer]'));
+    opener = link;
+    show(links.indexOf(link));
+    viewer.hidden = false;
+    document.body.className += ' still-viewer-open';
+    closeButton.focus();
+  }
+  function close() {
+    if (!viewer || viewer.hidden) return;
+    viewer.hidden = true;
+    image.removeAttribute('src');
+    document.body.className = document.body.className.replace(/\s*still-viewer-open/g, '');
+    if (opener && document.body.contains(opener)) opener.focus();
+    opener = null;
+  }
+
+  document.addEventListener('click', function (event) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    var link = stillLink(event.target);
+    if (!link) return;
+    event.preventDefault();
+    open(link);
+  });
+  document.addEventListener('keydown', function (event) {
+    if (!viewer || viewer.hidden) return;
+    var key = event.key || '';
+    if (key === 'Escape' || key === 'Esc' || event.keyCode === 27) { event.preventDefault(); close(); }
+    else if (key === 'ArrowLeft' || event.keyCode === 37) { event.preventDefault(); show(index - 1); }
+    else if (key === 'ArrowRight' || event.keyCode === 39) { event.preventDefault(); show(index + 1); }
+  });
 }());

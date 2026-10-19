@@ -1,12 +1,13 @@
 use crate::ai::{
     SearchMode, apply_draft, cancel_draft, dedupe_sources, draft_page, draft_thumbnail,
     import_recipe, normalize_generated, parse_pi_response, recipe_schema, retry_guidance,
-    system_recipe_prompt, validate_generated,
+    strip_markdown_links, system_recipe_prompt, validate_generated,
 };
 use crate::auth::setup_create;
 use crate::media::MediaChannels;
 use crate::recipes::{
-    choose_thumbnail, discard_thumbnail, home, remove_thumbnail, start_thumbnail_recompute,
+    choose_thumbnail, discard_thumbnail, home, recipe_page, recipe_still, remove_thumbnail,
+    start_thumbnail_recompute,
 };
 use crate::{
     AppError, AppState, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient,
@@ -19,7 +20,6 @@ use axum::{
     http::{Request, StatusCode, header},
     response::IntoResponse,
 };
-use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sqlx::{
@@ -231,6 +231,8 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
+        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
+        embedder: None,
     })
 }
 
@@ -417,6 +419,184 @@ async fn preview_offers_candidates_and_apply_persists_the_chosen_photo() {
     assert_eq!(remaining, 0, "candidates die with the applied draft");
 }
 
+/// A video draft's moment pool and step moments move onto the saved recipe:
+/// each moment lands on the step block created for it, its stills are served
+/// to the owner only, and nothing stays behind on the consumed draft.
+#[tokio::test]
+async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
+    let db = database().await;
+    let s = state(db.clone());
+    insert_draft(&db, "tm1", None, None).await;
+    sqlx::query("UPDATE ai_drafts SET sources_json=? WHERE id='tm1'")
+        .bind(
+            json!([{"title": "Reel", "url": "https://www.instagram.com/reel/AbCdEf123/"}])
+                .to_string(),
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+    let vector = crate::embeddings::to_blob(&vec![0.0_f32; crate::embeddings::DIMENSIONS]);
+    for (kind, seconds) in [("audio", 0.0_f64), ("audio", 6.0), ("frame", 4.0)] {
+        sqlx::query(
+            "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector)VALUES('tm1',?,?,?)",
+        )
+        .bind(kind)
+        .bind(seconds)
+        .bind(&vector)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    for seconds in (0_i64..=16).step_by(2) {
+        sqlx::query("INSERT INTO draft_moment_stills(draft_id,seconds,jpeg)VALUES('tm1',?,?)")
+            .bind(seconds)
+            .bind(format!("still-{seconds}").into_bytes())
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO draft_step_moments(draft_id,step_index,seconds,source)VALUES('tm1',1,6,'audio')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let preview = response_body(
+        draft_page(
+            State(s.clone()),
+            AuthUser { id: "u1".into() },
+            Path("tm1".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        preview.matches("class=\"step-moment\"").count(),
+        1,
+        "only step 2 has a moment"
+    );
+    assert!(preview.contains("0:06 · Matched to the narration"));
+    // An audio moment shows stills spread over its 12 s window.
+    for seconds in [8, 12, 16] {
+        assert!(preview.contains(&format!("/ai/drafts/tm1/stills/{seconds}\"")));
+    }
+
+    let response = apply_draft(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path("tm1".into()),
+        Form(ApplyDraftForm { thumbnail: None }),
+    )
+    .await
+    .unwrap();
+    let recipe_id = response.headers()["location"]
+        .to_str()
+        .unwrap()
+        .trim_start_matches("/recipes/")
+        .to_string();
+    let second_step: String = sqlx::query_scalar(
+        "SELECT id FROM recipe_blocks WHERE recipe_id=? AND section='step' AND position=1",
+    )
+    .bind(&recipe_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let moments: Vec<(String, i64, String)> =
+        sqlx::query_as("SELECT step_id,seconds,source FROM recipe_step_moments")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(moments, vec![(second_step, 6, "audio".to_string())]);
+    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM recipe_moment_vectors WHERE recipe_id=?1),
+                (SELECT COUNT(*) FROM recipe_moment_stills WHERE recipe_id=?1),
+                (SELECT COUNT(*) FROM draft_moment_vectors),
+                (SELECT COUNT(*) FROM draft_moment_stills),
+                (SELECT COUNT(*) FROM draft_step_moments)",
+    )
+    .bind(&recipe_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        counts,
+        (3, 9, 0, 0, 0),
+        "the pool moves and the draft keeps nothing"
+    );
+
+    let page = recipe_page(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path(recipe_id.clone()),
+        axum::extract::Query(crate::RecipeQuery {
+            edit: None,
+            edit_meta: None,
+            view: None,
+            step: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(page.contains("0:06 · Matched to the narration"));
+    assert!(page.contains(&format!("/recipes/{recipe_id}/stills/12\"")));
+
+    let still = recipe_still(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path((recipe_id.clone(), 12)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_body(still).await, "still-12");
+
+    // "Find step moments" stores a fresh pool: it replaces the old one.
+    let fresh = crate::moments::MomentPool {
+        vectors: vec![crate::moments::MomentVector {
+            kind: crate::moments::MomentKind::Frame,
+            seconds: 12.0,
+            vector: vec![0.0; crate::embeddings::DIMENSIONS],
+        }],
+        stills: [12, 14]
+            .into_iter()
+            .map(|seconds| crate::moments::MomentStill {
+                seconds,
+                jpeg: format!("fresh-{seconds}").into_bytes(),
+            })
+            .collect(),
+    };
+    crate::recipes::store_recipe_moment_pool(&db, &recipe_id, &fresh)
+        .await
+        .unwrap();
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM recipe_moment_vectors WHERE recipe_id=?1),
+                (SELECT COUNT(*) FROM recipe_moment_stills WHERE recipe_id=?1)",
+    )
+    .bind(&recipe_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 2));
+    let still = recipe_still(
+        State(s.clone()),
+        AuthUser { id: "u1".into() },
+        Path((recipe_id.clone(), 12)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_body(still).await, "fresh-12");
+    let stranger = recipe_still(
+        State(s.clone()),
+        AuthUser { id: "u2".into() },
+        Path((recipe_id, 12)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(stranger, AppError::NotFound));
+}
+
 #[tokio::test]
 async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
     let db = database().await;
@@ -595,10 +775,14 @@ async fn library_cards_flag_recipes_that_have_a_dish_photo() {
         .await
         .unwrap();
     let html = response_body(
-        home(State(s), AuthUser { id: "u1".into() })
-            .await
-            .unwrap()
-            .into_response(),
+        home(
+            State(s),
+            AuthUser { id: "u1".into() },
+            axum::extract::Query(crate::HomeQuery::default()),
+        )
+        .await
+        .unwrap()
+        .into_response(),
     )
     .await;
     assert!(html.contains("/recipes/r1/thumbnail"));
@@ -643,7 +827,7 @@ fn fake_jpeg() -> Vec<u8> {
 async fn upload_replaces_the_photo_and_clears_pending_frames() {
     let db = database().await;
     let s = state(db.clone());
-    setup_create(
+    let setup = setup_create(
         State(s.clone()),
         Form(SetupForm {
             username: "alice".into(),
@@ -653,6 +837,13 @@ async fn upload_replaces_the_photo_and_clears_pending_frames() {
     )
     .await
     .unwrap();
+    let session = setup.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
     let alice_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username='alice'")
         .fetch_one(&db)
         .await
@@ -677,14 +868,10 @@ async fn upload_replaces_the_photo_and_clears_pending_frames() {
     let mut body = b"--B\r\nContent-Disposition: form-data; name=\"image\"; filename=\"p.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".to_vec();
     body.extend(fake_jpeg());
     body.extend_from_slice(b"\r\n--B--\r\n");
-    let authorization = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode("alice:secret-pass")
-    );
     let request = Request::builder()
         .method("POST")
         .uri("/recipes/r1/thumbnail/upload")
-        .header(header::AUTHORIZATION, &authorization)
+        .header(header::COOKIE, &session)
         .header(header::CONTENT_TYPE, "multipart/form-data; boundary=B")
         .body(Body::from(body))
         .unwrap();
@@ -794,4 +981,22 @@ async fn recompute_needs_a_social_video_source() {
         }
         other => panic!("expected a bad-request rejection, got {other:?}"),
     }
+}
+
+#[test]
+fn generated_text_drops_markdown_citations_and_keeps_link_labels() {
+    assert_eq!(
+        strip_markdown_links(
+            "Garlic prep is inferred. ([pbs.org](https://www.pbs.org/food/rice?utm_source=openai))"
+        ),
+        "Garlic prep is inferred."
+    );
+    assert_eq!(
+        strip_markdown_links("See [this guide](https://example.com) (2 min) [a] b"),
+        "See this guide (2 min) [a] b"
+    );
+    assert_eq!(
+        strip_markdown_links("Unclosed [x](http"),
+        "Unclosed [x](http"
+    );
 }

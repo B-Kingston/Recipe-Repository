@@ -103,9 +103,13 @@ Production adaptive OCR output:
 
 This reel retained the strongest OCR quality: the production output contains
 quantities (`6`, `10`, `tsp`, `tbsp`, and `2 cups`), repaired word spacing, and
-no random symbols or digit-soup tokens. A few displayed cards are naturally
-sentence fragments because the text itself continues on the next card; no
-individual word is broken.
+no random symbols or digit-soup tokens. Three displayed cards end mid-sentence
+(`you can easily remove the`, `Season with a hefty pinch of`, `Serve it with any
+sauce you`). That is a defect, not the card text continuing on the next card:
+the words that finish them (`skin`, `salt`, `like`) sat on the same card, on a
+row of their own, and the old one-word gate in `pi/local-media.py` (a lone token
+with fewer than 5 letters or digits) dropped them even at confidence 1.0. Rows
+are now merged first and a lone word is kept at confidence 0.95 or higher.
 
 ### Optimized adaptive rerun
 
@@ -119,8 +123,9 @@ caption cards and matched 107/109 unique reference words.
 | PP-OCRv6 small | 81 | 49.91s | 79 | 26 | 98.17% | 100% |
 
 Paddle retained every ingredient and quantity card with no invalid symbols or
-digit soup. The two unmatched reference words are continuations absent from
-the locally emitted sentence fragments. Wall time was slower than the earlier
+digit soup. The two unmatched reference words are `salt` and `skin`, the last
+words of two of the cut-off cards described above, not text from another card.
+Wall time was slower than the earlier
 42.36s Paddle run despite four fewer inference jobs, so it is treated as
 cold-process/model variance rather than a speed improvement.
 
