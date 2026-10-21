@@ -1,7 +1,8 @@
 /* E-ink mode. /display.css imports this after app.css for browsers in e-ink
    mode (chosen in Settings › Display, or a Kindle browser on Automatic).
-   Pure black on white: cards get black outlines instead of shadows, tints
-   become white, photos turn grey, nothing animates, and the type grows. */
+   Pure black on white: cards and tickets get black outlines instead of
+   shadows, tints become white, photos turn grey, nothing animates, and the
+   type grows. */
 
 :root {
   --ground: #ffffff;
@@ -33,14 +34,21 @@ a:hover { color: #000000; }
 .brand-mark-lines { stroke: #000000; }
 .top-nav a[aria-current="page"] { box-shadow: inset 0 0 0 2px #000000; }
 
-.recipe-card, .recipe-sheet, .block, .panel, .empty-state, .setup-page .setup-card, .letter-nav a {
+.recipe-sheet, .block, .panel, .empty-state, .setup-page .setup-card, .letter-nav a {
   border: 2px solid #000000;
   box-shadow: none;
 }
-.recipe-card:hover, .recipe-card:focus { box-shadow: none; }
 .block.step-block { border: 0; }
-.card-tab { top: -32px; border: 2px solid #000000; border-bottom: 0; }
 .letter-nav span { color: #8a8a8a; }
+
+/* The rail becomes line art; a ticket keeps its serrated shape (with finer
+   teeth) and gets a 1px black outline that follows the teeth. */
+.rail { background-image: url('/static/rail-eink.svg'); filter: none; }
+.ticket {
+  -webkit-filter: drop-shadow(1px 0 0 #000000) drop-shadow(-1px 0 0 #000000) drop-shadow(0 1px 0 #000000) drop-shadow(0 -1px 0 #000000);
+  filter: drop-shadow(1px 0 0 #000000) drop-shadow(-1px 0 0 #000000) drop-shadow(0 1px 0 #000000) drop-shadow(0 -1px 0 #000000);
+}
+.ticket-paper { --tooth: 6px; font-size: 14px; }
 .version-tab { border: 2px solid #000000; border-bottom: 0; }
 .version-tab.is-current { background: #000000; color: #ffffff; }
 .recipe-sheet .form-panel, .edit-form, .add-form, .chart-detail, .prompt-help, .thumb-picker { border: 1px solid #000000; }
@@ -60,10 +68,12 @@ a:hover { color: #000000; }
 .evidence-warning, .debug-warnings { color: #000000; }
 .chart-leaf.is-active { box-shadow: inset 4px 0 #000000; font-weight: 700; }
 
-.recipe-title, .recipe-lines { font-size: 18px; }
 .page-header h1 { font-size: 2.8rem; }
 .page-header .deck, .ingredient-row, .step-block .block-text, .block-index { font-size: 19px; }
-.step-ingredients, .recipe-meta, .step-moment-source { font-size: 14px; }
+.step-ingredients, .step-moment-source { font-size: 14px; }
+.ticket-bar { font-size: 14.5px; }
+.ticket-head { font-size: 16px; }
+.ticket-items.is-packed { font-size: 13.5px; }
 .button, button, .top-nav a, .view-tab { font-size: 16px; }
 .button, button { min-height: 48px; }
 .chart-detail h3 { font-size: 1.45rem; }

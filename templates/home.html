@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}Recipe box · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Recipe rail · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
 <section id="all-recipes">
   <div class="section-heading search-heading">
     <div>
@@ -6,14 +6,14 @@
       <p class="eyebrow">Search</p>
       <h1>Results for “{{ query }}”</h1>
       {% else %}
-      <h1>Recipe box</h1>
-      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} card{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
+      <h1>Recipe rail</h1>
+      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} ticket{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
       {% endif %}
     </div>
     <form class="search-form" method="get" action="/" role="search">
       <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
       <label class="visually-hidden" for="search-q">Search recipes</label>
-      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the box">
+      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the rail">
       <button class="primary" type="submit">Search</button>
     </form>
   </div>
@@ -24,14 +24,14 @@
   {% if recipes.len() == 0 && results %}
   <div class="empty-state">
     <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
-    <h2>No cards match.</h2>
-    <p>Nothing in your box is close to “{{ query }}”. Try different words.</p>
+    <h2>No tickets match.</h2>
+    <p>Nothing on your rail is close to “{{ query }}”. Try different words.</p>
   </div>
   {% endif %}
   {% if recipes.len() == 0 && !results %}
   <div class="empty-state">
     <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
-    <h2>The box is empty.</h2>
+    <h2>The rail is empty.</h2>
     <p>Describe a dish, mention a recipe you love, or paste a link to research.</p>
     <div class="actions centered"><a class="button primary" href="/recipes/new">Add recipe</a></div>
   </div>
@@ -43,17 +43,39 @@
   </nav>
   {% endif %}
 
-  <div class="recipe-grid{% if !results %} is-filed{% endif %}">
+  {# Every ticket is preceded by a rail; app.css shows only the rails that
+     start a row at the current column count (rail-1, rail-2 or rail-3). #}
+  <div class="ticket-rail">
   {% for recipe in recipes %}
-    <a class="recipe-card" href="/recipes/{{ recipe.id }}"{% if recipe.letter != "" %} id="letter-{{ recipe.anchor() }}"{% endif %}>
-      {% if recipe.letter != "" %}<span class="card-tab" aria-hidden="true">{{ recipe.letter }}</span>{% endif %}
-      <span class="recipe-card-head">
-        <strong class="recipe-title">{{ recipe.title }}</strong>
-        {% if recipe.has_thumbnail %}<img class="recipe-thumb" src="/recipes/{{ recipe.id }}/thumbnail" alt="">{% endif %}
-      </span>
-      <span class="recipe-lines"><span class="recipe-description">{{ recipe.description }}</span></span>
-      <span class="recipe-meta"><span>{{ recipe.serves() }}</span><span>{{ recipe.total_time() }}</span></span>
-    </a>
+    <div class="rail rail-1{% if loop.index0 % 2 == 0 %} rail-2{% endif %}{% if loop.index0 % 3 == 0 %} rail-3{% endif %}" aria-hidden="true"></div>
+    <article class="ticket"{% if recipe.letter != "" %} id="letter-{{ recipe.anchor() }}"{% endif %}>
+      <div class="ticket-paper">
+        <div class="ticket-bars">
+          <h2 class="ticket-bar ticket-head"><a class="ticket-link" href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a>{% if recipe.has_thumbnail %}<img class="ticket-thumb" src="/recipes/{{ recipe.id }}/thumbnail" alt="">{% endif %}</h2>
+          {% if recipe.total_time() != "" %}<p class="ticket-bar">Ready in {{ recipe.total_time() }}</p>{% endif %}
+          {% if recipe.serves() != "" %}<p class="ticket-bar">{{ recipe.serves() }}</p>{% endif %}
+        </div>
+        <p class="ticket-label">Recipe details:</p>
+        <dl class="ticket-details">
+          <div><dt>Number:</dt><dd>{{ "{:03}"|format(loop.index) }}</dd></div>
+          <div><dt>Filed under:</dt><dd>{{ recipe.filed_under() }}</dd></div>
+        </dl>
+        {% if recipe.description != "" %}
+        <div class="ticket-note">
+          <svg class="ticket-note-icon" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><circle cx="9" cy="9" r="9"/><path d="M9 4.6v5.4"/><circle class="ticket-note-dot" cx="9" cy="13.3" r="1.3"/></svg>
+          <p>{{ recipe.description }}</p>
+        </div>
+        {% endif %}
+        {% if !recipe.ingredients.is_empty() %}
+        <p class="ticket-label">Ingredients:</p>
+        <ul class="ticket-items{% if recipe.packed() %} is-packed{% endif %}">
+          {% for item in recipe.ingredients %}
+          <li><b class="ticket-qty">{{ item.quantity }}{% if item.unit != "" %} {{ item.unit }}{% endif %}</b> <span class="ticket-item">{{ item.text }}{% if item.optional != 0 %} <em>(optional)</em>{% endif %}</span><span class="ticket-box" aria-hidden="true"></span></li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+    </article>
   {% endfor %}
   </div>
 </section>

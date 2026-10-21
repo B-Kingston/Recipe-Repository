@@ -1,11 +1,11 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
-    LibraryCard, delete_block, delete_version, file_by_letter, find_version, move_block,
-    recipe_versions, record_version, update_block, update_recipe, view_version,
+    LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_by_letter, find_version,
+    home, move_block, recipe_versions, record_version, update_block, update_recipe, view_version,
 };
-use crate::{AppError, AppState, BlockForm, RecipeForm, stamp};
+use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, stamp};
 use axum::Form;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use parking_lot::Mutex;
 use sqlx::{
     SqlitePool,
@@ -325,6 +325,7 @@ fn card(title: &str) -> LibraryCard {
         cook_minutes: None,
         has_thumbnail: false,
         letter: String::new(),
+        ingredients: Vec::new(),
     }
 }
 
@@ -390,4 +391,62 @@ fn library_card_shows_servings_and_total_time() {
     dal.prep_minutes = None;
     dal.cook_minutes = Some(120);
     assert_eq!(dal.total_time(), "2 h");
+}
+
+#[tokio::test]
+async fn library_tickets_print_ingredients_and_pack_long_lists() {
+    let db = database().await;
+    let now = stamp();
+    sqlx::query(
+        "INSERT INTO recipes(id,title,servings,prep_minutes,user_id,created_at,updated_at)
+         VALUES('big','Big stew',6,40,'u1',?,?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit,optional)
+         VALUES('i0','r','ingredient',0,'Silken tofu','300','g',0),
+               ('i1','r','ingredient',1,'Chilli flakes','1/2','tsp',1),
+               ('s0','r','step',0,'Blend everything','','',0)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    for position in 0..=TICKET_COLUMNS_AFTER {
+        sqlx::query(
+            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES(?,'big','ingredient',?,?)",
+        )
+        .bind(format!("b{position}"))
+        .bind(position as i64)
+        .bind(format!("Item {position}"))
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    let page = home(
+        State(state(db)),
+        AuthUser { id: "u1".into() },
+        Query(HomeQuery::default()),
+    )
+    .await
+    .unwrap()
+    .0;
+    // "Big stew" files before "Test": it opens every rail, "Test" only a
+    // one-column rail.
+    assert!(page.contains(r#"<div class="rail rail-1 rail-2 rail-3" aria-hidden="true">"#));
+    assert!(page.contains(r#"<div class="rail rail-1" aria-hidden="true">"#));
+    assert!(page.contains("Ready in 40 min"));
+    assert!(page.contains("Serves 6"));
+    assert!(page.contains("<dd>001</dd>") && page.contains("<dd>002</dd>"));
+    assert!(page.contains("<dd>B</dd>") && page.contains("<dd>T</dd>"));
+    assert!(page.contains(
+        r#"<b class="ticket-qty">300 g</b> <span class="ticket-item">Silken tofu</span>"#
+    ));
+    assert!(page.contains("Chilli flakes <em>(optional)</em>"));
+    assert!(!page.contains("Blend everything"));
+    assert_eq!(page.matches(r#"class="ticket-items is-packed""#).count(), 1);
+    assert_eq!(page.matches(r#"class="ticket-items""#).count(), 1);
 }

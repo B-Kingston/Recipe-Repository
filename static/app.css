@@ -1,7 +1,9 @@
-/* Recipe Box: every recipe is a typed index card. Courier Prime carries the
-   card copy (titles, ingredients, steps); Libre Franklin carries the UI. The
-   palette lives in custom properties so e-ink mode (static/eink.css, loaded
-   through /display.css) can swap it for pure black on white. */
+/* Recipe Box: every recipe is a typed index card, and the library hangs them
+   as order tickets on a kitchen rail. Courier Prime carries the card copy
+   (titles, ingredients, steps); Libre Franklin carries the UI and the
+   tickets. The palette lives in custom properties so e-ink mode
+   (static/eink.css, loaded through /display.css) can swap it for pure black
+   on white. */
 
 @font-face {
   font-family: 'Courier Prime';
@@ -314,61 +316,120 @@ label > input[type=checkbox] { margin-right: 8px; }
 .letter-nav a:hover { background: var(--ink); color: var(--on-ink); }
 .letter-nav span { color: #a3abb4; }
 
-.recipe-grid {
+/* The rail: recipes hang as kitchen order tickets, one rail per row. Every
+   ticket is preceded by a rail element and only the rails that start a row
+   at the current column count show (rail-1, rail-2 or rail-3), so each row
+   gets a full-width rail without the server knowing the screen size.
+   static/rail.svg stretches to any width; the tickets tuck under its lip. */
+.ticket-rail {
+  --rail-inset: 28px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
-  gap: 24px;
-  padding-top: 28px;
+  grid-template-columns: minmax(0, 1fr);
+  column-gap: 32px;
+  padding: 36px var(--rail-inset) 0;
 }
-.recipe-grid.is-filed { row-gap: 52px; padding-top: 58px; }
-.recipe-card {
+.rail {
   position: relative;
-  display: flex;
-  flex-direction: column;
-  min-height: 200px;
-  padding: 20px 22px 16px;
-  border-radius: var(--radius);
-  background: var(--card);
-  box-shadow: var(--shadow);
-  color: var(--ink);
-  text-decoration: none;
+  z-index: 2;
+  display: none;
+  grid-column: 1 / -1;
+  height: 48px;
+  margin: 44px calc(-1 * var(--rail-inset)) 0;
+  background: url('/static/rail.svg') 0 0 / 100% 48px no-repeat;
+  filter: drop-shadow(0 1px 1px rgba(17, 26, 34, .28)) drop-shadow(0 7px 7px rgba(17, 26, 34, .18));
+}
+.rail:first-child { margin-top: 0; }
+.rail-1 { display: block; }
+@media (min-width: 600px) {
+  .ticket-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rail-1 { display: none; }
+  .rail-2 { display: block; }
+}
+@media (min-width: 1000px) {
+  .ticket-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .rail-2 { display: none; }
+  .rail-3 { display: block; }
+}
+
+.ticket {
+  position: relative;
+  z-index: 1;
+  align-self: start;
+  justify-self: center;
+  width: 100%;
+  max-width: 340px;
+  margin-top: -17px;
+  transform-origin: 50% 0;
+  filter: drop-shadow(0 1px 1px rgba(17, 26, 34, .14)) drop-shadow(0 12px 14px rgba(17, 26, 34, .12));
   scroll-margin-top: 60px;
 }
-.recipe-card:hover { color: var(--ink); box-shadow: var(--shadow-lift); }
-.recipe-card:hover .recipe-title { text-decoration: underline; text-decoration-color: var(--rule); }
-.card-tab {
-  position: absolute;
-  top: -30px;
-  left: 22px;
-  display: grid;
-  place-items: center;
-  min-width: 48px;
-  height: 32px;
-  padding: 0 12px 2px;
-  border-radius: 10px 10px 0 0;
+/* Tickets hang slightly askew, in a five-ticket cycle so rows don't repeat. */
+.ticket:nth-of-type(5n+1) { transform: rotate(-1deg); }
+.ticket:nth-of-type(5n+2) { transform: rotate(.6deg); }
+.ticket:nth-of-type(5n+3) { transform: rotate(-.4deg); }
+.ticket:nth-of-type(5n+4) { transform: rotate(.85deg); }
+.ticket:nth-of-type(5n) { transform: rotate(-.2deg); }
+/* The paper has serrated edges on all four sides: a mask of --tooth wide
+   teeth (half as deep) around an inset rectangle. The top 14px of padding
+   is hidden under the rail. */
+.ticket-paper {
+  --tooth: 10px;
+  position: relative;
+  padding: 31px 20px 22px;
   background: var(--card);
-  color: var(--rule-ink);
-  font: 700 18px/1 var(--type);
+  color: var(--ink-strong);
+  font: 13px/1.4 var(--sans);
+  -webkit-mask:
+    linear-gradient(#000, #000) 50% 50% / calc(100% - var(--tooth)) calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(135deg, #000 50%, transparent 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(225deg, transparent 50%, #000 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y;
+  mask:
+    linear-gradient(#000, #000) 50% 50% / calc(100% - var(--tooth)) calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(135deg, #000 50%, transparent 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y,
+    linear-gradient(225deg, transparent 50%, #000 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y;
 }
-.recipe-card-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  padding-bottom: 10px;
-  border-bottom: 2px solid var(--rule);
-}
-.recipe-title { flex: 1 1 auto; min-width: 0; font: 700 20px/1.25 var(--type); overflow-wrap: anywhere; }
-.recipe-thumb { flex: none; display: block; width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
-.recipe-lines {
-  display: block;
-  flex: 1 1 auto;
-  min-height: 56px;
-  margin-top: 2px;
-  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 27px, var(--lines) 27px, var(--lines) 28px);
-  font: 16px/28px var(--type);
-}
-.recipe-description { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
-.recipe-meta { display: flex; justify-content: space-between; gap: 12px; padding-top: 12px; color: var(--muted); font: 600 13px/1.2 var(--sans); }
+.ticket-bars { display: grid; gap: 6px; }
+.ticket-bar { margin: 0; padding: 6px 11px; background: var(--ink-strong); color: var(--on-ink); font: 700 13.5px/1.3 var(--sans); }
+.ticket-head { display: flex; align-items: center; gap: 10px; font-size: 15px; }
+.ticket-link { flex: 1 1 auto; min-width: 0; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.ticket-link:hover { color: var(--on-ink); }
+.ticket-link:focus-visible { outline-color: var(--on-ink); outline-offset: 3px; }
+/* The title link covers the whole ticket. */
+.ticket-link::after { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; }
+.ticket:hover .ticket-link { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.ticket-thumb { flex: none; display: block; width: 38px; height: 38px; margin: -3px -6px -3px 0; object-fit: cover; border-radius: 3px; }
+.ticket-label { margin: 14px 0 5px; font: 700 13.5px/1.2 var(--sans); }
+.ticket-details { display: grid; gap: 1px; margin: 0; }
+.ticket-details div { display: flex; justify-content: space-between; gap: 12px; }
+.ticket-details dt { color: var(--body); }
+.ticket-details dd { margin: 0; }
+.ticket-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; }
+.ticket-note-icon { flex: none; width: 16px; height: 16px; margin-top: 1px; fill: var(--ink-strong); }
+.ticket-note-icon path { fill: none; stroke: var(--on-ink); stroke-width: 2.2; stroke-linecap: round; }
+.ticket-note-icon .ticket-note-dot { fill: var(--on-ink); }
+.ticket-note p { display: -webkit-box; margin: 0; overflow: hidden; font-weight: 700; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
+/* Short lists line the amounts up in a column; long ones (is-packed) run
+   each line together and flow down two columns to keep the ticket short. */
+.ticket-items { margin: 0; padding: 0; list-style: none; }
+.ticket-items li { display: grid; grid-template-columns: 4.4em minmax(0, 1fr) 11px; column-gap: 8px; align-items: baseline; padding: 2px 0; }
+.ticket-qty { font-weight: 800; overflow-wrap: anywhere; }
+.ticket-items em { color: var(--muted); }
+.ticket-box { align-self: start; width: 11px; height: 11px; margin-top: 4px; border: 1.5px solid currentColor; border-radius: 2px; }
+.ticket-items.is-packed { -webkit-column-count: 2; column-count: 2; -webkit-column-gap: 14px; column-gap: 14px; font-size: 12.5px; }
+.ticket-items.is-packed li { display: block; position: relative; padding-right: 16px; -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
+.ticket-items.is-packed .ticket-box { position: absolute; top: 2px; right: 0; }
 
 .empty-state {
   margin-top: 28px;
@@ -819,6 +880,7 @@ body.still-viewer-open { overflow: hidden; }
   .block, .panel, .form-panel { padding: 18px; }
   .recipe-sheet { padding: 26px 20px 28px; border-radius: var(--radius); }
   .version-tabs { padding: 0 12px; }
+  .ticket-rail { --rail-inset: 18px; column-gap: 24px; }
   .page-header h1 { font-size: 1.9rem; }
   .hero-photo { width: 100%; max-width: 360px; height: auto; aspect-ratio: 1; }
   .ingredients-section { max-width: none; }
@@ -837,7 +899,7 @@ body.still-viewer-open { overflow: hidden; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .button, button, .recipe-card, .top-nav a, .view-tab, .add-mode-tab, .letter-nav a {
+  .button, button, .top-nav a, .view-tab, .add-mode-tab, .letter-nav a {
     transition: background-color .12s ease, border-color .12s ease, box-shadow .12s ease, color .12s ease;
   }
 }
