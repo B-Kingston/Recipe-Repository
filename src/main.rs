@@ -32,6 +32,7 @@ use uuid::Uuid;
 mod ai;
 mod auth;
 mod chart;
+mod display;
 mod embeddings;
 mod media;
 mod media_worker;
@@ -391,6 +392,8 @@ struct HomeTemplate {
     results: bool,
     /// Search status shown above the recipes (indexing progress, service problems).
     notice: String,
+    /// The A to Z strip over the filed library; empty for search results.
+    letters: Vec<crate::recipes::LetterLink>,
 }
 #[derive(Template)]
 #[template(path = "setup.html")]
@@ -410,6 +413,15 @@ struct LoginTemplate {
 #[template(path = "password_reset.html")]
 struct ResetPasswordTemplate {
     error: String,
+}
+#[derive(Template)]
+#[template(path = "display.html")]
+struct DisplayTemplate {
+    /// The mode saved in this browser: "auto", "colour" or "eink".
+    mode: &'static str,
+    /// The request comes from a Kindle browser, so Automatic means e-ink here.
+    kindle: bool,
+    saved: bool,
 }
 #[derive(Template)]
 #[template(path = "recipe.html")]
@@ -1015,6 +1027,10 @@ fn routes(state: Arc<AppState>) -> Router {
             "/settings/password",
             get(reset_password_page).post(reset_password),
         )
+        .route(
+            "/settings/display",
+            get(display::display_page).post(display::update_display),
+        )
         .route("/settings/authorise-codex", get(authorise_codex_start))
         .route(
             "/settings/authorise-codex/status/{flow_id}",
@@ -1043,6 +1059,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/setup", get(setup_page).post(setup_create))
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
+        .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
         .with_state(state)

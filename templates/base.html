@@ -3,22 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f5f5f2">
+  <meta name="theme-color" content="#ffffff">
   <title>{% block title %}Recipe Repository{% endblock %}</title>
   {% block head %}{% endblock %}
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/display.css">
 </head>
 <body>
   <header class="utility-bar">
-    <a class="brand" href="/" aria-label="Recipe Repository home"><img class="brand-mark" src="/static/library.svg" width="30" height="24" alt="" aria-hidden="true"><span class="brand-text">Recipe Repository</span></a>
-    <nav class="top-nav" aria-label="Main navigation">
-      <a href="/">Library</a>
-      <a href="/recipes/new">Add recipe</a>
-    </nav>
-  <a class="utility-action" href="/settings" aria-label="Settings">
-    <img class="settings-icon" src="/static/cog-round.svg" alt="" aria-hidden="true">
-    <span class="visually-hidden">Settings</span>
-  </a>
+    <div class="utility-inner">
+      <a class="brand" href="/" aria-label="Recipe Repository home">
+        <svg class="brand-mark" width="28" height="22" viewBox="0 0 28 22" aria-hidden="true" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg>
+        <span class="brand-text">Recipe Repository</span>
+      </a>
+      <nav class="top-nav" aria-label="Main navigation">
+        <a href="/"{% block nav_library %}{% endblock %}>Library</a>
+        <a href="/recipes/new"{% block nav_add %}{% endblock %}>Add recipe</a>
+        <a href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
+      </nav>
+    </div>
   </header>
   <main class="app-shell">
     <div class="paper">

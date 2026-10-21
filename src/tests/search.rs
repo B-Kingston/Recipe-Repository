@@ -261,7 +261,8 @@ async fn searching_without_an_embedding_service_explains_and_lists_every_recipe(
     .unwrap()
     .0;
     assert!(page.contains(NOT_CONFIGURED));
-    assert!(page.contains("All Recipes"));
+    assert!(page.contains("Recipe box"));
+    assert!(page.contains("filed A to Z"));
     assert!(page.contains("href=\"/recipes/r\""));
     assert!(!page.contains("href=\"/recipes/other\""));
     assert!(page.contains("value=\"supper\""));

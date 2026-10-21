@@ -1,13 +1,19 @@
-{% extends "base.html" %}{% block title %}Recipe Library · Recipe Repository{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Recipe box · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
 <section id="all-recipes">
   <div class="section-heading search-heading">
     <div>
-      <p class="eyebrow">Cookbook / Index</p>
-      {% if results %}<h1>Results for “{{ query }}”</h1>{% else %}<h1>All Recipes</h1>{% endif %}
+      {% if results %}
+      <p class="eyebrow">Search</p>
+      <h1>Results for “{{ query }}”</h1>
+      {% else %}
+      <h1>Recipe box</h1>
+      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} card{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
+      {% endif %}
     </div>
     <form class="search-form" method="get" action="/" role="search">
+      <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
       <label class="visually-hidden" for="search-q">Search recipes</label>
-      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search recipes">
+      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the box">
       <button class="primary" type="submit">Search</button>
     </form>
   </div>
@@ -17,29 +23,36 @@
 
   {% if recipes.len() == 0 && results %}
   <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true"><img src="/static/library.svg" width="30" height="24" alt=""></span>
-    <h2>No recipes match.</h2>
-    <p class="home-prompt">Nothing in your library is close to “{{ query }}”. Try different words.</p>
+    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
+    <h2>No cards match.</h2>
+    <p>Nothing in your box is close to “{{ query }}”. Try different words.</p>
   </div>
   {% endif %}
   {% if recipes.len() == 0 && !results %}
   <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true"><img src="/static/library.svg" width="30" height="24" alt=""></span>
-    <h2>The cupboard is bare.</h2>
-    <p class="home-prompt">Describe a dish, mention a recipe you love, or paste a URL to research.</p>
+    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
+    <h2>The box is empty.</h2>
+    <p>Describe a dish, mention a recipe you love, or paste a link to research.</p>
     <div class="actions centered"><a class="button primary" href="/recipes/new">Add recipe</a></div>
   </div>
   {% endif %}
 
-  <div class="recipe-grid">
+  {% if !results && recipes.len() > 0 %}
+  <nav class="letter-nav" aria-label="Jump to letter">
+    {% for link in letters %}{% if link.present %}<a href="#letter-{{ link.anchor }}">{{ link.letter }}</a>{% else %}<span aria-hidden="true">{{ link.letter }}</span>{% endif %}{% endfor %}
+  </nav>
+  {% endif %}
+
+  <div class="recipe-grid{% if !results %} is-filed{% endif %}">
   {% for recipe in recipes %}
-    <a class="recipe-card" href="/recipes/{{ recipe.id }}">
-      {% if recipe.has_thumbnail %}<img class="recipe-thumb" src="/recipes/{{ recipe.id }}/thumbnail" alt="">{% else %}<span class="recipe-glyph" aria-hidden="true"><img src="/static/library.svg" width="26" height="21" alt=""></span>{% endif %}
-      <span class="recipe-copy">
-        <strong>{{ recipe.title }}</strong>
-        <em>{% if recipe.description != "" %}{{ recipe.description }}{% else %}Open recipe card{% endif %}</em>
+    <a class="recipe-card" href="/recipes/{{ recipe.id }}"{% if recipe.letter != "" %} id="letter-{{ recipe.anchor() }}"{% endif %}>
+      {% if recipe.letter != "" %}<span class="card-tab" aria-hidden="true">{{ recipe.letter }}</span>{% endif %}
+      <span class="recipe-card-head">
+        <strong class="recipe-title">{{ recipe.title }}</strong>
+        {% if recipe.has_thumbnail %}<img class="recipe-thumb" src="/recipes/{{ recipe.id }}/thumbnail" alt="">{% endif %}
       </span>
-      <span class="recipe-arrow" aria-hidden="true">›</span>
+      <span class="recipe-lines"><span class="recipe-description">{{ recipe.description }}</span></span>
+      <span class="recipe-meta"><span>{{ recipe.serves() }}</span><span>{{ recipe.total_time() }}</span></span>
     </a>
   {% endfor %}
   </div>

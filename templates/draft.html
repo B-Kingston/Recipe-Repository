@@ -1,29 +1,39 @@
 {% extends "base.html" %}{% block title %}AI Draft · Recipe Repository{% endblock %}{% block content %}
 {% if error != "" %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<article class="recipe-sheet">
 <header class="page-header">
   <div class="page-header-copy">
-    <p class="breadcrumb">Cookbook / Draft for review</p>
+    <p class="eyebrow">Draft for review · not saved yet</p>
     <h1>{{ recipe.title }}</h1>
     <p class="deck">{{ recipe.description }}</p>
-    <p class="metadata"><span>{{ recipe.servings }} servings</span><span>{{ recipe.prep_minutes }} min prep</span><span>{{ recipe.cook_minutes }} min cook</span></p>
-    {% if sources.len() > 0 %}
-    <details class="source-disclosure">
-      <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
-      <ol class="source-popover">
-        {% for source in sources %}<li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>{% endfor %}
-      </ol>
-    </details>
-    {% endif %}
-  </div>
-  <div class="actions page-actions">
-    {% if thumbs.is_empty() %}<form class="inline" method="post" action="/ai/drafts/{{ id }}/apply" data-busy-label="Saving…"><button class="primary">Save recipe</button></form>{% endif %}
-    <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel" data-confirm="Discard this draft? You will need to research it again to get it back." data-busy-label="Discarding…"><button>Discard</button></form>
   </div>
 </header>
+<div class="card-rule" aria-hidden="true"></div>
+<div class="recipe-facts">
+  <dl class="fact-list">
+    <div><dt>Serves</dt><dd>{{ recipe.servings }}</dd></div>
+    <div><dt>Prep</dt><dd>{{ recipe.prep_minutes }} min</dd></div>
+    <div><dt>Cook</dt><dd>{{ recipe.cook_minutes }} min</dd></div>
+  </dl>
+  {% if sources.len() > 0 %}
+  <details class="source-disclosure">
+    <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
+    <ol class="source-popover">
+      {% for source in sources %}<li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>{% endfor %}
+    </ol>
+  </details>
+  {% endif %}
+</div>
+<div class="card-actions">
+  <div class="actions page-actions">
+    {% if thumbs.is_empty() %}<form class="inline" method="post" action="/ai/drafts/{{ id }}/apply" data-busy-label="Saving…"><button class="primary">Save recipe</button></form>{% endif %}
+    <form class="inline" method="post" action="/ai/drafts/{{ id }}/cancel" data-confirm="Discard this draft? You will need to research it again to get it back." data-busy-label="Discarding…"><button class="quiet danger">Discard</button></form>
+  </div>
+</div>
 {% if !thumbs.is_empty() %}
 <form class="panel thumb-picker" method="post" action="/ai/drafts/{{ id }}/apply" data-busy-label="Saving…">
-  <h2>Dish photo</h2>
-  <p class="muted">Choose the library card photo, then save.</p>
+  <h2 class="section-label">Dish photo</h2>
+  <p class="muted">Choose the photo for this recipe's card, then save.</p>
   <div class="thumb-options">
     {% for thumb in thumbs %}
     <label class="thumb-option">
@@ -36,25 +46,26 @@
   <p class="actions form-actions"><button class="primary">Save recipe</button></p>
 </form>
 {% endif %}
-<article class="draft-panel">
+<div class="card-body draft-panel">
   <section class="recipe-section ingredients-section">
-    <div class="column-heading"><span aria-hidden="true">I</span><h2>Ingredients</h2></div>
-    <div class="ingredients-box">
-      <ul class="ingredient-list">{% for item in recipe.ingredients %}<li>{% if item.quantity != "" %}<strong>{{ item.quantity }}</strong> {% endif %}{% if item.unit != "" %}{{ item.unit }} {% endif %}{{ item.name }}{% if item.optional %} <em>(optional)</em>{% endif %}</li>{% endfor %}</ul>
-    </div>
+    <h2 class="section-label">Ingredients</h2>
+    <ul class="ingredient-list">{% for item in recipe.ingredients %}<li class="ingredient-row"><span class="ingredient-qty">{{ item.quantity }}{% if item.unit != "" %} {{ item.unit }}{% endif %}</span><span class="block-text">{{ item.name }}{% if item.optional %} <em>(optional)</em>{% endif %}</span></li>{% endfor %}</ul>
   </section>
   <section class="recipe-section method-section">
-    <div class="column-heading"><span aria-hidden="true">M</span><h2>Method</h2></div>
+    <h2 class="section-label">Method</h2>
+    <ol class="step-list">
     {% for step in recipe.steps %}
-    <div class="step-group">
+    <li class="step-group">
       <div class="block step-block"><span class="block-index">{{ loop.index }}.</span><span class="block-text">{{ step.text }}</span></div>
       {% if step.ingredients.len() > 0 %}
       <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}"><span class="step-ingredients-label">Add</span>{% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}</div>
       {% endif %}
       {% match step_moments[loop.index0] %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
-    </div>
+    </li>
     {% endfor %}
+    </ol>
   </section>
+</div>
 </article>
 {% match evidence %}
 {% when Some with (evidence) %}

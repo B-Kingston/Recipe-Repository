@@ -29,9 +29,9 @@ fn block_label(section: &str, action: &str) -> String {
     format!("{noun} {action}")
 }
 
-/// The library page. Without `?q=` it lists every recipe; with it, the
-/// recipes ranked by embedding similarity, or the full list plus a notice
-/// when the embedding service is missing or down.
+/// The library page. Without `?q=` it lists every recipe filed A to Z; with
+/// it, the recipes ranked by embedding similarity, or the filed list plus a
+/// notice when the embedding service is missing or down.
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -39,42 +39,45 @@ pub(crate) async fn home(
 ) -> Result<Html<String>> {
     let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
     let cards: Vec<LibraryCard> = sqlx::query_as(
-        "SELECT id,title,description,thumbnail_jpeg IS NOT NULL AS has_thumbnail
+        "SELECT id,title,description,servings,prep_minutes,cook_minutes,
+                thumbnail_jpeg IS NOT NULL AS has_thumbnail
          FROM recipes WHERE user_id=? ORDER BY updated_at DESC",
     )
     .bind(&user.id)
     .fetch_all(&state.db)
     .await?;
-    if query.is_empty() {
-        return render(HomeTemplate {
-            recipes: cards,
-            query,
-            results: false,
-            notice: String::new(),
-        });
-    }
-    let (recipes, results, notice) = match search::search(&state, &user.id, &query).await {
-        Outcome::Ranked { ids, indexing } => {
-            let mut by_id: HashMap<String, LibraryCard> = cards
-                .into_iter()
-                .map(|card| (card.id.clone(), card))
-                .collect();
-            let found = ids.iter().filter_map(|id| by_id.remove(id)).collect();
-            let notice = if indexing > 0 {
-                search::indexing_note(indexing)
-            } else {
-                String::new()
-            };
-            (found, true, notice)
+    let (mut recipes, results, notice) = if query.is_empty() {
+        (cards, false, String::new())
+    } else {
+        match search::search(&state, &user.id, &query).await {
+            Outcome::Ranked { ids, indexing } => {
+                let mut by_id: HashMap<String, LibraryCard> = cards
+                    .into_iter()
+                    .map(|card| (card.id.clone(), card))
+                    .collect();
+                let found = ids.iter().filter_map(|id| by_id.remove(id)).collect();
+                let notice = if indexing > 0 {
+                    search::indexing_note(indexing)
+                } else {
+                    String::new()
+                };
+                (found, true, notice)
+            }
+            Outcome::NotConfigured => (cards, false, search::NOT_CONFIGURED.to_owned()),
+            Outcome::Unavailable => (cards, false, search::UNAVAILABLE.to_owned()),
         }
-        Outcome::NotConfigured => (cards, false, search::NOT_CONFIGURED.to_owned()),
-        Outcome::Unavailable => (cards, false, search::UNAVAILABLE.to_owned()),
+    };
+    let letters = if results {
+        Vec::new()
+    } else {
+        file_by_letter(&mut recipes)
     };
     render(HomeTemplate {
         recipes,
         query,
         results,
         notice,
+        letters,
     })
 }
 
@@ -85,7 +88,92 @@ pub(crate) struct LibraryCard {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) description: String,
+    pub(crate) servings: Option<i64>,
+    pub(crate) prep_minutes: Option<i64>,
+    pub(crate) cook_minutes: Option<i64>,
     pub(crate) has_thumbnail: bool,
+    /// The letter tab this card carries: set by `file_by_letter` on the first
+    /// card of each letter, empty on every other card and on search results.
+    #[sqlx(skip)]
+    pub(crate) letter: String,
+}
+
+impl LibraryCard {
+    /// "Serves 4", or empty when the recipe has no serving count.
+    pub(crate) fn serves(&self) -> String {
+        match self.servings {
+            Some(servings) if servings > 0 => format!("Serves {servings}"),
+            _ => String::new(),
+        }
+    }
+
+    /// Prep plus cook time, such as "35 min" or "1 h 10 min"; empty when
+    /// neither is set.
+    pub(crate) fn total_time(&self) -> String {
+        let minutes = self.prep_minutes.unwrap_or(0).max(0) + self.cook_minutes.unwrap_or(0).max(0);
+        match (minutes / 60, minutes % 60) {
+            (0, 0) => String::new(),
+            (0, rest) => format!("{rest} min"),
+            (hours, 0) => format!("{hours} h"),
+            (hours, rest) => format!("{hours} h {rest} min"),
+        }
+    }
+
+    /// The fragment id of this card's letter tab, such as "B" or "other".
+    pub(crate) fn anchor(&self) -> String {
+        letter_anchor(self.letter.chars().next().unwrap_or('#'))
+    }
+}
+
+/// One link in the library's A to Z strip.
+pub(crate) struct LetterLink {
+    pub(crate) letter: char,
+    pub(crate) anchor: String,
+    /// A card is filed under this letter, so the link has a target.
+    pub(crate) present: bool,
+}
+
+/// The letter a title is filed under: its first letter, upper-cased, or '#'
+/// when the title starts with a digit or a letter outside A to Z.
+pub(crate) fn file_letter(title: &str) -> char {
+    match title.chars().find(|c| c.is_alphanumeric()) {
+        Some(c) if c.is_ascii_alphabetic() => c.to_ascii_uppercase(),
+        _ => '#',
+    }
+}
+
+fn letter_anchor(letter: char) -> String {
+    if letter == '#' {
+        "other".to_owned()
+    } else {
+        letter.to_string()
+    }
+}
+
+/// Files the library like a recipe box: sorts the cards by letter, then
+/// title, puts a tab on the first card of each letter, and returns the A to Z
+/// strip, led by '#' when some titles start with anything else.
+pub(crate) fn file_by_letter(cards: &mut [LibraryCard]) -> Vec<LetterLink> {
+    cards.sort_by_cached_key(|card| (file_letter(&card.title), card.title.to_lowercase()));
+    let mut present = Vec::new();
+    for card in cards.iter_mut() {
+        let letter = file_letter(&card.title);
+        if present.last() != Some(&letter) {
+            card.letter = letter.to_string();
+            present.push(letter);
+        }
+    }
+    let other = present.first() == Some(&'#');
+    other
+        .then_some('#')
+        .into_iter()
+        .chain('A'..='Z')
+        .map(|letter| LetterLink {
+            letter,
+            anchor: letter_anchor(letter),
+            present: present.contains(&letter),
+        })
+        .collect()
 }
 
 /// A recipe with its blocks, loaded to build its search document.

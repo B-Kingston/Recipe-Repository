@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block title %}Settings · Recipe Repository{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Settings · Recipe Repository{% endblock %}{% block nav_settings %} aria-current="page"{% endblock %}{% block content %}
 <div class="form-intro">
   <p class="eyebrow">Configuration</p>
   <h1>Settings</h1>
@@ -137,6 +137,11 @@
       <label><input type="checkbox" name="enabled" value="on"{% if step_moments %} checked{% endif %}> Capture and show video step moments</label>
       <button class="primary" type="submit">Save step moments</button>
     </form>
+  </div>
+  <div class="block">
+    <h2>Display</h2>
+    <p class="muted block-note">Colour, e-ink, or automatic: e-ink on Kindle browsers and colour everywhere else. Saved for this browser only.</p>
+    <p class="actions"><a class="button" href="/settings/display">Display settings</a></p>
   </div>
   <div class="block">
     <h2>Account</h2>
