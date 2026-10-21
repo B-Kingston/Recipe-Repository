@@ -268,25 +268,26 @@ export function recipePrompt(systemPrompt, searchMode = "off") {
 }
 
 export function completionContext(request, searchMode = "off") {
-  const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
+  return plainContext(recipePrompt(request.systemPrompt, searchMode), request.prompt);
+}
 
-  // Use the low-level completion API with an explicit context. Do not use
-  // AgentSession/createAgentSession here: those APIs assemble pi's default
-  // coding-agent system prompt before sending the request.
+/** One system prompt and one user message. Use the low-level completion API
+ *  with an explicit context. Do not use AgentSession/createAgentSession here:
+ *  those APIs assemble pi's default coding-agent system prompt. */
+function plainContext(systemPrompt, prompt) {
   return {
     systemPrompt,
-    messages: [{ role: "user", content: request.prompt, timestamp: Date.now() }],
+    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
     tools: [],
   };
 }
 
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
-const AI_GATEWAY_CLEANER_TIMEOUT_MS = 180_000;
 
 /** POST JSON and return the parsed body. Throws WorkerError on transport
  *  failure or non-2xx (error body truncated to 300 chars; never includes the
- *  key). Shared by the Responses API path, the Messages API path and the
- *  AI Gateway cleaner. */
+ *  key).  Shared by the Responses API path, the Messages API path and model
+ *  discovery. */
 async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -327,51 +328,6 @@ async function fetchJson(url, headers, body, fetchImpl, timeoutMs = OPENAI_RESPO
   }
 }
 
-/** Vercel AI Gateway's OpenAI-compatible chat-completions request used only
- * for reducing noisy local video evidence before final recipe generation. */
-export async function aiGatewayChatCompletion(
-  apiBaseUrl,
-  apiKey,
-  modelId,
-  systemPrompt,
-  prompt,
-  fetchImpl = fetch,
-  options = {},
-) {
-  const url = `${apiBaseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const headers = { Authorization: `Bearer ${apiKey}` };
-  const body = {
-    model: modelId,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: prompt },
-    ],
-    // Reasoning is off by default for this extraction task. The caller may
-    // select a Gateway-supported effort or omit the field for compatibility.
-    reasoning: options.reasoning !== undefined ? options.reasoning : { effort: "none" },
-    stream: false,
-    max_tokens: options.maxTokens ?? 2048,
-  };
-  if (body.reasoning === null) delete body.reasoning;
-  if (typeof options.temperature === "number") body.temperature = options.temperature;
-  return fetchJson(url, headers, body, fetchImpl, AI_GATEWAY_CLEANER_TIMEOUT_MS);
-}
-
-function cleanerMessageText(data) {
-  const message = data?.choices?.[0]?.message;
-  if (!message || message.refusal) {
-    throw new WorkerError("output", "AI Gateway refused the media-cleaner request.");
-  }
-  if (typeof message.content === "string") return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content
-      .filter((part) => part?.type === "text" && typeof part.text === "string")
-      .map((part) => part.text)
-      .join("");
-  }
-  throw new WorkerError("output", "AI Gateway returned no media-cleaner text.");
-}
-
 function cleanerScalar(value, max = 800) {
   if (typeof value !== "string") return "";
   return value.replaceAll("\u0000", " ").trim().slice(0, max);
@@ -405,7 +361,7 @@ export function formatRecipeEvidence(value) {
     ? value.recipeEvidence
     : value;
   if (!root || typeof root !== "object" || Array.isArray(root)) {
-    throw new WorkerError("output", "AI Gateway returned an invalid media-cleaner object.");
+    throw new WorkerError("output", "The video cleaner returned an invalid object.");
   }
   const title = cleanerScalar(root.title);
   const servings = cleanerScalar(root.servings);
@@ -414,7 +370,7 @@ export function formatRecipeEvidence(value) {
   const timings = cleanerList(root.timings);
   const notes = cleanerList(root.relevant_notes ?? root.relevantNotes);
   if (ingredients.length === 0 && steps.length === 0) {
-    throw new WorkerError("output", "AI Gateway found no recipe facts in the video evidence.");
+    throw new WorkerError("output", "The video cleaner found no recipe facts in the video evidence.");
   }
   const lines = [];
   if (title) lines.push(`Dish: ${title}`);
@@ -437,15 +393,11 @@ export function formatRecipeEvidence(value) {
   }
   const text = lines.join("\n").trim();
   if (text.length > 24_000) {
-    throw new WorkerError("output", "AI Gateway returned too much media-cleaner text.");
+    throw new WorkerError("output", "The video cleaner returned too much text.");
   }
   return text;
 }
 
-export function parseAiGatewayCleaner(data) {
-  const text = cleanerMessageText(data);
-  return formatRecipeEvidence(extractJson(text));
-}
 
 /** POST {base}/responses with bearer auth; returns the parsed JSON body. */
 export async function openaiResponse(apiBaseUrl, apiKey, modelId, systemPrompt, prompt, searchMode, reasoningEffort = "low", fetchImpl = fetch) {
@@ -744,33 +696,41 @@ async function subscriptionRuntime(request) {
   return ModelRuntime.create({ authPath, modelsPath: join(agentDir, "models.json") });
 }
 
+/** Reduces imported video evidence to recipe-only facts with whichever
+ * backend the host routed the request to (a subscription or an endpoint),
+ * without web search. Only the known evidence fields come back. */
 async function cleanMedia(request) {
-  const apiKey = nonBlank(process.env.AI_GATEWAY_API_KEY);
-  if (!apiKey) throw new WorkerError("configuration", "AI_GATEWAY_API_KEY is not configured.");
-  const apiBaseUrl = nonBlank(process.env.AI_GATEWAY_BASE_URL) ?? "https://ai-gateway.vercel.sh/v1";
-  const modelId = nonBlank(request.model)
-    ?? nonBlank(process.env.AI_GATEWAY_CLEANER_MODEL)
-    ?? "poolside/laguna-s-2.1-free";
-  const data = await aiGatewayChatCompletion(apiBaseUrl, apiKey, modelId, request.systemPrompt, request.prompt, fetch, {
-    reasoning: request.reasoning && typeof request.reasoning === "object" ? request.reasoning : undefined,
-    maxTokens: typeof request.maxTokens === "number" ? request.maxTokens : undefined,
-    temperature: typeof request.temperature === "number" ? request.temperature : undefined,
+  const completion = await complete(request, {
+    systemPrompt: request.systemPrompt,
+    searchMode: "off",
+    reasoningEffort: normalizeEffort(request.reasoningEffort),
   });
-  outputJson({ cleanedText: parseAiGatewayCleaner(data), model: modelId });
+  outputJson({ cleanedText: cleanedEvidence(completion.text), model: request.model ?? "" });
 }
 
-/** Recipe generation against an OpenAI- or Anthropic-spec endpoint. The base
- * URL and key come from the host and are never logged. */
-async function generateViaEndpoint(request, searchMode, reasoningEffort) {
-  if (isPiAiSpec(request.provider)) return generateViaPiAi(request, reasoningEffort);
+/** The cleaner's reply reduced to the known evidence fields. */
+export function cleanedEvidence(text) {
+  return formatRecipeEvidence(extractJson(text));
+}
+
+/** One model call through the request's backend: a subscription, a native
+ * OpenAI/Anthropic endpoint, or a pi-ai provider. Returns the reply text with
+ * any web-search citations it gathered. */
+function complete(request, options) {
+  if (!isEndpointRequest(request)) return completeViaSubscription(request, options);
+  if (isPiAiSpec(request.provider)) return completeViaPiAi(request, options);
+  return completeViaEndpoint(request, options);
+}
+
+/** A call against an OpenAI- or Anthropic-spec endpoint. The base URL and
+ * key come from the host and are never logged. */
+async function completeViaEndpoint(request, { systemPrompt, searchMode, reasoningEffort }) {
   const apiBaseUrl = nonBlank(request.apiBaseUrl);
   const apiKey = nonBlank(request.apiKey);
   const model = nonBlank(request.model);
   if (!apiBaseUrl || !apiKey || !model) {
     throw new WorkerError("worker", "Missing apiBaseUrl, apiKey, or model for the API request.");
   }
-  const systemPrompt = recipePrompt(request.systemPrompt, searchMode);
-  const acceptUnverifiable = searchMode === "gapfill";
   if (request.provider === "anthropic") {
     const data = await anthropicTurn(apiBaseUrl, apiKey, model, systemPrompt, request.prompt, reasoningEffort, searchMode);
     if (data.stop_reason === "max_tokens") {
@@ -778,7 +738,7 @@ async function generateViaEndpoint(request, searchMode, reasoningEffort) {
     }
     const { text, searched, refused, citations } = parseAnthropicOutput(data);
     if (refused) throw new WorkerError("worker", "Anthropic refused the request.");
-    return finishRecipe({ label: "Anthropic", text, citations, searched, searchMode, acceptUnverifiable });
+    return { label: "Anthropic", text, citations, searched };
   }
   const data = await openaiResponse(apiBaseUrl, apiKey, model, systemPrompt, request.prompt, searchMode, reasoningEffort);
   if (data.status && data.status !== "completed") {
@@ -786,15 +746,14 @@ async function generateViaEndpoint(request, searchMode, reasoningEffort) {
   }
   const { text, searched, refused, citations } = parseResponsesOutput(data);
   if (refused) throw new WorkerError("worker", "OpenAI refused the request.");
-  return finishRecipe({ label: "OpenAI", text, citations, searched, searchMode, acceptUnverifiable });
+  return { label: "OpenAI", text, citations, searched };
 }
 
-/** Recipe generation through any pi-ai provider (Google, Mistral, Groq,
- * OpenRouter, a custom Chat Completions server, …) with the endpoint's own
- * key. These providers have no native web search here, so the host sends
- * searchMode "off" and the recipe carries no sources. A blank key is only
- * valid for a custom server. */
-export async function generateViaPiAi(request, reasoningEffort, models = piAiModels(), fetchImpl = undefined) {
+/** A call through any pi-ai provider (Google, Mistral, Groq, OpenRouter, a
+ * custom Chat Completions server, …) with the endpoint's own key. These
+ * providers have no web search here. A blank key is only valid for a custom
+ * server. */
+export async function completeViaPiAi(request, { systemPrompt, reasoningEffort }, models = piAiModels(), fetchImpl = undefined) {
   const spec = nonBlank(request.provider);
   const apiKey = nonBlank(request.apiKey);
   const modelId = nonBlank(request.model);
@@ -803,7 +762,7 @@ export async function generateViaPiAi(request, reasoningEffort, models = piAiMod
     throw new WorkerError("configuration", "Missing API key for this AI provider.");
   }
   const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
-  const response = await models.completeSimple(model, completionContext(request, "off"), {
+  const response = await models.completeSimple(model, plainContext(systemPrompt, request.prompt), {
     apiKey: apiKey ?? "none",
     reasoning: reasoningEffort,
     maxRetries: 1,
@@ -816,18 +775,11 @@ export async function generateViaPiAi(request, reasoningEffort, models = piAiMod
   if (response.stopReason === "length") {
     throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
   }
-  return finishRecipe({
-    label: model.provider,
-    text: assistantText(response),
-    citations: new Map(),
-    searched: false,
-    searchMode: "off",
-    acceptUnverifiable: false,
-  });
+  return { label: model.provider, text: assistantText(response), citations: new Map(), searched: false };
 }
 
-/** Recipe generation through a pi subscription (ChatGPT for Codex, Claude Pro/Max). */
-async function generateViaSubscription(request, searchMode, reasoningEffort) {
+/** A call through a pi subscription (ChatGPT for Codex, Claude Pro/Max). */
+async function completeViaSubscription(request, { systemPrompt, searchMode, reasoningEffort }) {
   const subscription = subscriptionOf(request);
   const modelRuntime = await subscriptionRuntime(request);
   if (!(await modelRuntime.checkAuth(subscription.id))) {
@@ -842,7 +794,7 @@ async function generateViaSubscription(request, searchMode, reasoningEffort) {
   const observer = searchMode === "off"
     ? null
     : createNativeSearchObserver(globalThis.fetch, { allowUnverifiedFallback: searchMode === "gapfill" });
-  const response = await modelRuntime.completeSimple(model, completionContext(request, searchMode), {
+  const response = await modelRuntime.completeSimple(model, plainContext(systemPrompt, request.prompt), {
     reasoning: reasoningEffort,
     maxRetries: 1,
     ...(observer ? { fetch: observer.fetch, ...subscription.searchOptions(searchMode) } : {}),
@@ -851,13 +803,25 @@ async function generateViaSubscription(request, searchMode, reasoningEffort) {
     throw new WorkerError("worker", response.errorMessage || "Pi model request failed.");
   }
   const observed = observer ? await observer.finish() : { invoked: false, sources: new Map() };
+  return { label: subscription.label, text: assistantText(response), citations: observed.sources, searched: observed.invoked };
+}
+
+/** Recipe generation through the request's backend. pi-ai providers have no
+ * web search, so they always generate as "off" (the host downgrades grounded
+ * requests; gap-fill sources are optional). Only a native endpoint's gap-fill
+ * may keep unverifiable claimed sources. */
+export async function generateRecipe(request, searchMode, reasoningEffort, completeImpl = complete) {
+  const piAi = isEndpointRequest(request) && isPiAiSpec(request.provider);
+  const effective = piAi ? "off" : searchMode;
+  const completion = await completeImpl(request, {
+    systemPrompt: recipePrompt(request.systemPrompt, effective),
+    searchMode: effective,
+    reasoningEffort,
+  });
   return finishRecipe({
-    label: subscription.label,
-    text: assistantText(response),
-    citations: observed.sources,
-    searched: observed.invoked,
-    searchMode,
-    acceptUnverifiable: false,
+    ...completion,
+    searchMode: effective,
+    acceptUnverifiable: isEndpointRequest(request) && !piAi && searchMode === "gapfill",
   });
 }
 
@@ -865,11 +829,7 @@ async function main() {
   const request = parseRequest(await readStdin());
   if (request.command === "listModels") return listModels(request);
   if (request.command === "cleanMedia") return cleanMedia(request);
-  const searchMode = searchModeOf(request);
-  const reasoningEffort = normalizeEffort(request.reasoningEffort);
-  outputJson(isEndpointRequest(request)
-    ? await generateViaEndpoint(request, searchMode, reasoningEffort)
-    : await generateViaSubscription(request, searchMode, reasoningEffort));
+  outputJson(await generateRecipe(request, searchModeOf(request), normalizeEffort(request.reasoningEffort)));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

@@ -245,9 +245,7 @@ pub(crate) async fn new_recipe(
         use_audio: true,
         use_ocr: true,
         video_mode: query.mode.as_deref() == Some("video"),
-        gateway_configured: crate::ai_gateway_credential(&state.db, &user.id)
-            .await?
-            .is_some(),
+        cleaner_configured: crate::ai::media_cleaner_configured(&state, &user.id).await,
     })
 }
 

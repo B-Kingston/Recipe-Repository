@@ -65,8 +65,6 @@ const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-5-5";
 const DEFAULT_REASONING_EFFORT: &str = "low";
-const AI_GATEWAY_DEFAULT_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
-const AI_GATEWAY_PROVIDER: &str = "vercel-ai-gateway";
 /// Reasoning efforts offered for the model, matching the worker protocol.
 /// Newer Codex models also support `xhigh` and `max`; Anthropic endpoints
 /// cap those values at their highest available thinking budget in the worker.
@@ -193,7 +191,7 @@ enum AppError {
     )]
     AiNotConfigured,
     #[error(
-        "The video cleaner is not set up. Save its API key in Settings before importing a video."
+        "The video cleaner's AI provider is not connected. Choose one in Settings before importing a video."
     )]
     MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
@@ -523,7 +521,7 @@ struct AddRecipeTemplate {
     use_audio: bool,
     use_ocr: bool,
     video_mode: bool,
-    gateway_configured: bool,
+    cleaner_configured: bool,
 }
 #[derive(Template)]
 #[template(path = "media_import_run.html")]
@@ -580,9 +578,10 @@ struct SettingsTemplate {
     endpoints: Vec<EndpointRow>,
     /// The "Add a provider" choices.
     presets: &'static [ProviderPreset],
-    gateway_configured: bool,
-    gateway_key_masked: String,
-    gateway_base_url: String,
+    cleaner_configured: bool,
+    /// The cleaner's provider value; empty follows the active AI provider.
+    cleaner_provider: String,
+    cleaner_model: String,
     saved: bool,
     password_changed: bool,
     /// Whether video step moments are captured and shown (global setting).
@@ -828,18 +827,14 @@ struct StepMomentsForm {
     #[serde(default)]
     enabled: Option<String>,
 }
+/// Settings form for the video cleaner: a provider value ("" follows the
+/// active AI provider) and an optional model.
 #[derive(Deserialize)]
-struct AiGatewayForm {
-    base_url: String,
+struct MediaCleanerForm {
     #[serde(default)]
-    api_key: String,
-}
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct AiGatewayCredential {
-    #[serde(rename = "apiKey")]
-    pub(crate) api_key: String,
-    #[serde(rename = "baseUrl")]
-    pub(crate) base_url: String,
+    provider: String,
+    #[serde(default)]
+    model: String,
 }
 #[derive(Deserialize)]
 struct RecipeQuery {
@@ -1010,7 +1005,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/recipes/{id}/candidate/{idx}", get(candidate_thumbnail))
         .route("/recipes/{id}/stills/{seconds}", get(recipe_still))
         .route("/settings", get(settings_page).post(update_settings))
-        .route("/settings/vercel-gateway", post(update_ai_gateway))
+        .route("/settings/media-cleaner", post(update_media_cleaner))
         .route("/settings/step-moments", post(update_step_moments))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
@@ -1206,7 +1201,7 @@ pub(crate) const CLAUDE_PI_PROVIDER: &str = "anthropic";
 const OPENAI_SPEC: &str = "openai";
 const ANTHROPIC_SPEC: &str = "anthropic";
 /// A custom server speaking OpenAI Chat Completions, run through pi-ai.
-const OPENAI_COMPATIBLE_SPEC: &str = "openai-compatible";
+pub(crate) const OPENAI_COMPATIBLE_SPEC: &str = "openai-compatible";
 
 /// One choice in the Settings "Add a provider" picker. `spec` is what the
 /// worker dispatches on: "openai" and "anthropic" run its native Responses and
@@ -1355,15 +1350,22 @@ pub(crate) async fn store_pi_credential<T: Serialize>(
     Ok(())
 }
 
-/// Reads the per-user Vercel AI Gateway credential used only by the media
-/// cleaner. Invalid legacy rows are treated as unconfigured.
-pub(crate) async fn ai_gateway_credential(
-    db: &SqlitePool,
-    user_id: &str,
-) -> Result<Option<AiGatewayCredential>> {
-    Ok(pi_credential(db, user_id, AI_GATEWAY_PROVIDER)
+const MEDIA_CLEANER_PROVIDER_SETTING: &str = "media_cleaner_provider";
+const MEDIA_CLEANER_MODEL_SETTING: &str = "media_cleaner_model";
+
+/// The video cleaner's own provider ("pi", "claude", or an endpoint id);
+/// None follows the active AI provider.
+pub(crate) async fn media_cleaner_setting(db: &SqlitePool) -> Result<Option<String>> {
+    Ok(app_setting(db, MEDIA_CLEANER_PROVIDER_SETTING)
         .await?
-        .and_then(|value| serde_json::from_value(value).ok()))
+        .filter(|value| !value.trim().is_empty()))
+}
+
+/// The video cleaner's model; None uses its provider's model.
+pub(crate) async fn media_cleaner_model(db: &SqlitePool) -> Result<Option<String>> {
+    Ok(app_setting(db, MEDIA_CLEANER_MODEL_SETTING)
+        .await?
+        .filter(|value| !value.trim().is_empty()))
 }
 
 /// One app_settings value, if it has been saved.
@@ -1616,16 +1618,9 @@ async fn settings_page(
             model: endpoint.model,
         })
         .collect::<Vec<_>>();
-    let gateway = ai_gateway_credential(&s.db, &user.id).await?;
-    let gateway_configured = gateway.is_some();
-    let gateway_key_masked = gateway
-        .as_ref()
-        .map(|credential| mask_key(&credential.api_key))
-        .unwrap_or_default();
-    let gateway_base_url = gateway
-        .as_ref()
-        .map(|credential| credential.base_url.clone())
-        .unwrap_or_else(|| AI_GATEWAY_DEFAULT_BASE_URL.into());
+    let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
+    let cleaner_provider = media_cleaner_setting(&s.db).await?.unwrap_or_default();
+    let cleaner_model = media_cleaner_model(&s.db).await?.unwrap_or_default();
     // First paint shows the cached catalogues; the page's script then replaces
     // the options from /settings/models with live discovery.
     let model = selected_model(&s.db, &s.model).await?;
@@ -1654,9 +1649,9 @@ async fn settings_page(
         claude_error: query.claude_error,
         endpoints,
         presets: PROVIDER_PRESETS,
-        gateway_configured,
-        gateway_key_masked,
-        gateway_base_url,
+        cleaner_configured,
+        cleaner_provider,
+        cleaner_model,
         saved: query.saved == "1",
         password_changed: query.notice == "password_changed",
         step_moments: step_moments_enabled(&s.db).await?,
@@ -1832,32 +1827,25 @@ async fn save_subscription_model(
     set_app_setting(&s.db, setting_key, &model).await
 }
 
-/// Saves the Vercel AI Gateway credential for video evidence cleaning. A
-/// blank key preserves the existing key, so editing the URL never requires
-/// exposing the secret back to the browser.
-async fn update_ai_gateway(
+/// Chooses the video cleaner's provider and model. A blank provider follows
+/// the active AI provider; a blank model uses the provider's own model.
+async fn update_media_cleaner(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
-    Form(form): Form<AiGatewayForm>,
+    Form(form): Form<MediaCleanerForm>,
 ) -> Result<Redirect> {
-    let base_url = normalise_url(&form.base_url, "Video cleaner base URL")?;
-    let api_key = trim(&form.api_key);
-    let api_key = if api_key.is_empty() {
-        ai_gateway_credential(&s.db, &user.id)
-            .await?
-            .map(|credential| credential.api_key)
-            .ok_or_else(|| AppError::BadRequest("Enter the video cleaner API key.".into()))?
-    } else {
-        api_key
-    };
-    store_pi_credential(
-        &s.db,
-        &user.id,
-        AI_GATEWAY_PROVIDER,
-        &AiGatewayCredential { api_key, base_url },
-    )
-    .await?;
-    Ok(Redirect::to("/settings"))
+    let provider = trim(&form.provider);
+    let known = provider.is_empty()
+        || pi_provider_for(&provider).is_some()
+        || find_endpoint(&s.db, &user.id, &provider).await?.is_some();
+    if !known {
+        return Err(AppError::BadRequest(
+            "Choose a provider for the video cleaner.".into(),
+        ));
+    }
+    set_app_setting(&s.db, MEDIA_CLEANER_PROVIDER_SETTING, &provider).await?;
+    set_app_setting(&s.db, MEDIA_CLEANER_MODEL_SETTING, &trim(&form.model)).await?;
+    Ok(Redirect::to("/settings?saved=1"))
 }
 
 /// Switches video step moments on or off for every user. Off stops new
@@ -1964,6 +1952,10 @@ async fn delete_endpoint(
     forget_model_catalogue(&s, &id);
     if ai_provider(&s.db).await? == id {
         set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
+    }
+    if media_cleaner_setting(&s.db).await?.as_deref() == Some(id.as_str()) {
+        set_app_setting(&s.db, MEDIA_CLEANER_PROVIDER_SETTING, "").await?;
+        set_app_setting(&s.db, MEDIA_CLEANER_MODEL_SETTING, "").await?;
     }
     Ok(Redirect::to("/settings"))
 }

@@ -112,13 +112,20 @@
     </details>
   </div>
   <div class="block">
-    <h2>Video cleaner <span class="codex-status{% if gateway_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if gateway_configured %}&#10003; Connected{% else %}Not connected{% endif %}</span></h2>
-    <p class="muted block-note">Enter the Vercel gateway details for the cleaner. It removes chatter from captions, transcripts and on-screen text before a video recipe is generated.</p>
-    <form method="post" action="/settings/vercel-gateway">
-      <label for="gateway_base_url">Base URL</label>
-      <input type="url" id="gateway_base_url" name="base_url" value="{{ gateway_base_url }}" required>
-      <label for="gateway_api_key">API key{% if gateway_configured %} <span class="muted">(current key {{ gateway_key_masked }} · leave blank to keep it)</span>{% endif %}</label>
-      <input type="password" id="gateway_api_key" name="api_key" autocomplete="off"{% if !gateway_configured %} required{% endif %}>
+    <h2>Video cleaner <span class="codex-status{% if cleaner_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if cleaner_configured %}&#10003; Ready{% else %}Not connected{% endif %}</span></h2>
+    <p class="muted block-note">Before a video recipe is written, the cleaner strips chatter from the caption, speech and on-screen text. A small, fast model is enough.</p>
+    <form method="post" action="/settings/media-cleaner">
+      <label for="cleaner_provider">Provider</label>
+      <select id="cleaner_provider" name="provider">
+        <option value=""{% if cleaner_provider == "" %} selected{% endif %}>Same as AI provider</option>
+        <option value="pi"{% if cleaner_provider == "pi" %} selected{% endif %}>Codex (ChatGPT)</option>
+        <option value="claude"{% if cleaner_provider == "claude" %} selected{% endif %}>Claude (Pro/Max)</option>
+        {% for endpoint in endpoints %}
+        <option value="{{ endpoint.id }}"{% if cleaner_provider == endpoint.id %} selected{% endif %}>{{ endpoint.name }}</option>
+        {% endfor %}
+      </select>
+      <label for="cleaner_model">Model <span class="muted">(blank uses the provider's model)</span></label>
+      <input type="text" id="cleaner_model" name="model" value="{{ cleaner_model }}" autocomplete="off" autocapitalize="off" spellcheck="false">
       <button class="primary" type="submit">Save video cleaner</button>
     </form>
   </div>

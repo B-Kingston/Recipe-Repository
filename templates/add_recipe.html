@@ -42,7 +42,7 @@
         <p class="muted">Paste a public Instagram or Facebook reel. The recipe is read from the caption, what is said, and the text on screen.</p>
       </div>
       {% if video_error != "" %}<p class="error" role="alert">{{ video_error }}</p>{% endif %}
-      {% if !gateway_configured %}<p class="error">Video import needs the video cleaner. <a href="/settings">Connect it in Settings</a> first.</p>{% endif %}
+      {% if !cleaner_configured %}<p class="error">Video import needs a connected AI provider for the video cleaner. <a href="/settings">Set one up in Settings</a> first.</p>{% endif %}
       <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import" data-busy-label="Starting…">
         <label for="social-url">Reel or post link<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/reel/…" autocomplete="url"></label>
         <label for="import-notes">Anything to change? <span class="field-help">Optional</span><textarea id="import-notes" class="short-textarea" name="notes" maxlength="4000" placeholder="e.g. make it vegetarian, it serves four…">{{ notes }}</textarea></label>

@@ -1,11 +1,11 @@
 use crate::auth::AuthUser;
 use crate::{
-    AiGatewayForm, AppError, AppState, CLAUDE_PI_PROVIDER, CODEX_PI_PROVIDER, ClaudeExchangeForm,
-    ClaudeFlow, EndpointForm, SettingsForm, add_endpoint, ai_gateway_credential, ai_provider,
+    AppError, AppState, CLAUDE_PI_PROVIDER, CODEX_PI_PROVIDER, ClaudeExchangeForm, ClaudeFlow,
+    EndpointForm, MediaCleanerForm, SettingsForm, add_endpoint, ai_provider,
     authorise_claude_exchange, delete_endpoint, disconnect_claude, disconnect_codex, find_endpoint,
-    insert_endpoint, list_endpoints, mask_key, pi_credential, reconcile_ai_provider,
-    selected_claude_model, selected_effort, selected_model, stamp, store_pi_credential,
-    update_ai_gateway, update_settings,
+    insert_endpoint, list_endpoints, mask_key, media_cleaner_model, media_cleaner_setting,
+    pi_credential, reconcile_ai_provider, selected_claude_model, selected_effort, selected_model,
+    stamp, store_pi_credential, update_media_cleaner, update_settings,
 };
 use axum::{
     extract::{Form, Path, State},
@@ -107,69 +107,123 @@ async fn set_provider(db: &SqlitePool, value: &str) {
     .unwrap();
 }
 
+fn cleaner_form(provider: &str, model: &str) -> MediaCleanerForm {
+    MediaCleanerForm {
+        provider: provider.into(),
+        model: model.into(),
+    }
+}
+
 #[tokio::test]
-async fn gateway_credentials_are_saved_per_user() {
+async fn the_media_cleaner_follows_the_ai_provider_until_one_is_chosen() {
     let db = database().await;
-    let _ = update_ai_gateway(
-        State(state(db.clone())),
+    let state = state(db.clone());
+    assert_eq!(media_cleaner_setting(&db).await.unwrap(), None);
+    let groq = add(&db, "Groq", "groq", "", "gsk-key").await;
+    let _ = update_media_cleaner(
+        State(state.clone()),
         AuthUser { id: "u1".into() },
-        Form(AiGatewayForm {
-            base_url: "https://ai-gateway.vercel.sh/v1/".into(),
-            api_key: "vg-secret-abcdefgh".into(),
-        }),
+        Form(cleaner_form(&groq, " llama-3.1-8b-instant ")),
     )
     .await
     .unwrap();
-    let credential = ai_gateway_credential(&db, "u1").await.unwrap().unwrap();
-    assert_eq!(credential.api_key, "vg-secret-abcdefgh");
-    assert_eq!(credential.base_url, "https://ai-gateway.vercel.sh/v1");
-    assert!(ai_gateway_credential(&db, "u2").await.unwrap().is_none());
+    assert_eq!(
+        media_cleaner_setting(&db).await.unwrap(),
+        Some(groq.clone())
+    );
+    assert_eq!(
+        media_cleaner_model(&db).await.unwrap().as_deref(),
+        Some("llama-3.1-8b-instant")
+    );
+    // Back to following the AI provider, with the provider's own model.
+    let _ = update_media_cleaner(
+        State(state),
+        AuthUser { id: "u1".into() },
+        Form(cleaner_form("", "")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(media_cleaner_setting(&db).await.unwrap(), None);
+    assert_eq!(media_cleaner_model(&db).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn blank_gateway_key_preserves_the_saved_secret() {
+async fn the_media_cleaner_rejects_unknown_and_foreign_providers() {
     let db = database().await;
-    for (base_url, api_key) in [
-        ("https://first.example/v1", "vg-secret"),
-        ("https://second.example/v1", ""),
-    ] {
-        let _ = update_ai_gateway(
-            State(state(db.clone())),
-            AuthUser { id: "u1".into() },
-            Form(AiGatewayForm {
-                base_url: base_url.into(),
-                api_key: api_key.into(),
-            }),
-        )
+    let state = state(db.clone());
+    let foreign = add(&db, "Groq", "groq", "", "gsk-key").await;
+    sqlx::query("UPDATE ai_endpoints SET user_id='u2' WHERE id=?")
+        .bind(&foreign)
+        .execute(&db)
         .await
         .unwrap();
+    for provider in ["missing-id", foreign.as_str()] {
+        let result = update_media_cleaner(
+            State(state.clone()),
+            AuthUser { id: "u1".into() },
+            Form(cleaner_form(provider, "")),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "{provider}");
     }
-    let credential = ai_gateway_credential(&db, "u1").await.unwrap().unwrap();
-    assert_eq!(credential.api_key, "vg-secret");
-    assert_eq!(credential.base_url, "https://second.example/v1");
+    assert_eq!(media_cleaner_setting(&db).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn gateway_requires_a_key_and_valid_url() {
+async fn deleting_the_cleaners_endpoint_returns_it_to_the_ai_provider() {
     let db = database().await;
-    for form in [
-        AiGatewayForm {
-            base_url: "https://ai-gateway.vercel.sh/v1".into(),
-            api_key: String::new(),
-        },
-        AiGatewayForm {
-            base_url: "ai-gateway.vercel.sh/v1".into(),
-            api_key: "vg-secret".into(),
-        },
-    ] {
-        let result = update_ai_gateway(
-            State(state(db.clone())),
-            AuthUser { id: "u1".into() },
-            Form(form),
-        )
-        .await;
-        assert!(matches!(result, Err(AppError::BadRequest(_))));
-    }
+    let state = state(db.clone());
+    let id = add(&db, "Groq", "groq", "", "gsk-key").await;
+    let _ = update_media_cleaner(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Form(cleaner_form(&id, "llama-3.1-8b-instant")),
+    )
+    .await
+    .unwrap();
+    let _ = delete_endpoint(State(state), AuthUser { id: "u1".into() }, Path(id)).await;
+    assert_eq!(media_cleaner_setting(&db).await.unwrap(), None);
+    assert_eq!(media_cleaner_model(&db).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_saved_gateway_key_migrates_to_the_cleaners_own_endpoint() {
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().in_memory(true))
+        .await
+        .unwrap();
+    let mut before = sqlx::migrate!();
+    before.migrations = before
+        .migrations
+        .iter()
+        .filter(|migration| migration.version < 16)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    before.run(&db).await.unwrap();
+    sqlx::query("INSERT INTO pi_credentials (user_id, provider, credential_json, updated_at) VALUES ('u1', 'vercel-ai-gateway', ?, ?)")
+        .bind(r#"{"apiKey":"vck-secret","baseUrl":"https://ai-gateway.vercel.sh/v1"}"#)
+        .bind(stamp())
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::migrate!().run(&db).await.unwrap();
+    let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
+    assert_eq!(endpoint.name, "Vercel AI Gateway");
+    assert_eq!(endpoint.spec, "openai-compatible");
+    assert_eq!(endpoint.base_url, "https://ai-gateway.vercel.sh/v1");
+    assert_eq!(endpoint.api_key, "vck-secret");
+    assert_eq!(endpoint.model, "poolside/laguna-s-2.1-free");
+    assert_eq!(media_cleaner_setting(&db).await.unwrap(), Some(endpoint.id));
+    assert!(
+        pi_credential(&db, "u1", "vercel-ai-gateway")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The AI provider is untouched.
+    assert_eq!(ai_provider(&db).await.unwrap(), "pi");
 }
 
 #[tokio::test]

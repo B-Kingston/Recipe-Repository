@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   WorkerError,
-  aiGatewayChatCompletion,
   anthropicMessages,
   anthropicThinking,
   anthropicTurn,
@@ -11,11 +10,12 @@ import {
   catalogModelIds,
   completionContext,
   formatRecipeEvidence,
-  generateViaPiAi,
+  cleanedEvidence,
+  completeViaPiAi,
+  generateRecipe,
   isPiAiSpec,
   normalizeEffort,
   openaiResponse,
-  parseAiGatewayCleaner,
   parseAnthropicOutput,
   parseRequest,
   parseResponsesOutput,
@@ -212,75 +212,22 @@ test("searchModeOf accepts only the three known modes", () => {
   assert.equal(searchModeOf({ searchMode: "gapfill" }), "gapfill");
 });
 
-test("aiGatewayChatCompletion uses the requested chat-completions model and reasoning", async () => {
-  let capturedUrl;
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
-    capturedUrl = url;
-    capturedInit = init;
-    return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
-  };
-  await aiGatewayChatCompletion("https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free", "sys", "raw evidence", fetchImpl);
-  assert.equal(capturedUrl, "https://ai-gateway.vercel.sh/v1/chat/completions");
-  assert.equal(capturedInit.headers.Authorization, "Bearer vg-test");
-  const sent = JSON.parse(capturedInit.body);
-  assert.equal(sent.model, "poolside/laguna-s-2.1-free");
-  assert.deepEqual(sent.messages, [
-    { role: "system", content: "sys" },
-    { role: "user", content: "raw evidence" },
-  ]);
-  assert.deepEqual(sent.reasoning, { effort: "none" });
-  assert.equal(sent.stream, false);
-  assert.equal(sent.max_tokens, 2048);
-  assert.ok(!("temperature" in sent));
-});
-
-test("aiGatewayChatCompletion honours reasoning/maxTokens/temperature options and omits reasoning when null", async () => {
-  let capturedInit;
-  const fetchImpl = async (_url, init) => {
-    capturedInit = init;
-    return { ok: true, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
-  };
-  // Off + tuned max_tokens and a deterministic temperature.
-  await aiGatewayChatCompletion(
-    "https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free",
-    "sys", "raw evidence", fetchImpl,
-    { reasoning: { effort: "none" }, maxTokens: 1024, temperature: 0 },
-  );
-  let sent = JSON.parse(capturedInit.body);
-  assert.deepEqual(sent.reasoning, { effort: "none" });
-  assert.equal(sent.max_tokens, 1024);
-  assert.equal(sent.temperature, 0);
-  // null reasoning means the field is omitted entirely (some models reject it).
-  await aiGatewayChatCompletion(
-    "https://ai-gateway.vercel.sh/v1/", "vg-test", "poolside/laguna-s-2.1-free",
-    "sys", "raw evidence", fetchImpl, { reasoning: null },
-  );
-  sent = JSON.parse(capturedInit.body);
-  assert.ok(!("reasoning" in sent), "null reasoning should omit the field");
-  assert.equal(sent.max_tokens, 2048, "unset maxTokens keeps the default");
-});
-
-test("parseAiGatewayCleaner keeps recipe fields and discards cleaner prose and unknown fields", () => {
-  const cleaned = parseAiGatewayCleaner({
-    choices: [{ message: { content: "```json\n" + JSON.stringify({
+test("cleanedEvidence keeps recipe fields and discards cleaner prose and unknown fields", () => {
+  const cleaned = cleanedEvidence("```json\n" + JSON.stringify({
       title: "Chilli tofu",
       ingredients: [{ quantity: "200", unit: "g", name: "tofu" }, "1 tbsp oil"],
       steps: ["Crisp the tofu"],
       timings: ["Fry for 5 minutes"],
       relevant_notes: ["Serve hot"],
       rambling: "Follow me for more recipes",
-    }) + "\n```" } }],
-  });
+    }) + "\n```");
   assert.equal(cleaned, "Dish: Chilli tofu\nIngredients:\n- 200 g tofu\n- 1 tbsp oil\nMethod:\n1. Crisp the tofu\nTimings and temperatures:\n- Fry for 5 minutes\nRelevant recipe notes:\n- Serve hot");
   assert.ok(!cleaned.includes("Follow me"));
 });
 
-test("parseAiGatewayCleaner finds the JSON object between prose that contains braces", () => {
+test("cleanedEvidence finds the JSON object between prose that contains braces", () => {
   const object = JSON.stringify({ title: "Soup", steps: ["Simmer {gently}"] });
-  const cleaned = parseAiGatewayCleaner({
-    choices: [{ message: { content: `Here it is: ${object} (see {ref})` } }],
-  });
+  const cleaned = cleanedEvidence(`Here it is: ${object} (see {ref})`);
   assert.equal(cleaned, "Dish: Soup\nMethod:\n1. Simmer {gently}");
 });
 
@@ -647,19 +594,20 @@ test("piAiModel uses the catalogue entry, borrows a shape for unknown ids, and r
   assert.throws(() => piAiModel(models, "openai-compatible", "llama3"), (error) => error.code === "configuration");
 });
 
-test("generateViaPiAi sends the key to a built-in provider and drops unverifiable sources", async () => {
+test("completeViaPiAi sends the key and system prompt to a built-in provider", async () => {
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
     return chatCompletionStream(RECIPE_REPLY);
   };
-  const result = await generateViaPiAi(
-    { provider: "groq", apiKey: "gsk-test", model: "llama-3.3-70b-versatile", prompt: "Toast", systemPrompt: "Cook." },
-    "low",
+  const result = await completeViaPiAi(
+    { provider: "groq", apiKey: "gsk-test", model: "llama-3.3-70b-versatile", prompt: "Toast" },
+    { systemPrompt: "Cook. Use an empty sources array.", reasoningEffort: "low" },
     piAiModels(),
     fetchImpl,
   );
-  assert.deepEqual(result, { recipe: { title: "Toast" }, sources: [] });
+  assert.equal(result.text, RECIPE_REPLY);
+  assert.equal(result.searched, false);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://api.groq.com/openai/v1/chat/completions");
   assert.equal(calls[0].headers.get("authorization"), "Bearer gsk-test");
@@ -667,37 +615,38 @@ test("generateViaPiAi sends the key to a built-in provider and drops unverifiabl
   assert.match(JSON.stringify(calls[0].body.messages), /Use an empty sources array/);
 });
 
-test("generateViaPiAi reaches a keyless custom server at its own base URL", async () => {
+test("completeViaPiAi reaches a keyless custom server at its own base URL", async () => {
   const urls = [];
   const fetchImpl = async (url) => {
     urls.push(String(url));
     return chatCompletionStream(RECIPE_REPLY);
   };
-  const result = await generateViaPiAi(
-    { provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1", apiKey: "", model: "llama3", prompt: "Toast", systemPrompt: "Cook." },
-    "low",
+  const result = await completeViaPiAi(
+    { provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1", apiKey: "", model: "llama3", prompt: "Toast" },
+    { systemPrompt: "Cook.", reasoningEffort: "low" },
     piAiModels(),
     fetchImpl,
   );
-  assert.equal(result.recipe.title, "Toast");
+  assert.equal(result.text, RECIPE_REPLY);
   assert.deepEqual(urls, ["http://ollama:11434/v1/chat/completions"]);
 });
 
-test("generateViaPiAi requires a model, and a key for built-in providers", async () => {
+test("completeViaPiAi requires a model, and a key for built-in providers", async () => {
+  const options = { systemPrompt: "s", reasoningEffort: "low" };
   await assert.rejects(
-    generateViaPiAi({ provider: "groq", apiKey: "k", model: "", prompt: "p", systemPrompt: "s" }, "low"),
+    completeViaPiAi({ provider: "groq", apiKey: "k", model: "", prompt: "p" }, options),
     (error) => error.code === "configuration",
   );
   await assert.rejects(
-    generateViaPiAi({ provider: "groq", apiKey: "", model: "m", prompt: "p", systemPrompt: "s" }, "low"),
+    completeViaPiAi({ provider: "groq", apiKey: "", model: "m", prompt: "p" }, options),
     (error) => error.code === "configuration",
   );
 });
 
-test("generateViaPiAi maps a provider error to a retryable WorkerError", async () => {
+test("completeViaPiAi maps a provider error to a retryable WorkerError", async () => {
   const fetchImpl = async () => new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503, headers: { "Content-Type": "application/json" } });
   await assert.rejects(
-    generateViaPiAi({ provider: "groq", apiKey: "k", model: "llama-3.3-70b-versatile", prompt: "p", systemPrompt: "s" }, "low", piAiModels(), fetchImpl),
+    completeViaPiAi({ provider: "groq", apiKey: "k", model: "llama-3.3-70b-versatile", prompt: "p" }, { systemPrompt: "s", reasoningEffort: "low" }, piAiModels(), fetchImpl),
     (error) => error instanceof WorkerError && error.code === "worker" && error.retryable,
   );
 });
@@ -717,4 +666,35 @@ test("listEndpointModels lists a keyless custom server without an Authorization 
   const models = await listEndpointModels({ provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1" }, fetchImpl);
   assert.deepEqual(models, ["llama3"]);
   assert.equal(headers.Authorization, undefined);
+});
+
+test("generateRecipe runs pi-ai providers without search and drops their unverifiable sources", async () => {
+  let seen;
+  const completeImpl = async (_request, options) => {
+    seen = options;
+    return { label: "groq", text: RECIPE_REPLY, citations: new Map(), searched: false };
+  };
+  const result = await generateRecipe({ provider: "groq", prompt: "p", systemPrompt: "s" }, "gapfill", "low", completeImpl);
+  assert.equal(seen.searchMode, "off");
+  assert.match(seen.systemPrompt, /Use an empty sources array/);
+  assert.deepEqual(result, { recipe: { title: "Toast" }, sources: [] });
+});
+
+test("generateRecipe keeps a native endpoint's gap-fill sources when the API returns no citations", async () => {
+  let seen;
+  const completeImpl = async (_request, options) => {
+    seen = options;
+    return { label: "OpenAI", text: RECIPE_REPLY, citations: new Map(), searched: true };
+  };
+  const result = await generateRecipe({ provider: "openai", prompt: "p", systemPrompt: "s" }, "gapfill", "low", completeImpl);
+  assert.equal(seen.searchMode, "gapfill");
+  assert.deepEqual(result.sources, [{ title: "x", url: "https://x.example/" }]);
+});
+
+test("generateRecipe requires a search on grounded subscription requests", async () => {
+  const completeImpl = async () => ({ label: "Codex", text: RECIPE_REPLY, citations: new Map(), searched: false });
+  await assert.rejects(
+    generateRecipe({ piProvider: "openai-codex", prompt: "p", systemPrompt: "s" }, "grounded", "low", completeImpl),
+    (error) => error.code === "output",
+  );
 });
