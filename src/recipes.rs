@@ -72,6 +72,7 @@ pub(crate) async fn home(
     } else {
         file_by_letter(&mut recipes)
     };
+    attach_ingredients(&state.db, &user.id, &mut recipes).await?;
     render(HomeTemplate {
         recipes,
         query,
@@ -81,7 +82,7 @@ pub(crate) async fn home(
     })
 }
 
-/// One library-card row: the fields home.html renders plus whether a dish
+/// One library ticket: the fields home.html renders plus whether a dish
 /// photo exists. The listing query never loads the JPEG bytes themselves.
 #[derive(FromRow)]
 pub(crate) struct LibraryCard {
@@ -92,13 +93,31 @@ pub(crate) struct LibraryCard {
     pub(crate) prep_minutes: Option<i64>,
     pub(crate) cook_minutes: Option<i64>,
     pub(crate) has_thumbnail: bool,
-    /// The letter tab this card carries: set by `file_by_letter` on the first
-    /// card of each letter, empty on every other card and on search results.
+    /// Set by `file_by_letter` on the first card of each letter, which the
+    /// A to Z strip links to; empty on every other card and on search results.
     #[sqlx(skip)]
     pub(crate) letter: String,
+    /// The ingredient lines printed on the ticket, in recipe order; filled
+    /// by `attach_ingredients`.
+    #[sqlx(skip)]
+    pub(crate) ingredients: Vec<Block>,
 }
 
+/// Ingredient lists longer than this print in two columns, so a big recipe
+/// makes a wider-packed ticket rather than a very long one.
+pub(crate) const TICKET_COLUMNS_AFTER: usize = 8;
+
 impl LibraryCard {
+    /// The letter this recipe is filed under, printed on every ticket.
+    pub(crate) fn filed_under(&self) -> char {
+        file_letter(&self.title)
+    }
+
+    /// True when the ticket's ingredients print in two columns.
+    pub(crate) fn packed(&self) -> bool {
+        self.ingredients.len() > TICKET_COLUMNS_AFTER
+    }
+
     /// "Serves 4", or empty when the recipe has no serving count.
     pub(crate) fn serves(&self) -> String {
         match self.servings {
@@ -150,9 +169,9 @@ fn letter_anchor(letter: char) -> String {
     }
 }
 
-/// Files the library like a recipe box: sorts the cards by letter, then
-/// title, puts a tab on the first card of each letter, and returns the A to Z
-/// strip, led by '#' when some titles start with anything else.
+/// Files the library A to Z: sorts the cards by letter, then title, marks
+/// the first card of each letter, and returns the A to Z strip, led by '#'
+/// when some titles start with anything else.
 pub(crate) fn file_by_letter(cards: &mut [LibraryCard]) -> Vec<LetterLink> {
     cards.sort_by_cached_key(|card| (file_letter(&card.title), card.title.to_lowercase()));
     let mut present = Vec::new();
@@ -174,6 +193,30 @@ pub(crate) fn file_by_letter(cards: &mut [LibraryCard]) -> Vec<LetterLink> {
             present: present.contains(&letter),
         })
         .collect()
+}
+
+/// Loads the ingredient lines of every card in one query.
+async fn attach_ingredients(
+    db: &SqlitePool,
+    user_id: &str,
+    cards: &mut [LibraryCard],
+) -> Result<()> {
+    let rows: Vec<IndexBlockRow> = sqlx::query_as(
+        "SELECT recipe_id,id,section,position,text,quantity,unit,optional FROM recipe_blocks
+         WHERE section='ingredient' AND recipe_id IN (SELECT id FROM recipes WHERE user_id=?)
+         ORDER BY recipe_id, position",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+    let mut by_recipe: HashMap<String, Vec<Block>> = HashMap::new();
+    for row in rows {
+        by_recipe.entry(row.recipe_id).or_default().push(row.block);
+    }
+    for card in cards {
+        card.ingredients = by_recipe.remove(&card.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 /// A recipe with its blocks, loaded to build its search document.
