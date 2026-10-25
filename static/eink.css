@@ -31,7 +31,14 @@ img { filter: grayscale(1) contrast(1.1); }
 .ticket-thumb-toggle, .ticket-photo, .hero-photo { display: none; }
 a:hover { color: #000000; }
 
-.utility-bar { border-bottom: 2px solid #000000; }
+.utility-bar { position: relative; }
+.utility-inner {
+  border: 2px solid #000000;
+  background: #ffffff;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
 .brand-mark-lines { stroke: #000000; }
 .top-nav a[aria-current="page"] { box-shadow: inset 0 0 0 2px #000000; }
 .account-panel {

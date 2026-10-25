@@ -87,55 +87,68 @@ h1 { margin-bottom: .5rem; font: 800 2.6rem/1.05 var(--sans); letter-spacing: -.
 h2 { margin: 1.6rem 0 .65rem; font: 700 1.25rem/1.2 var(--sans); }
 h3 { font: 700 1rem/1.3 var(--sans); }
 
-/* Header */
+/* Header: a frosted pill floating over the counter. The bar itself is a
+   transparent sticky strip that lets clicks through around the pill. */
 .utility-bar {
-  position: relative;
+  position: sticky;
+  top: 0;
   z-index: 10;
-  border-bottom: 1px solid var(--wash);
-  background: var(--card);
+  padding: 14px 16px 0;
+  pointer-events: none;
 }
 .utility-inner {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 4px 24px;
-  width: min(100%, 1160px);
+  gap: 16px;
+  width: min(100%, max(50%, 660px));
   margin: 0 auto;
-  padding: 8px 32px;
+  padding: 6px 6px 6px 22px;
+  border: 1px solid rgba(255, 255, 255, .75);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .62);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9), 0 0 0 1px rgba(31, 41, 51, .06), 0 10px 30px rgba(31, 41, 51, .1);
+  -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  backdrop-filter: blur(18px) saturate(1.6);
+  pointer-events: auto;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .utility-inner { background: rgba(255, 255, 255, .94); }
 }
 .brand {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  min-height: 48px;
-  font: 700 21px/1 var(--type);
+  min-height: 44px;
+  font: 700 19px/1 var(--type);
   text-decoration: none;
+  white-space: nowrap;
 }
 .brand:hover { color: var(--ink); }
 .brand-mark { flex: none; width: 28px; height: 22px; fill: none; }
 .brand-mark rect { stroke: currentColor; stroke-width: 1.6; }
 .brand-mark-rule { stroke: var(--rule); stroke-width: 1.6; }
 .brand-mark-lines { stroke: #9fb4cb; stroke-width: 1.2; }
-.top-nav { display: flex; flex-wrap: wrap; gap: 4px; }
+.top-nav { display: flex; gap: 2px; }
 .top-nav a {
   display: inline-flex;
   align-items: center;
   min-height: 44px;
   padding: 0 16px;
-  border-radius: var(--radius-sm);
+  border-radius: 999px;
   font: 600 15px/1 var(--sans);
   text-decoration: none;
+  white-space: nowrap;
 }
-.top-nav a:hover { background: var(--soft); color: var(--ink); }
-.top-nav a[aria-current="page"] { background: var(--ground); }
+.top-nav a:hover { background: rgba(255, 255, 255, .7); color: var(--ink); }
+.top-nav a[aria-current="page"] { background: var(--ink); color: var(--on-ink); }
 
 /* Account menu: the avatar at the end of the header opens a recipe ticket,
    pinned up under it, listing the other accounts (switch, or sign in),
    Create account, and Sign out. The ticket reuses the library's paper, bars
    and labels. A <details>, so it works without the script; app.js closes it
    on an outside click or Escape. */
-.utility-end { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.utility-end { display: flex; align-items: center; gap: 8px; }
 .account-menu { position: relative; }
 .account-button {
   display: inline-flex;
@@ -1025,8 +1038,9 @@ body.still-viewer-open { overflow: hidden; }
 .debug-final-list li { margin: 3px 0; }
 
 @media (max-width: 760px) {
-  .utility-inner { padding: 6px 16px; }
-  .top-nav a { padding: 0 10px; font-size: 14px; }
+  .utility-bar { padding: 10px 12px 0; }
+  .utility-inner { width: 100%; padding-left: 16px; }
+  .top-nav a { padding: 0 12px; font-size: 14px; }
   .app-shell { padding: 0 16px; }
   .paper { padding: 22px 0 56px; }
   h1 { font-size: 2.1rem; }
@@ -1050,9 +1064,10 @@ body.still-viewer-open { overflow: hidden; }
   .import-progress-heading .muted { text-align: left; }
   .import-found { grid-template-columns: 1fr; }
 }
-@media (max-width: 520px) {
+@media (max-width: 600px) {
   .brand-text { display: none; }
   .utility-end { gap: 4px; }
+  .top-nav a { padding: 0 10px; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
