@@ -1,0 +1,24 @@
+{% extends "base.html" %}{% block title %}Create account · Recipe Repository{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Accounts</p>
+  <h1>Create account</h1>
+  <p class="deck">A new account starts with its own empty library and uses the shared AI logins until it chooses its own in Settings. This browser switches to it and stays signed in to your current account too.</p>
+</div>
+<div class="compact-panel">
+  <form method="post" action="/accounts/new">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" value="{{ username }}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40" required autofocus>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" required aria-describedby="password-hint">
+    <p class="muted" id="password-hint">At least 8 characters.</p>
+    <label for="confirm_password">Confirm password</label>
+    <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required aria-describedby="confirm-hint">
+    <p class="muted" id="confirm-hint">Both passwords must match.</p>
+    {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <p class="actions">
+      <a class="button" href="/">Cancel</a>
+      <button class="button primary" type="submit">Create account</button>
+    </p>
+  </form>
+</div>
+{% endblock %}

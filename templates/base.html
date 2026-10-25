@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#ffffff">
+  <meta name="theme-color" content="#eceef0">
   <title>{% block title %}Recipe Repository{% endblock %}</title>
   {% block head %}{% endblock %}
   <link rel="stylesheet" href="/static/app.css">
@@ -16,11 +16,67 @@
         <svg class="brand-mark" width="28" height="22" viewBox="0 0 28 22" aria-hidden="true" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg>
         <span class="brand-text">Recipe Repository</span>
       </a>
-      <nav class="top-nav" aria-label="Main navigation">
-        <a href="/"{% block nav_library %}{% endblock %}>Library</a>
-        <a href="/recipes/new"{% block nav_add %}{% endblock %}>Add recipe</a>
-        <a href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
-      </nav>
+      <div class="utility-end">
+        <nav class="top-nav" aria-label="Main navigation">
+          <a href="/"{% block nav_library %}{% endblock %}>Library</a>
+          <a href="/recipes/new"{% block nav_add %}{% endblock %}>Add recipe</a>
+          <a href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
+        </nav>
+        {% if let Some(menu) = crate::auth::account_menu() %}
+        <details class="account-menu" data-account-menu>
+          <summary class="account-button" title="Account: {{ menu.username }}">
+            <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
+            <span class="visually-hidden">Account: {{ menu.username }}</span>
+          </summary>
+          <div class="account-panel">
+            <div class="ticket-paper account-ticket">
+              <div class="ticket-bars">
+                <p class="ticket-bar ticket-head"><span class="account-name">{{ menu.username }}</span></p>
+                <p class="ticket-bar">Signed in</p>
+              </div>
+              {% if !menu.others.is_empty() %}
+              <p class="ticket-label">Switch account:</p>
+              <ul class="account-list">
+                {% for account in menu.others %}
+                <li>
+                  {% if account.signed_in %}
+                  <form method="post" action="/accounts/switch">
+                    <input type="hidden" name="user_id" value="{{ account.id }}">
+                    <button class="account-row" type="submit">
+                      <span class="account-avatar" aria-hidden="true">{{ account.initial }}</span>
+                      <span class="account-name">{{ account.username }}</span>
+                    </button>
+                  </form>
+                  {% else %}
+                  <a class="account-row" href="{{ account.sign_in_url }}">
+                    <span class="account-avatar" aria-hidden="true">{{ account.initial }}</span>
+                    <span class="account-name">{{ account.username }}</span>
+                    <span class="account-state">sign in</span>
+                  </a>
+                  {% endif %}
+                </li>
+                {% endfor %}
+              </ul>
+              {% endif %}
+              <div class="account-actions">
+                <a class="account-row account-action" href="/accounts/new">
+                  <span class="account-avatar account-avatar-add" aria-hidden="true">+</span>
+                  <span class="account-name">Create account</span>
+                </a>
+                <form method="post" action="/logout">
+                  <button class="account-row account-action" type="submit">Sign out of {{ menu.username }}</button>
+                </form>
+                {% if menu.several_signed_in %}
+                <form method="post" action="/logout/all">
+                  <button class="account-row account-action" type="submit">Sign out of all accounts</button>
+                </form>
+                {% endif %}
+              </div>
+            </div>
+          </div>
+        </details>
+        {% endif %}
+      </div>
     </div>
   </header>
   <main class="app-shell">

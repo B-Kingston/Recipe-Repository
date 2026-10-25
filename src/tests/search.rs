@@ -1,7 +1,8 @@
 use crate::auth::AuthUser;
 use crate::recipes::{home, store_embedding};
 use crate::search::{
-    Indexed, MAX_RESULTS, NOT_CONFIGURED, normalize_query, rank, recipe_document, stale_documents,
+    Indexed, MAX_RESULTS, keyword_rank, keyword_terms, normalize_query, rank, recipe_document,
+    stale_documents, tokens,
 };
 use crate::{AppState, Block, HomeQuery, stamp};
 use axum::extract::{Query, State};
@@ -247,23 +248,122 @@ async fn storing_a_vector_for_a_deleted_recipe_is_skipped() {
     assert_eq!(count, 0);
 }
 
-#[tokio::test]
-async fn searching_without_an_embedding_service_explains_and_lists_every_recipe() {
-    let db = database().await;
-    let page = home(
+async fn search_page(db: SqlitePool, query: &str) -> String {
+    home(
         State(state(db)),
         AuthUser { id: "u1".into() },
         Query(HomeQuery {
-            q: Some("  supper ".into()),
+            q: Some(query.into()),
         }),
     )
     .await
     .unwrap()
-    .0;
-    assert!(page.contains(NOT_CONFIGURED));
-    assert!(page.contains("Recipe rail"));
-    assert!(page.contains("filed A to Z"));
+    .0
+}
+
+#[tokio::test]
+async fn without_an_embedding_service_search_falls_back_to_word_matches() {
+    let db = database().await;
+    sqlx::query(
+        "INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('b1','r','step',0,'Simmer the sauce for an hour.')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let page = search_page(db.clone(), "  supper ").await;
+    assert!(!page.contains("class=\"notice\""));
+    assert!(page.contains("Results for “supper”"));
     assert!(page.contains("href=\"/recipes/r\""));
     assert!(!page.contains("href=\"/recipes/other\""));
     assert!(page.contains("value=\"supper\""));
+
+    // Step text is searched too; a word nowhere in the recipe finds nothing.
+    assert!(
+        search_page(db.clone(), "simmering sauces")
+            .await
+            .contains("href=\"/recipes/r\"")
+    );
+    assert!(
+        search_page(db, "chocolate")
+            .await
+            .contains("No tickets match.")
+    );
+}
+
+#[tokio::test]
+async fn choosing_word_search_searches_by_word() {
+    let db = database().await;
+    sqlx::query(
+        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('u1','search_engine','bm25',?)",
+    )
+    .bind(stamp())
+    .execute(&db)
+    .await
+    .unwrap();
+    let page = search_page(db, "quick").await;
+    assert!(!page.contains("class=\"notice\""));
+    assert!(page.contains("href=\"/recipes/r\""));
+}
+
+#[test]
+fn tokens_lowercase_drop_stopwords_and_fold_plurals() {
+    assert_eq!(
+        tokens("Tomatoes, Berries and the Glass of Dishes; hummus/couscous 2 eggs"),
+        [
+            "tomato", "berry", "glass", "dish", "hummus", "couscous", "2", "egg"
+        ]
+    );
+}
+
+fn documents(recipes: &[(&str, &str, &str, &[Block])]) -> Vec<(String, Vec<String>)> {
+    recipes
+        .iter()
+        .map(|(id, title, description, blocks)| {
+            (id.to_string(), keyword_terms(title, description, blocks))
+        })
+        .collect()
+}
+
+#[test]
+fn keyword_rank_finds_words_anywhere_and_ranks_title_matches_first() {
+    let steps = [block(
+        "step",
+        0,
+        "Finish with a pinch of sumac.",
+        "",
+        "",
+        false,
+    )];
+    let ingredients = [block("ingredient", 0, "sumac", "1", "tsp", false)];
+    let docs = documents(&[
+        ("salad", "Fattoush", "A bread salad.", &steps),
+        ("rub", "Sumac rub", "", &[]),
+        ("dip", "Dip", "", &ingredients),
+        ("cake", "Cake", "A sponge.", &[]),
+    ]);
+    assert_eq!(keyword_rank("Sumac", &docs), ["rub", "dip", "salad"]);
+    assert!(keyword_rank("the and of", &docs).is_empty());
+    assert!(keyword_rank("saffron", &docs).is_empty());
+    assert!(keyword_rank("sumac", &[]).is_empty());
+}
+
+#[test]
+fn keyword_rank_prefers_recipes_matching_more_and_rarer_words() {
+    let docs = documents(&[
+        ("both", "Chicken and rice", "", &[]),
+        ("chicken", "Roast chicken", "", &[]),
+        ("rice", "Rice pudding", "", &[]),
+        ("soup", "Soup", "Chicken stock.", &[]),
+    ]);
+    let ranked = keyword_rank("chicken rice", &docs);
+    assert_eq!(ranked.first().map(String::as_str), Some("both"));
+    assert!(ranked.contains(&"rice".to_owned()));
+}
+
+#[test]
+fn keyword_rank_returns_at_most_the_result_cap() {
+    let docs: Vec<(String, Vec<String>)> = (0..40)
+        .map(|index| (format!("r{index:02}"), tokens("Lentil soup")))
+        .collect();
+    assert_eq!(keyword_rank("lentils", &docs).len(), MAX_RESULTS);
 }

@@ -1,15 +1,22 @@
 //! Library search: every recipe becomes one EmbeddingGemma document vector
 //! (`recipe_embeddings`), and a query is ranked against them by cosine
-//! similarity. The pure pieces (`recipe_document`, `rank`) are unit-tested;
-//! `refresh_index` and `search` orchestrate the embedding sidecar and the
-//! database through the accessors in `recipes.rs`.
+//! similarity. BM25 over every word of each recipe is the backup: it answers
+//! when the embedding service is missing or down, or for every search when the
+//! user picks it in Settings. The pure pieces (`recipe_document`, `rank`,
+//! `keyword_terms`, `keyword_rank`) are unit-tested; `refresh_index` and
+//! `search` orchestrate the embedding sidecar and the database through the
+//! accessors in `recipes.rs`.
 
 use crate::embeddings::{self, Embedder, Input};
 use crate::recipes;
 use crate::{AppState, Block};
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
-use std::{collections::HashSet, sync::LazyLock, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+    time::Duration,
+};
 use tracing::{info, warn};
 
 /// Longest recipe body (description, ingredients, method) that is embedded.
@@ -32,13 +39,19 @@ const REFRESH_BATCH: usize = 16;
 /// Startup backfill: the sidecar may still be downloading its model.
 const BACKFILL_ATTEMPTS: u32 = 60;
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
-
-/// Shown when `EMBEDDING_URL` is unset.
-pub(crate) const NOT_CONFIGURED: &str =
-    "Search needs the embedding service (EMBEDDING_URL is not set).";
-/// Shown when the embedding service fails.
-pub(crate) const UNAVAILABLE: &str =
-    "Search is unavailable right now: the embedding service did not respond.";
+/// BM25 term-frequency saturation.
+const BM25_K1: f32 = 1.2;
+/// BM25 document-length normalisation.
+const BM25_B: f32 = 0.75;
+/// Title words count this many times, so a title match outweighs a passing mention.
+const TITLE_WEIGHT: usize = 3;
+/// A word match must score at least this share of the best word match.
+pub(crate) const KEYWORD_CUTOFF: f32 = 0.25;
+/// Words too common in recipes and queries to rank by.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to",
+    "with",
+];
 
 /// Users whose remaining stale recipes are already being embedded in the background.
 static BACKGROUND: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
@@ -57,15 +70,12 @@ pub(crate) struct Indexed {
     pub(crate) vector: Vec<f32>,
 }
 
-/// What a library search produced.
+/// What a library search produced: matching recipe ids, best first, and a
+/// notice for the page (empty when there is nothing to say).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
-    /// Matching recipe ids, best first; `indexing` recipes are not searchable yet.
-    Ranked { ids: Vec<String>, indexing: usize },
-    /// No embedding service is configured.
-    NotConfigured,
-    /// The embedding service failed.
-    Unavailable,
+pub(crate) struct Outcome {
+    pub(crate) ids: Vec<String>,
+    pub(crate) notice: String,
 }
 
 /// Trims a raw `?q=` value and caps it at 200 characters.
@@ -238,6 +248,121 @@ pub(crate) fn rank(query: &str, query_vector: &[f32], entries: &[Indexed]) -> Ve
         .collect()
 }
 
+/// Lowercased words of `text`, split on anything but letters and digits,
+/// stopwords dropped and simple plurals folded ("tomatoes" -> "tomato").
+pub(crate) fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .filter(|word| !STOPWORDS.contains(&word.as_str()))
+        .map(fold_plural)
+        .collect()
+}
+
+fn fold_plural(word: String) -> String {
+    let len = word.chars().count();
+    if len > 4 && word.ends_with("ies") {
+        format!("{}y", &word[..word.len() - 3])
+    } else if len > 4
+        && ["oes", "ches", "shes", "sses", "xes"]
+            .iter()
+            .any(|suffix| word.ends_with(suffix))
+    {
+        word[..word.len() - 2].to_owned()
+    } else if len > 3 && word.ends_with('s') && !word.ends_with("ss") && !word.ends_with("us") {
+        word[..word.len() - 1].to_owned()
+    } else {
+        word
+    }
+}
+
+/// Every word of a recipe for BM25: the title (counted `TITLE_WEIGHT`
+/// times), description, ingredient lines and method, uncapped.
+pub(crate) fn keyword_terms(title: &str, description: &str, blocks: &[Block]) -> Vec<String> {
+    let title = tokens(title);
+    let mut terms = Vec::with_capacity(title.len() * TITLE_WEIGHT);
+    for _ in 0..TITLE_WEIGHT {
+        terms.extend(title.iter().cloned());
+    }
+    terms.extend(tokens(description));
+    for block in blocks {
+        terms.extend(tokens(&format!(
+            "{} {} {}",
+            block.quantity, block.unit, block.text
+        )));
+    }
+    terms
+}
+
+/// Ids of the recipes (id, `keyword_terms`) that match a query by BM25, best
+/// first: at least one query word, a score within `KEYWORD_CUTOFF` of the
+/// best, at most `MAX_RESULTS`.
+pub(crate) fn keyword_rank(query: &str, documents: &[(String, Vec<String>)]) -> Vec<String> {
+    let mut terms = tokens(query);
+    terms.sort();
+    terms.dedup();
+    if terms.is_empty() || documents.is_empty() {
+        return Vec::new();
+    }
+    let count = documents.len() as f32;
+    let average = (documents
+        .iter()
+        .map(|(_, words)| words.len())
+        .sum::<usize>() as f32
+        / count)
+        .max(1.0);
+    let frequencies: Vec<HashMap<&str, usize>> = documents
+        .iter()
+        .map(|(_, words)| {
+            let mut found = HashMap::new();
+            for word in words {
+                if terms.contains(word) {
+                    *found.entry(word.as_str()).or_default() += 1;
+                }
+            }
+            found
+        })
+        .collect();
+    let idf: Vec<f32> = terms
+        .iter()
+        .map(|term| {
+            let with = frequencies
+                .iter()
+                .filter(|found| found.contains_key(term.as_str()))
+                .count() as f32;
+            (1.0 + (count - with + 0.5) / (with + 0.5)).ln()
+        })
+        .collect();
+
+    let mut scored: Vec<(f32, &str)> = documents
+        .iter()
+        .zip(&frequencies)
+        .filter(|(_, found)| !found.is_empty())
+        .map(|((id, words), found)| {
+            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * words.len() as f32 / average);
+            let score = terms
+                .iter()
+                .zip(&idf)
+                .filter_map(|(term, idf)| {
+                    let tf = *found.get(term.as_str())? as f32;
+                    Some(idf * tf * (BM25_K1 + 1.0) / (tf + norm))
+                })
+                .sum::<f32>();
+            (score, id.as_str())
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let Some(&(best, _)) = scored.first() else {
+        return Vec::new();
+    };
+    scored
+        .into_iter()
+        .take_while(|(score, _)| *score >= best * KEYWORD_CUTOFF)
+        .take(MAX_RESULTS)
+        .map(|(_, id)| id.to_owned())
+        .collect()
+}
+
 /// Releases a user's background-refresh slot when the task ends.
 struct BackgroundSlot(String);
 
@@ -266,19 +391,39 @@ fn spawn_background_refresh(db: SqlitePool, embedder: Embedder, user_id: String)
 }
 
 /// Searches one user's library for `query` (already `normalize_query`d and
-/// non-empty). Never fails: service problems become `NotConfigured` or
-/// `Unavailable` so the page can still list every recipe.
-pub(crate) async fn search(state: &AppState, user_id: &str, query: &str) -> Outcome {
+/// non-empty) with the engine chosen in Settings. Embedding search quietly
+/// falls back to BM25 when the service is missing or fails, so the page
+/// always gets results.
+pub(crate) async fn search(state: &AppState, user_id: &str, query: &str) -> crate::Result<Outcome> {
+    if crate::keyword_search_selected(&state.db, user_id).await? {
+        return keyword_search(state, user_id, query).await;
+    }
     let Some(embedder) = state.embedder.as_ref() else {
-        return Outcome::NotConfigured;
+        return keyword_search(state, user_id, query).await;
     };
     match ranked(state, embedder, user_id, query).await {
-        Ok(outcome) => outcome,
+        Ok(outcome) => Ok(outcome),
         Err(error) => {
-            warn!(%error, "Library search failed");
-            Outcome::Unavailable
+            warn!(%error, "Library search failed; falling back to word matches");
+            keyword_search(state, user_id, query).await
         }
     }
+}
+
+/// BM25 over every recipe of the user, read fresh, so it needs no index.
+async fn keyword_search(state: &AppState, user_id: &str, query: &str) -> crate::Result<Outcome> {
+    let documents: Vec<(String, Vec<String>)> = recipes::index_sources(&state.db, Some(user_id))
+        .await?
+        .into_iter()
+        .map(|source| {
+            let terms = keyword_terms(&source.title, &source.description, &source.blocks);
+            (source.id, terms)
+        })
+        .collect();
+    Ok(Outcome {
+        ids: keyword_rank(query, &documents),
+        notice: String::new(),
+    })
 }
 
 async fn ranked(
@@ -291,13 +436,18 @@ async fn ranked(
     if refresh.remaining > 0 {
         spawn_background_refresh(state.db.clone(), embedder.clone(), user_id.to_owned());
     }
+    let notice = if refresh.remaining > 0 {
+        indexing_note(refresh.remaining)
+    } else {
+        String::new()
+    };
     let entries = recipes::indexed_recipes(&state.db, user_id)
         .await
         .map_err(|error| error.to_string())?;
     if entries.is_empty() {
-        return Ok(Outcome::Ranked {
+        return Ok(Outcome {
             ids: Vec::new(),
-            indexing: refresh.remaining,
+            notice,
         });
     }
     let vector = embedder
@@ -306,9 +456,9 @@ async fn ranked(
         .into_iter()
         .next()
         .ok_or_else(|| "embedding service returned no query vector".to_owned())?;
-    Ok(Outcome::Ranked {
+    Ok(Outcome {
         ids: rank(query, &vector, &entries),
-        indexing: refresh.remaining,
+        notice,
     })
 }
 

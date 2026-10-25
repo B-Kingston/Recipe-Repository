@@ -1,6 +1,6 @@
 use crate::chart::{build_chart, infer_step_ingredients};
 use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
-use crate::search::{self, Indexed, Outcome};
+use crate::search::{self, Indexed};
 use crate::thumbs::{self, ThumbCandidate};
 use crate::{
     AddRecipeQuery, AddRecipeTemplate, AppError, AppState, AuthUser, Block, BlockForm,
@@ -30,8 +30,8 @@ fn block_label(section: &str, action: &str) -> String {
 }
 
 /// The library page. Without `?q=` it lists every recipe filed A to Z; with
-/// it, the recipes ranked by embedding similarity, or the filed list plus a
-/// notice when the embedding service is missing or down.
+/// it, the recipes ranked by embedding similarity or BM25 (the user's choice,
+/// and the fallback when the embedding service is missing or down).
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -40,7 +40,7 @@ pub(crate) async fn home(
     let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
     let cards: Vec<LibraryCard> = sqlx::query_as(
         "SELECT id,title,description,servings,prep_minutes,cook_minutes,
-                thumbnail_jpeg IS NOT NULL AS has_thumbnail
+                thumbnail_jpeg IS NOT NULL AS has_thumbnail,created_at
          FROM recipes WHERE user_id=? ORDER BY updated_at DESC",
     )
     .bind(&user.id)
@@ -49,36 +49,28 @@ pub(crate) async fn home(
     let (mut recipes, results, notice) = if query.is_empty() {
         (cards, false, String::new())
     } else {
-        match search::search(&state, &user.id, &query).await {
-            Outcome::Ranked { ids, indexing } => {
-                let mut by_id: HashMap<String, LibraryCard> = cards
-                    .into_iter()
-                    .map(|card| (card.id.clone(), card))
-                    .collect();
-                let found = ids.iter().filter_map(|id| by_id.remove(id)).collect();
-                let notice = if indexing > 0 {
-                    search::indexing_note(indexing)
-                } else {
-                    String::new()
-                };
-                (found, true, notice)
-            }
-            Outcome::NotConfigured => (cards, false, search::NOT_CONFIGURED.to_owned()),
-            Outcome::Unavailable => (cards, false, search::UNAVAILABLE.to_owned()),
-        }
+        let outcome = search::search(&state, &user.id, &query).await?;
+        let mut by_id: HashMap<String, LibraryCard> = cards
+            .into_iter()
+            .map(|card| (card.id.clone(), card))
+            .collect();
+        let found = outcome
+            .ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect();
+        (found, true, outcome.notice)
     };
-    let letters = if results {
-        Vec::new()
-    } else {
-        file_by_letter(&mut recipes)
-    };
+    if !results {
+        file_a_to_z(&mut recipes);
+    }
     attach_ingredients(&state.db, &user.id, &mut recipes).await?;
+    stamp_added(&mut recipes);
     render(HomeTemplate {
         recipes,
         query,
         results,
         notice,
-        letters,
     })
 }
 
@@ -93,14 +85,15 @@ pub(crate) struct LibraryCard {
     pub(crate) prep_minutes: Option<i64>,
     pub(crate) cook_minutes: Option<i64>,
     pub(crate) has_thumbnail: bool,
-    /// Set by `file_by_letter` on the first card of each letter, which the
-    /// A to Z strip links to; empty on every other card and on search results.
-    #[sqlx(skip)]
-    pub(crate) letter: String,
+    pub(crate) created_at: String,
     /// The ingredient lines printed on the ticket, in recipe order; filled
     /// by `attach_ingredients`.
     #[sqlx(skip)]
     pub(crate) ingredients: Vec<Block>,
+    /// When the recipe was added, as printed at the foot of the ticket;
+    /// filled by `stamp_added`.
+    #[sqlx(skip)]
+    pub(crate) added: String,
 }
 
 /// Ingredient lists longer than this print in two columns, so a big recipe
@@ -108,11 +101,6 @@ pub(crate) struct LibraryCard {
 pub(crate) const TICKET_COLUMNS_AFTER: usize = 8;
 
 impl LibraryCard {
-    /// The letter this recipe is filed under, printed on every ticket.
-    pub(crate) fn filed_under(&self) -> char {
-        file_letter(&self.title)
-    }
-
     /// True when the ticket's ingredients print in two columns.
     pub(crate) fn packed(&self) -> bool {
         self.ingredients.len() > TICKET_COLUMNS_AFTER
@@ -137,19 +125,6 @@ impl LibraryCard {
             (hours, rest) => format!("{hours} h {rest} min"),
         }
     }
-
-    /// The fragment id of this card's letter tab, such as "B" or "other".
-    pub(crate) fn anchor(&self) -> String {
-        letter_anchor(self.letter.chars().next().unwrap_or('#'))
-    }
-}
-
-/// One link in the library's A to Z strip.
-pub(crate) struct LetterLink {
-    pub(crate) letter: char,
-    pub(crate) anchor: String,
-    /// A card is filed under this letter, so the link has a target.
-    pub(crate) present: bool,
 }
 
 /// The letter a title is filed under: its first letter, upper-cased, or '#'
@@ -161,38 +136,37 @@ pub(crate) fn file_letter(title: &str) -> char {
     }
 }
 
-fn letter_anchor(letter: char) -> String {
-    if letter == '#' {
-        "other".to_owned()
-    } else {
-        letter.to_string()
-    }
+/// Files the library A to Z: by letter (titles starting with anything else
+/// come first), then title.
+pub(crate) fn file_a_to_z(cards: &mut [LibraryCard]) {
+    cards.sort_by_cached_key(|card| (file_letter(&card.title), card.title.to_lowercase()));
 }
 
-/// Files the library A to Z: sorts the cards by letter, then title, marks
-/// the first card of each letter, and returns the A to Z strip, led by '#'
-/// when some titles start with anything else.
-pub(crate) fn file_by_letter(cards: &mut [LibraryCard]) -> Vec<LetterLink> {
-    cards.sort_by_cached_key(|card| (file_letter(&card.title), card.title.to_lowercase()));
-    let mut present = Vec::new();
-    for card in cards.iter_mut() {
-        let letter = file_letter(&card.title);
-        if present.last() != Some(&letter) {
-            card.letter = letter.to_string();
-            present.push(letter);
-        }
-    }
-    let other = present.first() == Some(&'#');
-    other
-        .then_some('#')
-        .into_iter()
-        .chain('A'..='Z')
-        .map(|letter| LetterLink {
-            letter,
-            anchor: letter_anchor(letter),
-            present: present.contains(&letter),
+/// Stamps each ticket with the UTC date its recipe was added, e.g.
+/// "15 Oct 2026", adding the time ("15 Oct 2026, 22:11") when another
+/// ticket shares that date.
+pub(crate) fn stamp_added(cards: &mut [LibraryCard]) {
+    let added: Vec<Option<chrono::DateTime<Utc>>> = cards
+        .iter()
+        .map(|card| {
+            chrono::DateTime::parse_from_rfc3339(&card.created_at)
+                .ok()
+                .map(|time| time.with_timezone(&Utc))
         })
-        .collect()
+        .collect();
+    let mut per_day: HashMap<chrono::NaiveDate, usize> = HashMap::new();
+    for time in added.iter().flatten() {
+        *per_day.entry(time.date_naive()).or_default() += 1;
+    }
+    for (card, time) in cards.iter_mut().zip(added) {
+        card.added = match time {
+            Some(time) if per_day[&time.date_naive()] > 1 => {
+                time.format("%-d %b %Y, %H:%M").to_string()
+            }
+            Some(time) => time.format("%-d %b %Y").to_string(),
+            None => String::new(),
+        };
+    }
 }
 
 /// Loads the ingredient lines of every card in one query.
@@ -400,7 +374,8 @@ pub(crate) async fn recipe_page(
     let mut uses = step_ingredients_by_step(&state.db, &id).await?;
     let recipe_sources = sources(&state.db, &user.id, &id).await?;
     let video_url = social_source_url(&recipe_sources);
-    let moments_shown = video_url.is_some() && crate::step_moments_enabled(&state.db).await?;
+    let moments_shown =
+        video_url.is_some() && crate::step_moments_enabled(&state.db, &user.id).await?;
     let mut step_moments = if moments_shown {
         recipe_step_moments(&state.db, &id).await?
     } else {
@@ -774,7 +749,7 @@ pub(crate) async fn add_block(
     invalidate_chart(&mut tx, &id).await?;
     record_version(&mut tx, &user.id, &id, &block_label(section, "added")).await?;
     tx.commit().await?;
-    moments::spawn_recipe_refresh(&state, &id);
+    moments::spawn_recipe_refresh(&state, &user.id, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -789,7 +764,7 @@ pub(crate) async fn update_block(
     let mut tx = state.db.begin().await?;
     save_block_edit(&mut tx, &user.id, &id, &block, &text, &form).await?;
     tx.commit().await?;
-    moments::spawn_recipe_refresh(&state, &id);
+    moments::spawn_recipe_refresh(&state, &user.id, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -945,7 +920,7 @@ pub(crate) async fn move_block(
         }
     }
     tx.commit().await?;
-    moments::spawn_recipe_refresh(&state, &id);
+    moments::spawn_recipe_refresh(&state, &user.id, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -976,7 +951,7 @@ pub(crate) async fn delete_block(
     )
     .await?;
     tx.commit().await?;
-    moments::spawn_recipe_refresh(&state, &id);
+    moments::spawn_recipe_refresh(&state, &user.id, &id);
     Ok(redirect_recipe(&id))
 }
 
@@ -1567,7 +1542,7 @@ pub(crate) async fn start_moment_capture(
             "Video step moments need the embedding service (EMBEDDING_URL).".into(),
         ));
     };
-    if !crate::step_moments_enabled(&state.db).await? {
+    if !crate::step_moments_enabled(&state.db, &user.id).await? {
         return Err(AppError::BadRequest(
             "Video step moments are turned off in Settings.".into(),
         ));
@@ -1582,6 +1557,7 @@ pub(crate) async fn start_moment_capture(
         return Ok(redirect_recipe(&id));
     }
     let job_state = state.clone();
+    let user_id = user.id.clone();
     let recipe_id = id.clone();
     tokio::spawn(async move {
         let outcome: Result<usize> = async {
@@ -1590,7 +1566,7 @@ pub(crate) async fn start_moment_capture(
                 return Ok(0);
             }
             store_recipe_moment_pool(&job_state.db, &recipe_id, &pool).await?;
-            moments::refresh_recipe(&job_state, &recipe_id).await?;
+            moments::refresh_recipe(&job_state, &user_id, &recipe_id).await?;
             Ok(pool.vectors.len())
         }
         .await;

@@ -294,7 +294,8 @@ async fn run_media_import(
         let observer = Arc::new(MediaDebug::new(0, frames_dir, emitter));
         let extras = VideoExtras {
             thumbnails: true,
-            moments: state.embedder.is_some() && crate::step_moments_enabled(&state.db).await?,
+            moments: state.embedder.is_some()
+                && crate::step_moments_enabled(&state.db, &user.id).await?,
             embedder: state.embedder.clone(),
         };
         // Evidence comes back as soon as transcription and OCR finish. Dish
@@ -393,8 +394,15 @@ async fn run_media_import(
 }
 
 async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
-    let provider = crate::ai_provider(&state.db).await?;
-    ensure_provider_configured(state, &user.id, &provider).await
+    let ai_user = crate::ai_account(&state.db, &user.id).await?;
+    let provider = crate::ai_provider(&state.db, &ai_user).await?;
+    ensure_provider_configured(state, &ai_user, &provider).await
+}
+
+/// Whether the user's recipes can generate: the AI setup they use (shared or
+/// their own) has a connected provider.
+pub(crate) async fn ai_configured(state: &AppState, user: &AuthUser) -> bool {
+    ensure_ai_configured(state, user).await.is_ok()
 }
 
 /// Whether a provider value can run: a connected subscription, or a saved
@@ -465,17 +473,18 @@ async fn retry_backoff(attempt: usize) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
-/// The provider the video cleaner runs on: its own Settings choice, or the
-/// active AI provider when none is chosen.
-async fn media_cleaner_provider(state: &AppState) -> Result<String> {
-    match crate::media_cleaner_setting(&state.db).await? {
+/// The provider the user's video cleaner runs on: its own Settings choice,
+/// or their active AI provider when none is chosen.
+async fn media_cleaner_provider(state: &AppState, user_id: &str) -> Result<String> {
+    match crate::media_cleaner_setting(&state.db, user_id).await? {
         Some(provider) => Ok(provider),
-        None => crate::ai_provider(&state.db).await,
+        None => crate::ai_provider(&state.db, user_id).await,
     }
 }
 
 async fn ensure_media_cleaner_configured(state: &AppState, user_id: &str) -> Result<()> {
-    let provider = media_cleaner_provider(state).await?;
+    let user_id = &crate::ai_account(&state.db, user_id).await?;
+    let provider = media_cleaner_provider(state, user_id).await?;
     ensure_provider_configured(state, user_id, &provider)
         .await
         .map_err(|error| match error {
@@ -501,9 +510,10 @@ async fn clean_media_evidence(
     mut evidence: MediaEvidence,
 ) -> Result<MediaEvidence> {
     ensure_media_cleaner_configured(state, user_id).await?;
-    let provider = media_cleaner_provider(state).await?;
+    let user_id = &crate::ai_account(&state.db, user_id).await?;
+    let provider = media_cleaner_provider(state, user_id).await?;
     let (backend, provider_model) = resolve_backend(state, user_id, &provider).await?;
-    let model = crate::media_cleaner_model(&state.db)
+    let model = crate::media_cleaner_model(&state.db, user_id)
         .await?
         .unwrap_or(provider_model);
     let cleaner_prompt = cleaner_prompt(&evidence);
@@ -790,7 +800,7 @@ async fn draft_moment_views(
     step_count: usize,
 ) -> Result<Vec<Option<crate::MomentView>>> {
     let mut views = vec![None; step_count];
-    if !crate::step_moments_enabled(&state.db).await? {
+    if !crate::step_moments_enabled(&state.db, &user.id).await? {
         return Ok(views);
     }
     let moments = draft_step_moments(&state.db, id).await?;
@@ -827,7 +837,14 @@ async fn match_new_draft(state: &AppState, user: &AuthUser, draft_id: &str) {
         let mut recipe: GeneratedRecipe =
             serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
         normalize_generated(&mut recipe)?;
-        crate::moments::match_draft(state, draft_id, draft.recipe_id.as_deref(), &recipe).await
+        crate::moments::match_draft(
+            state,
+            &user.id,
+            draft_id,
+            draft.recipe_id.as_deref(),
+            &recipe,
+        )
+        .await
     }
     .await;
     if let Err(error) = result {
@@ -1207,10 +1224,14 @@ async fn pi_recipe(
     prompt: &str,
     search_mode: SearchMode,
 ) -> Result<(GeneratedRecipe, Vec<Source>)> {
-    let provider = crate::ai_provider(&state.db).await?;
-    let (backend, model) = resolve_backend(state, &user.id, &provider).await?;
+    // The AI account's credentials serve the call, and a refreshed token is
+    // stored back on that account, so a shared login stays valid for everyone.
+    let ai_user = crate::ai_account(&state.db, &user.id).await?;
+    let provider = crate::ai_provider(&state.db, &ai_user).await?;
+    let (backend, model) = resolve_backend(state, &ai_user, &provider).await?;
     request_recipe(
         state,
+        &ai_user,
         &backend,
         &model,
         prompt,
@@ -1229,9 +1250,9 @@ async fn resolve_backend<'a>(
     match crate::pi_provider_for(provider) {
         Some(pi_provider) => {
             let model = if pi_provider == crate::CLAUDE_PI_PROVIDER {
-                crate::selected_claude_model(&state.db).await?
+                crate::selected_claude_model(&state.db, user_id).await?
             } else {
-                crate::selected_model(&state.db, &state.model).await?
+                crate::selected_model(&state.db, user_id, &state.model).await?
             };
             Ok((
                 RecipeBackend::Subscription {
@@ -1275,12 +1296,14 @@ pub(crate) fn endpoint_search_mode(spec: &str, search_mode: SearchMode) -> Searc
 /// fails validation. Only validated output is returned.
 async fn request_recipe(
     state: &AppState,
+    user_id: &str,
     backend: &RecipeBackend<'_>,
     model: &str,
     prompt: &str,
     search_mode: SearchMode,
 ) -> Result<(GeneratedRecipe, Vec<Source>)> {
-    let effort = crate::selected_effort(&state.db, crate::DEFAULT_REASONING_EFFORT).await?;
+    let effort =
+        crate::selected_effort(&state.db, user_id, crate::DEFAULT_REASONING_EFFORT).await?;
     let system_prompt = format!(
         "{}\n\n{}\n\nRecipe JSON schema:\n{}",
         system_recipe_prompt(search_mode),
