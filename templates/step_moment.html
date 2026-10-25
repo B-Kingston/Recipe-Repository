@@ -1,4 +1,4 @@
 <div class="step-moment">
   <span class="step-moment-source" title="{{ moment.source }}">{{ moment.label }} in the video</span>
-  {% if moment.stills.len() > 0 %}<span class="step-moment-stills">{% for still in moment.stills %}<a href="{{ still }}" data-still-viewer><img src="{{ still }}" alt="Video frame near {{ moment.label }}" loading="lazy"></a>{% endfor %}</span>{% endif %}
+  {% if moment.stills.len() > 0 %}<span class="step-moment-stills">{% for still in moment.stills %}<a href="{{ still }}" data-still-viewer hx-boost="false"><img src="{{ still }}" alt="Video frame near {{ moment.label }}" loading="lazy"></a>{% endfor %}</span>{% endif %}
 </div>

@@ -6,7 +6,9 @@
 </div>
 <div class="compact-panel">
   {% if saved %}<p class="notice" role="status">Display saved.</p>{% endif %}
-  <form class="block" method="post" action="/settings/display">
+  {# A new mode changes /display.css in <head>, which a swap would keep, so
+     saving reloads the whole page. #}
+  <form class="block" method="post" action="/settings/display" hx-boost="false">
     <fieldset>
       <legend class="section-label">Show recipes in</legend>
       <label class="toggle-row"><input type="radio" name="mode" value="auto"{% if mode == "auto" %} checked{% endif %}><span class="choice-text"><span>Automatic</span><span class="field-help">E-ink on Kindle browsers, colour everywhere else.{% if kindle %} This browser is a Kindle, so it gets e-ink.{% endif %}</span></span></label>

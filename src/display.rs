@@ -3,12 +3,15 @@
 //! the default, picks e-ink for Kindle browsers. The choice lives in a
 //! per-browser cookie, so a Kindle and a laptop can each keep their own.
 
-use crate::{AppError, AuthUser, DisplayTemplate, Result, render};
+use crate::{
+    AppError, AuthUser, DisplayTemplate, Result,
+    htmx::{Flash, flash_cookie},
+    render,
+};
 use axum::{
     Form,
-    extract::Query,
-    http::{HeaderMap, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    http::{HeaderMap, HeaderValue, header},
+    response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
 
@@ -96,11 +99,6 @@ pub(crate) async fn display_css(headers: HeaderMap) -> Response {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct DisplayQuery {
-    pub(crate) saved: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub(crate) struct DisplayForm {
     pub(crate) mode: String,
 }
@@ -108,12 +106,12 @@ pub(crate) struct DisplayForm {
 pub(crate) async fn display_page(
     _user: AuthUser,
     headers: HeaderMap,
-    Query(query): Query<DisplayQuery>,
+    flash: Flash,
 ) -> Result<Html<String>> {
     render(DisplayTemplate {
         mode: chosen_mode(&headers).as_str(),
         kindle: is_kindle(&headers),
-        saved: query.saved.is_some(),
+        saved: flash.is("display_saved"),
     })
 }
 
@@ -134,8 +132,14 @@ pub(crate) async fn update_display(
         ),
     };
     Ok((
-        [(header::SET_COOKIE, cookie)],
-        Redirect::to("/settings/display?saved=1"),
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                HeaderValue::from_str(&cookie).expect("display cookies are ASCII"),
+            ),
+            (header::SET_COOKIE, flash_cookie("display_saved")),
+        ]),
+        Redirect::to("/settings/display"),
     )
         .into_response())
 }

@@ -1,13 +1,13 @@
 use crate::auth::AuthUser;
 use crate::display::{
-    DisplayForm, DisplayMode, DisplayQuery, chosen_mode, display_css, display_page, is_kindle,
-    update_display, uses_eink,
+    DisplayForm, DisplayMode, chosen_mode, display_css, display_page, is_kindle, update_display,
+    uses_eink,
 };
+use crate::htmx::Flash;
 use crate::{AppError, AppState, routes};
 use axum::{
     Form,
     body::{Body, to_bytes},
-    extract::Query,
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 };
 use parking_lot::Mutex;
@@ -119,14 +119,21 @@ async fn saving_a_mode_sets_or_clears_the_cookie() {
     .await
     .unwrap();
     assert_eq!(saved.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        saved.headers()[header::LOCATION],
-        "/settings/display?saved=1"
-    );
-    let cookie = saved.headers()[header::SET_COOKIE].to_str().unwrap();
+    // The notice rides in a one-time flash cookie, not the query string.
+    assert_eq!(saved.headers()[header::LOCATION], "/settings/display");
+    let cookies: Vec<&str> = saved
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
     assert!(
-        cookie.starts_with("recipe_display=eink;") && cookie.contains("Max-Age=31536000"),
-        "{cookie}"
+        cookies[0].starts_with("recipe_display=eink;") && cookies[0].contains("Max-Age=31536000"),
+        "{cookies:?}"
+    );
+    assert!(
+        cookies[1].starts_with("recipe_flash=display_saved;"),
+        "{cookies:?}"
     );
 
     let auto = update_display(
@@ -158,9 +165,7 @@ async fn display_page_checks_the_saved_mode() {
     let page = display_page(
         user(),
         headers(Some("recipe_display=colour"), KINDLE),
-        Query(DisplayQuery {
-            saved: Some("1".into()),
-        }),
+        Flash("display_saved".into()),
     )
     .await
     .unwrap()

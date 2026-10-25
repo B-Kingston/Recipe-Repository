@@ -16,7 +16,7 @@
 // compatible with ModelRuntime's credential store and its token refresh.
 
 import { createHash, randomBytes } from "node:crypto";
-import { readStdin, outputJson, runMain } from "./cli.mjs";
+import { readStdin, outputJson, runMain } from "./cli.ts";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
@@ -26,9 +26,46 @@ const SCOPES = "org:create_api_key user:profile user:inference user:sessions:cla
 // pi-ai subtracts five minutes so a token is refreshed before it lapses.
 const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 
-const base64url = (buffer) => buffer.toString("base64url");
+/** The `start` reply, minus its status. */
+export interface ClaudeFlow {
+  url: string;
+  verifier: string;
+}
 
-export function startFlow() {
+/** What the user pasted, split into its parts. */
+export interface AuthorizationInput {
+  code?: string;
+  state?: string;
+}
+
+/** The `exchange` request on stdin. Both fields come from the host as JSON. */
+export interface ExchangeRequest {
+  input?: unknown;
+  verifier?: unknown;
+}
+
+/** The anthropic OAuth credential, in ModelRuntime's credential-store shape. */
+export interface ClaudeCredential {
+  type: "oauth";
+  access: string;
+  refresh: string;
+  expires: number;
+}
+
+/** The `exchange` reply. */
+export type ExchangeResult =
+  | { status: "complete"; credential: ClaudeCredential }
+  | { status: "failed"; message: string };
+
+interface TokenBody {
+  access_token?: unknown;
+  refresh_token?: unknown;
+  expires_in?: unknown;
+}
+
+const base64url = (buffer: Buffer): string => buffer.toString("base64url");
+
+export function startFlow(): ClaudeFlow {
   const verifier = base64url(randomBytes(32));
   const challenge = base64url(createHash("sha256").update(verifier).digest());
   // state is the PKCE verifier, as in pi-ai's copy-code login. Anthropic echoes
@@ -48,7 +85,7 @@ export function startFlow() {
 
 /** Accepts what the user pastes: "code#state", a redirect URL, a query
  * string, or a bare code. */
-export function parseAuthorizationInput(input) {
+export function parseAuthorizationInput(input: unknown): AuthorizationInput {
   const value = typeof input === "string" ? input.trim() : "";
   if (!value) return {};
   try {
@@ -71,7 +108,7 @@ export function parseAuthorizationInput(input) {
   return { code: value };
 }
 
-export async function exchangeCode({ input, verifier }, fetchImpl = fetch) {
+export async function exchangeCode({ input, verifier }: ExchangeRequest, fetchImpl: typeof fetch = fetch): Promise<ExchangeResult> {
   if (typeof verifier !== "string" || !verifier) throw new Error("Missing verifier");
   const { code, state } = parseAuthorizationInput(input);
   if (!code) return { status: "failed", message: "Paste the code Anthropic shows after you sign in." };
@@ -98,7 +135,7 @@ export async function exchangeCode({ input, verifier }, fetchImpl = fetch) {
       message: `Token exchange failed with status ${response.status}${text ? `: ${text.slice(0, 300)}` : ""}`,
     };
   }
-  let token;
+  let token: TokenBody | null;
   try {
     token = JSON.parse(text);
   } catch {
@@ -119,12 +156,12 @@ export async function exchangeCode({ input, verifier }, fetchImpl = fetch) {
   };
 }
 
-async function main() {
+async function main(): Promise<void> {
   const [subcommand] = process.argv.slice(2);
   if (subcommand === "start") {
     outputJson({ status: "ok", ...startFlow() });
   } else if (subcommand === "exchange") {
-    let request;
+    let request: ExchangeRequest | null;
     try {
       request = JSON.parse(await readStdin());
     } catch {

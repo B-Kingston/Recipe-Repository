@@ -1076,6 +1076,32 @@ body.still-viewer-open { overflow: hidden; }
   }
 }
 
+/* htmx requests (a page change, a form, a search) get no browser spinner, so
+   a thin bar runs along the top of the window while one is out. Pollers aim
+   their indicator at themselves and never show it. E-ink keeps it still. */
+body.htmx-request::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  width: 100%;
+  height: 3px;
+  background: var(--rule-ink);
+  pointer-events: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  body.htmx-request::before {
+    transform-origin: left;
+    animation: page-loading 1.4s ease-in-out infinite;
+  }
+  @keyframes page-loading {
+    from { transform: scaleX(.1); }
+    60% { transform: scaleX(.85); }
+    to { transform: scaleX(.95); }
+  }
+}
+
 @media print {
   body { background: white; }
   .utility-bar, .back-link, .version-tabs, .card-actions, .source-disclosure, .chart-view, .add-block, .thumb-manage, .recipe-details-form { display: none; }

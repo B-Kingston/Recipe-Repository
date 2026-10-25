@@ -1,7 +1,7 @@
 {% extends "base.html" %}{% block title %}Recipes · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
 <section id="all-recipes">
   <div class="section-heading search-heading">
-    <div>
+    <div id="search-title">
       {% if results %}
       <p class="eyebrow">Search</p>
       <h1>Results for “{{ query }}”</h1>
@@ -10,14 +10,20 @@
       {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} ticket{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
       {% endif %}
     </div>
-    <form class="search-form" method="get" action="/" role="search" data-live-search>
+    {# Searches as you type: a pause of 350 ms (or Enter) fetches the library
+       for the query and swaps in the title and results; the form itself stays,
+       so the field keeps its focus and caret. A newer search replaces an older
+       one, and the address bar follows the query. Without JavaScript the form
+       submits normally. #}
+    <form class="search-form" method="get" action="/" role="search" data-live-search hx-get="/" hx-trigger="submit" hx-target="#search-results" hx-select="#search-results" hx-select-oob="#search-title" hx-swap="outerHTML show:none" hx-replace-url="true" hx-sync="this:replace">
       <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
       <label class="visually-hidden" for="search-q">Search recipes</label>
-      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the rail">
+      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the rail" hx-get="/" hx-trigger="input changed delay:350ms" hx-sync="closest form:replace">
       <button class="primary" type="submit">Search</button>
     </form>
   </div>
 
+  <div id="search-results">
   {% if notice != "" %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
   {% if results %}<div class="actions"><a class="button" href="/">Show all recipes</a></div>{% endif %}
 
@@ -67,6 +73,7 @@
       </div>
     </article>
   {% endfor %}
+  </div>
   </div>
 </section>
 {% endblock %}

@@ -1,9 +1,13 @@
-{% extends "base.html" %}{% block title %}Debug run · Recipe Repository{% endblock %}{% block head %}{% if !finished %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}{% block content %}
+{% extends "base.html" %}{% block title %}Debug run · Recipe Repository{% endblock %}{% block head %}{% if !finished %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}{% block content %}
+{# While the run is going, htmx fetches this page every few seconds and swaps
+   in the fresh #debug-run; the finished page has no poller, so it stops. #}
+<div id="debug-run">
+{% if !finished %}<span hidden hx-get="/settings/media-debug/{{ run_id }}" hx-trigger="every 3s" hx-target="#debug-run" hx-select="#debug-run" hx-swap="outerHTML show:none" hx-indicator="this"></span>{% endif %}
 <div class="form-intro">
   <p class="eyebrow">Settings / Developer tools</p>
   <h1>Extraction run</h1>
   <p class="deck">
-    {% if finished %}All URLs finished. Review the extraction phases and the recipe cleaner's output below.{% else %}Running. This page reloads every few seconds until the run finishes, and results appear as each phase reports.{% endif %}
+    {% if finished %}All URLs finished. Review the extraction phases and the recipe cleaner's output below.{% else %}Running. This page updates every few seconds until the run finishes, and results appear as each phase reports.{% endif %}
     <span class="muted">Run {{ run_id.split("-").next().unwrap_or("") }}</span>
   </p>
   <p class="actions"><a class="button compact" href="/settings/media-debug">New run</a> <a class="button compact" href="/settings">Settings</a></p>
@@ -58,5 +62,6 @@
       {% endif %}
     </section>
     {% endfor %}
+</div>
 </div>
 {% endblock %}
