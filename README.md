@@ -1,6 +1,6 @@
 # Recipe Repository
 
-A deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page on the server, SQLite holds the data, and the only browser script (`static/app.js`) is an optional ES5 progressive enhancement.
+A deliberately small recipe library for Kindle browsers and ordinary desktop browsers. It is a single Rust/Axum process: Askama renders every page on the server, SQLite holds the data, and htmx swaps pages in place so navigation and saves feel instant without a client-side app. The browser scripts are optional: htmx (lowered to ES5) and `static/app.js`, compiled from the TypeScript in `web/` to ES5 for Kindle browsers. With JavaScript off, every page is plain HTML.
 
 ## Start it
 
@@ -45,13 +45,13 @@ Access is by account: the first is created on first visit, and any signed-in use
 
 ## Verification
 
-The project has Rust unit tests (recipe validation, source deduplication, auth, media and thumbnail pipelines) and Node tests for the Pi worker. Run them in throwaway containers so the host needs no toolchain:
+The project has Rust unit tests (recipe validation, source deduplication, auth, media and thumbnail pipelines) and Node tests for the Pi worker, which is TypeScript that Node runs directly (built-in type stripping, no build step). Run them in throwaway containers so the host needs no toolchain:
 
 ```sh
 docker run --rm -v "$PWD":/src:ro -e CARGO_TARGET_DIR=/tmp/target rust:1.88-slim sh -c \
   'apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null && rustup component add rustfmt clippy >/dev/null && cp -r /src /work && cd /work && cargo fmt --check && cargo test && cargo clippy -- -D warnings'
-docker run --rm -v "$PWD":/src:ro node:22-bookworm-slim sh -c \
-  'cp -r /src /work && cd /work && npm ci && npm test'
+docker run --rm -v "$PWD":/src:ro node:22.23.4-bookworm-slim sh -c \
+  'cp -r /src /work && cd /work && npm ci && npm test && npm run typecheck'
 ```
 
 The intended complete validation command is:

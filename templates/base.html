@@ -5,11 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#eceef0">
   <title>{% block title %}Recipe Repository{% endblock %}</title>
+  {# htmx swaps whole pages in place (hx-boost on the body). Snapshots of
+     pages are never kept in localStorage: another account may use this
+     browser, so Back fetches the page again instead. Scripts in swapped
+     content never run; app.js wires every page through htmx.onLoad. #}
+  <meta name="htmx-config" content='{"historyCacheSize":0,"refreshOnHistoryMiss":false,"scrollBehavior":"auto","allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false}'>
   {% block head %}{% endblock %}
   <link rel="stylesheet" href="/static/app.css">
   <link rel="stylesheet" href="/display.css">
+  <script src="/static/htmx.js" defer></script>
+  <script src="/static/app.js" defer></script>
 </head>
-<body>
+<body hx-boost="true" hx-indicator="body">
   <header class="utility-bar">
     <div class="utility-inner">
       <a class="brand" href="/" aria-label="Recipe Repository home">
@@ -23,7 +30,8 @@
           <a href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
         </nav>
         {% if let Some(menu) = crate::auth::account_menu() %}
-        <details class="account-menu" data-account-menu>
+        {# Switching or leaving an account reloads the whole page. #}
+        <details class="account-menu" data-account-menu hx-boost="false">
           <summary class="account-button" title="Account: {{ menu.username }}">
             <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
             <span class="visually-hidden">Account: {{ menu.username }}</span>
@@ -84,6 +92,5 @@
       {% block content %}{% endblock %}
     </div>
   </main>
-  <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { exchangeCode, parseAuthorizationInput, startFlow } from "./claude-auth.mjs";
+import { exchangeCode, parseAuthorizationInput, startFlow } from "./claude-auth.ts";
 
 test("startFlow issues a PKCE S256 challenge for its verifier, sent as state", () => {
   const { url, verifier } = startFlow();
@@ -28,6 +28,7 @@ test("exchangeCode rejects a code from another sign-in without calling Anthropic
   let called = false;
   const result = await exchangeCode({ input: "abc#other", verifier: "mine" }, async () => {
     called = true;
+    return new Response();
   });
 
   assert.equal(result.status, "failed");
@@ -35,15 +36,15 @@ test("exchangeCode rejects a code from another sign-in without calling Anthropic
 });
 
 test("exchangeCode returns an oauth credential that expires before the token does", async () => {
-  let body;
+  let body: { code_verifier?: string; state?: string } | undefined;
   const before = Date.now();
   const result = await exchangeCode({ input: "abc#mine", verifier: "mine" }, async (_url, init) => {
-    body = JSON.parse(init.body);
+    body = JSON.parse(String(init?.body));
     return new Response(JSON.stringify({ access_token: "sk-ant-oat-1", refresh_token: "r1", expires_in: 3600 }));
   });
 
-  assert.equal(body.code_verifier, "mine");
-  assert.equal(body.state, "mine");
+  assert.equal(body?.code_verifier, "mine");
+  assert.equal(body?.state, "mine");
   assert.equal(result.status, "complete");
   assert.equal(result.credential.type, "oauth");
   assert.equal(result.credential.access, "sk-ant-oat-1");

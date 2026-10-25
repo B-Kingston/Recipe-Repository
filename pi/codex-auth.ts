@@ -16,7 +16,7 @@
 // flow (auth/oauth/openai-codex.js) so the credential shape stays compatible
 // with ModelRuntime's credential store.
 
-import { outputJson, readStdin, runMain } from "./cli.mjs";
+import { outputJson, readStdin, runMain } from "./cli.ts";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode";
@@ -27,10 +27,69 @@ const DEVICE_REDIRECT_URI = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_CODE_TIMEOUT_SECONDS = 15 * 60;
 const ACCOUNT_CLAIM_PATH = "https://api.openai.com/auth";
 
-async function requestJson(url, options) {
+/** The device code a started flow polls with. */
+export interface DeviceAuth {
+  deviceAuthId: string;
+  userCode: string;
+}
+
+/** The `start` reply, minus its status. */
+export interface DeviceFlow extends DeviceAuth {
+  verificationUri: string;
+  intervalSeconds: number;
+  expiresInSeconds: number;
+}
+
+/** The openai-codex OAuth credential, in ModelRuntime's credential-store shape. */
+export interface CodexCredential {
+  type: "oauth";
+  access: string;
+  refresh: string;
+  expires: number;
+  accountId: string;
+}
+
+/** The `poll` reply. */
+export type PollResult =
+  | { status: "complete"; credential: CodexCredential }
+  | { status: "pending" }
+  | { status: "slow_down" }
+  | { status: "failed"; message: string };
+
+interface DeviceCodeBody {
+  device_auth_id?: string;
+  user_code?: string;
+  interval?: number | string;
+}
+
+interface DeviceTokenBody {
+  authorization_code?: string;
+  code_verifier?: string;
+  error?: string | { code?: string } | null;
+}
+
+interface TokenBody {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: unknown;
+}
+
+interface AccessTokenClaims {
+  [ACCOUNT_CLAIM_PATH]?: { chatgpt_account_id?: unknown } | null;
+}
+
+/** A response with its body parsed as JSON when it is JSON. The body type is
+ * what the endpoint documents; every field is checked before use. */
+interface JsonResponse<T> {
+  response: Response;
+  json: T | null;
+  text: string;
+}
+
+async function requestJson<T>(url: string, options: RequestInit): Promise<JsonResponse<T>> {
   const response = await fetch(url, options);
   const text = await response.text().catch(() => "");
-  let json = null;
+  let json: T | null = null;
   try {
     json = JSON.parse(text);
   } catch {
@@ -39,8 +98,8 @@ async function requestJson(url, options) {
   return { response, json, text };
 }
 
-export async function startDeviceFlow() {
-  const { response, json } = await requestJson(DEVICE_USER_CODE_URL, {
+export async function startDeviceFlow(): Promise<DeviceFlow> {
+  const { response, json } = await requestJson<DeviceCodeBody>(DEVICE_USER_CODE_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
@@ -67,10 +126,10 @@ export async function startDeviceFlow() {
   };
 }
 
-function decodeAccountId(accessToken) {
+function decodeAccountId(accessToken: string): string | null {
   const parts = accessToken.split(".");
   if (parts.length !== 3) return null;
-  let payload;
+  let payload: AccessTokenClaims | null;
   try {
     payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
   } catch {
@@ -80,8 +139,8 @@ function decodeAccountId(accessToken) {
   return typeof accountId === "string" && accountId.length > 0 ? accountId : null;
 }
 
-export async function exchangeAuthorizationCode(code, codeVerifier) {
-  const { response, json } = await requestJson(TOKEN_URL, {
+export async function exchangeAuthorizationCode(code: string, codeVerifier: string): Promise<CodexCredential> {
+  const { response, json } = await requestJson<TokenBody>(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -111,8 +170,8 @@ export async function exchangeAuthorizationCode(code, codeVerifier) {
   };
 }
 
-export async function pollDeviceFlow(device) {
-  const { response, json, text } = await requestJson(DEVICE_TOKEN_URL, {
+export async function pollDeviceFlow(device: DeviceAuth): Promise<PollResult> {
+  const { response, json, text } = await requestJson<DeviceTokenBody>(DEVICE_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -150,12 +209,12 @@ export async function pollDeviceFlow(device) {
   };
 }
 
-async function main() {
+async function main(): Promise<void> {
   const [subcommand] = process.argv.slice(2);
   if (subcommand === "start") {
     outputJson({ status: "ok", ...(await startDeviceFlow()) });
   } else if (subcommand === "poll") {
-    let device;
+    let device: Partial<DeviceAuth> | null;
     try {
       device = JSON.parse(await readStdin());
     } catch {
@@ -164,7 +223,7 @@ async function main() {
     if (!device?.deviceAuthId || !device.userCode) {
       throw new Error("Missing deviceAuthId or userCode");
     }
-    outputJson(await pollDeviceFlow(device));
+    outputJson(await pollDeviceFlow({ deviceAuthId: device.deviceAuthId, userCode: device.userCode }));
   } else {
     throw new Error(`Unknown subcommand: ${subcommand}`);
   }

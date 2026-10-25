@@ -7,8 +7,8 @@
   </div>
 
   <div class="add-mode-switch" role="tablist" aria-label="Recipe source">
-    <a id="add-mode-prompt" class="add-mode-tab{% if !video_mode %} is-active{% endif %}" href="/recipes/new" role="tab" aria-controls="add-prompt-panel" aria-selected="{% if !video_mode %}true{% else %}false{% endif %}" data-add-mode="prompt">Research a recipe</a>
-    <a id="add-mode-video" class="add-mode-tab{% if video_mode %} is-active{% endif %}" href="/recipes/new?mode=video" role="tab" aria-controls="add-video-panel" aria-selected="{% if video_mode %}true{% else %}false{% endif %}" data-add-mode="video">Import a video</a>
+    <a id="add-mode-prompt" class="add-mode-tab{% if !video_mode %} is-active{% endif %}" href="/recipes/new" role="tab" aria-controls="add-prompt-panel" aria-selected="{% if !video_mode %}true{% else %}false{% endif %}" data-add-mode="prompt" hx-boost="false">Research a recipe</a>
+    <a id="add-mode-video" class="add-mode-tab{% if video_mode %} is-active{% endif %}" href="/recipes/new?mode=video" role="tab" aria-controls="add-video-panel" aria-selected="{% if video_mode %}true{% else %}false{% endif %}" data-add-mode="video" hx-boost="false">Import a video</a>
   </div>
 
   <div class="add-recipe-panels">

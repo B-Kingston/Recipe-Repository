@@ -3,6 +3,7 @@ mod auth;
 mod chart;
 mod config;
 mod display;
+mod htmx;
 mod media;
 mod moments;
 mod recipes;

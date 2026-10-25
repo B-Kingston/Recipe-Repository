@@ -9,4 +9,7 @@ node_modules
 **/__pycache__
 *.md
 src/tests/
-pi/*.test.mjs
+pi/*.test.ts
+# Built by the Dockerfile web stage; a local build must never ship.
+static/app.js
+static/htmx.js

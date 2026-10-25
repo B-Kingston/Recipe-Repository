@@ -1,0 +1,20 @@
+{
+  // htmx 1.9 is written for IE11 and has a few let/const lines that older
+  // Kindle browsers cannot parse, so the build lowers it to ES5 as well:
+  // static/htmx.js, a build output like app.js. No type checking; this only
+  // rewrites syntax.
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "target": "ES5",
+    "lib": ["ES5", "DOM"],
+    "module": "none",
+    "outFile": "../static/htmx.js",
+    "removeComments": true,
+    "noEmitOnError": true,
+    "newLine": "lf",
+    "types": [],
+    "skipLibCheck": true
+  },
+  "files": ["../node_modules/htmx.org/dist/htmx.js"]
+}

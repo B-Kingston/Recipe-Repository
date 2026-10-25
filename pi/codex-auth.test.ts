@@ -4,11 +4,11 @@ import {
   exchangeAuthorizationCode,
   pollDeviceFlow,
   startDeviceFlow,
-} from "./codex-auth.mjs";
+} from "./codex-auth.ts";
 
 // A signed-looking JWT whose payload carries the chatgpt_account_id claim the
 // Codex flow extracts. Signature bytes are irrelevant to the decoder.
-function accountJwt(accountId) {
+function accountJwt(accountId: string): string {
   const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url");
   const payload = Buffer.from(
     JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
@@ -16,11 +16,23 @@ function accountJwt(accountId) {
   return `${header}.${payload}.signature`;
 }
 
-function mockFetch(routes) {
-  const calls = [];
+/** A canned reply; a route may also compute one from the request. */
+interface Reply {
+  status?: number;
+  body: unknown;
+}
+
+/** The request options the flow sends: always a string body. */
+interface SentOptions {
+  body: string;
+}
+
+function mockFetch(routes: Record<string, Reply | ((options: SentOptions) => Reply)>) {
+  const calls: { url: string; options: SentOptions }[] = [];
   const original = globalThis.fetch;
-  globalThis.fetch = async (url, options) => {
-    calls.push({ url, options });
+  globalThis.fetch = async (url, init) => {
+    const options = init as SentOptions;
+    calls.push({ url: String(url), options });
     const route = routes[String(url)];
     if (!route) throw new Error(`Unexpected fetch: ${url}`);
     const response = typeof route === "function" ? route(options) : route;
@@ -73,7 +85,7 @@ test("pollDeviceFlow exchanges the code and returns a pi-compatible credential",
     // Redirect URI must match the device auth callback pi uses.
     const tokenCall = fake.calls.find((call) => call.url === "https://auth.openai.com/oauth/token");
     assert.equal(
-      new URLSearchParams(tokenCall.options.body).get("redirect_uri"),
+      new URLSearchParams(tokenCall?.options.body).get("redirect_uri"),
       "https://auth.openai.com/deviceauth/callback",
     );
   } finally {

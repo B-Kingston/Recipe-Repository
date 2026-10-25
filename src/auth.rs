@@ -374,16 +374,19 @@ fn encode_query_value(value: &str) -> String {
 
 /// Sends a signed-out visitor to the sign-in page. A GET keeps its path and
 /// query in `next`, so signing in returns there. Other methods go to the
-/// library after sign-in, because their form data is gone.
+/// library after sign-in, because their form data is gone. An htmx request
+/// gets `HX-Redirect`, so the sign-in page loads whole instead of inside the
+/// page that asked.
 fn login_redirect(req: &Request) -> Response {
     let target = req
         .uri()
         .path_and_query()
         .map_or("/", |target| target.as_str());
     if !matches!(*req.method(), Method::GET | Method::HEAD) || target == "/" {
-        return Redirect::to("/login").into_response();
+        return crate::htmx::full_page_redirect(req.headers(), "/login");
     }
-    Redirect::to(&format!("/login?next={}", encode_query_value(target))).into_response()
+    let to = format!("/login?next={}", encode_query_value(target));
+    crate::htmx::full_page_redirect(req.headers(), &to)
 }
 
 /// The sign-in page for one account, its username filled in.
@@ -807,8 +810,14 @@ pub(crate) async fn reset_password(
     let cookie = create_session(&mut *tx, &user.id).await?;
     tx.commit().await?;
     Ok((
-        [(header::SET_COOKIE, cookie)],
-        Redirect::to("/settings?notice=password_changed"),
+        AppendHeaders([
+            (header::SET_COOKIE, cookie),
+            (
+                header::SET_COOKIE,
+                crate::htmx::flash_cookie("password_changed"),
+            ),
+        ]),
+        Redirect::to("/settings#settings-account"),
     )
         .into_response())
 }
@@ -828,7 +837,7 @@ pub(crate) async fn auth_middleware(
     let sessions = browser_sessions(&state.db, req.headers()).await?;
     let Some(active) = sessions.first() else {
         if user_count(&state.db).await? == 0 {
-            return Ok(Redirect::to("/setup").into_response());
+            return Ok(crate::htmx::full_page_redirect(req.headers(), "/setup"));
         }
         return Ok(login_redirect(&req));
     };

@@ -723,7 +723,17 @@ async fn reset_password_requires_current_password_and_updates_login() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&response), "/settings?notice=password_changed");
+    assert_eq!(location(&response), "/settings#settings-account");
+    assert!(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| value
+                .as_bytes()
+                .starts_with(b"recipe_flash=password_changed;")),
+        "the notice rides in the flash cookie"
+    );
     let new_cookie = set_cookie(&response).expect("this browser gets a new session");
     let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
         .bind(&user_id)

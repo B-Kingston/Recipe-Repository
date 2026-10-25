@@ -7,7 +7,7 @@ import {
   nativeSearchPayload,
   normalizeSourceUrl,
   optionalSearchPayload,
-} from "./native-search.mjs";
+} from "./native-search.ts";
 
 test("nativeSearchPayload forces OpenAI hosted web search", () => {
   const original = { model: "gpt-test", tools: [{ type: "function", name: "old" }] };

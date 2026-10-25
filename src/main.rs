@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Form, Path, Query, State},
     http::{StatusCode, header},
     middleware,
-    response::{Html, IntoResponse, Json, Redirect, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -34,6 +34,7 @@ mod auth;
 mod chart;
 mod display;
 mod embeddings;
+mod htmx;
 mod media;
 mod media_worker;
 mod moments;
@@ -53,6 +54,7 @@ use ai::{
     import_frame, import_page, import_recipe, import_run_page, media_debug_frame, media_debug_page,
     media_debug_run_page, media_debug_start,
 };
+use htmx::{Flash, flash_redirect};
 use media::MediaEvidence;
 use recipes::{
     add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
@@ -614,8 +616,6 @@ struct SettingsTemplate {
     claude_authorised: bool,
     claude_auth_url: String,
     claude_selected: bool,
-    claude_connected_notice: bool,
-    claude_error: String,
     endpoints: Vec<EndpointRow>,
     /// The "Add a provider" choices.
     presets: &'static [ProviderPreset],
@@ -628,8 +628,14 @@ struct SettingsTemplate {
     /// Cached models for the cleaner's provider (the blank "provider's model"
     /// choice is in the template); the script replaces them live.
     cleaner_model_options: Vec<SelectOption>,
-    saved: bool,
-    password_changed: bool,
+    /// One-time notices from the last save, each shown in its own block
+    /// (empty for none); `ai_error` is the AI block's failure notice.
+    ai_notice: &'static str,
+    ai_error: &'static str,
+    cleaner_notice: &'static str,
+    moments_notice: &'static str,
+    search_notice: &'static str,
+    account_notice: &'static str,
     /// Whether video step moments are captured and shown (global setting).
     step_moments: bool,
     /// Whether the embedding sidecar is configured (`EMBEDDING_URL`).
@@ -638,14 +644,11 @@ struct SettingsTemplate {
     search_choice: &'static str,
     /// Whether the shared account searches with BM25 (what "shared" follows).
     shared_search_bm25: bool,
-    notice: String,
     /// The provider refused the stored Codex / Claude sign-in on its last use.
     codex_refused: bool,
     claude_refused: bool,
     /// The login the AI setup in use generates with was refused (shared or own).
     active_login_refused: bool,
-    /// A login check that found a refused login, or could not finish.
-    check_error: String,
 }
 struct SelectOption {
     value: String,
@@ -690,23 +693,6 @@ struct ClaudeExchangeForm {
     flow_id: String,
     #[serde(default)]
     code: String,
-}
-#[derive(Deserialize)]
-struct SettingsQuery {
-    #[serde(default)]
-    claude: String,
-    #[serde(default)]
-    claude_error: String,
-    #[serde(default)]
-    saved: String,
-    #[serde(default)]
-    notice: String,
-    /// A login check's outcome: "works", "refused", or "failed".
-    #[serde(default)]
-    check: String,
-    /// The checked login: "codex", "claude", or an endpoint id.
-    #[serde(default)]
-    login: String,
 }
 #[derive(Deserialize)]
 struct ModelsQuery {
@@ -990,12 +976,11 @@ async fn main() -> anyhowless::Result<()> {
     let state = Arc::new(AppState {
         db,
         model: configured_model,
-        pi_worker_path: env::var("PI_WORKER_PATH")
-            .unwrap_or_else(|_| "pi/recipe-worker.mjs".into()),
+        pi_worker_path: env::var("PI_WORKER_PATH").unwrap_or_else(|_| "pi/recipe-worker.ts".into()),
         auth_script_path: env::var("PI_AUTH_SCRIPT_PATH")
-            .unwrap_or_else(|_| "pi/codex-auth.mjs".into()),
+            .unwrap_or_else(|_| "pi/codex-auth.ts".into()),
         claude_auth_script_path: env::var("PI_CLAUDE_AUTH_SCRIPT_PATH")
-            .unwrap_or_else(|_| "pi/claude-auth.mjs".into()),
+            .unwrap_or_else(|_| "pi/claude-auth.ts".into()),
         search_grounding: env_bool("PI_SEARCH_ENABLED", true),
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         claude_flows: Arc::new(Mutex::new(HashMap::new())),
@@ -1139,6 +1124,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
+        .layer(middleware::from_fn(htmx::htmx_layer))
         .with_state(state)
 }
 
@@ -1850,7 +1836,7 @@ async fn pi_authorised(db: &SqlitePool, user_id: &str, pi_provider: &str) -> boo
 async fn settings_page(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
-    Query(query): Query<SettingsQuery>,
+    flash: Flash,
 ) -> Result<Html<String>> {
     let (shared_id, shared_ai_owner) = shared_ai_account(&s.db).await?.unwrap_or_default();
     let owns_shared_ai = shared_id == user.id;
@@ -1888,15 +1874,6 @@ async fn settings_page(
         user.id.as_str()
     };
     let active_login_refused = active_login_refused(&s.db, ai_user).await?;
-    let checked_login = match query.login.as_str() {
-        "codex" => Some(ai::subscription_name(CODEX_PI_PROVIDER).to_string()),
-        "claude" => Some(ai::subscription_name(CLAUDE_PI_PROVIDER).to_string()),
-        id => endpoints
-            .iter()
-            .find(|endpoint| endpoint.id == id)
-            .map(|endpoint| endpoint.name.clone()),
-    };
-    let (check_notice, check_error) = login_check_messages(&query.check, checked_login.as_deref());
     let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
     let cleaner_provider = media_cleaner_setting(&s.db, &user.id)
         .await?
@@ -1910,7 +1887,10 @@ async fn settings_page(
         cleaner_provider.as_str()
     };
     let cleaner_model_options = cleaner_model_options(
-        cached_model_catalogue(&s, pi_provider_for(cleaner_source).unwrap_or(cleaner_source)),
+        cached_model_catalogue(
+            &s,
+            pi_provider_for(cleaner_source).unwrap_or(cleaner_source),
+        ),
         &cleaner_model,
     );
     // First paint shows the cached catalogues; the page's script then replaces
@@ -1944,8 +1924,6 @@ async fn settings_page(
         claude_authorised,
         claude_auth_url: "/settings/authorise-claude".into(),
         claude_selected,
-        claude_connected_notice: query.claude == "connected",
-        claude_error: query.claude_error,
         endpoints,
         presets: PROVIDER_PRESETS,
         cleaner_configured,
@@ -1953,8 +1931,48 @@ async fn settings_page(
         ai_provider: provider.clone(),
         cleaner_model,
         cleaner_model_options,
-        saved: query.saved == "1",
-        password_changed: query.notice == "password_changed",
+        ai_notice: match flash.0.as_str() {
+            "provider_saved" | "logins_saved" => "Settings saved.",
+            "provider_added" => "Provider added.",
+            "provider_removed" => "Provider removed.",
+            "disconnected" => "Subscription disconnected.",
+            "claude_connected" => "Claude connected.",
+            "codex_login_works" => "ChatGPT (Codex) sign-in works.",
+            "claude_login_works" => "Claude sign-in works.",
+            "endpoint_key_works" => "The API key works.",
+            _ => "",
+        },
+        ai_error: match flash.0.as_str() {
+            "claude_code_missing" => "Paste the code Claude showed you.",
+            "claude_expired" => "This sign-in expired. Start the authorisation again.",
+            "login_refused" => {
+                "The provider refused that sign-in: it has expired or was revoked. Reconnect it (or replace its key) below."
+            }
+            "login_check_failed" => {
+                "That sign-in could not be checked right now. It may still work; check again later."
+            }
+            _ => "",
+        },
+        cleaner_notice: if flash.is("cleaner_saved") {
+            "Video cleaner saved."
+        } else {
+            ""
+        },
+        moments_notice: if flash.is("moments_saved") {
+            "Step moments saved."
+        } else {
+            ""
+        },
+        search_notice: if flash.is("search_saved") {
+            "Search saved."
+        } else {
+            ""
+        },
+        account_notice: if flash.is("password_changed") {
+            "Password changed."
+        } else {
+            ""
+        },
         step_moments: step_moments_enabled(&s.db, &user.id).await?,
         embeddings_configured: s.embedder.is_some(),
         search_choice: match own_search_engine(&s.db, &user.id).await? {
@@ -1963,15 +1981,9 @@ async fn settings_page(
         },
         shared_search_bm25: !owns_shared_ai
             && own_search_engine(&s.db, &shared_id).await? == SEARCH_BM25,
-        notice: if query.notice == "disconnected" {
-            "Subscription disconnected.".into()
-        } else {
-            check_notice
-        },
         codex_refused,
         claude_refused,
         active_login_refused,
-        check_error,
     })
 }
 
@@ -1987,59 +1999,29 @@ async fn active_login_refused(db: &SqlitePool, user_id: &str) -> Result<bool> {
     }
 }
 
-/// The Settings notice and error for a login check's outcome; empty when no
-/// check ran or the login is unknown.
-fn login_check_messages(check: &str, login: Option<&str>) -> (String, String) {
-    let Some(name) = login else {
-        return (String::new(), String::new());
-    };
-    match check {
-        "works" => (format!("{name} sign-in works."), String::new()),
-        "refused" => (
-            String::new(),
-            format!(
-                "{name} refused the sign-in: it has expired or was revoked. Reconnect {name} (or replace its key) to keep generating recipes."
-            ),
-        ),
-        "failed" => (
-            String::new(),
-            format!("{name} could not be checked right now. It may still work; check again later."),
-        ),
-        _ => (String::new(), String::new()),
-    }
-}
-
-/// Where Settings goes after a login check.
-fn login_check_redirect(login: &str, check: ai::LoginCheck) -> Redirect {
-    let outcome = match check {
-        ai::LoginCheck::Works => "works",
-        ai::LoginCheck::Refused => "refused",
-        ai::LoginCheck::Failed => "failed",
-    };
-    Redirect::to(&format!("/settings?check={outcome}&login={login}"))
-}
-
 /// Refreshes the user's own Codex or Claude sign-in now, so an expired or
 /// revoked login is found (and flagged) before a generation needs it.
 async fn check_subscription(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(provider): Path<String>,
-) -> Result<Redirect> {
-    let pi_provider = match provider.as_str() {
-        "codex" => CODEX_PI_PROVIDER,
-        "claude" => CLAUDE_PI_PROVIDER,
+) -> Result<Response> {
+    let (pi_provider, works) = match provider.as_str() {
+        "codex" => (CODEX_PI_PROVIDER, "codex_login_works"),
+        "claude" => (CLAUDE_PI_PROVIDER, "claude_login_works"),
         _ => return Err(AppError::NotFound),
     };
     let check = match ai::check_subscription_login(&s, &user.id, pi_provider).await {
         Ok(check) => check,
-        Err(AppError::AiNotConfigured) => return Ok(Redirect::to("/settings")),
+        Err(AppError::AiNotConfigured) => {
+            return Ok(axum::response::Redirect::to("/settings#settings-ai").into_response());
+        }
         Err(error) => {
             warn!(%error, pi_provider, "Login check could not run");
             ai::LoginCheck::Failed
         }
     };
-    Ok(login_check_redirect(&provider, check))
+    Ok(login_check_redirect(check, works))
 }
 
 /// Tests one of the user's endpoint keys by listing the endpoint's models.
@@ -2047,7 +2029,7 @@ async fn check_endpoint(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let endpoint = find_endpoint(&s.db, &user.id, &id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -2058,7 +2040,18 @@ async fn check_endpoint(
             ai::LoginCheck::Failed
         }
     };
-    Ok(login_check_redirect(&endpoint.id, check))
+    Ok(login_check_redirect(check, "endpoint_key_works"))
+}
+
+/// Back to the AI block with the check's notice. A refused login also shows
+/// on its own row, which names it.
+fn login_check_redirect(check: ai::LoginCheck, works: &str) -> Response {
+    let key = match check {
+        ai::LoginCheck::Works => works,
+        ai::LoginCheck::Refused => "login_refused",
+        ai::LoginCheck::Failed => "login_check_failed",
+    };
+    flash_redirect("/settings#settings-ai", key)
 }
 
 /// Model options for the Settings select: the discovered catalogue when
@@ -2162,7 +2155,7 @@ async fn update_settings(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<SettingsForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let provider = trim(&form.provider);
     let effort = trim(&form.reasoning_effort);
     let effort = if effort.is_empty() {
@@ -2210,7 +2203,7 @@ async fn update_settings(
     // leaves the previous settings untouched.
     set_app_setting(&s.db, &user.id, "reasoning_effort", &effort).await?;
     set_app_setting(&s.db, &user.id, "ai_provider", &provider).await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect("/settings#settings-ai", "provider_saved"))
 }
 
 /// Validates the model against the provider's discovered list (fallback list
@@ -2246,7 +2239,7 @@ async fn update_media_cleaner(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<MediaCleanerForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let provider = trim(&form.provider);
     let known = provider.is_empty()
         || pi_provider_for(&provider).is_some()
@@ -2264,7 +2257,10 @@ async fn update_media_cleaner(
         &trim(&form.model),
     )
     .await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect(
+        "/settings#settings-cleaner",
+        "cleaner_saved",
+    ))
 }
 
 /// What an account's AI setup generates with: the provider's label and its
@@ -2299,7 +2295,7 @@ async fn update_ai_logins(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<AiLoginsForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let value = match form.mode.trim() {
         "own" => "own",
         "shared" => "shared",
@@ -2310,7 +2306,7 @@ async fn update_ai_logins(
         }
     };
     set_app_setting(&s.db, &user.id, AI_LOGINS_SETTING, value).await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect("/settings#settings-ai", "logins_saved"))
 }
 
 /// Switches video step moments on or off for the signed-in user. Off stops
@@ -2320,10 +2316,13 @@ async fn update_step_moments(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<StepMomentsForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let value = if form.enabled.is_some() { "on" } else { "off" };
     set_app_setting(&s.db, &user.id, STEP_MOMENTS_SETTING, value).await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect(
+        "/settings#settings-moments",
+        "moments_saved",
+    ))
 }
 
 /// Saves the signed-in user's library search engine. "shared" follows the
@@ -2332,13 +2331,13 @@ async fn update_search_engine(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<SearchEngineForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let value = match form.engine.as_str() {
         SEARCH_EMBEDDINGS | SEARCH_BM25 | SEARCH_SHARED => form.engine.as_str(),
         _ => return Err(AppError::BadRequest("Unknown search engine.".into())),
     };
     set_app_setting(&s.db, &user.id, SEARCH_ENGINE_SETTING, value).await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect("/settings#settings-search", "search_saved"))
 }
 
 /// A required http(s) base URL with any trailing slash removed.
@@ -2361,7 +2360,7 @@ async fn add_endpoint(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<EndpointForm>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     let preset = PROVIDER_PRESETS
         .iter()
         .find(|preset| preset.key == form.provider.trim())
@@ -2390,7 +2389,7 @@ async fn add_endpoint(
     )
     .await?;
     set_app_setting(&s.db, &user.id, "ai_provider", &id).await?;
-    Ok(Redirect::to("/settings?saved=1"))
+    Ok(flash_redirect("/settings#settings-ai", "provider_added"))
 }
 
 /// A display name for a new endpoint: the provider's label, or a custom
@@ -2427,7 +2426,7 @@ async fn delete_endpoint(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
-) -> Result<Redirect> {
+) -> Result<Response> {
     crate::remove_endpoint(&s.db, &user.id, &id).await?;
     forget_model_catalogue(&s, &id);
     if ai_provider(&s.db, &user.id).await? == id {
@@ -2437,7 +2436,7 @@ async fn delete_endpoint(
         set_app_setting(&s.db, &user.id, MEDIA_CLEANER_PROVIDER_SETTING, "").await?;
         set_app_setting(&s.db, &user.id, MEDIA_CLEANER_MODEL_SETTING, "").await?;
     }
-    Ok(Redirect::to("/settings"))
+    Ok(flash_redirect("/settings#settings-ai", "provider_removed"))
 }
 
 /// Codex models the pi SDK no longer serves. A stored choice of one of these
@@ -2630,13 +2629,10 @@ async fn authorise_claude_start(
     .map(IntoResponse::into_response)
 }
 
-/// Sends the user back to Settings with a Claude error notice.
-fn claude_failure_redirect(message: &str) -> Redirect {
-    let message: String = message.chars().take(200).collect();
-    let url =
-        reqwest::Url::parse_with_params("http://localhost/settings", [("claude_error", message)])
-            .expect("static base URL with query pairs parses");
-    Redirect::to(&format!("/settings?{}", url.query().unwrap_or_default()))
+/// Sends the user back to Settings with a Claude error notice, named by its
+/// flash key (`settings_page` words it).
+fn claude_failure_redirect(key: &str) -> Response {
+    flash_redirect("/settings#settings-ai", key)
 }
 
 /// Completes a Claude flow: the pasted code (or redirect URL) is exchanged by
@@ -2650,7 +2646,7 @@ async fn authorise_claude_exchange(
 ) -> Result<Response> {
     let input = trim(&form.code);
     if input.is_empty() {
-        return Ok(claude_failure_redirect("Paste the code Claude showed you.").into_response());
+        return Ok(claude_failure_redirect("claude_code_missing"));
     }
     // The flow is only read here and removed once the exchange succeeds, so a
     // failed attempt leaves the sign-in page usable for another paste.
@@ -2663,10 +2659,7 @@ async fn authorise_claude_exchange(
             .cloned()
     };
     let Some(flow) = flow else {
-        return Ok(
-            claude_failure_redirect("This sign-in expired. Start the authorisation again.")
-                .into_response(),
-        );
+        return Ok(claude_failure_redirect("claude_expired"));
     };
     let payload = serde_json::to_vec(&json!({ "input": input, "verifier": flow.verifier }))
         .map_err(|_| AppError::ClaudeAuth("invalid flow state".into()))?;
@@ -2685,7 +2678,7 @@ async fn authorise_claude_exchange(
     {
         store_pi_credential(&s.db, &user.id, CLAUDE_PI_PROVIDER, credential).await?;
         s.claude_flows.lock().remove(&form.flow_id);
-        return Ok(Redirect::to("/settings?claude=connected").into_response());
+        return Ok(flash_redirect("/settings#settings-ai", "claude_connected"));
     }
     let message = value["message"]
         .as_str()
@@ -2711,7 +2704,7 @@ async fn disconnect_subscription(
     user: &AuthUser,
     pi_provider: &str,
     provider: &str,
-) -> Result<Redirect> {
+) -> Result<Response> {
     sqlx::query("DELETE FROM pi_credentials WHERE user_id=? AND provider=?")
         .bind(&user.id)
         .bind(pi_provider)
@@ -2722,14 +2715,14 @@ async fn disconnect_subscription(
     {
         set_app_setting(&s.db, &user.id, "ai_provider", PROVIDER_CODEX).await?;
     }
-    Ok(Redirect::to("/settings?notice=disconnected"))
+    Ok(flash_redirect("/settings#settings-ai", "disconnected"))
 }
 
-async fn disconnect_codex(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Redirect> {
+async fn disconnect_codex(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
     disconnect_subscription(&s, &user, CODEX_PI_PROVIDER, PROVIDER_CODEX).await
 }
 
-async fn disconnect_claude(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Redirect> {
+async fn disconnect_claude(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
     disconnect_subscription(&s, &user, CLAUDE_PI_PROVIDER, PROVIDER_CLAUDE).await
 }
 

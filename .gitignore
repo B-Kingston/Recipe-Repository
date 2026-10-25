@@ -9,3 +9,6 @@ target/
 node_modules/
 .DS_Store
 bench/*/out/
+# Browser build outputs (npm run build:web)
+static/app.js
+static/htmx.js

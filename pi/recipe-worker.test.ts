@@ -28,7 +28,21 @@ import {
   listEndpointModels,
   verifiedSources,
   workerFailure,
-} from "./recipe-worker.mjs";
+} from "./recipe-worker.ts";
+import type { Complete, CompletionOptions } from "./recipe-worker.ts";
+import type { Model } from "@earendil-works/pi-ai";
+
+/** What a fake fetch receives: the worker sends string headers and a JSON string body. */
+interface SentInit {
+  method: string;
+  headers: Record<string, string>;
+  body: string;
+}
+
+/** A fake fetch whose responses carry only the fields the worker reads. */
+function fakeFetch(respond: (url: string, init: SentInit) => Promise<Partial<Response>>): typeof fetch {
+  return respond as unknown as typeof fetch;
+}
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
   const models = [
@@ -94,13 +108,13 @@ test("parseRequest accepts listModels without a prompt but requires one otherwis
 });
 
 test("openaiResponse posts to /responses with web_search when search is enabled", async () => {
-  let capturedUrl;
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
+  let capturedUrl!: string;
+  let capturedInit!: SentInit;
+  const fetchImpl = fakeFetch(async (url, init) => {
     capturedUrl = url;
     capturedInit = init;
     return { ok: true, json: async () => ({ status: "completed" }) };
-  };
+  });
   const body = await openaiResponse(
     "https://api.openai.com/v1",
     "sk-test",
@@ -127,11 +141,11 @@ test("openaiResponse posts to /responses with web_search when search is enabled"
 });
 
 test("openaiResponse omits tools and tool_choice when search is disabled", async () => {
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
+  let capturedInit!: SentInit;
+  const fetchImpl = fakeFetch(async (url, init) => {
     capturedInit = init;
     return { ok: true, json: async () => ({}) };
-  };
+  });
   await openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", "off", "low", fetchImpl);
   const sent = JSON.parse(capturedInit.body);
   assert.ok(!("tools" in sent));
@@ -139,17 +153,17 @@ test("openaiResponse omits tools and tool_choice when search is disabled", async
 });
 
 test("openaiResponse strips a trailing slash from the base URL", async () => {
-  let capturedUrl;
-  const fetchImpl = async (url) => {
+  let capturedUrl!: string;
+  const fetchImpl = fakeFetch(async (url) => {
     capturedUrl = url;
     return { ok: true, json: async () => ({}) };
-  };
+  });
   await openaiResponse("https://api.openai.com/v1/", "sk-test", "gpt-5.6-luna", "sys", "prompt", "off", "low", fetchImpl);
   assert.equal(capturedUrl, "https://api.openai.com/v1/responses");
 });
 
 test("openaiResponse maps a non-2xx response to a WorkerError and marks transient failures retryable", async () => {
-  const rejects = (status) => openaiResponse(
+  const rejects = (status: number) => openaiResponse(
     "https://api.openai.com/v1",
     "sk-test",
     "gpt-5.6-luna",
@@ -157,7 +171,7 @@ test("openaiResponse maps a non-2xx response to a WorkerError and marks transien
     "prompt",
     "off",
     "low",
-    async () => ({ ok: false, status, text: async () => "bad key" }),
+    fakeFetch(async () => ({ ok: false, status, text: async () => "bad key" })),
   );
   await assert.rejects(rejects(401), (error) => {
     assert.ok(error instanceof WorkerError);
@@ -174,11 +188,11 @@ test("openaiResponse maps a non-2xx response to a WorkerError and marks transien
 });
 
 test("openaiResponse offers web_search without forcing it in gap-fill mode", async () => {
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
+  let capturedInit!: SentInit;
+  const fetchImpl = fakeFetch(async (url, init) => {
     capturedInit = init;
     return { ok: true, json: async () => ({}) };
-  };
+  });
   await openaiResponse("https://api.openai.com/v1", "sk-test", "gpt-5.6-luna", "sys", "prompt", "gapfill", "low", fetchImpl);
   const sent = JSON.parse(capturedInit.body);
   assert.deepEqual(sent.tools, [{ type: "web_search" }]);
@@ -197,10 +211,10 @@ test("completionContext sends only the explicit non-coding context", () => {
   const context = completionContext({
     prompt: "Make a tomato pasta",
     systemPrompt: "You are a recipe assistant.",
-  }, false);
+  }, "off");
 
-  assert.equal(context.systemPrompt.startsWith("You are a recipe assistant."), true);
-  assert.equal(context.systemPrompt.includes("coding assistant"), false);
+  assert.equal(context.systemPrompt?.startsWith("You are a recipe assistant."), true);
+  assert.equal(context.systemPrompt?.includes("coding assistant"), false);
   assert.deepEqual(context.tools, []);
   assert.equal(context.messages.length, 1);
   assert.equal(context.messages[0].role, "user");
@@ -250,13 +264,13 @@ test("anthropicUrl maps base URLs to the Messages API paths", () => {
 });
 
 test("anthropicMessages posts to /v1/messages with a cached system prompt and a named web_search tool", async () => {
-  let capturedUrl;
-  let capturedInit;
-  const fetchImpl = async (url, init) => {
+  let capturedUrl!: string;
+  let capturedInit!: SentInit;
+  const fetchImpl = fakeFetch(async (url, init) => {
     capturedUrl = url;
     capturedInit = init;
     return { ok: true, json: async () => ({ type: "message", content: [] }) };
-  };
+  });
   const body = await anthropicMessages(
     "https://api.anthropic.com",
     "sk-ant-test",
@@ -310,16 +324,16 @@ test("anthropicThinking uses adaptive effort from 4.6 on and budgets before it",
 });
 
 test("anthropicTurn continues a pause_turn with the paused content and joins all content", async () => {
-  const sent = [];
+  const sent: { messages: unknown }[] = [];
   const replies = [
     { stop_reason: "pause_turn", content: [{ type: "server_tool_use", id: "s1", name: "web_search", input: {} }] },
     { stop_reason: "pause_turn", content: [{ type: "web_search_tool_result", tool_use_id: "s1", content: [] }] },
     { stop_reason: "end_turn", content: [{ type: "text", text: "done" }] },
   ];
-  const fetchImpl = async (url, init) => {
+  const fetchImpl = fakeFetch(async (url, init) => {
     sent.push(JSON.parse(init.body));
     return { ok: true, json: async () => replies[sent.length - 1] };
-  };
+  });
   const result = await anthropicTurn("https://api.anthropic.com", "k", "claude-opus-5-5", "s", "p", "low", "grounded", fetchImpl);
   assert.equal(sent.length, 3);
   assert.deepEqual(sent[0].messages, [{ role: "user", content: "p" }]);
@@ -333,10 +347,10 @@ test("anthropicTurn continues a pause_turn with the paused content and joins all
 
 test("anthropicTurn gives up on a turn that keeps pausing", async () => {
   let calls = 0;
-  const fetchImpl = async () => {
+  const fetchImpl = fakeFetch(async () => {
     calls += 1;
     return { ok: true, json: async () => ({ stop_reason: "pause_turn", content: [] }) };
-  };
+  });
   await assert.rejects(
     anthropicTurn("https://api.anthropic.com", "k", "claude-opus-5-5", "s", "p", "low", "grounded", fetchImpl),
     (error) => error instanceof WorkerError && error.retryable,
@@ -345,18 +359,18 @@ test("anthropicTurn gives up on a turn that keeps pausing", async () => {
 });
 
 test("listEndpointModels follows Anthropic pagination and keeps its newest-first order", async () => {
-  const urls = [];
+  const urls: string[] = [];
   const pages = [
     { data: [{ id: "claude-opus-5-5" }, { id: "claude-sonnet-5-5" }], has_more: true, last_id: "claude-sonnet-5-5" },
     { data: [{ id: "claude-haiku-4-5" }], has_more: false, last_id: "claude-haiku-4-5" },
   ];
-  const fetchImpl = async (url, init) => {
+  const fetchImpl = fakeFetch(async (url, init) => {
     urls.push(url);
     assert.equal(init.method, "GET");
     assert.equal(init.headers["x-api-key"], "k");
     assert.equal(init.headers["anthropic-version"], "2023-06-01");
     return { ok: true, json: async () => pages[urls.length - 1] };
-  };
+  });
   const models = await listEndpointModels({ provider: "anthropic", apiBaseUrl: "https://api.anthropic.com/", apiKey: "k" }, fetchImpl);
   assert.deepEqual(models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]);
   assert.equal(urls[0], "https://api.anthropic.com/v1/models?limit=1000");
@@ -364,14 +378,14 @@ test("listEndpointModels follows Anthropic pagination and keeps its newest-first
 });
 
 test("listEndpointModels sorts an OpenAI-spec list newest first", async () => {
-  let captured;
-  const fetchImpl = async (url, init) => {
+  let captured!: { url: string; init: SentInit };
+  const fetchImpl = fakeFetch(async (url, init) => {
     captured = { url, init };
     return {
       ok: true,
       json: async () => ({ data: [{ id: "old", created: 1 }, { id: "new", created: 3 }, { id: "mid", created: 2 }, { id: "new", created: 3 }] }),
     };
-  };
+  });
   const models = await listEndpointModels({ provider: "openai", apiBaseUrl: "https://api.openai.com/v1", apiKey: "sk" }, fetchImpl);
   assert.deepEqual(models, ["new", "mid", "old"]);
   assert.equal(captured.url, "https://api.openai.com/v1/models");
@@ -379,7 +393,7 @@ test("listEndpointModels sorts an OpenAI-spec list newest first", async () => {
 });
 
 test("listEndpointModels requires a base URL and key", async () => {
-  await assert.rejects(listEndpointModels({ provider: "openai", apiKey: "sk" }), (error) => error.code === "input");
+  await assert.rejects(listEndpointModels({ provider: "openai", apiKey: "sk" }), (error) => error instanceof WorkerError && error.code === "input");
 });
 
 test("parseAnthropicOutput reads web_search_result items and text citations", () => {
@@ -564,7 +578,7 @@ test("verifiedSources rejects unverifiable claims when the fallback is disabled"
 });
 
 /** A Chat Completions SSE stream that streams one assistant text reply. */
-function chatCompletionStream(text) {
+function chatCompletionStream(text: string) {
   const chunks = [
     { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
     { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
@@ -589,19 +603,19 @@ test("piAiModel uses the catalogue entry, borrows a shape for unknown ids, and r
   const unknown = piAiModel(models, "groq", "brand-new-model");
   assert.equal(unknown.id, "brand-new-model");
   assert.equal(unknown.provider, "groq");
-  assert.throws(() => piAiModel(models, "no-such-provider", "m"), (error) => error.code === "configuration");
+  assert.throws(() => piAiModel(models, "no-such-provider", "m"), (error) => error instanceof WorkerError && error.code === "configuration");
   const custom = piAiModel(models, "openai-compatible", "llama3", "http://ollama:11434/v1/");
   assert.equal(custom.baseUrl, "http://ollama:11434/v1");
-  assert.equal(custom.compat.supportsDeveloperRole, false);
-  assert.throws(() => piAiModel(models, "openai-compatible", "llama3"), (error) => error.code === "configuration");
+  assert.equal((custom as Model<"openai-completions">).compat?.supportsDeveloperRole, false);
+  assert.throws(() => piAiModel(models, "openai-compatible", "llama3"), (error) => error instanceof WorkerError && error.code === "configuration");
 });
 
 test("completeViaPiAi sends the key and system prompt to a built-in provider", async () => {
-  const calls = [];
-  const fetchImpl = async (url, init) => {
+  const calls: { url: string; headers: Headers; body: { model: string; messages: unknown } }[] = [];
+  const fetchImpl = fakeFetch(async (url, init) => {
     calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
     return chatCompletionStream(RECIPE_REPLY);
-  };
+  });
   const result = await completeViaPiAi(
     { provider: "groq", apiKey: "gsk-test", model: "llama-3.3-70b-versatile", prompt: "Toast" },
     { systemPrompt: "Cook. Use an empty sources array.", reasoningEffort: "low" },
@@ -618,11 +632,11 @@ test("completeViaPiAi sends the key and system prompt to a built-in provider", a
 });
 
 test("completeViaPiAi reaches a keyless custom server at its own base URL", async () => {
-  const urls = [];
-  const fetchImpl = async (url) => {
+  const urls: string[] = [];
+  const fetchImpl = fakeFetch(async (url) => {
     urls.push(String(url));
     return chatCompletionStream(RECIPE_REPLY);
-  };
+  });
   const result = await completeViaPiAi(
     { provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1", apiKey: "", model: "llama3", prompt: "Toast" },
     { systemPrompt: "Cook.", reasoningEffort: "low" },
@@ -634,19 +648,19 @@ test("completeViaPiAi reaches a keyless custom server at its own base URL", asyn
 });
 
 test("completeViaPiAi requires a model, and a key for built-in providers", async () => {
-  const options = { systemPrompt: "s", reasoningEffort: "low" };
+  const options = { systemPrompt: "s", reasoningEffort: "low" } as const;
   await assert.rejects(
     completeViaPiAi({ provider: "groq", apiKey: "k", model: "", prompt: "p" }, options),
-    (error) => error.code === "configuration",
+    (error) => error instanceof WorkerError && error.code === "configuration",
   );
   await assert.rejects(
     completeViaPiAi({ provider: "groq", apiKey: "", model: "m", prompt: "p" }, options),
-    (error) => error.code === "configuration",
+    (error) => error instanceof WorkerError && error.code === "configuration",
   );
 });
 
 test("completeViaPiAi maps a provider error to a retryable WorkerError", async () => {
-  const fetchImpl = async () => new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503, headers: { "Content-Type": "application/json" } });
+  const fetchImpl = fakeFetch(async () => new Response(JSON.stringify({ error: { message: "overloaded" } }), { status: 503, headers: { "Content-Type": "application/json" } }));
   await assert.rejects(
     completeViaPiAi({ provider: "groq", apiKey: "k", model: "llama-3.3-70b-versatile", prompt: "p" }, { systemPrompt: "s", reasoningEffort: "low" }, piAiModels(), fetchImpl),
     (error) => error instanceof WorkerError && error.code === "worker" && error.retryable,
@@ -654,25 +668,25 @@ test("completeViaPiAi maps a provider error to a retryable WorkerError", async (
 });
 
 test("listEndpointModels reads a built-in provider's catalogue without a request", async () => {
-  const fetchImpl = async () => { throw new Error("no network expected"); };
+  const fetchImpl = fakeFetch(async () => { throw new Error("no network expected"); });
   const models = await listEndpointModels({ provider: "groq", apiKey: "k" }, fetchImpl);
   assert.ok(models.includes("llama-3.3-70b-versatile"));
 });
 
 test("listEndpointModels lists a keyless custom server without an Authorization header", async () => {
-  let headers;
-  const fetchImpl = async (url, init) => {
+  let headers!: Record<string, string>;
+  const fetchImpl = fakeFetch(async (url, init) => {
     headers = init.headers;
     return new Response(JSON.stringify({ data: [{ id: "llama3" }] }), { status: 200 });
-  };
+  });
   const models = await listEndpointModels({ provider: "openai-compatible", apiBaseUrl: "http://ollama:11434/v1" }, fetchImpl);
   assert.deepEqual(models, ["llama3"]);
   assert.equal(headers.Authorization, undefined);
 });
 
 test("generateRecipe runs pi-ai providers without search and drops their unverifiable sources", async () => {
-  let seen;
-  const completeImpl = async (_request, options) => {
+  let seen!: CompletionOptions;
+  const completeImpl: Complete = async (_request, options) => {
     seen = options;
     return { label: "groq", text: RECIPE_REPLY, citations: new Map(), searched: false };
   };
@@ -683,8 +697,8 @@ test("generateRecipe runs pi-ai providers without search and drops their unverif
 });
 
 test("generateRecipe keeps a native endpoint's gap-fill sources when the API returns no citations", async () => {
-  let seen;
-  const completeImpl = async (_request, options) => {
+  let seen!: CompletionOptions;
+  const completeImpl: Complete = async (_request, options) => {
     seen = options;
     return { label: "OpenAI", text: RECIPE_REPLY, citations: new Map(), searched: true };
   };
@@ -697,28 +711,30 @@ test("generateRecipe requires a search on grounded subscription requests", async
   const completeImpl = async () => ({ label: "Codex", text: RECIPE_REPLY, citations: new Map(), searched: false });
   await assert.rejects(
     generateRecipe({ piProvider: "openai-codex", prompt: "p", systemPrompt: "s" }, "grounded", "low", completeImpl),
-    (error) => error.code === "output",
+    (error) => error instanceof WorkerError && error.code === "output",
   );
 });
 
 test("isAuthFailure recognises refused logins and keys", () => {
-  const refused = [
+  const modelsError = (message: string, code: string): Error =>
+    Object.assign(new Error(message), { name: "ModelsError", code });
+  const refused: unknown[] = [
     new Error("OAuth refresh failed for anthropic: Anthropic token refresh request failed. status=400; body={\"error\": \"invalid_grant\"}"),
-    Object.assign(new Error("OAuth refresh failed for openai-codex"), { name: "ModelsError", code: "oauth" }),
+    modelsError("OAuth refresh failed for openai-codex", "oauth"),
     new WorkerError("worker", "API returned HTTP 401: {\"error\":{\"type\":\"authentication_error\"}}"),
     new Error("401 Unauthorized"),
     new Error("Incorrect API key provided: sk-...abcd"),
     new Error("invalid x-api-key"),
   ];
-  for (const error of refused) assert.equal(isAuthFailure(error), true, error.message);
-  const other = [
+  for (const error of refused) assert.equal(isAuthFailure(error), true, String(error));
+  const other: unknown[] = [
     new WorkerError("worker", "API returned HTTP 429: rate limited", { retryable: true }),
     new WorkerError("worker", "API returned HTTP 500"),
     new WorkerError("configuration", "Pi is not logged in to Claude. Authorise Claude from the Settings page."),
-    Object.assign(new Error("Credential store modify failed for anthropic"), { name: "ModelsError", code: "auth" }),
+    modelsError("Credential store modify failed for anthropic", "auth"),
     new Error("Anthropic response was truncated by max_tokens."),
   ];
-  for (const error of other) assert.equal(isAuthFailure(error), false, error.message);
+  for (const error of other) assert.equal(isAuthFailure(error), false, String(error));
 });
 
 test("workerFailure reports a refused login as a non-retryable auth failure", () => {

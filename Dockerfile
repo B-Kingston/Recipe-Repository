@@ -1,8 +1,21 @@
-FROM node:22-bookworm-slim AS pi-deps
+# Node is pinned to a patch release: 22.23.4 is the first 22.x with the
+# bundled Brotli decoder fixed (CVE-2026-111497), and a floating tag could
+# build from an older cached image. Raise it, never lower it.
+FROM node:22.23.4-bookworm-slim AS pi-deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=cache,id=kindle-recipes-npm,target=/root/.npm,sharing=locked \
     npm ci --omit=dev --prefer-offline --cache=/root/.npm
+
+# The browser scripts: web/*.ts compiled to one ES5 static/app.js, and htmx
+# lowered to ES5 as static/htmx.js (older Kindle browsers parse nothing newer).
+FROM node:22.23.4-bookworm-slim AS web
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,id=kindle-recipes-npm,target=/root/.npm,sharing=locked \
+    npm ci --prefer-offline --cache=/root/.npm
+COPY web ./web
+RUN npm run build:web
 
 FROM rust:1.88-slim AS builder
 WORKDIR /app
@@ -24,7 +37,7 @@ RUN --mount=type=cache,id=kindle-recipes-cargo-registry,target=/usr/local/cargo/
     touch src/main.rs && cargo build --release --locked && \
     cp target/release/kindle-recipes /app/kindle-recipes
 
-FROM node:22-bookworm-slim
+FROM node:22.23.4-bookworm-slim
 RUN --mount=type=cache,id=kindle-recipes-apt-archives,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=kindle-recipes-apt-lists,target=/var/lib/apt/lists,sharing=locked \
     --mount=type=cache,id=kindle-recipes-pip,target=/root/.cache/pip,sharing=locked \
@@ -47,6 +60,7 @@ RUN --mount=type=cache,id=kindle-recipes-apt-archives,target=/var/cache/apt,shar
 WORKDIR /app
 COPY --from=builder /app/kindle-recipes /usr/local/bin/kindle-recipes
 COPY static /app/static
+COPY --from=web /app/static/app.js /app/static/htmx.js /app/static/
 COPY pi /app/pi
 COPY --from=pi-deps /app/package.json /app/package.json
 COPY --from=pi-deps /app/node_modules /app/node_modules

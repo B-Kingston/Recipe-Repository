@@ -58,7 +58,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
 async fn save(
     state: &Arc<AppState>,
     form: SettingsForm,
-) -> Result<axum::response::Redirect, AppError> {
+) -> Result<axum::response::Response, AppError> {
     update_settings(
         State(state.clone()),
         AuthUser { id: "u1".into() },
@@ -842,10 +842,7 @@ async fn disconnecting_claude_keeps_codex_and_falls_back_to_it() {
     let redirect = disconnect_claude(State(state.clone()), AuthUser { id: "u1".into() })
         .await
         .unwrap();
-    assert_eq!(
-        redirect.into_response().headers()[header::LOCATION],
-        "/settings?notice=disconnected"
-    );
+    assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
             .await
@@ -879,10 +876,7 @@ async fn disconnecting_active_codex_without_a_fallback_leaves_the_setting() {
     let redirect = disconnect_codex(State(state.clone()), AuthUser { id: "u1".into() })
         .await
         .unwrap();
-    assert_eq!(
-        redirect.into_response().headers()[header::LOCATION],
-        "/settings?notice=disconnected"
-    );
+    assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CODEX_PI_PROVIDER)
             .await
@@ -923,11 +917,7 @@ async fn empty_claude_code_keeps_the_flow_for_a_retry() {
         .await
         .unwrap()
         .into_response();
-        let location = response.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(location.contains("claude_error=Paste"), "{location}");
+        assert_flash(&response, "/settings#settings-ai", "claude_code_missing");
     }
     assert!(state.claude_flows.lock().contains_key("flow"));
 }
@@ -971,11 +961,29 @@ async fn add_user(db: &SqlitePool, id: &str, username: &str, created_at: &str) {
 }
 
 async fn settings_body(state: &Arc<AppState>, user_id: &str) -> String {
-    let query = axum::extract::Query::try_from_uri(&"/settings".parse().unwrap()).unwrap();
-    let html = crate::settings_page(State(state.clone()), AuthUser { id: user_id.into() }, query)
-        .await
-        .unwrap();
+    settings_body_with(state, user_id, "").await
+}
+
+async fn settings_body_with(state: &Arc<AppState>, user_id: &str, flash: &str) -> String {
+    let html = crate::settings_page(
+        State(state.clone()),
+        AuthUser { id: user_id.into() },
+        crate::htmx::Flash(flash.into()),
+    )
+    .await
+    .unwrap();
     html.0
+}
+
+/// A 303 to `location` that sets the one-time `flash` notice.
+fn assert_flash(response: &axum::response::Response, location: &str, flash: &str) {
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[header::LOCATION], location);
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(
+        cookie.starts_with(&format!("recipe_flash={flash};")),
+        "{cookie}"
+    );
 }
 
 async fn choose_ai_logins(state: &Arc<AppState>, user_id: &str, mode: &str) {
@@ -1138,6 +1146,7 @@ async fn a_refused_subscription_login_is_flagged_until_it_works_again() {
         user_id: "u1",
         pi_provider: CLAUDE_PI_PROVIDER,
     };
+    let refused = || crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER);
 
     // Any other failure passes through for the caller's own handling.
     let other = crate::ai::track_login(
@@ -1149,32 +1158,26 @@ async fn a_refused_subscription_login_is_flagged_until_it_works_again() {
     )
     .await;
     assert!(other.is_ok_and(|output| !output.status.success()));
-    assert!(
-        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
-            .await
-            .unwrap()
-    );
+    assert!(!refused().await.unwrap());
 
-    let refused = crate::ai::track_login(
+    match crate::ai::track_login(
         &state,
         login,
         "Claude",
         true,
         worker_output(1, REFUSED_LOGIN),
     )
-    .await;
-    match refused {
-        Err(AppError::AiLoginRefused(message)) => assert!(
-            message.contains("Reconnect Claude in Settings"),
-            "{message}"
-        ),
+    .await
+    {
+        Err(AppError::AiLoginRefused(message)) => {
+            assert!(
+                message.contains("Reconnect Claude in Settings"),
+                "{message}"
+            )
+        }
         other => panic!("expected a refused login, got {:?}", other.map(|_| ())),
     }
-    assert!(
-        crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
-            .await
-            .unwrap()
-    );
+    assert!(refused().await.unwrap());
     let body = settings_body(&state, "u1").await;
     assert!(body.contains("Sign-in expired"), "{body}");
     assert!(body.contains("refused its sign-in"), "{body}");
@@ -1184,20 +1187,12 @@ async fn a_refused_subscription_login_is_flagged_until_it_works_again() {
     crate::ai::track_login(&state, login, "Claude", false, worker_output(0, "{}"))
         .await
         .unwrap();
-    assert!(
-        crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
-            .await
-            .unwrap()
-    );
+    assert!(refused().await.unwrap());
     // A call that signed in clears it.
     crate::ai::track_login(&state, login, "Claude", true, worker_output(0, "{}"))
         .await
         .unwrap();
-    assert!(
-        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
-            .await
-            .unwrap()
-    );
+    assert!(!refused().await.unwrap());
 
     // Reconnecting (or a stored token refresh) clears it as well.
     crate::ai::track_login(
@@ -1217,11 +1212,7 @@ async fn a_refused_subscription_login_is_flagged_until_it_works_again() {
     )
     .await
     .unwrap();
-    assert!(
-        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
-            .await
-            .unwrap()
-    );
+    assert!(!refused().await.unwrap());
     assert!(
         !settings_body(&state, "u1")
             .await
@@ -1241,10 +1232,12 @@ async fn a_rejected_endpoint_key_is_flagged_on_its_row_and_for_sharing_accounts(
 
     match crate::ai::track_login(&state, login, "Groq", true, worker_output(1, REFUSED_LOGIN)).await
     {
-        Err(AppError::AiLoginRefused(message)) => assert!(
-            message.starts_with("Groq rejected its API key"),
-            "{message}"
-        ),
+        Err(AppError::AiLoginRefused(message)) => {
+            assert!(
+                message.starts_with("Groq rejected its API key"),
+                "{message}"
+            )
+        }
         other => panic!("expected a refused login, got {:?}", other.map(|_| ())),
     }
     assert!(
@@ -1281,21 +1274,44 @@ async fn a_rejected_endpoint_key_is_flagged_on_its_row_and_for_sharing_accounts(
     );
 }
 
-#[test]
-fn login_checks_report_their_outcome_by_name() {
-    assert_eq!(
-        crate::login_check_messages("works", Some("Claude")),
-        ("Claude sign-in works.".to_string(), String::new())
-    );
-    let (notice, error) = crate::login_check_messages("refused", Some("Claude"));
-    assert!(notice.is_empty());
-    assert!(error.starts_with("Claude refused the sign-in"), "{error}");
-    let (_, error) = crate::login_check_messages("failed", Some("Groq"));
-    assert!(error.contains("could not be checked"), "{error}");
-    assert_eq!(
-        crate::login_check_messages("works", None),
-        (String::new(), String::new())
-    );
+#[tokio::test]
+async fn login_checks_flash_their_outcome_in_the_ai_block() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    for (check, works, flash) in [
+        (
+            crate::ai::LoginCheck::Works,
+            "claude_login_works",
+            "claude_login_works",
+        ),
+        (
+            crate::ai::LoginCheck::Refused,
+            "claude_login_works",
+            "login_refused",
+        ),
+        (
+            crate::ai::LoginCheck::Failed,
+            "endpoint_key_works",
+            "login_check_failed",
+        ),
+    ] {
+        assert_flash(
+            &crate::login_check_redirect(check, works),
+            "/settings#settings-ai",
+            flash,
+        );
+    }
+    for (flash, text) in [
+        ("codex_login_works", "ChatGPT (Codex) sign-in works."),
+        ("claude_login_works", "Claude sign-in works."),
+        ("endpoint_key_works", "The API key works."),
+        ("login_refused", "The provider refused that sign-in"),
+        ("login_check_failed", "could not be checked right now"),
+    ] {
+        let body = settings_body_with(&state, "u1", flash).await;
+        assert!(body.contains(text), "{flash}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -1323,7 +1339,30 @@ async fn checking_an_unknown_login_is_not_found() {
         Path("claude".into()),
     )
     .await
-    .unwrap()
-    .into_response();
-    assert_eq!(missing.headers()[header::LOCATION], "/settings");
+    .unwrap();
+    assert_eq!(missing.headers()[header::LOCATION], "/settings#settings-ai");
+}
+
+#[tokio::test]
+async fn the_cleaner_model_is_a_select_that_keeps_the_saved_model() {
+    let db = database().await;
+    let state = state(db.clone());
+    // The first account owns the AI setup, so its page shows the cleaner.
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    crate::set_app_setting(&db, "u1", "media_cleaner_model", "my-small-model")
+        .await
+        .unwrap();
+    let html = settings_body(&state, "u1").await;
+    assert!(
+        html.contains(r#"<select id="cleaner_model" name="model" data-ai-provider="pi">"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="">Provider's model</option>"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="my-small-model" selected>my-small-model</option>"#),
+        "{html}"
+    );
 }

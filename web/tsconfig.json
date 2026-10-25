@@ -1,0 +1,38 @@
+{
+  // The browser half: compiled to one ES5 script, static/app.js, because
+  // older Kindle browsers run nothing newer. Only the ES5 library is visible,
+  // so a later built-in (Promise, Array.from, String#includes, ...) fails the
+  // build instead of the page. The files share the `Recipes` namespace and
+  // are concatenated in this order; main.ts must stay last.
+  // static/app.js is a build output (gitignored): `npm run build:web`, or the
+  // Dockerfile's web stage.
+  "compilerOptions": {
+    "target": "ES5",
+    "lib": ["ES5", "DOM"],
+    "module": "none",
+    "moduleResolution": "node10",
+    "outFile": "../static/app.js",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmitOnError": true,
+    "removeComments": true,
+    "newLine": "lf",
+    "types": [],
+    "skipLibCheck": true
+  },
+  "files": [
+    "src/globals.d.ts",
+    "src/dom.ts",
+    "src/pages.ts",
+    "src/chrome.ts",
+    "src/library.ts",
+    "src/recipe.ts",
+    "src/settings.ts",
+    "src/codex-authorise.ts",
+    "src/import-run.ts",
+    "src/main.ts"
+  ]
+}

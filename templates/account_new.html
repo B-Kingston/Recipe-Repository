@@ -5,7 +5,8 @@
   <p class="deck">A new account starts with its own empty library and uses the shared AI logins until it chooses its own in Settings. This browser switches to it and stays signed in to your current account too.</p>
 </div>
 <div class="compact-panel">
-  <form method="post" action="/accounts/new">
+  {# The new account signs in at once, so the whole page reloads as it. #}
+  <form method="post" action="/accounts/new" hx-boost="false">
     <label for="username">Username</label>
     <input id="username" name="username" type="text" value="{{ username }}" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40" required autofocus>
     <label for="password">Password</label>
