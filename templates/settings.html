@@ -7,17 +7,62 @@
 {% if password_changed %}<p class="notice" role="status">Password changed.</p>{% endif %}
 {% if !notice.is_empty() %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
 <div class="compact-panel">
+  {% if uses_shared_ai %}
+  <div class="block">
+    <h2>AI provider <span class="codex-status{% if ai_ready %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if ai_ready %}&#10003; Shared{% else %}Not connected{% endif %}</span></h2>
+    {% if ai_ready %}
+    <p class="muted block-note">Recipes are generated with {{ shared_ai_owner }}'s AI logins: <strong>{{ shared_ai_summary }}</strong>. The video cleaner and reasoning effort follow {{ shared_ai_owner }}'s settings too.</p>
+    {% else %}
+    <p class="muted block-note">This account shares {{ shared_ai_owner }}'s AI logins, but {{ shared_ai_owner }} has not connected an AI provider yet. Use your own logins to connect one for this account.</p>
+    {% endif %}
+    <form method="post" action="/settings/ai-logins">
+      <input type="hidden" name="mode" value="own">
+      <button type="submit">Use my own AI logins</button>
+    </form>
+  </div>
+  {% else %}
   <div class="block">
     <h2>AI provider</h2>
+    {% if owns_shared_ai %}<p class="muted block-note">Shared: other accounts generate recipes with these logins unless they choose their own.</p>
+    {% else %}
+    <div class="block-note">
+      <p class="muted">You are using your own AI logins instead of {{ shared_ai_owner }}'s shared ones.</p>
+      <form method="post" action="/settings/ai-logins">
+        <input type="hidden" name="mode" value="shared">
+        <button class="compact" type="submit">Use {{ shared_ai_owner }}'s shared logins</button>
+      </form>
+    </div>
+    {% endif %}
     {% if claude_connected_notice %}<p class="notice" role="status">Claude connected.</p>{% endif %}
     {% if claude_error != "" %}<p class="error" role="alert">{{ claude_error }}</p>{% endif %}
     <form method="post" action="/settings">
       <fieldset>
         <legend class="muted">Generate recipes with</legend>
-        <label class="toggle-row"><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if !codex_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
-        <label class="toggle-row"><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}><span>Claude (Pro/Max)</span>{% if !claude_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
+        <div class="toggle-row provider-row">
+          <label><input type="radio" name="provider" value="pi"{% if codex_selected %} checked{% endif %}><span>Codex (ChatGPT)</span>{% if !codex_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
+          {% if codex_authorised %}
+          <span class="provider-actions">
+            <a class="button compact" href="{{ codex_auth_url }}">Reconnect</a>
+            <button class="compact" type="submit" form="disconnect-codex">Disconnect</button>
+          </span>
+          {% endif %}
+        </div>
+        <div class="toggle-row provider-row">
+          <label><input type="radio" name="provider" value="claude"{% if claude_selected %} checked{% endif %}><span>Claude (Pro/Max)</span>{% if !claude_authorised %}<span class="muted">Not connected</span>{% endif %}</label>
+          {% if claude_authorised %}
+          <span class="provider-actions">
+            <a class="button compact" href="{{ claude_auth_url }}">Reconnect</a>
+            <button class="compact" type="submit" form="disconnect-claude">Disconnect</button>
+          </span>
+          {% endif %}
+        </div>
         {% for endpoint in endpoints %}
-        <label class="toggle-row"><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span><span class="muted">key {{ endpoint.key_masked }}</span></label>
+        <div class="toggle-row provider-row">
+          <label><input type="radio" name="provider" value="{{ endpoint.id }}"{% if endpoint.selected %} checked{% endif %}><span>{{ endpoint.name }}</span><span class="muted">key {{ endpoint.key_masked }}</span></label>
+          <span class="provider-actions">
+            <button class="compact" type="submit" form="remove-endpoint-{{ endpoint.id }}" aria-label="Remove {{ endpoint.name }}">Remove</button>
+          </span>
+        </div>
         {% endfor %}
       </fieldset>
       <div data-model-panel="pi"{% if !codex_selected %} hidden{% endif %}>
@@ -67,28 +112,15 @@
       </select>
       <button class="primary" type="submit">Save</button>
     </form>
+    {# The row buttons submit these through form="" since forms cannot nest inside the settings form. #}
     {% if codex_authorised %}
-    <div class="actions" data-provider-actions="pi"{% if !codex_selected %} hidden{% endif %}>
-      <a class="button compact" href="{{ codex_auth_url }}">Reconnect</a>
-      <form class="inline" method="post" action="/settings/disconnect/codex" data-confirm="Disconnect Codex? Recipes will stop generating with Codex until you reconnect.">
-        <button class="compact" type="submit">Disconnect</button>
-      </form>
-    </div>
+    <form id="disconnect-codex" method="post" action="/settings/disconnect/codex" data-confirm="Disconnect Codex? Recipes will stop generating with Codex until you reconnect."></form>
     {% endif %}
     {% if claude_authorised %}
-    <div class="actions" data-provider-actions="claude"{% if !claude_selected %} hidden{% endif %}>
-      <a class="button compact" href="{{ claude_auth_url }}">Reconnect</a>
-      <form class="inline" method="post" action="/settings/disconnect/claude" data-confirm="Disconnect Claude? Recipes will stop generating with Claude until you reconnect.">
-        <button class="compact" type="submit">Disconnect</button>
-      </form>
-    </div>
+    <form id="disconnect-claude" method="post" action="/settings/disconnect/claude" data-confirm="Disconnect Claude? Recipes will stop generating with Claude until you reconnect."></form>
     {% endif %}
     {% for endpoint in endpoints %}
-    <div class="actions" data-provider-actions="{{ endpoint.id }}"{% if !endpoint.selected %} hidden{% endif %}>
-      <form class="inline" method="post" action="/settings/endpoints/{{ endpoint.id }}/delete" data-confirm="Remove {{ endpoint.name }} and its API key?">
-        <button class="compact" type="submit">Remove {{ endpoint.name }}</button>
-      </form>
-    </div>
+    <form id="remove-endpoint-{{ endpoint.id }}" method="post" action="/settings/endpoints/{{ endpoint.id }}/delete" data-confirm="Remove {{ endpoint.name }} and its API key?"></form>
     {% endfor %}
     <details class="add-block">
       <summary>Add a provider with an API key</summary>
@@ -129,6 +161,7 @@
       <button class="primary" type="submit">Save video cleaner</button>
     </form>
   </div>
+  {% endif %}
   <div class="block">
     <h2>Video step moments <span class="codex-status{% if step_moments && embeddings_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if !embeddings_configured %}Needs embedding service{% else if step_moments %}&#10003; On{% else %}Off{% endif %}</span></h2>
     <p class="muted block-note">Video imports match each method step to the moment the cook talks about it, or shows it when there is no narration. Each step then shows the time and a few frames from that moment. Off stops new imports from capturing moments and hides them on every recipe.</p>
@@ -158,6 +191,18 @@
     <h3>Media extraction debugger</h3>
     <p class="muted">A developer tool. Runs the Instagram and Facebook reel analysis on one or more URLs and shows each phase as it finishes: caption, transcript, on-screen text, and the cleaner's output.</p>
     <p class="actions"><a class="button" href="/settings/media-debug">Open debugger</a></p>
+    <h3>Library search</h3>
+    <p class="muted">Search by meaning ranks recipes with the embedding service and falls back to word search while that service is missing or down. Word search (BM25) matches the words of every recipe: title, description, ingredients, and method.</p>
+    {% if owns_shared_ai %}<p class="muted">Shared: other accounts search the same way unless they choose their own.</p>{% endif %}
+    <form method="post" action="/settings/search-engine">
+      <fieldset>
+        <legend class="muted">Search the library with</legend>
+        {% if !owns_shared_ai %}<label class="toggle-row"><input type="radio" name="engine" value="shared"{% if search_choice == "shared" %} checked{% endif %}><span>Same as {{ shared_ai_owner }}</span><span class="muted">{% if shared_search_bm25 %}Word search{% else %}Search by meaning{% endif %}</span></label>{% endif %}
+        <label class="toggle-row"><input type="radio" name="engine" value="embeddings"{% if search_choice == "embeddings" %} checked{% endif %}><span>Search by meaning (EmbeddingGemma)</span>{% if !embeddings_configured %}<span class="muted">Not configured</span>{% endif %}</label>
+        <label class="toggle-row"><input type="radio" name="engine" value="bm25"{% if search_choice == "bm25" %} checked{% endif %}><span>Word search (BM25)</span></label>
+      </fieldset>
+      <button class="primary" type="submit">Save search</button>
+    </form>
   </details>
 <script>
 (function () {
@@ -210,9 +255,6 @@
         panels[key].hidden = hidden;
         // Only the shown panel's fields are submitted.
         Array.prototype.forEach.call(panels[key].querySelectorAll('input, select'), function (field) { field.disabled = hidden; });
-      });
-      Array.prototype.forEach.call(document.querySelectorAll('[data-provider-actions]'), function (actions) {
-        actions.hidden = actions.getAttribute('data-provider-actions') !== radio.value;
       });
       load(radio.value);
     });

@@ -289,6 +289,13 @@ async fn first_setup_creates_user_and_claims_orphans() {
     .execute(&db)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('','ai_provider','claude',?)",
+    )
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
 
     let response = setup_create(
         State(state(db.clone())),
@@ -319,9 +326,15 @@ async fn first_setup_creates_user_and_claims_orphans() {
             .fetch_one(&db)
             .await
             .unwrap();
+    let setting_owner: String =
+        sqlx::query_scalar("SELECT user_id FROM app_settings WHERE key='ai_provider'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(recipe_owner, user_id);
     assert_eq!(draft_owner, user_id);
     assert_eq!(credential_owner, user_id);
+    assert_eq!(setting_owner, user_id);
 
     setup_create(
         State(state(db.clone())),
@@ -746,4 +759,395 @@ async fn reset_password_requires_current_password_and_updates_login() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(set_cookie(&response).is_none());
     sign_in(&app, "alice", "reset-secret").await;
+}
+
+/// Every `name=value` the response sets, in header order.
+fn set_cookies(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok()?.split(';').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The value of the named cookie among those a response sets.
+fn cookie_set(response: &Response, name: &str) -> Option<String> {
+    set_cookies(response)
+        .into_iter()
+        .find_map(|cookie| cookie.strip_prefix(&format!("{name}=")).map(str::to_string))
+}
+
+/// The browser's `Cookie` header for an active session and remembered ones.
+fn browser(active: &str, remembered: &[&str]) -> String {
+    format!(
+        "recipe_session={active}; recipe_accounts={}",
+        remembered.join(".")
+    )
+}
+
+fn token(cookie: &str) -> &str {
+    cookie.strip_prefix("recipe_session=").unwrap()
+}
+
+async fn user_id(db: &SqlitePool, username: &str) -> String {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+        .bind(username)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+async fn add_account(db: &SqlitePool, username: &str, password: &str) {
+    sqlx::query("INSERT INTO users(id,username,password_hash,created_at) VALUES(?,?,?,?)")
+        .bind(format!("{username}-id"))
+        .bind(username)
+        .bind(hash_password(password).unwrap())
+        .bind(stamp())
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_account_menu_creates_accounts_and_switches_between_them() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    let now = stamp();
+    sqlx::query(
+        "INSERT INTO recipes(id,title,user_id,created_at,updated_at)
+         VALUES('alice-recipe','Alice recipe',?,?,?)",
+    )
+    .bind(&alice_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // Every signed-in page carries the menu for the active account.
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&alice, &[]))))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(body.contains("data-account-menu"), "{body}");
+    assert!(
+        body.contains(
+            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">alice</span>"
+        )
+    );
+    assert!(body.contains("href=\"/accounts/new\""));
+    assert!(!body.contains("Sign out of all accounts"));
+
+    let response = app
+        .clone()
+        .oneshot(request("/accounts/new", Some(&browser(&alice, &[]))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Usernames are unique regardless of case, and the password rules apply.
+    for (form, expected) in [
+        (
+            "username=Alice&password=bob-secret&confirm_password=bob-secret",
+            "That username is taken.",
+        ),
+        (
+            "username=bob&password=short&confirm_password=short",
+            "Password must be at least 8 characters.",
+        ),
+        (
+            "username=+&password=bob-secret&confirm_password=bob-secret",
+            "Username is required.",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(post("/accounts/new", Some(&browser(&alice, &[])), form))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{form}");
+        assert!(set_cookies(&response).is_empty(), "{form}");
+        assert!(response_body(response).await.contains(expected), "{form}");
+    }
+
+    // Creating bob switches the browser to him; alice stays signed in behind.
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/accounts/new",
+            Some(&browser(&alice, &[])),
+            "username=+bob+&password=bob-secret&confirm_password=bob-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/");
+    let bob = cookie_set(&response, "recipe_session").unwrap();
+    assert_ne!(bob, alice);
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some(alice.as_str())
+    );
+    let bob_id = user_id(&db, "bob").await;
+
+    // Bob has his own empty library and his own settings.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/recipes/alice-recipe",
+            Some(&browser(&bob, &[&alice])),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&bob, &[&alice]))))
+        .await
+        .unwrap();
+    assert!(set_cookies(&response).is_empty(), "nothing changed");
+    let body = response_body(response).await;
+    assert!(
+        body.contains(
+            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">bob</span>"
+        )
+    );
+    assert!(body.contains(&format!("name=\"user_id\" value=\"{alice_id}\"")));
+    assert!(body.contains("Sign out of all accounts"));
+
+    // Switching makes alice active again and remembers bob.
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/accounts/switch",
+            Some(&browser(&bob, &[&alice])),
+            &format!("user_id={alice_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/");
+    assert_eq!(
+        cookie_set(&response, "recipe_session").as_deref(),
+        Some(alice.as_str())
+    );
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some(bob.as_str())
+    );
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/recipes/alice-recipe",
+            Some(&browser(&alice, &[&bob])),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // An account this browser is not signed in to needs its password, and
+    // an unknown account is not found.
+    add_account(&db, "carol", "carol-secret").await;
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/accounts/switch",
+            Some(&browser(&alice, &[&bob])),
+            "user_id=carol-id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/login?username=carol");
+    assert!(set_cookies(&response).is_empty());
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/accounts/switch",
+            Some(&browser(&alice, &[&bob])),
+            "user_id=nobody",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&alice, &[&bob]))))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(body.contains("href=\"/login?username=carol\""), "{body}");
+    assert!(body.contains(&format!("name=\"user_id\" value=\"{bob_id}\"")));
+}
+
+#[tokio::test]
+async fn signing_in_adds_an_account_and_signing_out_falls_back_to_the_next() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    add_account(&db, "carol", "carol-secret").await;
+
+    // With a session, the sign-in page adds an account.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/login?username=carol",
+            Some(&browser(&alice, &[])),
+        ))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(body.contains("Add an account"), "{body}");
+    assert!(body.contains(r#"name="username" type="text" value="carol""#));
+    let response = app.clone().oneshot(request("/login", None)).await.unwrap();
+    let body = response_body(response).await;
+    assert!(!body.contains("Add an account"));
+    assert!(!body.contains("data-account-menu"));
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/login",
+            Some(&browser(&alice, &[])),
+            "username=carol&password=carol-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let carol = cookie_set(&response, "recipe_session").unwrap();
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some(alice.as_str())
+    );
+
+    // Signing in to the active account again replaces its session.
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/login",
+            Some(&browser(&carol, &[&alice])),
+            "username=carol&password=carol-secret",
+        ))
+        .await
+        .unwrap();
+    let carol_again = cookie_set(&response, "recipe_session").unwrap();
+    assert_ne!(carol_again, carol);
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some(alice.as_str())
+    );
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id='carol-id'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 1);
+    let carol = carol_again;
+
+    // Signing out of carol hands the browser back to alice.
+    let response = app
+        .clone()
+        .oneshot(post("/logout", Some(&browser(&carol, &[&alice])), ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            format!("recipe_session={alice}"),
+            "recipe_accounts=".to_string()
+        ]
+    );
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&carol, &[]))))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/login");
+
+    // Signing out of the last account clears both cookies.
+    let response = app
+        .clone()
+        .oneshot(post("/logout", Some(&browser(&alice, &[])), ""))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/login");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            "recipe_session=".to_string(),
+            "recipe_accounts=".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_ended_session_hands_over_to_a_remembered_account() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    add_account(&db, "carol", "carol-secret").await;
+    add_account(&db, "dave", "dave-secret").await;
+    let carol = token(&sign_in(&app, "carol", "carol-secret").await).to_string();
+    let dave = token(&sign_in(&app, "dave", "dave-secret").await).to_string();
+
+    // Carol's session ends: alice takes over, and the accounts cookie drops
+    // carol's token and anything malformed.
+    sqlx::query("UPDATE sessions SET expires_at = ? WHERE user_id = 'carol-id'")
+        .bind((Utc::now() - Duration::minutes(1)).to_rfc3339())
+        .execute(&db)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/",
+            Some(&browser(&carol, &[&alice, "junk", &dave, &carol])),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            format!("recipe_session={alice}"),
+            format!("recipe_accounts={dave}")
+        ]
+    );
+    let body = response_body(response).await;
+    assert!(
+        body.contains(
+            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">alice</span>"
+        )
+    );
+
+    // Signing out of all accounts ends every session the browser holds.
+    let response = app
+        .clone()
+        .oneshot(post("/logout/all", Some(&browser(&alice, &[&dave])), ""))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/login");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            "recipe_session=".to_string(),
+            "recipe_accounts=".to_string()
+        ]
+    );
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id <> 'carol-id'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

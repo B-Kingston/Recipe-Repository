@@ -1,20 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="100%" height="48">
   <!-- The ticket rail for e-ink mode: the same stretchable layout as
-       rail.svg, drawn as flat black line art with no gradients or filters. -->
-  <rect x="0" y="3" width="100%" height="42" fill="#ffffff"/>
-  <rect x="0" y="3" width="100%" height="2.5" fill="#000000"/>
-  <rect x="0" y="16" width="100%" height="2" fill="#000000"/>
-  <rect x="0" y="26" width="100%" height="1" fill="#000000"/>
-  <rect x="0" y="34" width="100%" height="11" fill="#000000"/>
-  <rect x="0" y="37" width="100%" height="1" fill="#ffffff"/>
-  <path d="M18 1H7a7 7 0 0 0-7 7v32a7 7 0 0 0 7 7h11z" fill="#000000"/>
-  <circle cx="9.5" cy="24" r="3.6" fill="none" stroke="#ffffff" stroke-width="1.4"/>
-  <path d="M7.7 24h3.6M9.5 22.2v3.6" stroke="#ffffff" stroke-width="1.2"/>
-  <svg x="100%" y="0" width="18" height="48" overflow="visible">
-    <g transform="translate(-18 0)">
-      <path d="M0 1h11a7 7 0 0 1 7 7v32a7 7 0 0 1-7 7H0z" fill="#000000"/>
-      <circle cx="8.5" cy="24" r="3.6" fill="none" stroke="#ffffff" stroke-width="1.4"/>
-      <path d="M6.7 24h3.6M8.5 22.2v3.6" stroke="#ffffff" stroke-width="1.2"/>
-    </g>
+       rail.svg, drawn as a plain outlined bar with one slot line and solid
+       end caps, with no gradients or filters. -->
+  <rect x="0" y="4" width="100%" height="40" fill="#ffffff"/>
+  <rect x="0" y="4" width="100%" height="2" fill="#000000"/>
+  <rect x="0" y="33" width="100%" height="1.5" fill="#000000"/>
+  <rect x="0" y="42" width="100%" height="2" fill="#000000"/>
+  <path d="M10 1H4a4 4 0 0 0-4 4v38a4 4 0 0 0 4 4h6z" fill="#000000"/>
+  <svg x="100%" y="0" width="10" height="48" overflow="visible">
+    <path transform="translate(-10 0)" d="M0 1h6a4 4 0 0 1 4 4v38a4 4 0 0 1-4 4H0z" fill="#000000"/>
   </svg>
 </svg>

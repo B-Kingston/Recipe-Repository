@@ -1,6 +1,7 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
-    LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_by_letter, find_version,
+    LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
+    stamp_added,
     home, move_block, recipe_versions, record_version, update_block, update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, stamp};
@@ -324,13 +325,29 @@ fn card(title: &str) -> LibraryCard {
         prep_minutes: None,
         cook_minutes: None,
         has_thumbnail: false,
-        letter: String::new(),
+        created_at: String::new(),
         ingredients: Vec::new(),
+        added: String::new(),
     }
 }
 
 #[test]
-fn library_is_filed_a_to_z_with_one_tab_per_letter() {
+fn ticket_stamp_adds_the_time_only_when_dates_clash() {
+    let mut cards = vec![card("Dal"), card("Pho"), card("Ragu"), card("Old")];
+    cards[0].created_at = "2026-10-15T09:05:00+00:00".into();
+    cards[1].created_at = "2026-10-15T22:11:00+00:00".into();
+    cards[2].created_at = "2026-10-16T08:00:00+00:00".into();
+    cards[3].created_at = "not a time".into();
+    stamp_added(&mut cards);
+    let added: Vec<&str> = cards.iter().map(|card| card.added.as_str()).collect();
+    assert_eq!(
+        added,
+        ["15 Oct 2026, 09:05", "15 Oct 2026, 22:11", "16 Oct 2026", ""]
+    );
+}
+
+#[test]
+fn library_is_filed_a_to_z() {
     let mut cards = vec![
         card("chicken adobo"),
         card("Banana bread"),
@@ -338,7 +355,7 @@ fn library_is_filed_a_to_z_with_one_tab_per_letter() {
         card("Charred corn"),
         card("Éclairs"),
     ];
-    let links = file_by_letter(&mut cards);
+    file_a_to_z(&mut cards);
     let titles: Vec<&str> = cards.iter().map(|card| card.title.as_str()).collect();
     assert_eq!(
         titles,
@@ -350,30 +367,6 @@ fn library_is_filed_a_to_z_with_one_tab_per_letter() {
             "chicken adobo"
         ]
     );
-    let tabs: Vec<&str> = cards.iter().map(|card| card.letter.as_str()).collect();
-    assert_eq!(tabs, ["#", "", "B", "C", ""]);
-    assert_eq!(cards[0].anchor(), "other");
-    assert_eq!(cards[2].anchor(), "B");
-    assert_eq!(links.len(), 27);
-    assert_eq!(
-        (links[0].letter, links[0].anchor.as_str(), links[0].present),
-        ('#', "other", true)
-    );
-    let present: String = links
-        .iter()
-        .filter(|link| link.present)
-        .map(|link| link.letter)
-        .collect();
-    assert_eq!(present, "#BC");
-}
-
-#[test]
-fn library_strip_leaves_out_other_when_every_title_starts_with_a_letter() {
-    let mut cards = vec![card("Pancakes")];
-    let links = file_by_letter(&mut cards);
-    assert_eq!(links.len(), 26);
-    assert_eq!(links[0].letter, 'A');
-    assert!(links[15].present);
 }
 
 #[test]
@@ -434,14 +427,11 @@ async fn library_tickets_print_ingredients_and_pack_long_lists() {
     .await
     .unwrap()
     .0;
-    // "Big stew" files before "Test": it opens every rail, "Test" only a
-    // one-column rail.
-    assert!(page.contains(r#"<div class="rail rail-1 rail-2 rail-3" aria-hidden="true">"#));
-    assert!(page.contains(r#"<div class="rail rail-1" aria-hidden="true">"#));
+    // One rail hangs the whole library; later rows are pinned on in CSS.
+    assert_eq!(page.matches(r#"<div class="rail" aria-hidden="true">"#).count(), 1);
     assert!(page.contains("Ready in 40 min"));
     assert!(page.contains("Serves 6"));
-    assert!(page.contains("<dd>001</dd>") && page.contains("<dd>002</dd>"));
-    assert!(page.contains("<dd>B</dd>") && page.contains("<dd>T</dd>"));
+    assert!(!page.contains("Filed under") && !page.contains("ticket-box"));
     assert!(page.contains(
         r#"<b class="ticket-qty">300 g</b> <span class="ticket-item">Silken tofu</span>"#
     ));

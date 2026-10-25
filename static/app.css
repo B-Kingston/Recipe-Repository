@@ -130,6 +130,95 @@ h3 { font: 700 1rem/1.3 var(--sans); }
 .top-nav a:hover { background: var(--soft); color: var(--ink); }
 .top-nav a[aria-current="page"] { background: var(--ground); }
 
+/* Account menu: the avatar at the end of the header opens a recipe ticket,
+   pinned up under it, listing the other accounts (switch, or sign in),
+   Create account, and Sign out. The ticket reuses the library's paper, bars
+   and labels. A <details>, so it works without the script; app.js closes it
+   on an outside click or Escape. */
+.utility-end { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.account-menu { position: relative; }
+.account-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  cursor: pointer;
+  list-style: none;
+}
+.account-button::-webkit-details-marker { display: none; }
+.account-button:hover .account-avatar, .account-menu[open] .account-button .account-avatar { box-shadow: 0 0 0 3px var(--wash); }
+.account-avatar {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--ink-strong);
+  color: var(--on-ink);
+  font: 700 15px/1 var(--sans);
+  text-transform: uppercase;
+}
+.account-panel {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: -6px;
+  z-index: 20;
+  width: min(290px, calc(100vw - 24px));
+  transform: rotate(-.8deg);
+  transform-origin: 50% 14px;
+  /* A hairline edge and a tight contact shadow keep the white paper apart
+     from the white header; the soft drop gives it lift over the page. */
+  filter: drop-shadow(0 0 1px rgba(17, 26, 34, .3)) drop-shadow(0 2px 3px rgba(17, 26, 34, .2)) drop-shadow(0 14px 18px rgba(17, 26, 34, .18));
+}
+/* The pushpin, as on the library's pinned tickets. */
+.account-panel::before {
+  content: "";
+  position: absolute;
+  z-index: 3;
+  top: 5px;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin-left: -9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 32%, #f3a3b0 0 14%, #c7344d 34%, #8a1d30 78%);
+  box-shadow: 0 3px 3px rgba(17, 26, 34, .35), 2px 6px 6px rgba(17, 26, 34, .18);
+  pointer-events: none;
+}
+.account-ticket { padding-bottom: 18px; }
+.account-ticket .ticket-head { font-size: 16px; }
+.account-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-list { margin: 0; padding: 0; list-style: none; }
+.account-list form, .account-actions form { margin: 0; }
+.account-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-strong);
+  font: 600 14px/1.2 var(--sans);
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+.account-row:hover { border-color: transparent; background: var(--soft); color: var(--ink-strong); }
+.account-row .account-avatar { width: 24px; height: 24px; font-size: 12px; }
+.account-row .account-avatar-add { border: 1.5px solid var(--ink-strong); background: transparent; color: var(--ink-strong); font-size: 17px; font-weight: 400; }
+.account-state { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 500; }
+/* A torn-off stub: the account actions sit below a dashed tear line. */
+.account-actions { margin-top: 12px; padding-top: 10px; border-top: 1.5px dashed var(--border); }
+.account-action { font-weight: 700; }
+
 .app-shell { width: min(100%, 1160px); margin: 0 auto; padding: 0 32px; }
 .paper { padding: 36px 0 96px; }
 
@@ -254,6 +343,10 @@ label.inline input { margin-top: 0; }
 .toggle-row input[type=radio] { flex: none; }
 .toggle-row .codex-status { margin-left: 0; }
 .toggle-row .muted { font-weight: 400; }
+.provider-row { cursor: default; }
+.provider-row > label { display: flex; flex: 1 1 auto; align-items: center; gap: 4px 12px; flex-wrap: wrap; margin: 0; font: inherit; cursor: pointer; }
+.provider-actions { display: flex; flex: none; gap: 8px; margin-left: auto; }
+.provider-actions .button.compact, .provider-actions button.compact { min-height: 34px; padding: 0 12px; font-size: 13px; }
 .choice-text { display: flex; flex: 1 1 0; flex-direction: column; gap: 2px; min-width: 0; }
 .check-row { display: flex; align-items: baseline; gap: .5rem; margin: 1rem 0 .2rem; font: 600 14px/1.4 var(--sans); }
 .check-row input { margin-top: 0; }
@@ -310,68 +403,109 @@ label > input[type=checkbox] { margin-right: 8px; }
 .search-form input { flex: 1 1 auto; min-width: 0; min-height: 44px; margin: 0; padding: 0; border: 0; background: transparent; }
 .search-form input:focus { box-shadow: none; }
 .search-form button { flex: none; min-height: 40px; }
-.letter-nav { display: flex; flex-wrap: wrap; gap: 4px; margin: 24px 0 0; font: 700 16px/1 var(--type); }
-.letter-nav a, .letter-nav span { display: grid; flex: 1 0 32px; place-items: center; max-width: 44px; height: 44px; border-radius: 8px; }
-.letter-nav a { background: var(--card); color: var(--rule-ink); text-decoration: none; }
-.letter-nav a:hover { background: var(--ink); color: var(--on-ink); }
-.letter-nav span { color: #a3abb4; }
 
-/* The rail: recipes hang as kitchen order tickets, one rail per row. Every
-   ticket is preceded by a rail element and only the rails that start a row
-   at the current column count show (rail-1, rail-2 or rail-3), so each row
-   gets a full-width rail without the server knowing the screen size.
-   static/rail.svg stretches to any width; the tickets tuck under its lip. */
+/* The rail: recipes hang as kitchen order tickets from one rail across the
+   top. static/rail.svg stretches to any width; the first row of tickets
+   tucks under its lip. Later rows are pinned to the wall with a pushpin
+   (::before) and swing twice as far. Which tickets make up the first row
+   depends on the column count. */
 .ticket-rail {
   --rail-inset: 28px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  column-gap: 32px;
+  gap: 40px 32px;
   padding: 36px var(--rail-inset) 0;
 }
 .rail {
   position: relative;
   z-index: 2;
-  display: none;
   grid-column: 1 / -1;
   height: 48px;
-  margin: 44px calc(-1 * var(--rail-inset)) 0;
+  margin: 0 calc(-1 * var(--rail-inset)) -57px;
   background: url('/static/rail.svg') 0 0 / 100% 48px no-repeat;
   filter: drop-shadow(0 1px 1px rgba(17, 26, 34, .28)) drop-shadow(0 7px 7px rgba(17, 26, 34, .18));
 }
-.rail:first-child { margin-top: 0; }
-.rail-1 { display: block; }
 @media (min-width: 600px) {
   .ticket-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .rail-1 { display: none; }
-  .rail-2 { display: block; }
 }
 @media (min-width: 1000px) {
   .ticket-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .rail-2 { display: none; }
-  .rail-3 { display: block; }
 }
 
 .ticket {
+  --tilt: 0deg;
+  /* Pinned: swings from the pin, and to the other side on hover. */
+  --rest: rotate(calc(var(--tilt) * 2));
+  --lifted: rotate(calc(var(--tilt) * -2));
   position: relative;
   z-index: 1;
   align-self: start;
   justify-self: center;
   width: 100%;
   max-width: 340px;
-  margin-top: -17px;
-  transform-origin: 50% 0;
-  filter: drop-shadow(0 1px 1px rgba(17, 26, 34, .14)) drop-shadow(0 12px 14px rgba(17, 26, 34, .12));
+  transform: var(--rest);
+  transform-origin: 50% 14px;
+  /* app.js sets --curl to its bending filter while a rail ticket is grabbed. */
+  filter: var(--curl, ) drop-shadow(0 1px 1px rgba(17, 26, 34, .14)) drop-shadow(0 12px 14px rgba(17, 26, 34, .12));
   scroll-margin-top: 60px;
 }
 /* Tickets hang slightly askew, in a five-ticket cycle so rows don't repeat. */
-.ticket:nth-of-type(5n+1) { transform: rotate(-1deg); }
-.ticket:nth-of-type(5n+2) { transform: rotate(.6deg); }
-.ticket:nth-of-type(5n+3) { transform: rotate(-.4deg); }
-.ticket:nth-of-type(5n+4) { transform: rotate(.85deg); }
-.ticket:nth-of-type(5n) { transform: rotate(-.2deg); }
-/* The paper has serrated edges on all four sides: a mask of --tooth wide
-   teeth (half as deep) around an inset rectangle. The top 14px of padding
-   is hidden under the rail. */
+.ticket:nth-of-type(5n+1) { --tilt: -1deg; }
+.ticket:nth-of-type(5n+2) { --tilt: .6deg; }
+.ticket:nth-of-type(5n+3) { --tilt: -.4deg; }
+.ticket:nth-of-type(5n+4) { --tilt: .85deg; }
+.ticket:nth-of-type(5n) { --tilt: -.2deg; }
+.ticket::before {
+  content: "";
+  position: absolute;
+  z-index: 3;
+  top: 5px;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin-left: -9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 32%, #f3a3b0 0 14%, #c7344d 34%, #8a1d30 78%);
+  box-shadow: 0 3px 3px rgba(17, 26, 34, .35), 2px 6px 6px rgba(17, 26, 34, .18);
+  pointer-events: none;
+}
+/* Hovering a ticket deepens its shadow and moves it to --lifted. */
+@media (hover: hover) {
+  .ticket:hover {
+    transform: var(--lifted);
+    filter: var(--curl, ) drop-shadow(0 2px 2px rgba(17, 26, 34, .16)) drop-shadow(0 18px 20px rgba(17, 26, 34, .16));
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .ticket { transition: transform .18s ease, filter .18s ease; }
+}
+/* The first row hangs from the rail instead and keeps its tilt on hover;
+   app.js curls up the bottom corner nearest the pointer, as if grabbed. */
+.ticket:first-of-type {
+  --rest: rotate(var(--tilt));
+  --lifted: var(--rest);
+  transform-origin: 50% 0;
+}
+.ticket:first-of-type::before { display: none; }
+@media (min-width: 600px) {
+  .ticket:nth-of-type(-n+2) {
+    --rest: rotate(var(--tilt));
+    --lifted: var(--rest);
+    transform-origin: 50% 0;
+  }
+  .ticket:nth-of-type(-n+2)::before { display: none; }
+}
+@media (min-width: 1000px) {
+  .ticket:nth-of-type(-n+3) {
+    --rest: rotate(var(--tilt));
+    --lifted: var(--rest);
+    transform-origin: 50% 0;
+  }
+  .ticket:nth-of-type(-n+3)::before { display: none; }
+}
+/* The paper has serrated top and bottom edges and straight sides: a mask
+   of --tooth wide teeth (half as deep) above and below a full-width
+   rectangle. The top 14px of padding is hidden under the rail. */
 .ticket-paper {
   --tooth: 10px;
   position: relative;
@@ -380,25 +514,17 @@ label > input[type=checkbox] { margin-right: 8px; }
   color: var(--ink-strong);
   font: 13px/1.4 var(--sans);
   -webkit-mask:
-    linear-gradient(#000, #000) 50% 50% / calc(100% - var(--tooth)) calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(#000, #000) 50% 50% / 100% calc(100% - var(--tooth)) no-repeat,
     linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
     linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
     linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
-    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
-    linear-gradient(225deg, #000 50%, transparent 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(135deg, #000 50%, transparent 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(225deg, transparent 50%, #000 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y;
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x;
   mask:
-    linear-gradient(#000, #000) 50% 50% / calc(100% - var(--tooth)) calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(#000, #000) 50% 50% / 100% calc(100% - var(--tooth)) no-repeat,
     linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
     linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
     linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
-    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
-    linear-gradient(225deg, #000 50%, transparent 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(135deg, #000 50%, transparent 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y,
-    linear-gradient(225deg, transparent 50%, #000 50%) 100% 0 / var(--tooth) var(--tooth) repeat-y;
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x;
 }
 .ticket-bars { display: grid; gap: 6px; }
 .ticket-bar { margin: 0; padding: 6px 11px; background: var(--ink-strong); color: var(--on-ink); font: 700 13.5px/1.3 var(--sans); }
@@ -408,28 +534,58 @@ label > input[type=checkbox] { margin-right: 8px; }
 .ticket-link:focus-visible { outline-color: var(--on-ink); outline-offset: 3px; }
 /* The title link covers the whole ticket. */
 .ticket-link::after { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; }
-.ticket:hover .ticket-link { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
-.ticket-thumb { flex: none; display: block; width: 38px; height: 38px; margin: -3px -6px -3px 0; object-fit: cover; border-radius: 3px; }
+/* The thumbnail sits above the title link's cover so it can be clicked.
+   Hovering it grows the full photo out of it to cover the top of the ticket
+   (it stays while hovered); clicking either pins the photo open or closes it. */
+.ticket-thumb-toggle { position: relative; z-index: 1; flex: none; display: block; margin: -3px -6px -3px 0; padding: 0; border: 0; background: none; cursor: pointer; }
+.ticket-thumb { display: block; width: 38px; height: 38px; object-fit: cover; border-radius: 6px; }
+.ticket-photo {
+  position: absolute;
+  z-index: 2;
+  top: 31px;
+  left: 20px;
+  display: block;
+  width: calc(100% - 40px);
+  height: auto;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: 12px;
+  /* A paper-coloured mat wide enough to fill the corners, so the bars under
+     the photo don't show around its curves. */
+  box-shadow: 0 0 0 6px var(--card);
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(.12);
+  transform-origin: 100% 0;
+  transition: transform .2s ease, opacity .2s ease, visibility 0s .2s;
+}
+.ticket.is-photo-open .ticket-photo { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+/* Only where hover is real: a tap leaves a sticky :hover behind, which would
+   hold the photo open after the tap that closes it. */
+@media (hover: hover) {
+  .ticket:has(.ticket-thumb-toggle:hover) .ticket-photo,
+  .ticket:has(.ticket-photo:hover) .ticket-photo { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+}
+@media (prefers-reduced-motion: reduce) { .ticket-photo { transition: none; } }
 .ticket-label { margin: 14px 0 5px; font: 700 13.5px/1.2 var(--sans); }
-.ticket-details { display: grid; gap: 1px; margin: 0; }
-.ticket-details div { display: flex; justify-content: space-between; gap: 12px; }
-.ticket-details dt { color: var(--body); }
-.ticket-details dd { margin: 0; }
 .ticket-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; }
 .ticket-note-icon { flex: none; width: 16px; height: 16px; margin-top: 1px; fill: var(--ink-strong); }
 .ticket-note-icon path { fill: none; stroke: var(--on-ink); stroke-width: 2.2; stroke-linecap: round; }
 .ticket-note-icon .ticket-note-dot { fill: var(--on-ink); }
 .ticket-note p { display: -webkit-box; margin: 0; overflow: hidden; font-weight: 700; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
-/* Short lists line the amounts up in a column; long ones (is-packed) run
-   each line together and flow down two columns to keep the ticket short. */
+/* Short lists line the amounts up in a column; an amount wider than the
+   column widens its own row instead of wrapping, up to half the ticket.
+   Long lists (is-packed) run each line together and flow down two columns
+   to keep the ticket short. */
 .ticket-items { margin: 0; padding: 0; list-style: none; }
-.ticket-items li { display: grid; grid-template-columns: 4.4em minmax(0, 1fr) 11px; column-gap: 8px; align-items: baseline; padding: 2px 0; }
-.ticket-qty { font-weight: 800; overflow-wrap: anywhere; }
+.ticket-items li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
+.ticket-qty { flex: 0 0 auto; min-width: 4.4em; max-width: 50%; font-weight: 800; overflow-wrap: anywhere; }
+.ticket-item { flex: 1 1 0; min-width: 0; }
 .ticket-items em { color: var(--muted); }
-.ticket-box { align-self: start; width: 11px; height: 11px; margin-top: 4px; border: 1.5px solid currentColor; border-radius: 2px; }
 .ticket-items.is-packed { -webkit-column-count: 2; column-count: 2; -webkit-column-gap: 14px; column-gap: 14px; font-size: 12.5px; }
-.ticket-items.is-packed li { display: block; position: relative; padding-right: 16px; -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
-.ticket-items.is-packed .ticket-box { position: absolute; top: 2px; right: 0; }
+.ticket-added { margin: 14px 0 0; color: var(--muted); font-size: 11px; letter-spacing: .02em; }
+.ticket-items.is-packed li { display: block; -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
 
 .empty-state {
   margin-top: 28px;
@@ -896,10 +1052,11 @@ body.still-viewer-open { overflow: hidden; }
 }
 @media (max-width: 520px) {
   .brand-text { display: none; }
+  .utility-end { gap: 4px; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .button, button, .top-nav a, .view-tab, .add-mode-tab, .letter-nav a {
+  .button, button, .top-nav a, .view-tab, .add-mode-tab {
     transition: background-color .12s ease, border-color .12s ease, box-shadow .12s ease, color .12s ease;
   }
 }

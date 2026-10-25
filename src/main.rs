@@ -41,8 +41,9 @@ mod recipes;
 mod search;
 mod thumbs;
 use auth::{
-    AuthUser, auth_middleware, login, login_page, logout, reset_password, reset_password_page,
-    setup_create, setup_page,
+    AuthUser, auth_middleware, create_account, login, login_page, logout, logout_all,
+    new_account_page, reset_password, reset_password_page, setup_create, setup_page,
+    switch_account,
 };
 
 use ai::{
@@ -392,8 +393,6 @@ struct HomeTemplate {
     results: bool,
     /// Search status shown above the recipes (indexing progress, service problems).
     notice: String,
-    /// The A to Z strip over the filed library; empty for search results.
-    letters: Vec<crate::recipes::LetterLink>,
 }
 #[derive(Template)]
 #[template(path = "setup.html")]
@@ -408,6 +407,14 @@ struct LoginTemplate {
     username: String,
     /// Local path to return to after sign-in.
     next: String,
+    /// The browser already has a session, so this sign-in adds an account.
+    adding: bool,
+}
+#[derive(Template)]
+#[template(path = "account_new.html")]
+struct NewAccountTemplate {
+    error: String,
+    username: String,
 }
 #[derive(Template)]
 #[template(path = "password_reset.html")]
@@ -576,6 +583,16 @@ struct DraftTemplate {
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTemplate {
+    /// Username of the account whose AI setup the others share.
+    shared_ai_owner: String,
+    /// This account is the one whose AI setup is shared.
+    owns_shared_ai: bool,
+    /// This account uses the shared AI setup, so its own is not shown.
+    uses_shared_ai: bool,
+    /// What the shared setup generates with, e.g. "Claude (Pro/Max) · claude-opus-5-5".
+    shared_ai_summary: String,
+    /// The AI setup this account uses can generate recipes.
+    ai_ready: bool,
     model_options: Vec<SelectOption>,
     claude_model_options: Vec<SelectOption>,
     effort_options: Vec<SelectOption>,
@@ -600,6 +617,10 @@ struct SettingsTemplate {
     step_moments: bool,
     /// Whether the embedding sidecar is configured (`EMBEDDING_URL`).
     embeddings_configured: bool,
+    /// The user's saved search choice: "embeddings", "bm25" or "shared".
+    search_choice: &'static str,
+    /// Whether the shared account searches with BM25 (what "shared" follows).
+    shared_search_bm25: bool,
     notice: String,
 }
 struct SelectOption {
@@ -748,6 +769,12 @@ pub(crate) struct LoginForm {
 #[derive(Deserialize)]
 struct LoginQuery {
     next: Option<String>,
+    /// Prefills the username, e.g. from the account menu.
+    username: Option<String>,
+}
+#[derive(Deserialize)]
+pub(crate) struct SwitchAccountForm {
+    user_id: String,
 }
 #[derive(Default, Deserialize)]
 struct BlockForm {
@@ -834,6 +861,16 @@ struct EndpointForm {
 }
 /// Settings form for the video step-moments switch: the checkbox is absent
 /// when unticked.
+/// Settings form for the AI-login choice: "own" or "shared".
+#[derive(Deserialize)]
+struct AiLoginsForm {
+    mode: String,
+}
+/// Settings form for the library search engine: "embeddings", "bm25" or "shared".
+#[derive(Deserialize)]
+struct SearchEngineForm {
+    engine: String,
+}
 #[derive(Deserialize)]
 struct StepMomentsForm {
     #[serde(default)]
@@ -907,7 +944,7 @@ async fn main() -> anyhowless::Result<()> {
     import_legacy_codex_auth(&db).await?;
     crate::recipes::delete_expired_draft_thumbnails(&db, &stamp()).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-    set_default_model(&db, &configured_model).await?;
+    retire_codex_models(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
     let removed_expired_drafts = sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
         .bind(stamp())
@@ -1019,6 +1056,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_page).post(update_settings))
         .route("/settings/media-cleaner", post(update_media_cleaner))
         .route("/settings/step-moments", post(update_step_moments))
+        .route("/settings/search-engine", post(update_search_engine))
+        .route("/settings/ai-logins", post(update_ai_logins))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route("/settings/disconnect/codex", post(disconnect_codex))
@@ -1027,6 +1066,8 @@ fn routes(state: Arc<AppState>) -> Router {
             "/settings/password",
             get(reset_password_page).post(reset_password),
         )
+        .route("/accounts/new", get(new_account_page).post(create_account))
+        .route("/accounts/switch", post(switch_account))
         .route(
             "/settings/display",
             get(display::display_page).post(display::update_display),
@@ -1059,6 +1100,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/setup", get(setup_page).post(setup_create))
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
+        .route("/logout/all", post(logout_all))
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
@@ -1372,34 +1414,40 @@ const MEDIA_CLEANER_MODEL_SETTING: &str = "media_cleaner_model";
 
 /// The video cleaner's own provider ("pi", "claude", or an endpoint id);
 /// None follows the active AI provider.
-pub(crate) async fn media_cleaner_setting(db: &SqlitePool) -> Result<Option<String>> {
-    Ok(app_setting(db, MEDIA_CLEANER_PROVIDER_SETTING)
+pub(crate) async fn media_cleaner_setting(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<String>> {
+    Ok(app_setting(db, user_id, MEDIA_CLEANER_PROVIDER_SETTING)
         .await?
         .filter(|value| !value.trim().is_empty()))
 }
 
 /// The video cleaner's model; None uses its provider's model.
-pub(crate) async fn media_cleaner_model(db: &SqlitePool) -> Result<Option<String>> {
-    Ok(app_setting(db, MEDIA_CLEANER_MODEL_SETTING)
+pub(crate) async fn media_cleaner_model(db: &SqlitePool, user_id: &str) -> Result<Option<String>> {
+    Ok(app_setting(db, user_id, MEDIA_CLEANER_MODEL_SETTING)
         .await?
         .filter(|value| !value.trim().is_empty()))
 }
 
-/// One app_settings value, if it has been saved.
-async fn app_setting(db: &SqlitePool, key: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?")
-        .bind(key)
-        .fetch_optional(db)
-        .await?;
+/// One of the user's app_settings values, if it has been saved.
+async fn app_setting(db: &SqlitePool, user_id: &str, key: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM app_settings WHERE user_id = ? AND key = ?")
+            .bind(user_id)
+            .bind(key)
+            .fetch_optional(db)
+            .await?;
     Ok(row.map(|(value,)| value))
 }
 
-/// Saves one app_settings value, replacing any previous one.
-async fn set_app_setting(db: &SqlitePool, key: &str, value: &str) -> Result<()> {
+/// Saves one of the user's app_settings values, replacing any previous one.
+async fn set_app_setting(db: &SqlitePool, user_id: &str, key: &str, value: &str) -> Result<()> {
     sqlx::query(
-        "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        "INSERT INTO app_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
+    .bind(user_id)
     .bind(key)
     .bind(value)
     .bind(stamp())
@@ -1408,23 +1456,109 @@ async fn set_app_setting(db: &SqlitePool, key: &str, value: &str) -> Result<()> 
     Ok(())
 }
 
-/// app_settings key of the global "video step moments" switch.
+/// app_settings key of the user's "video step moments" switch.
 const STEP_MOMENTS_SETTING: &str = "step_moments";
 
-/// Whether video imports capture, and recipe pages show, step moments.
-/// On unless switched off in Settings.
-pub(crate) async fn step_moments_enabled(db: &SqlitePool) -> Result<bool> {
-    Ok(app_setting(db, STEP_MOMENTS_SETTING).await?.as_deref() != Some("off"))
+/// Whether the user's video imports capture, and their recipe pages show,
+/// step moments. On unless switched off in Settings.
+pub(crate) async fn step_moments_enabled(db: &SqlitePool, user_id: &str) -> Result<bool> {
+    Ok(app_setting(db, user_id, STEP_MOMENTS_SETTING)
+        .await?
+        .as_deref()
+        != Some("off"))
 }
 
-/// The active AI provider: "pi" (Codex), "claude" (Claude subscription) or an
-/// ai_endpoints row id. Stored app-wide like the model; reconcile_ai_provider
-/// keeps the value valid at startup and the endpoint handlers keep it valid at
-/// runtime. Anything absent resolves to "pi".
-pub(crate) async fn ai_provider(db: &SqlitePool) -> Result<String> {
-    Ok(app_setting(db, "ai_provider")
+/// app_settings key of the user's library search engine: "embeddings" (search
+/// by meaning), "bm25" (word search) or "shared" (absent too), which follows
+/// the shared account's choice the way AI logins do.
+const SEARCH_ENGINE_SETTING: &str = "search_engine";
+const SEARCH_EMBEDDINGS: &str = "embeddings";
+const SEARCH_BM25: &str = "bm25";
+const SEARCH_SHARED: &str = "shared";
+
+/// The user's own saved search choice: "embeddings", "bm25" or "shared".
+async fn own_search_engine(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
+    Ok(
+        match app_setting(db, user_id, SEARCH_ENGINE_SETTING)
+            .await?
+            .as_deref()
+        {
+            Some(SEARCH_EMBEDDINGS) => SEARCH_EMBEDDINGS,
+            Some(SEARCH_BM25) => SEARCH_BM25,
+            _ => SEARCH_SHARED,
+        },
+    )
+}
+
+/// The engine that runs the user's searches: their own choice, else the
+/// shared account's, else search by meaning.
+async fn search_engine(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
+    let own = own_search_engine(db, user_id).await?;
+    if own != SEARCH_SHARED {
+        return Ok(own);
+    }
+    let shared = match shared_ai_account(db).await? {
+        Some((id, _)) if id != user_id => own_search_engine(db, &id).await?,
+        _ => SEARCH_SHARED,
+    };
+    Ok(if shared == SEARCH_BM25 {
+        SEARCH_BM25
+    } else {
+        SEARCH_EMBEDDINGS
+    })
+}
+
+/// Whether the user's library searches use BM25 word search for every query
+/// instead of search by meaning (which falls back to BM25 on its own).
+pub(crate) async fn keyword_search_selected(db: &SqlitePool, user_id: &str) -> Result<bool> {
+    Ok(search_engine(db, user_id).await? == SEARCH_BM25)
+}
+
+/// The user's active AI provider: "pi" (Codex), "claude" (Claude
+/// subscription) or one of their ai_endpoints row ids. Stored per user like
+/// the model; reconcile_ai_provider keeps the value valid at startup and the
+/// endpoint handlers keep it valid at runtime. Anything absent resolves to
+/// "pi".
+pub(crate) async fn ai_provider(db: &SqlitePool, user_id: &str) -> Result<String> {
+    Ok(app_setting(db, user_id, "ai_provider")
         .await?
         .unwrap_or_else(|| PROVIDER_CODEX.into()))
+}
+
+/// app_settings key of an account's AI-login choice: "own" uses the account's
+/// own providers, subscriptions, keys, and models; anything else uses the
+/// shared account's.
+const AI_LOGINS_SETTING: &str = "ai_logins";
+
+/// The account whose AI setup every other account shares by default: the
+/// first one created, as (id, username).
+pub(crate) async fn shared_ai_account(db: &SqlitePool) -> Result<Option<(String, String)>> {
+    Ok(
+        sqlx::query_as("SELECT id, username FROM users ORDER BY created_at, id LIMIT 1")
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
+/// Whether the user chose their own AI setup over the shared one.
+async fn uses_own_ai(db: &SqlitePool, user_id: &str) -> Result<bool> {
+    Ok(app_setting(db, user_id, AI_LOGINS_SETTING)
+        .await?
+        .as_deref()
+        == Some("own"))
+}
+
+/// The account whose AI provider, subscriptions, API keys, models, and video
+/// cleaner serve `user_id`'s generations: the shared account's, unless the
+/// user chose their own. The shared account always uses its own. Resolving an
+/// AI account again returns it unchanged.
+pub(crate) async fn ai_account(db: &SqlitePool, user_id: &str) -> Result<String> {
+    if uses_own_ai(db, user_id).await? {
+        return Ok(user_id.to_string());
+    }
+    Ok(shared_ai_account(db)
+        .await?
+        .map_or_else(|| user_id.to_string(), |(id, _)| id))
 }
 
 /// All registered AI endpoints for one user, oldest first.
@@ -1541,34 +1675,41 @@ fn mask_key(key: &str) -> String {
     format!("{MASK}{tail}")
 }
 
-/// Heals a stale ai_provider setting at startup: the pre-endpoint "openai"
-/// value or a deleted endpoint id resolves to the first registered endpoint,
-/// falling back to Codex ("pi"). Missing settings are left alone (the read
-/// path defaults to "pi").
+/// Heals stale ai_provider settings at startup: the pre-endpoint "openai"
+/// value or an id that is not one of the user's endpoints resolves to their
+/// first registered endpoint, falling back to Codex ("pi"). Missing settings
+/// are left alone (the read path defaults to "pi").
 async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
-    let Some(current) = app_setting(db, "ai_provider").await? else {
-        return Ok(());
-    };
-    if current == PROVIDER_CODEX || current == PROVIDER_CLAUDE {
-        return Ok(());
-    }
-    let live: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? LIMIT 1")
-        .bind(&current)
+    let settings: Vec<(String, String)> =
+        sqlx::query_as("SELECT user_id, value FROM app_settings WHERE key = 'ai_provider'")
+            .fetch_all(db)
+            .await?;
+    for (user_id, current) in settings {
+        if current == PROVIDER_CODEX || current == PROVIDER_CLAUDE {
+            continue;
+        }
+        let live: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? AND user_id=? LIMIT 1")
+                .bind(&current)
+                .bind(&user_id)
+                .fetch_optional(db)
+                .await?;
+        if live.is_some() {
+            continue;
+        }
+        let first: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM ai_endpoints WHERE user_id=? ORDER BY created_at LIMIT 1",
+        )
+        .bind(&user_id)
         .fetch_optional(db)
         .await?;
-    if live.is_some() {
-        return Ok(());
-    }
-    let first: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM ai_endpoints ORDER BY created_at LIMIT 1")
-            .fetch_optional(db)
-            .await?;
-    let value = first
-        .map(|(id,)| id)
-        .unwrap_or_else(|| PROVIDER_CODEX.into());
-    set_app_setting(db, "ai_provider", &value).await?;
-    if value != current {
-        info!(from = %current, to = %value, "Reconciled stale AI provider setting");
+        let value = first
+            .map(|(id,)| id)
+            .unwrap_or_else(|| PROVIDER_CODEX.into());
+        set_app_setting(db, &user_id, "ai_provider", &value).await?;
+        if value != current {
+            info!(%user_id, from = %current, to = %value, "Reconciled stale AI provider setting");
+        }
     }
     Ok(())
 }
@@ -1616,9 +1757,17 @@ async fn settings_page(
     user: AuthUser,
     Query(query): Query<SettingsQuery>,
 ) -> Result<Html<String>> {
+    let (shared_id, shared_ai_owner) = shared_ai_account(&s.db).await?.unwrap_or_default();
+    let owns_shared_ai = shared_id == user.id;
+    let uses_shared_ai = !owns_shared_ai && !uses_own_ai(&s.db, &user.id).await?;
+    let shared_ai_summary = if uses_shared_ai {
+        ai_summary(&s, &shared_id).await?
+    } else {
+        String::new()
+    };
     let codex_authorised = pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await;
     let claude_authorised = pi_authorised(&s.db, &user.id, CLAUDE_PI_PROVIDER).await;
-    let provider = crate::ai_provider(&s.db).await?;
+    let provider = crate::ai_provider(&s.db, &user.id).await?;
     let codex_selected = provider == PROVIDER_CODEX;
     let claude_selected = provider == PROVIDER_CLAUDE;
     let endpoints = crate::list_endpoints(&s.db, &user.id)
@@ -1636,12 +1785,16 @@ async fn settings_page(
         })
         .collect::<Vec<_>>();
     let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
-    let cleaner_provider = media_cleaner_setting(&s.db).await?.unwrap_or_default();
-    let cleaner_model = media_cleaner_model(&s.db).await?.unwrap_or_default();
+    let cleaner_provider = media_cleaner_setting(&s.db, &user.id)
+        .await?
+        .unwrap_or_default();
+    let cleaner_model = media_cleaner_model(&s.db, &user.id)
+        .await?
+        .unwrap_or_default();
     // First paint shows the cached catalogues; the page's script then replaces
     // the options from /settings/models with live discovery.
-    let model = selected_model(&s.db, &s.model).await?;
-    let claude_model = selected_claude_model(&s.db).await?;
+    let model = selected_model(&s.db, &user.id, &s.model).await?;
+    let claude_model = selected_claude_model(&s.db, &user.id).await?;
     let codex_models = if codex_authorised {
         cached_model_catalogue(&s, CODEX_PI_PROVIDER)
     } else {
@@ -1653,9 +1806,16 @@ async fn settings_page(
         Vec::new()
     };
     render(SettingsTemplate {
+        shared_ai_owner,
+        owns_shared_ai,
+        uses_shared_ai,
+        shared_ai_summary,
+        ai_ready: ai::ai_configured(&s, &user).await,
         model_options: model_options(codex_models, &model, MODEL_OPTIONS),
         claude_model_options: model_options(claude_models, &claude_model, CLAUDE_MODEL_OPTIONS),
-        effort_options: effort_options(&selected_effort(&s.db, DEFAULT_REASONING_EFFORT).await?),
+        effort_options: effort_options(
+            &selected_effort(&s.db, &user.id, DEFAULT_REASONING_EFFORT).await?,
+        ),
         codex_authorised,
         codex_auth_url: "/settings/authorise-codex".into(),
         codex_selected,
@@ -1671,8 +1831,14 @@ async fn settings_page(
         cleaner_model,
         saved: query.saved == "1",
         password_changed: query.notice == "password_changed",
-        step_moments: step_moments_enabled(&s.db).await?,
+        step_moments: step_moments_enabled(&s.db, &user.id).await?,
         embeddings_configured: s.embedder.is_some(),
+        search_choice: match own_search_engine(&s.db, &user.id).await? {
+            SEARCH_SHARED if owns_shared_ai => SEARCH_EMBEDDINGS,
+            choice => choice,
+        },
+        shared_search_bm25: !owns_shared_ai
+            && own_search_engine(&s.db, &shared_id).await? == SEARCH_BM25,
         notice: if query.notice == "disconnected" {
             "Subscription disconnected.".into()
         } else {
@@ -1745,9 +1911,9 @@ async fn settings_models(
         Some(pi_provider) => {
             let models = provider_models(&s, &user.id, pi_provider).await;
             let selected = if pi_provider == CLAUDE_PI_PROVIDER {
-                selected_claude_model(&s.db).await?
+                selected_claude_model(&s.db, &user.id).await?
             } else {
-                selected_model(&s.db, &s.model).await?
+                selected_model(&s.db, &user.id, &s.model).await?
             };
             (models, selected)
         }
@@ -1812,8 +1978,8 @@ async fn update_settings(
     }
     // Saved only once the provider and model are valid, so a rejected form
     // leaves the previous settings untouched.
-    set_app_setting(&s.db, "reasoning_effort", &effort).await?;
-    set_app_setting(&s.db, "ai_provider", &provider).await?;
+    set_app_setting(&s.db, &user.id, "reasoning_effort", &effort).await?;
+    set_app_setting(&s.db, &user.id, "ai_provider", &provider).await?;
     Ok(Redirect::to("/settings?saved=1"))
 }
 
@@ -1841,7 +2007,7 @@ async fn save_subscription_model(
             "Choose a supported {label} model."
         )));
     }
-    set_app_setting(&s.db, setting_key, &model).await
+    set_app_setting(&s.db, &user.id, setting_key, &model).await
 }
 
 /// Chooses the video cleaner's provider and model. A blank provider follows
@@ -1860,21 +2026,88 @@ async fn update_media_cleaner(
             "Choose a provider for the video cleaner.".into(),
         ));
     }
-    set_app_setting(&s.db, MEDIA_CLEANER_PROVIDER_SETTING, &provider).await?;
-    set_app_setting(&s.db, MEDIA_CLEANER_MODEL_SETTING, &trim(&form.model)).await?;
+    set_app_setting(&s.db, &user.id, MEDIA_CLEANER_PROVIDER_SETTING, &provider).await?;
+    set_app_setting(
+        &s.db,
+        &user.id,
+        MEDIA_CLEANER_MODEL_SETTING,
+        &trim(&form.model),
+    )
+    .await?;
     Ok(Redirect::to("/settings?saved=1"))
 }
 
-/// Switches video step moments on or off for every user. Off stops new
-/// imports from capturing a moment pool and hides moments on every page;
-/// stored moments stay, so switching back on shows them again.
+/// What an account's AI setup generates with: the provider's label and its
+/// model, e.g. "Claude (Pro/Max) · claude-opus-5-5".
+async fn ai_summary(s: &AppState, user_id: &str) -> Result<String> {
+    let provider = ai_provider(&s.db, user_id).await?;
+    let (label, model) = match provider.as_str() {
+        PROVIDER_CODEX => (
+            "Codex (ChatGPT)".to_string(),
+            selected_model(&s.db, user_id, &s.model).await?,
+        ),
+        PROVIDER_CLAUDE => (
+            "Claude (Pro/Max)".to_string(),
+            selected_claude_model(&s.db, user_id).await?,
+        ),
+        id => match find_endpoint(&s.db, user_id, id).await? {
+            Some(endpoint) => (endpoint.name.clone(), endpoint_model(&endpoint)),
+            None => ("Codex (ChatGPT)".to_string(), String::new()),
+        },
+    };
+    Ok(if model.trim().is_empty() {
+        label
+    } else {
+        format!("{label} · {model}")
+    })
+}
+
+/// Chooses between the shared AI setup and the user's own. The user's own
+/// providers, keys, and models are kept either way, so switching back and
+/// forth loses nothing.
+async fn update_ai_logins(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<AiLoginsForm>,
+) -> Result<Redirect> {
+    let value = match form.mode.trim() {
+        "own" => "own",
+        "shared" => "shared",
+        _ => {
+            return Err(AppError::BadRequest(
+                "Choose shared or own AI logins.".into(),
+            ));
+        }
+    };
+    set_app_setting(&s.db, &user.id, AI_LOGINS_SETTING, value).await?;
+    Ok(Redirect::to("/settings?saved=1"))
+}
+
+/// Switches video step moments on or off for the signed-in user. Off stops
+/// their new imports from capturing a moment pool and hides moments on their
+/// pages; stored moments stay, so switching back on shows them again.
 async fn update_step_moments(
     State(s): State<Arc<AppState>>,
-    _user: AuthUser,
+    user: AuthUser,
     Form(form): Form<StepMomentsForm>,
 ) -> Result<Redirect> {
     let value = if form.enabled.is_some() { "on" } else { "off" };
-    set_app_setting(&s.db, STEP_MOMENTS_SETTING, value).await?;
+    set_app_setting(&s.db, &user.id, STEP_MOMENTS_SETTING, value).await?;
+    Ok(Redirect::to("/settings?saved=1"))
+}
+
+/// Saves the signed-in user's library search engine. "shared" follows the
+/// shared account's choice; the shared account itself picks one of the two.
+async fn update_search_engine(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<SearchEngineForm>,
+) -> Result<Redirect> {
+    let value = match form.engine.as_str() {
+        SEARCH_EMBEDDINGS | SEARCH_BM25 | SEARCH_SHARED => form.engine.as_str(),
+        _ => return Err(AppError::BadRequest("Unknown search engine.".into())),
+    };
+    set_app_setting(&s.db, &user.id, SEARCH_ENGINE_SETTING, value).await?;
     Ok(Redirect::to("/settings?saved=1"))
 }
 
@@ -1926,7 +2159,7 @@ async fn add_endpoint(
         &model,
     )
     .await?;
-    set_app_setting(&s.db, "ai_provider", &id).await?;
+    set_app_setting(&s.db, &user.id, "ai_provider", &id).await?;
     Ok(Redirect::to("/settings?saved=1"))
 }
 
@@ -1967,12 +2200,12 @@ async fn delete_endpoint(
 ) -> Result<Redirect> {
     crate::remove_endpoint(&s.db, &user.id, &id).await?;
     forget_model_catalogue(&s, &id);
-    if ai_provider(&s.db).await? == id {
-        set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
+    if ai_provider(&s.db, &user.id).await? == id {
+        set_app_setting(&s.db, &user.id, "ai_provider", PROVIDER_CODEX).await?;
     }
-    if media_cleaner_setting(&s.db).await?.as_deref() == Some(id.as_str()) {
-        set_app_setting(&s.db, MEDIA_CLEANER_PROVIDER_SETTING, "").await?;
-        set_app_setting(&s.db, MEDIA_CLEANER_MODEL_SETTING, "").await?;
+    if media_cleaner_setting(&s.db, &user.id).await?.as_deref() == Some(id.as_str()) {
+        set_app_setting(&s.db, &user.id, MEDIA_CLEANER_PROVIDER_SETTING, "").await?;
+        set_app_setting(&s.db, &user.id, MEDIA_CLEANER_MODEL_SETTING, "").await?;
     }
     Ok(Redirect::to("/settings"))
 }
@@ -1981,32 +2214,45 @@ async fn delete_endpoint(
 /// would fail every generation, so startup moves it to the default model.
 const RETIRED_CODEX_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4"];
 
-/// Seeds the Codex model from PI_MODEL on first run, and replaces a stored
-/// choice that the pi SDK no longer serves.
-async fn set_default_model(db: &SqlitePool, model: &str) -> Result<()> {
-    match app_setting(db, "model").await? {
-        Some(stored) if !RETIRED_CODEX_MODELS.contains(&stored.as_str()) => {}
-        _ => set_app_setting(db, "model", model).await?,
+/// Replaces every user's stored Codex model that the pi SDK no longer serves
+/// with the PI_MODEL default. A user without a stored choice already gets the
+/// default from `selected_model`.
+async fn retire_codex_models(db: &SqlitePool, model: &str) -> Result<()> {
+    for retired in RETIRED_CODEX_MODELS {
+        sqlx::query("UPDATE app_settings SET value=?, updated_at=? WHERE key='model' AND value=?")
+            .bind(model)
+            .bind(stamp())
+            .bind(retired)
+            .execute(db)
+            .await?;
     }
     Ok(())
 }
 
-pub(crate) async fn selected_model(db: &SqlitePool, fallback: &str) -> Result<String> {
-    Ok(app_setting(db, "model")
+pub(crate) async fn selected_model(
+    db: &SqlitePool,
+    user_id: &str,
+    fallback: &str,
+) -> Result<String> {
+    Ok(app_setting(db, user_id, "model")
         .await?
         .unwrap_or_else(|| fallback.into()))
 }
 
 /// The Claude subscription model; separate from the Codex `model` setting so
 /// switching providers keeps each choice.
-pub(crate) async fn selected_claude_model(db: &SqlitePool) -> Result<String> {
-    Ok(app_setting(db, "claude_model")
+pub(crate) async fn selected_claude_model(db: &SqlitePool, user_id: &str) -> Result<String> {
+    Ok(app_setting(db, user_id, "claude_model")
         .await?
         .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.into()))
 }
 
-pub(crate) async fn selected_effort(db: &SqlitePool, fallback: &str) -> Result<String> {
-    Ok(app_setting(db, "reasoning_effort")
+pub(crate) async fn selected_effort(
+    db: &SqlitePool,
+    user_id: &str,
+    fallback: &str,
+) -> Result<String> {
+    Ok(app_setting(db, user_id, "reasoning_effort")
         .await?
         .unwrap_or_else(|| fallback.into()))
 }
@@ -2241,10 +2487,10 @@ async fn disconnect_subscription(
         .bind(pi_provider)
         .execute(&s.db)
         .await?;
-    if ai_provider(&s.db).await? == provider
+    if ai_provider(&s.db, &user.id).await? == provider
         && pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await
     {
-        set_app_setting(&s.db, "ai_provider", PROVIDER_CODEX).await?;
+        set_app_setting(&s.db, &user.id, "ai_provider", PROVIDER_CODEX).await?;
     }
     Ok(Redirect::to("/settings?notice=disconnected"))
 }

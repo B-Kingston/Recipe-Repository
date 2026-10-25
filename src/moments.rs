@@ -500,6 +500,7 @@ pub(crate) fn view(moment: &StepMoment, still_seconds: &[u64], still_base: &str)
 /// switched-off setting, or a missing sidecar stores nothing.
 pub(crate) async fn match_draft(
     state: &AppState,
+    user_id: &str,
     draft_id: &str,
     recipe_id: Option<&str>,
     recipe: &GeneratedRecipe,
@@ -507,7 +508,7 @@ pub(crate) async fn match_draft(
     let Some(embedder) = &state.embedder else {
         return Ok(());
     };
-    if !crate::step_moments_enabled(&state.db).await? {
+    if !crate::step_moments_enabled(&state.db, user_id).await? {
         return Ok(());
     }
     let vectors = draft_moment_vectors(&state.db, draft_id, recipe_id).await?;
@@ -522,11 +523,15 @@ pub(crate) async fn match_draft(
 }
 
 /// Re-matches a saved recipe's steps to its moment pool after a step edit.
-pub(crate) async fn refresh_recipe(state: &AppState, recipe_id: &str) -> crate::Result<()> {
+pub(crate) async fn refresh_recipe(
+    state: &AppState,
+    user_id: &str,
+    recipe_id: &str,
+) -> crate::Result<()> {
     let Some(embedder) = &state.embedder else {
         return Ok(());
     };
-    if !crate::step_moments_enabled(&state.db).await? {
+    if !crate::step_moments_enabled(&state.db, user_id).await? {
         return Ok(());
     }
     let vectors = recipe_moment_vectors(&state.db, recipe_id).await?;
@@ -547,14 +552,15 @@ pub(crate) async fn refresh_recipe(state: &AppState, recipe_id: &str) -> crate::
 
 /// Runs [`refresh_recipe`] in the background so a step edit returns at once.
 /// Recipes without a moment pool cost one empty query.
-pub(crate) fn spawn_recipe_refresh(state: &Arc<AppState>, recipe_id: &str) {
+pub(crate) fn spawn_recipe_refresh(state: &Arc<AppState>, user_id: &str, recipe_id: &str) {
     if state.embedder.is_none() {
         return;
     }
     let state = state.clone();
+    let user_id = user_id.to_string();
     let recipe_id = recipe_id.to_string();
     tokio::spawn(async move {
-        if let Err(error) = refresh_recipe(&state, &recipe_id).await {
+        if let Err(error) = refresh_recipe(&state, &user_id, &recipe_id).await {
             warn!(%recipe_id, %error, "Step moments were not refreshed");
         }
     });
