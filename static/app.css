@@ -93,7 +93,7 @@ h3 { font: 700 1rem/1.3 var(--sans); }
   position: sticky;
   top: 0;
   z-index: 10;
-  padding: 14px 16px 0;
+  padding: 14px 32px 0;
   pointer-events: none;
 }
 .utility-inner {
@@ -101,7 +101,7 @@ h3 { font: 700 1rem/1.3 var(--sans); }
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  width: min(100%, max(50%, 660px));
+  width: min(100%, 1096px);
   margin: 0 auto;
   padding: 6px 6px 6px 22px;
   border: 1px solid rgba(255, 255, 255, .75);
@@ -397,8 +397,22 @@ label > input[type=checkbox] { margin-right: 8px; }
   justify-content: space-between;
   gap: 20px 40px;
 }
-.section-heading h1 { margin: 0; font-size: 3rem; overflow-wrap: anywhere; }
+.section-heading h1 { margin: 0; font-size: 2.4rem; overflow-wrap: anywhere; }
 .library-count { margin: 6px 0 0; color: var(--muted); font: 16px/1.4 var(--type); }
+/* The library heading lines the search box up with the title itself; the
+   eyebrow and the ticket count sit above and below it. */
+.search-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 460px);
+  align-items: center;
+  column-gap: 40px;
+  row-gap: 0;
+}
+.search-heading > div { display: contents; }
+.search-heading .eyebrow { grid-area: 1 / 1; }
+.search-heading h1 { grid-area: 2 / 1; }
+.search-heading .library-count { grid-area: 3 / 1; }
+.search-heading .search-form { grid-area: 2 / 2; max-width: none; }
 .search-form {
   display: flex;
   flex: 1 1 320px;
@@ -1038,13 +1052,15 @@ body.still-viewer-open { overflow: hidden; }
 .debug-final-list li { margin: 3px 0; }
 
 @media (max-width: 760px) {
-  .utility-bar { padding: 10px 12px 0; }
+  .utility-bar { padding: 10px 16px 0; }
   .utility-inner { width: 100%; padding-left: 16px; }
   .top-nav a { padding: 0 12px; font-size: 14px; }
   .app-shell { padding: 0 16px; }
   .paper { padding: 22px 0 56px; }
   h1 { font-size: 2.1rem; }
-  .section-heading h1 { font-size: 2.3rem; }
+  .section-heading h1 { font-size: 1.9rem; }
+  .search-heading { grid-template-columns: minmax(0, 1fr); }
+  .search-heading .search-form { grid-area: 4 / 1; margin-top: 16px; }
   .setup-page { padding: 16px; }
   .setup-page .setup-card { padding: 30px 22px; }
   .block, .panel, .form-panel { padding: 18px; }

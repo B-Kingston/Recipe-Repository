@@ -386,11 +386,23 @@ async fn run_media_import(
                 "url": 0,
                 "kind": "error",
                 "message": error.to_string(),
+                "settings": error_needs_settings(&error),
             }));
         }
     }
     run.pending.store(0, Ordering::SeqCst);
     run.record_event(json!({ "kind": "run-done" }));
+}
+
+/// Whether an import failure is fixed in Settings (a missing or refused
+/// login), so the import page offers a link there.
+fn error_needs_settings(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::AiNotConfigured
+            | AppError::MediaCleanerNotConfigured
+            | AppError::AiLoginRefused(_)
+    )
 }
 
 async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
@@ -546,18 +558,23 @@ async fn clean_media_evidence(
             break;
         }
         let code = value["code"].as_str().unwrap_or("worker");
+        let message = value["error"].as_str().unwrap_or("no message");
         let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
         if code == "configuration" {
             config_failed = true;
             break;
         }
         if attempt == 0 && retryable {
-            warn!(attempt, "Media cleaner failed; retrying once");
+            warn!(
+                attempt,
+                code, message, "Media cleaner failed; retrying once"
+            );
             retry_backoff(attempt).await;
             continue;
         }
         error!(
             code,
+            message,
             retryable,
             status = %out.status,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1212,7 +1229,15 @@ impl RecipeBackend<'_> {
                 request["apiBaseUrl"] = json!(endpoint.base_url);
                 request["apiKey"] = json!(endpoint.api_key);
                 let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
-                run_worker(state, payload, timeout).await
+                let output = run_worker(state, payload, timeout).await?;
+                track_login(
+                    state,
+                    crate::Login::Endpoint { id: &endpoint.id },
+                    &endpoint.name,
+                    true,
+                    output,
+                )
+                .await
             }
         }
     }
@@ -1571,6 +1596,9 @@ async fn run_subscription_worker(
     let auth = TempAuthFile::create(pi_provider, &credential).map_err(|_| AppError::Ai)?;
     request["authPath"] = json!(auth.path.to_string_lossy());
     request["piProvider"] = json!(pi_provider);
+    // A model listing can succeed without signing in, so only other commands
+    // prove that the login works.
+    let proves_login = request["command"] != "listModels";
     let payload = serde_json::to_vec(&request).map_err(|_| AppError::Ai)?;
     let output = run_worker(state, payload, timeout).await;
     if let Some(refreshed) = auth
@@ -1579,7 +1607,134 @@ async fn run_subscription_worker(
     {
         crate::store_pi_credential(&state.db, user_id, pi_provider, &refreshed).await?;
     }
-    output
+    let login = crate::Login::Subscription {
+        user_id,
+        pi_provider,
+    };
+    track_login(
+        state,
+        login,
+        subscription_name(pi_provider),
+        proves_login,
+        output?,
+    )
+    .await
+}
+
+/// The name Settings shows for a subscription's pi provider id.
+pub(crate) fn subscription_name(pi_provider: &str) -> &'static str {
+    if pi_provider == crate::CLAUDE_PI_PROVIDER {
+        "Claude"
+    } else {
+        "ChatGPT (Codex)"
+    }
+}
+
+/// What a user is told when a provider refuses a login.
+pub(crate) fn login_refused_message(login: crate::Login<'_>, name: &str) -> String {
+    match login {
+        crate::Login::Subscription { .. } => format!(
+            "Your {name} sign-in has expired or was revoked. Reconnect {name} in Settings, then try again."
+        ),
+        crate::Login::Endpoint { .. } => format!(
+            "{name} rejected its API key. Remove it in Settings and add it again with a working key, then try again."
+        ),
+    }
+}
+
+/// Checks a finished worker run for a refused login (the worker's `code`
+/// "auth": an OAuth refresh the provider rejected, a 401, an invalid key).
+/// A refusal is recorded on the login, so Settings flags it, and becomes
+/// `AiLoginRefused`, which no caller retries. A success that signed in clears
+/// an earlier refusal. Any other failure passes through unchanged.
+pub(crate) async fn track_login(
+    state: &AppState,
+    login: crate::Login<'_>,
+    name: &str,
+    proves_login: bool,
+    output: std::process::Output,
+) -> Result<std::process::Output> {
+    if output.status.success() {
+        if proves_login {
+            crate::mark_login_refused(&state.db, login, false).await?;
+        }
+        return Ok(output);
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    if value["code"] != "auth" {
+        return Ok(output);
+    }
+    error!(
+        login = name,
+        message = value["error"].as_str().unwrap_or("no message"),
+        status = %output.status,
+        "AI provider refused the login"
+    );
+    crate::mark_login_refused(&state.db, login, true).await?;
+    Err(AppError::AiLoginRefused(login_refused_message(login, name)))
+}
+
+/// What a Settings login check found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoginCheck {
+    /// The provider accepted the login (a subscription's token was refreshed).
+    Works,
+    /// The provider refused it; the login is now flagged in Settings.
+    Refused,
+    /// The check could not finish for another reason (network, server error).
+    Failed,
+}
+
+/// Refreshes a subscription's OAuth token now (the worker's `checkLogin`), so
+/// an expired or revoked sign-in shows up in Settings before a generation
+/// needs it. The refreshed token is stored like any other refresh.
+pub(crate) async fn check_subscription_login(
+    state: &AppState,
+    user_id: &str,
+    pi_provider: &str,
+) -> Result<LoginCheck> {
+    let request = json!({ "command": "checkLogin" });
+    match run_subscription_worker(state, user_id, pi_provider, request, MODEL_LIST_TIMEOUT).await {
+        Ok(output) => Ok(login_check_result(pi_provider, &output)),
+        Err(AppError::AiLoginRefused(_)) => Ok(LoginCheck::Refused),
+        Err(error) => Err(error),
+    }
+}
+
+/// Lists an endpoint's models with its key, which proves (or flags) the key.
+pub(crate) async fn check_endpoint_login(
+    state: &AppState,
+    endpoint: &crate::Endpoint,
+) -> Result<LoginCheck> {
+    let payload = serde_json::to_vec(&json!({
+        "command": "listModels",
+        "provider": endpoint.spec,
+        "apiBaseUrl": endpoint.base_url,
+        "apiKey": endpoint.api_key,
+    }))
+    .map_err(|_| AppError::Ai)?;
+    let output = run_worker(state, payload, MODEL_LIST_TIMEOUT).await?;
+    let login = crate::Login::Endpoint { id: &endpoint.id };
+    match track_login(state, login, &endpoint.name, true, output).await {
+        Ok(output) => Ok(login_check_result(&endpoint.name, &output)),
+        Err(AppError::AiLoginRefused(_)) => Ok(LoginCheck::Refused),
+        Err(error) => Err(error),
+    }
+}
+
+fn login_check_result(login: &str, output: &std::process::Output) -> LoginCheck {
+    if output.status.success() {
+        return LoginCheck::Works;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    warn!(
+        login,
+        code = value["code"].as_str().unwrap_or("worker"),
+        message = value["error"].as_str().unwrap_or("no message"),
+        status = %output.status,
+        "Login check failed"
+    );
+    LoginCheck::Failed
 }
 
 /// Where a model list comes from: a subscription's pi catalogue or a
@@ -1633,7 +1788,15 @@ async fn fetch_models(state: &AppState, source: &ModelSource<'_>) -> Result<Vec<
                 "apiKey": endpoint.api_key,
             }))
             .map_err(|_| AppError::Ai)?;
-            run_worker(state, payload, MODEL_LIST_TIMEOUT).await?
+            let output = run_worker(state, payload, MODEL_LIST_TIMEOUT).await?;
+            track_login(
+                state,
+                crate::Login::Endpoint { id: &endpoint.id },
+                &endpoint.name,
+                true,
+                output,
+            )
+            .await?
         }
     };
     if !output.status.success() {
@@ -2010,6 +2173,8 @@ pub(crate) struct DebugUrlState {
     pub(crate) captures: Vec<DebugCaptureRow>,
     pub(crate) cards: Vec<DebugCardRow>,
     pub(crate) error_message: String,
+    /// The failure is fixed in Settings (a missing or refused AI login).
+    pub(crate) error_settings: bool,
     /// Each lane's result event has arrived, so empty text means "none found"
     /// rather than "still working".
     pub(crate) description_read: bool,
@@ -2280,6 +2445,10 @@ pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            state.error_settings = event
+                .get("settings")
+                .and_then(Value::as_bool)
+                .unwrap_or_default();
         }
         _ => {}
     }
@@ -2502,6 +2671,7 @@ fn debug_url_view(state: &DebugUrlState, frames_base: &str, url_index: usize) ->
         cleaned_recipe_text: state.cleaned_recipe_text.clone(),
         warnings: state.warnings.clone(),
         error_message: state.error_message.clone(),
+        error_settings: state.error_settings,
         captures: state
             .captures
             .iter()

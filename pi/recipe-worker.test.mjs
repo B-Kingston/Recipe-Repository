@@ -13,6 +13,7 @@ import {
   cleanedEvidence,
   completeViaPiAi,
   generateRecipe,
+  isAuthFailure,
   isPiAiSpec,
   normalizeEffort,
   openaiResponse,
@@ -26,6 +27,7 @@ import {
   subscriptionOf,
   listEndpointModels,
   verifiedSources,
+  workerFailure,
 } from "./recipe-worker.mjs";
 
 test("catalogModelIds lists the 5.6 range first, newest to oldest", () => {
@@ -697,4 +699,43 @@ test("generateRecipe requires a search on grounded subscription requests", async
     generateRecipe({ piProvider: "openai-codex", prompt: "p", systemPrompt: "s" }, "grounded", "low", completeImpl),
     (error) => error.code === "output",
   );
+});
+
+test("isAuthFailure recognises refused logins and keys", () => {
+  const refused = [
+    new Error("OAuth refresh failed for anthropic: Anthropic token refresh request failed. status=400; body={\"error\": \"invalid_grant\"}"),
+    Object.assign(new Error("OAuth refresh failed for openai-codex"), { name: "ModelsError", code: "oauth" }),
+    new WorkerError("worker", "API returned HTTP 401: {\"error\":{\"type\":\"authentication_error\"}}"),
+    new Error("401 Unauthorized"),
+    new Error("Incorrect API key provided: sk-...abcd"),
+    new Error("invalid x-api-key"),
+  ];
+  for (const error of refused) assert.equal(isAuthFailure(error), true, error.message);
+  const other = [
+    new WorkerError("worker", "API returned HTTP 429: rate limited", { retryable: true }),
+    new WorkerError("worker", "API returned HTTP 500"),
+    new WorkerError("configuration", "Pi is not logged in to Claude. Authorise Claude from the Settings page."),
+    Object.assign(new Error("Credential store modify failed for anthropic"), { name: "ModelsError", code: "auth" }),
+    new Error("Anthropic response was truncated by max_tokens."),
+  ];
+  for (const error of other) assert.equal(isAuthFailure(error), false, error.message);
+});
+
+test("workerFailure reports a refused login as a non-retryable auth failure", () => {
+  assert.deepEqual(
+    workerFailure(new WorkerError("worker", "API returned HTTP 401: bad key", { retryable: true })),
+    { error: "API returned HTTP 401: bad key", code: "auth", retryable: false },
+  );
+  assert.deepEqual(
+    workerFailure(new WorkerError("output", "bad json")),
+    { error: "bad json", code: "output", retryable: true },
+  );
+  assert.deepEqual(
+    workerFailure(new Error("boom")),
+    { error: "boom", code: "worker", retryable: false },
+  );
+});
+
+test("parseRequest accepts checkLogin without a prompt", () => {
+  assert.equal(parseRequest(JSON.stringify({ command: "checkLogin" })).command, "checkLogin");
 });

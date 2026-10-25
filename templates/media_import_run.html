@@ -25,7 +25,7 @@
       {% for source in sources %}<li class="is-{{ source.state }}" data-found="{{ source.key }}"><strong>{{ source.label }}</strong><span data-found-detail>{{ source.detail }}</span></li>{% endfor %}
     </ul>
     <p class="error" role="alert" data-import-error{% if evidence.error_message == "" %} hidden{% endif %}>{{ evidence.error_message }}</p>
-    <p class="actions import-retry" data-import-retry{% if evidence.status != "failed" %} hidden{% endif %}><a class="button primary" href="{{ retry_url }}">Try again</a><a class="button" href="/recipes/new?mode=video">Import another video</a></p>
+    <p class="actions import-retry" data-import-retry{% if evidence.status != "failed" %} hidden{% endif %}><a class="button primary" href="{{ retry_url }}">Try again</a><a class="button" href="/settings" data-import-settings{% if !evidence.error_settings %} hidden{% endif %}>Open Settings</a><a class="button" href="/recipes/new?mode=video">Import another video</a></p>
     <p class="actions import-ready" data-import-ready{% match draft_url %}{% when Some with (_) %}{% when None %} hidden{% endmatch %}>
       {% match draft_url %}{% when Some with (url) %}<a class="button primary" data-import-draft href="{{ url }}">Review recipe</a>{% when None %}<a class="button primary" data-import-draft href="#">Review recipe</a>{% endmatch %}
       <span class="muted" data-import-ready-copy></span>

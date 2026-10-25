@@ -178,6 +178,8 @@ pub(crate) struct Endpoint {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) model: String,
+    /// The endpoint rejected its key on the last call that used it.
+    pub(crate) auth_failed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -198,6 +200,10 @@ enum AppError {
     MediaCleanerNotConfigured,
     #[error("The AI service could not prepare a grounded recipe. Please try again.")]
     Ai,
+    /// The provider refused the login: an expired or revoked subscription
+    /// sign-in, or a rejected API key. The text says what to fix in Settings.
+    #[error("{0}")]
+    AiLoginRefused(String),
     #[error("Codex authorisation failed: {0}")]
     CodexAuth(String),
     #[error("Claude authorisation failed: {0}")]
@@ -240,6 +246,12 @@ impl IntoResponse for AppError {
                 "Recipe not created",
                 self.to_string(),
                 false,
+            ),
+            Self::AiLoginRefused(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AI sign-in needs attention",
+                message.clone(),
+                true,
             ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -610,7 +622,12 @@ struct SettingsTemplate {
     cleaner_configured: bool,
     /// The cleaner's provider value; empty follows the active AI provider.
     cleaner_provider: String,
+    /// The active AI provider, which an empty cleaner provider follows.
+    ai_provider: String,
     cleaner_model: String,
+    /// Cached models for the cleaner's provider (the blank "provider's model"
+    /// choice is in the template); the script replaces them live.
+    cleaner_model_options: Vec<SelectOption>,
     saved: bool,
     password_changed: bool,
     /// Whether video step moments are captured and shown (global setting).
@@ -622,6 +639,13 @@ struct SettingsTemplate {
     /// Whether the shared account searches with BM25 (what "shared" follows).
     shared_search_bm25: bool,
     notice: String,
+    /// The provider refused the stored Codex / Claude sign-in on its last use.
+    codex_refused: bool,
+    claude_refused: bool,
+    /// The login the AI setup in use generates with was refused (shared or own).
+    active_login_refused: bool,
+    /// A login check that found a refused login, or could not finish.
+    check_error: String,
 }
 struct SelectOption {
     value: String,
@@ -641,6 +665,8 @@ struct EndpointRow {
     /// The last discovered models; the page script refreshes them live.
     model_options: Vec<String>,
     selected: bool,
+    /// The endpoint rejected its key on the last call that used it.
+    auth_failed: bool,
 }
 #[derive(Template)]
 #[template(path = "codex_authorise.html")]
@@ -675,6 +701,12 @@ struct SettingsQuery {
     saved: String,
     #[serde(default)]
     notice: String,
+    /// A login check's outcome: "works", "refused", or "failed".
+    #[serde(default)]
+    check: String,
+    /// The checked login: "codex", "claude", or an endpoint id.
+    #[serde(default)]
+    login: String,
 }
 #[derive(Deserialize)]
 struct ModelsQuery {
@@ -718,6 +750,7 @@ pub(crate) struct DebugUrlView {
     pub(crate) cleaned_recipe_text: String,
     pub(crate) warnings: Vec<String>,
     pub(crate) error_message: String,
+    pub(crate) error_settings: bool,
     pub(crate) captures: Vec<MediaDebugCaptureView>,
     pub(crate) cards: Vec<MediaDebugCardView>,
 }
@@ -1060,6 +1093,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings/ai-logins", post(update_ai_logins))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
+        .route("/settings/endpoints/{id}/check", post(check_endpoint))
+        .route("/settings/check/{provider}", post(check_subscription))
         .route("/settings/disconnect/codex", post(disconnect_codex))
         .route("/settings/disconnect/claude", post(disconnect_claude))
         .route(
@@ -1398,7 +1433,8 @@ pub(crate) async fn store_pi_credential<T: Serialize>(
          VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id,provider) DO UPDATE SET
            credential_json = excluded.credential_json,
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at,
+           auth_failed_at = NULL",
     )
     .bind(user_id)
     .bind(pi_provider)
@@ -1407,6 +1443,65 @@ pub(crate) async fn store_pi_credential<T: Serialize>(
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// A login the worker signs in with: one user's subscription credential or
+/// an endpoint's API key (endpoint ids are unique across users).
+#[derive(Clone, Copy)]
+pub(crate) enum Login<'a> {
+    Subscription {
+        user_id: &'a str,
+        pi_provider: &'a str,
+    },
+    Endpoint {
+        id: &'a str,
+    },
+}
+
+/// Records whether a provider refused a login: `true` stamps the failure,
+/// `false` clears an earlier one (a no-op when none is recorded).
+pub(crate) async fn mark_login_refused(
+    db: &SqlitePool,
+    login: Login<'_>,
+    refused: bool,
+) -> Result<()> {
+    let failed_at = refused.then(stamp);
+    let query = match login {
+        Login::Subscription {
+            user_id,
+            pi_provider,
+        } => sqlx::query(
+            "UPDATE pi_credentials SET auth_failed_at=?
+             WHERE user_id=? AND provider=? AND (? OR auth_failed_at IS NOT NULL)",
+        )
+        .bind(failed_at)
+        .bind(user_id)
+        .bind(pi_provider),
+        Login::Endpoint { id } => sqlx::query(
+            "UPDATE ai_endpoints SET auth_failed_at=?
+             WHERE id=? AND (? OR auth_failed_at IS NOT NULL)",
+        )
+        .bind(failed_at)
+        .bind(id),
+    };
+    query.bind(refused).execute(db).await?;
+    Ok(())
+}
+
+/// Whether the provider refused this subscription's login on its last use.
+pub(crate) async fn subscription_login_refused(
+    db: &SqlitePool,
+    user_id: &str,
+    pi_provider: &str,
+) -> Result<bool> {
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT auth_failed_at IS NOT NULL FROM pi_credentials WHERE user_id=? AND provider=?",
+    )
+    .bind(user_id)
+    .bind(pi_provider)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.is_some_and(|(refused,)| refused))
 }
 
 const MEDIA_CLEANER_PROVIDER_SETTING: &str = "media_cleaner_provider";
@@ -1564,7 +1659,7 @@ pub(crate) async fn ai_account(db: &SqlitePool, user_id: &str) -> Result<String>
 /// All registered AI endpoints for one user, oldest first.
 pub(crate) async fn list_endpoints(db: &SqlitePool, user_id: &str) -> Result<Vec<Endpoint>> {
     Ok(sqlx::query_as(
-        "SELECT id,name,spec,base_url,api_key,model FROM ai_endpoints WHERE user_id=? ORDER BY created_at",
+        "SELECT id,name,spec,base_url,api_key,model,auth_failed_at IS NOT NULL AS auth_failed FROM ai_endpoints WHERE user_id=? ORDER BY created_at",
     )
     .bind(user_id)
     .fetch_all(db)
@@ -1595,7 +1690,7 @@ pub(crate) async fn find_endpoint(
     id: &str,
 ) -> Result<Option<Endpoint>> {
     Ok(sqlx::query_as(
-        "SELECT id,name,spec,base_url,api_key,model FROM ai_endpoints WHERE user_id=? AND id=?",
+        "SELECT id,name,spec,base_url,api_key,model,auth_failed_at IS NOT NULL AS auth_failed FROM ai_endpoints WHERE user_id=? AND id=?",
     )
     .bind(user_id)
     .bind(id)
@@ -1779,11 +1874,29 @@ async fn settings_page(
             default_model: spec_default_model(&endpoint.spec).to_string(),
             web_search: spec_has_web_search(&endpoint.spec),
             model_options: cached_model_catalogue(&s, &endpoint.id),
+            auth_failed: endpoint.auth_failed,
             id: endpoint.id,
             name: endpoint.name,
             model: endpoint.model,
         })
         .collect::<Vec<_>>();
+    let codex_refused = subscription_login_refused(&s.db, &user.id, CODEX_PI_PROVIDER).await?;
+    let claude_refused = subscription_login_refused(&s.db, &user.id, CLAUDE_PI_PROVIDER).await?;
+    let ai_user = if uses_shared_ai {
+        shared_id.as_str()
+    } else {
+        user.id.as_str()
+    };
+    let active_login_refused = active_login_refused(&s.db, ai_user).await?;
+    let checked_login = match query.login.as_str() {
+        "codex" => Some(ai::subscription_name(CODEX_PI_PROVIDER).to_string()),
+        "claude" => Some(ai::subscription_name(CLAUDE_PI_PROVIDER).to_string()),
+        id => endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == id)
+            .map(|endpoint| endpoint.name.clone()),
+    };
+    let (check_notice, check_error) = login_check_messages(&query.check, checked_login.as_deref());
     let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
     let cleaner_provider = media_cleaner_setting(&s.db, &user.id)
         .await?
@@ -1791,6 +1904,15 @@ async fn settings_page(
     let cleaner_model = media_cleaner_model(&s.db, &user.id)
         .await?
         .unwrap_or_default();
+    let cleaner_source = if cleaner_provider.is_empty() {
+        provider.as_str()
+    } else {
+        cleaner_provider.as_str()
+    };
+    let cleaner_model_options = cleaner_model_options(
+        cached_model_catalogue(&s, pi_provider_for(cleaner_source).unwrap_or(cleaner_source)),
+        &cleaner_model,
+    );
     // First paint shows the cached catalogues; the page's script then replaces
     // the options from /settings/models with live discovery.
     let model = selected_model(&s.db, &user.id, &s.model).await?;
@@ -1828,7 +1950,9 @@ async fn settings_page(
         presets: PROVIDER_PRESETS,
         cleaner_configured,
         cleaner_provider,
+        ai_provider: provider.clone(),
         cleaner_model,
+        cleaner_model_options,
         saved: query.saved == "1",
         password_changed: query.notice == "password_changed",
         step_moments: step_moments_enabled(&s.db, &user.id).await?,
@@ -1842,9 +1966,99 @@ async fn settings_page(
         notice: if query.notice == "disconnected" {
             "Subscription disconnected.".into()
         } else {
-            String::new()
+            check_notice
         },
+        codex_refused,
+        claude_refused,
+        active_login_refused,
+        check_error,
     })
+}
+
+/// Whether the provider refused the login an account's AI setup generates
+/// with (its active subscription or endpoint).
+async fn active_login_refused(db: &SqlitePool, user_id: &str) -> Result<bool> {
+    let provider = ai_provider(db, user_id).await?;
+    match pi_provider_for(&provider) {
+        Some(pi_provider) => subscription_login_refused(db, user_id, pi_provider).await,
+        None => Ok(find_endpoint(db, user_id, &provider)
+            .await?
+            .is_some_and(|endpoint| endpoint.auth_failed)),
+    }
+}
+
+/// The Settings notice and error for a login check's outcome; empty when no
+/// check ran or the login is unknown.
+fn login_check_messages(check: &str, login: Option<&str>) -> (String, String) {
+    let Some(name) = login else {
+        return (String::new(), String::new());
+    };
+    match check {
+        "works" => (format!("{name} sign-in works."), String::new()),
+        "refused" => (
+            String::new(),
+            format!(
+                "{name} refused the sign-in: it has expired or was revoked. Reconnect {name} (or replace its key) to keep generating recipes."
+            ),
+        ),
+        "failed" => (
+            String::new(),
+            format!("{name} could not be checked right now. It may still work; check again later."),
+        ),
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// Where Settings goes after a login check.
+fn login_check_redirect(login: &str, check: ai::LoginCheck) -> Redirect {
+    let outcome = match check {
+        ai::LoginCheck::Works => "works",
+        ai::LoginCheck::Refused => "refused",
+        ai::LoginCheck::Failed => "failed",
+    };
+    Redirect::to(&format!("/settings?check={outcome}&login={login}"))
+}
+
+/// Refreshes the user's own Codex or Claude sign-in now, so an expired or
+/// revoked login is found (and flagged) before a generation needs it.
+async fn check_subscription(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(provider): Path<String>,
+) -> Result<Redirect> {
+    let pi_provider = match provider.as_str() {
+        "codex" => CODEX_PI_PROVIDER,
+        "claude" => CLAUDE_PI_PROVIDER,
+        _ => return Err(AppError::NotFound),
+    };
+    let check = match ai::check_subscription_login(&s, &user.id, pi_provider).await {
+        Ok(check) => check,
+        Err(AppError::AiNotConfigured) => return Ok(Redirect::to("/settings")),
+        Err(error) => {
+            warn!(%error, pi_provider, "Login check could not run");
+            ai::LoginCheck::Failed
+        }
+    };
+    Ok(login_check_redirect(&provider, check))
+}
+
+/// Tests one of the user's endpoint keys by listing the endpoint's models.
+async fn check_endpoint(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Redirect> {
+    let endpoint = find_endpoint(&s.db, &user.id, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let check = match ai::check_endpoint_login(&s, &endpoint).await {
+        Ok(check) => check,
+        Err(error) => {
+            warn!(%error, endpoint = %endpoint.name, "Login check could not run");
+            ai::LoginCheck::Failed
+        }
+    };
+    Ok(login_check_redirect(&endpoint.id, check))
 }
 
 /// Model options for the Settings select: the discovered catalogue when
@@ -1857,6 +2071,22 @@ fn model_options(fresh: Vec<String>, current: &str, fallback: &[&str]) -> Vec<Se
         fresh
     };
     if !values.iter().any(|value| value == current) {
+        values.insert(0, current.to_string());
+    }
+    values
+        .into_iter()
+        .map(|value| SelectOption {
+            selected: value == current,
+            value,
+        })
+        .collect()
+}
+
+/// Model options for the video cleaner select: the cached catalogue with the
+/// saved model kept first when it is missing. Empty means the provider's own
+/// model, which the template offers as its first option.
+fn cleaner_model_options(mut values: Vec<String>, current: &str) -> Vec<SelectOption> {
+    if !current.is_empty() && !values.iter().any(|value| value == current) {
         values.insert(0, current.to_string());
     }
     values

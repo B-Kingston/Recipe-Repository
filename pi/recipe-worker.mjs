@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -83,6 +83,46 @@ export class WorkerError extends Error {
   }
 }
 
+/** Provider replies that mean the login itself was refused: an OAuth refresh
+ *  the provider rejected (pi-ai's ModelsError code "oauth"), or a 401 or an
+ *  invalid-key error from the API. Reconnecting or replacing the key fixes
+ *  these, so the host reports them as a login problem, never retries them,
+ *  and marks the login in Settings. */
+const AUTH_FAILURE_PATTERNS = [
+  /OAuth refresh failed/i,
+  /invalid_grant/i,
+  /\bHTTP 401\b/,
+  /\bstatus[=: ]+401\b/i,
+  /authentication_error/i,
+  /invalid[ _-]?(?:x-)?api[ _-]?key/i,
+  /incorrect api key/i,
+  /\b401\b[^\n]{0,40}unauthori[sz]ed/i,
+  /unauthori[sz]ed[^\n]{0,40}\b401\b/i,
+];
+
+/** Whether an error means the provider refused the login (see AUTH_FAILURE_PATTERNS). */
+export function isAuthFailure(error) {
+  if (error instanceof WorkerError && error.code === "auth") return true;
+  if (error?.name === "ModelsError" && error.code === "oauth") return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return AUTH_FAILURE_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+/** The stdout failure line for an error: `code` "auth" when the login was
+ *  refused, else the WorkerError code or "worker". */
+export function workerFailure(error) {
+  const known = error instanceof WorkerError;
+  const auth = isAuthFailure(error);
+  return {
+    error: error instanceof Error ? error.message : "Pi worker failed.",
+    code: auth ? "auth" : known ? error.code : "worker",
+    // Output validation failures are worth one host-level retry; provider
+    // transport errors carry their own status-aware retry decision. A refused
+    // login fails the same way every time.
+    retryable: !auth && known && (error.retryable || error.code === "output"),
+  };
+}
+
 /** Parses one stdin request. listModels needs no prompt; every other command does. */
 export function parseRequest(input) {
   let request;
@@ -94,7 +134,7 @@ export function parseRequest(input) {
   if (!request || typeof request !== "object" || Array.isArray(request)) {
     throw new WorkerError("input", "Invalid worker request: invalid request");
   }
-  if (request.command !== "listModels"
+  if (request.command !== "listModels" && request.command !== "checkLogin"
     && (typeof request.prompt !== "string" || typeof request.systemPrompt !== "string")) {
     throw new WorkerError("input", "Invalid worker request: missing prompt or systemPrompt");
   }
@@ -686,6 +726,30 @@ async function listModels(request) {
   outputJson({ models: catalogModelIds(modelRuntime.getModels(subscription.id)) });
 }
 
+/**
+ * Refreshes a subscription's OAuth token now, whatever its expiry, so
+ * Settings can prove the login still works. The token's expiry is cleared in
+ * the per-request auth.json, which makes pi refresh it; the host reads the
+ * new token back and stores it. A refused refresh throws pi's "oauth" error,
+ * which the host reports as an expired login.
+ */
+async function checkLogin(request) {
+  const subscription = subscriptionOf(request);
+  const authPath = nonBlank(request.authPath);
+  if (!authPath) throw new WorkerError("input", "Missing authPath for the subscription credential.");
+  const auth = JSON.parse(await readFile(authPath, "utf8"));
+  if (auth?.[subscription.id]?.type !== "oauth") {
+    throw new WorkerError("configuration", subscription.notLoggedIn);
+  }
+  auth[subscription.id].expires = 0;
+  await writeFile(authPath, JSON.stringify(auth), { mode: 0o600 });
+  const modelRuntime = await subscriptionRuntime(request);
+  if (!(await modelRuntime.getAuth(subscription.id))) {
+    throw new WorkerError("configuration", subscription.notLoggedIn);
+  }
+  outputJson({ ok: true });
+}
+
 /** The pi runtime over the request's per-request auth.json. The SDK refreshes
  * an expired token in that file, and the host reads the refresh back. */
 async function subscriptionRuntime(request) {
@@ -828,19 +892,11 @@ export async function generateRecipe(request, searchMode, reasoningEffort, compl
 async function main() {
   const request = parseRequest(await readStdin());
   if (request.command === "listModels") return listModels(request);
+  if (request.command === "checkLogin") return checkLogin(request);
   if (request.command === "cleanMedia") return cleanMedia(request);
   outputJson(await generateRecipe(request, searchModeOf(request), normalizeEffort(request.reasoningEffort)));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  runMain(main, (error) => {
-    const known = error instanceof WorkerError;
-    return {
-      error: error instanceof Error ? error.message : "Pi worker failed.",
-      code: known ? error.code : "worker",
-      // Output validation failures are worth one host-level retry; provider
-      // transport errors carry their own status-aware retry decision.
-      retryable: known && (error.retryable || error.code === "output"),
-    };
-  });
+  runMain(main, workerFailure);
 }

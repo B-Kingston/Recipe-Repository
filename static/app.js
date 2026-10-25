@@ -272,6 +272,7 @@
   var draftCopy = root.querySelector('[data-import-draft-copy]');
   var heading = root.querySelector('[data-import-heading]');
   var retryBox = root.querySelector('[data-import-retry]');
+  var settingsLink = root.querySelector('[data-import-settings]');
   var readyCopy = root.querySelector('[data-import-ready-copy]');
   var details = root.querySelector('[data-import-details]');
   var notesCount = root.querySelector('[data-import-notes-count]');
@@ -599,6 +600,7 @@
         errorBox.textContent = event.message || 'The video import failed.';
         errorBox.hidden = false;
       }
+      if (settingsLink) settingsLink.hidden = !event.settings;
       if (heading) heading.textContent = 'Import stopped';
       if (retryBox) retryBox.hidden = false;
       unreadFound();

@@ -1108,3 +1108,222 @@ async fn other_accounts_share_the_first_accounts_search_engine_until_they_overri
         Err(AppError::BadRequest(_))
     ));
 }
+
+fn worker_output(code: i32, stdout: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
+}
+
+const REFUSED_LOGIN: &str = r#"{"error":"OAuth refresh failed for anthropic: invalid_grant","code":"auth","retryable":false}"#;
+
+#[tokio::test]
+async fn a_refused_subscription_login_is_flagged_until_it_works_again() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    store_pi_credential(
+        &db,
+        "u1",
+        CLAUDE_PI_PROVIDER,
+        &serde_json::json!({"type": "oauth"}),
+    )
+    .await
+    .unwrap();
+    set_provider(&db, "claude").await;
+    let login = crate::Login::Subscription {
+        user_id: "u1",
+        pi_provider: CLAUDE_PI_PROVIDER,
+    };
+
+    // Any other failure passes through for the caller's own handling.
+    let other = crate::ai::track_login(
+        &state,
+        login,
+        "Claude",
+        true,
+        worker_output(1, r#"{"error":"HTTP 500","code":"worker"}"#),
+    )
+    .await;
+    assert!(other.is_ok_and(|output| !output.status.success()));
+    assert!(
+        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+    );
+
+    let refused = crate::ai::track_login(
+        &state,
+        login,
+        "Claude",
+        true,
+        worker_output(1, REFUSED_LOGIN),
+    )
+    .await;
+    match refused {
+        Err(AppError::AiLoginRefused(message)) => assert!(
+            message.contains("Reconnect Claude in Settings"),
+            "{message}"
+        ),
+        other => panic!("expected a refused login, got {:?}", other.map(|_| ())),
+    }
+    assert!(
+        crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+    );
+    let body = settings_body(&state, "u1").await;
+    assert!(body.contains("Sign-in expired"), "{body}");
+    assert!(body.contains("refused its sign-in"), "{body}");
+    assert!(body.contains("action=\"/settings/check/claude\""), "{body}");
+
+    // A model listing does not sign in, so it leaves the flag alone.
+    crate::ai::track_login(&state, login, "Claude", false, worker_output(0, "{}"))
+        .await
+        .unwrap();
+    assert!(
+        crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+    );
+    // A call that signed in clears it.
+    crate::ai::track_login(&state, login, "Claude", true, worker_output(0, "{}"))
+        .await
+        .unwrap();
+    assert!(
+        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+    );
+
+    // Reconnecting (or a stored token refresh) clears it as well.
+    crate::ai::track_login(
+        &state,
+        login,
+        "Claude",
+        true,
+        worker_output(1, REFUSED_LOGIN),
+    )
+    .await
+    .unwrap_err();
+    store_pi_credential(
+        &db,
+        "u1",
+        CLAUDE_PI_PROVIDER,
+        &serde_json::json!({"type": "oauth", "access": "new"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !crate::subscription_login_refused(&db, "u1", CLAUDE_PI_PROVIDER)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !settings_body(&state, "u1")
+            .await
+            .contains("Sign-in expired")
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_endpoint_key_is_flagged_on_its_row_and_for_sharing_accounts() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
+    let id = add(&db, "Groq", "groq", "", "gsk-test-1234").await;
+    set_provider(&db, &id).await;
+    let login = crate::Login::Endpoint { id: &id };
+
+    match crate::ai::track_login(&state, login, "Groq", true, worker_output(1, REFUSED_LOGIN)).await
+    {
+        Err(AppError::AiLoginRefused(message)) => assert!(
+            message.starts_with("Groq rejected its API key"),
+            "{message}"
+        ),
+        other => panic!("expected a refused login, got {:?}", other.map(|_| ())),
+    }
+    assert!(
+        find_endpoint(&db, "u1", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auth_failed
+    );
+    let body = settings_body(&state, "u1").await;
+    assert!(body.contains("Key rejected"), "{body}");
+    assert!(
+        body.contains(&format!("action=\"/settings/endpoints/{id}/check\"")),
+        "{body}"
+    );
+    // An account sharing u1's logins is told who must reconnect.
+    let shared = settings_body(&state, "u2").await;
+    assert!(shared.contains("alice needs to reconnect it"), "{shared}");
+
+    crate::ai::track_login(&state, login, "Groq", true, worker_output(0, "{}"))
+        .await
+        .unwrap();
+    assert!(
+        !find_endpoint(&db, "u1", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auth_failed
+    );
+    assert!(
+        !settings_body(&state, "u2")
+            .await
+            .contains("needs to reconnect")
+    );
+}
+
+#[test]
+fn login_checks_report_their_outcome_by_name() {
+    assert_eq!(
+        crate::login_check_messages("works", Some("Claude")),
+        ("Claude sign-in works.".to_string(), String::new())
+    );
+    let (notice, error) = crate::login_check_messages("refused", Some("Claude"));
+    assert!(notice.is_empty());
+    assert!(error.starts_with("Claude refused the sign-in"), "{error}");
+    let (_, error) = crate::login_check_messages("failed", Some("Groq"));
+    assert!(error.contains("could not be checked"), "{error}");
+    assert_eq!(
+        crate::login_check_messages("works", None),
+        (String::new(), String::new())
+    );
+}
+
+#[tokio::test]
+async fn checking_an_unknown_login_is_not_found() {
+    let db = database().await;
+    let state = state(db.clone());
+    let unknown = crate::check_subscription(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Path("gemini".into()),
+    )
+    .await;
+    assert!(matches!(unknown, Err(AppError::NotFound)));
+    let foreign = crate::check_endpoint(
+        State(state.clone()),
+        AuthUser { id: "u2".into() },
+        Path(add(&db, "Groq", "groq", "", "gsk-test-1234").await),
+    )
+    .await;
+    assert!(matches!(foreign, Err(AppError::NotFound)));
+    // Without a stored sign-in there is nothing to check.
+    let missing = crate::check_subscription(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Path("claude".into()),
+    )
+    .await
+    .unwrap()
+    .into_response();
+    assert_eq!(missing.headers()[header::LOCATION], "/settings");
+}
