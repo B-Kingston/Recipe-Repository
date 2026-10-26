@@ -807,6 +807,7 @@ async fn failed_claude_exchange_keeps_the_flow_for_another_paste() {
     let response = authorise_claude_exchange(
         State(state.clone()),
         AuthUser { id: "u1".into() },
+        axum::http::HeaderMap::new(),
         Form(ClaudeExchangeForm {
             flow_id: "flow".into(),
             code: "not-a-real-code".into(),
@@ -909,6 +910,7 @@ async fn empty_claude_code_keeps_the_flow_for_a_retry() {
         let response = authorise_claude_exchange(
             State(state.clone()),
             AuthUser { id: "u1".into() },
+            axum::http::HeaderMap::new(),
             Form(ClaudeExchangeForm {
                 flow_id: "flow".into(),
                 code: code.into(),

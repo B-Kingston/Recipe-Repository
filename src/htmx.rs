@@ -130,6 +130,30 @@ pub(crate) async fn htmx_layer(req: Request, next: Next) -> Response {
     response
 }
 
+/// The htmx event that ends a sign-in popup (see `web/src/auth-popup.ts`).
+pub(crate) const POPUP_FINISHED: &str = "popup-finished";
+
+/// Ends a step that may run inside the Settings sign-in popup. An htmx
+/// request gets no swap (204), the `key` notice for the page underneath, and
+/// the `popup-finished` event, which closes the popup and refreshes that
+/// page's panel. A plain request gets the usual flash redirect to `to`.
+pub(crate) fn finish_popup(headers: &HeaderMap, to: &str, key: &str) -> Response {
+    if !is_htmx(headers) {
+        return flash_redirect(to, key);
+    }
+    (
+        StatusCode::NO_CONTENT,
+        AppendHeaders([
+            (header::SET_COOKIE, flash_cookie(key)),
+            (
+                header::HeaderName::from_static("hx-trigger"),
+                HeaderValue::from_static(POPUP_FINISHED),
+            ),
+        ]),
+    )
+        .into_response()
+}
+
 /// A redirect htmx can follow: plain requests get the usual 303, while htmx
 /// requests get `HX-Redirect`, which makes the browser load `to` as a whole
 /// page. Used where the next page has a different shell (sign-in, setup) or

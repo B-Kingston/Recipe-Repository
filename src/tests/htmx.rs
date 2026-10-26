@@ -316,3 +316,25 @@ async fn pages_load_htmx_and_the_compiled_script() {
     assert!(html.contains(r#"<script src="/static/app.js" defer></script>"#));
     assert!(html.contains(r#""historyCacheSize":0"#));
 }
+
+#[test]
+fn a_popup_step_ends_with_an_event_for_htmx_and_a_redirect_otherwise() {
+    let plain = crate::htmx::finish_popup(
+        &HeaderMap::new(),
+        "/settings#settings-ai",
+        "claude_connected",
+    );
+    assert_eq!(plain.status(), StatusCode::SEE_OTHER);
+    assert_eq!(plain.headers()[header::LOCATION], "/settings#settings-ai");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("hx-request", HeaderValue::from_static("true"));
+    let popup = crate::htmx::finish_popup(&headers, "/settings#settings-ai", "claude_connected");
+    assert_eq!(popup.status(), StatusCode::NO_CONTENT);
+    assert_eq!(popup.headers()["hx-trigger"], crate::htmx::POPUP_FINISHED);
+    let cookie = popup.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(
+        cookie.starts_with("recipe_flash=claude_connected;"),
+        "{cookie}"
+    );
+}

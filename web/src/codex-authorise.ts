@@ -1,5 +1,6 @@
 /* Authorise Codex: poll the device-code flow until ChatGPT confirms the
- * sign-in, then return to Settings. Stops once the page is swapped away. */
+ * sign-in, then return to Settings (closing the sign-in popup when it runs
+ * there). Stops once the flow is swapped away or the popup closes. */
 namespace Recipes {
   interface FlowState {
     status: string;
@@ -39,7 +40,7 @@ namespace Recipes {
           const done = root.querySelector("#codex-flow-done") as HTMLElement | null;
           if (done) done.hidden = false;
           if (waiting) waiting.hidden = true;
-          window.setTimeout(() => { if (attached(root)) go("/settings"); }, 1500);
+          window.setTimeout(() => { if (attached(root)) finishSignIn(); }, 1500);
           return;
         }
         if (state.status === "pending" || state.status === "slow_down") {

@@ -2,7 +2,7 @@ use askama::Template;
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Form, Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
@@ -2631,8 +2631,8 @@ async fn authorise_claude_start(
 
 /// Sends the user back to Settings with a Claude error notice, named by its
 /// flash key (`settings_page` words it).
-fn claude_failure_redirect(key: &str) -> Response {
-    flash_redirect("/settings#settings-ai", key)
+fn claude_failure_redirect(headers: &HeaderMap, key: &str) -> Response {
+    htmx::finish_popup(headers, "/settings#settings-ai", key)
 }
 
 /// Completes a Claude flow: the pasted code (or redirect URL) is exchanged by
@@ -2642,11 +2642,12 @@ fn claude_failure_redirect(key: &str) -> Response {
 async fn authorise_claude_exchange(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
+    headers: HeaderMap,
     Form(form): Form<ClaudeExchangeForm>,
 ) -> Result<Response> {
     let input = trim(&form.code);
     if input.is_empty() {
-        return Ok(claude_failure_redirect("claude_code_missing"));
+        return Ok(claude_failure_redirect(&headers, "claude_code_missing"));
     }
     // The flow is only read here and removed once the exchange succeeds, so a
     // failed attempt leaves the sign-in page usable for another paste.
@@ -2659,7 +2660,7 @@ async fn authorise_claude_exchange(
             .cloned()
     };
     let Some(flow) = flow else {
-        return Ok(claude_failure_redirect("claude_expired"));
+        return Ok(claude_failure_redirect(&headers, "claude_expired"));
     };
     let payload = serde_json::to_vec(&json!({ "input": input, "verifier": flow.verifier }))
         .map_err(|_| AppError::ClaudeAuth("invalid flow state".into()))?;
@@ -2678,7 +2679,11 @@ async fn authorise_claude_exchange(
     {
         store_pi_credential(&s.db, &user.id, CLAUDE_PI_PROVIDER, credential).await?;
         s.claude_flows.lock().remove(&form.flow_id);
-        return Ok(flash_redirect("/settings#settings-ai", "claude_connected"));
+        return Ok(htmx::finish_popup(
+            &headers,
+            "/settings#settings-ai",
+            "claude_connected",
+        ));
     }
     let message = value["message"]
         .as_str()

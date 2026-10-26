@@ -858,6 +858,34 @@ label > input[type=checkbox] { margin-right: 8px; }
 .still-viewer button[hidden] { display: none; }
 body.still-viewer-open { overflow: hidden; }
 
+/* The Settings sign-in popup (auth-popup.ts): a sign-in page's #auth-flow,
+   heading and blocks, on a scrolling backdrop. */
+.auth-popup {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 90;
+  overflow-y: auto;
+  padding: 8vh 16px 24px;
+  background: rgba(17, 26, 34, .45);
+}
+.auth-popup[hidden] { display: none; }
+.auth-popup-card {
+  position: relative;
+  width: min(100%, 640px);
+  margin: 0 auto;
+  padding: 26px 24px 8px;
+  border-radius: var(--radius);
+  background: var(--ground);
+  box-shadow: var(--shadow-lift);
+}
+.auth-popup-close { position: absolute; top: 10px; right: 10px; min-width: 44px; min-height: 44px; padding: 4px 10px; font-size: 22px; line-height: 1; }
+.auth-popup .form-intro { margin-bottom: 16px; padding-right: 48px; }
+.auth-popup .form-intro h1 { font-size: 1.8rem; }
+body.auth-popup-open { overflow: hidden; }
+
 /* Flow chart and cooking mode */
 .chart-view { margin-top: 28px; }
 .chart-heading {

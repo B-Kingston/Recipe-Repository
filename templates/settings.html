@@ -37,8 +37,10 @@
     {% endif %}
     {% if ai_notice != "" %}<p class="notice" role="status">{{ ai_notice }}</p>{% endif %}
     {% if ai_error != "" %}<p class="error" role="alert">{{ ai_error }}</p>{% endif %}
-    {% if active_login_refused %}<p class="error" role="alert">The provider you generate with refused its sign-in: it has expired or was revoked. Reconnect it (or replace its key) below.</p>{% endif %}
-    <form method="post" action="/settings" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" data-provider-form>
+    {# A check's own error already says so; show the standing banner only without one. #}
+    {% if active_login_refused && ai_error == "" %}<p class="error" role="alert">The provider you generate with refused its sign-in: it has expired or was revoked. Reconnect it (or replace its key) below.</p>{% endif %}
+    {# hx-disinherit: the Reconnect / Connect links inside load into the sign-in popup, not this form's #settings swap. #}
+    <form method="post" action="/settings" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" hx-disinherit="hx-target hx-select hx-swap" data-provider-form>
       <fieldset>
         <legend class="muted">Generate recipes with</legend>
         <div class="toggle-row provider-row">
@@ -46,7 +48,7 @@
           {% if codex_authorised %}
           <span class="provider-actions">
             <button class="compact" type="submit" form="check-codex">Refresh sign-in</button>
-            <a class="button compact{% if codex_refused %} primary{% endif %}" href="{{ codex_auth_url }}">Reconnect</a>
+            <a class="button compact{% if codex_refused %} primary{% endif %}" href="{{ codex_auth_url }}" hx-get="{{ codex_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
             <button class="compact" type="submit" form="disconnect-codex">Disconnect</button>
           </span>
           {% endif %}
@@ -56,7 +58,7 @@
           {% if claude_authorised %}
           <span class="provider-actions">
             <button class="compact" type="submit" form="check-claude">Refresh sign-in</button>
-            <a class="button compact{% if claude_refused %} primary{% endif %}" href="{{ claude_auth_url }}">Reconnect</a>
+            <a class="button compact{% if claude_refused %} primary{% endif %}" href="{{ claude_auth_url }}" hx-get="{{ claude_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
             <button class="compact" type="submit" form="disconnect-claude">Disconnect</button>
           </span>
           {% endif %}
@@ -81,7 +83,7 @@
         </select>
         {% else %}
         <p class="muted">Sign in with your ChatGPT Plus or Pro account to use Codex.</p>
-        <p class="actions"><a class="button primary" href="{{ codex_auth_url }}">Connect ChatGPT</a></p>
+        <p class="actions"><a class="button primary" href="{{ codex_auth_url }}" hx-get="{{ codex_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect ChatGPT</a></p>
         {% endif %}
       </div>
       <div data-model-panel="claude"{% if !claude_selected %} hidden{% endif %}>
@@ -94,7 +96,7 @@
         </select>
         {% else %}
         <p class="muted">Sign in with your Claude Pro or Max account to use Claude.</p>
-        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}">Connect Claude</a></p>
+        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}" hx-get="{{ claude_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect Claude</a></p>
         {% endif %}
       </div>
       {% for endpoint in endpoints %}
@@ -222,5 +224,14 @@
       <button class="primary" type="submit">Save search</button>
     </form>
   </details>
+</div>
+{# The sign-in popup: Reconnect / Connect load a sign-in page's #auth-flow
+   into it. It sits outside #settings so panel saves leave it alone. Without
+   JavaScript those links open the sign-in page itself. #}
+<div class="auth-popup" data-auth-popup role="dialog" aria-modal="true" aria-label="Sign in" hidden>
+  <div class="auth-popup-card">
+    <button class="auth-popup-close" type="button" data-auth-close aria-label="Close">&times;</button>
+    <div id="auth-popup-body"></div>
+  </div>
 </div>
 {% endblock %}

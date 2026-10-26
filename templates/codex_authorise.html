@@ -1,4 +1,6 @@
 {% extends "base.html" %}{% block title %}Authorise Codex · Recipe Repository{% endblock %}{% block content %}
+{# #auth-flow is what the Settings sign-in popup shows (see auth-popup.ts). #}
+<div class="auth-flow" id="auth-flow">
 <div class="form-intro">
   <p class="eyebrow">Configuration / AI</p>
   <h1>Authorise Codex</h1>
@@ -7,11 +9,11 @@
 <div class="compact-panel" data-codex-flow="{{ flow_id }}" data-codex-interval="{{ interval_seconds }}">
   <div class="block" id="codex-flow-waiting">
     <h2>1. Open the sign-in page</h2>
-    <p class="muted">Open <a href="{{ verification_uri }}">chatgpt.com/codex/device</a> and sign in to ChatGPT. Then come back to this page.</p>
+    <p class="muted">Open <a href="{{ verification_uri }}" target="_blank" rel="noopener">chatgpt.com/codex/device</a> (it opens in a new tab) and sign in to ChatGPT. Then come back here.</p>
     <h2>2. Enter this code</h2>
     <p class="codex-user-code">{{ user_code }}</p>
-    <p class="muted">This page checks automatically and finishes as soon as your account is connected. The code expires in {{ expires_seconds }} seconds.</p>
-    <p class="actions"><a class="button" href="/settings">Cancel</a></p>
+    <p class="muted">This checks automatically and finishes as soon as your account is connected. The code expires in {{ expires_seconds }} seconds.</p>
+    <p class="actions"><a class="button" href="/settings" data-auth-close>Cancel</a></p>
   </div>
   <div class="block" id="codex-flow-done" hidden>
     <h2>Connected</h2>
@@ -20,7 +22,8 @@
   <div class="block" id="codex-flow-failed" hidden>
     <h2>Authorisation incomplete</h2>
     <p class="error" role="alert" id="codex-flow-failed-message"></p>
-    <p class="actions"><a class="button primary" href="/settings/authorise-codex">Try again</a><a class="button" href="/settings">Back to Settings</a></p>
+    <p class="actions"><a class="button primary" href="/settings/authorise-codex" hx-get="/settings/authorise-codex" hx-target="#auth-flow" hx-select="#auth-flow" hx-swap="outerHTML" hx-push-url="false">Try again</a><a class="button" href="/settings" data-auth-close>Back to Settings</a></p>
   </div>
+</div>
 </div>
 {% endblock %}

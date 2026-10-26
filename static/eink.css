@@ -96,3 +96,7 @@ a:hover { color: #000000; }
 .button, button, .top-nav a, .view-tab { font-size: 16px; }
 .button, button { min-height: 48px; }
 .chart-detail h3 { font-size: 1.45rem; }
+
+/* The sign-in popup: plain white, outlined, no dimmed backdrop. */
+.auth-popup { background: #fff; }
+.auth-popup-card { border: 2px solid #000; background: #fff; box-shadow: none; }
