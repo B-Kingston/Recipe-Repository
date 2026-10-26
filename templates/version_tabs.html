@@ -1,0 +1,8 @@
+{% if versions.len() > 0 %}
+<nav class="version-tabs" id="version-history" aria-label="Recipe versions">
+  {% if active_version == 0 %}<span class="version-tab is-current" aria-current="page">Current</span>{% else %}<a class="version-tab" href="/recipes/{{ recipe.id }}">Current</a>{% endif %}
+  {% for row in versions %}
+  {% if row.version == active_version %}<span class="version-tab is-current" aria-current="page" title="{{ row.label }}, {{ row.created_display }}">v{{ row.version }} · {{ row.label }}</span>{% else %}<a class="version-tab" href="/recipes/{{ recipe.id }}/versions/{{ row.version }}" title="{{ row.label }}, {{ row.created_display }}">v{{ row.version }} · {{ row.label }}</a>{% endif %}
+  {% endfor %}
+</nav>
+{% endif %}
