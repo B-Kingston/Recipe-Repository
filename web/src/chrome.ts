@@ -1,6 +1,6 @@
-/* The page chrome: the account menu, the Add recipe mode switch, and the
- * full-page viewer for step moment stills. All delegated, so they keep
- * working after htmx swaps a page in. */
+/* The page chrome: the account menu and the full-page viewer for step
+ * moment stills. All delegated, so they keep working after htmx swaps a
+ * page in. */
 namespace Recipes {
   /* Account menu: a click outside the open panel, or Escape, closes it. */
   function accountMenu(): HTMLElement | null {
@@ -18,25 +18,6 @@ namespace Recipes {
     menu.removeAttribute("open");
     const summary = menu.querySelector("summary");
     if (summary) summary.focus();
-  });
-
-  /* Add recipe: one entry point with a progressive-enhancement mode switch.
-   * The tabs are links, so without JavaScript each mode is its own page. */
-  document.addEventListener("click", (event) => {
-    const tab = closest(event.target, "[data-add-mode]") as HTMLAnchorElement | null;
-    const root = tab && closest(tab, "[data-add-recipe]");
-    if (!tab || !root) return;
-    event.preventDefault();
-    const mode = tab.getAttribute("data-add-mode");
-    each(root.querySelectorAll("[data-add-mode]"), (node) => {
-      const active = node.getAttribute("data-add-mode") === mode;
-      node.className = "add-mode-tab" + (active ? " is-active" : "");
-      node.setAttribute("aria-selected", active ? "true" : "false");
-    });
-    each(root.querySelectorAll("[data-add-panel]"), (panel) => {
-      (panel as HTMLElement).hidden = panel.getAttribute("data-add-panel") !== mode;
-    });
-    if (window.history && window.history.replaceState) window.history.replaceState(window.history.state, "", tab.href);
   });
 
   /* Step moment stills: one click opens a still in a full-page viewer, with
