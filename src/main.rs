@@ -59,9 +59,9 @@ use htmx::{Flash, flash_redirect};
 use media::MediaEvidence;
 use recipes::{
     add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
-    delete_version, restore_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_still,
-    recipe_thumbnail, remove_thumbnail, start_moment_capture, start_thumbnail_recompute,
-    update_block, update_recipe, upload_thumbnail, view_version,
+    delete_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_still,
+    recipe_thumbnail, remove_thumbnail, restore_version, start_moment_capture,
+    start_thumbnail_recompute, update_block, update_recipe, upload_thumbnail, view_version,
 };
 
 const DRAFT_HOURS: i64 = 24;

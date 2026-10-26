@@ -1,8 +1,8 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
     LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
-    stamp_added,
-    home, move_block, recipe_versions, record_version, restore_version, update_block, update_recipe, view_version,
+    home, move_block, recipe_versions, record_version, restore_version, stamp_added, update_block,
+    update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, stamp};
 use axum::Form;
@@ -324,8 +324,12 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
         .execute(&db).await.unwrap();
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('s1','r','step',0,'Mix')")
         .execute(&db).await.unwrap();
-    sqlx::query("INSERT INTO recipe_step_ingredients(id,step_id,position,text) VALUES('u1','s1',0,'Flour')")
-        .execute(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO recipe_step_ingredients(id,step_id,position,text) VALUES('u1','s1',0,'Flour')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     update_recipe(
         State(state(db.clone())),
         AuthUser { id: "u1".into() },
@@ -369,9 +373,20 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
     assert_eq!(restored.label, "Restored version 1");
     assert_eq!(restored.snapshot, original);
     assert_eq!(restored.snapshot.title, "Test");
-    assert_eq!(restored.snapshot.steps[0].ingredients, vec!["Flour".to_string()]);
+    assert_eq!(
+        restored.snapshot.steps[0].ingredients,
+        vec!["Flour".to_string()]
+    );
     // The replaced recipe is still in the history.
-    assert_eq!(find_version(&db, "u1", "r", 3).await.unwrap().snapshot.steps.len(), 0);
+    assert_eq!(
+        find_version(&db, "u1", "r", 3)
+            .await
+            .unwrap()
+            .snapshot
+            .steps
+            .len(),
+        0
+    );
     // Restoring what is already current records nothing.
     restore_version(
         State(state(db.clone())),
@@ -409,7 +424,12 @@ fn ticket_stamp_adds_the_time_only_when_dates_clash() {
     let added: Vec<&str> = cards.iter().map(|card| card.added.as_str()).collect();
     assert_eq!(
         added,
-        ["15 Oct 2026, 09:05", "15 Oct 2026, 22:11", "16 Oct 2026", ""]
+        [
+            "15 Oct 2026, 09:05",
+            "15 Oct 2026, 22:11",
+            "16 Oct 2026",
+            ""
+        ]
     );
 }
 
@@ -495,7 +515,11 @@ async fn library_tickets_print_ingredients_and_pack_long_lists() {
     .unwrap()
     .0;
     // One rail hangs the whole library; later rows are pinned on in CSS.
-    assert_eq!(page.matches(r#"<div class="rail" aria-hidden="true">"#).count(), 1);
+    assert_eq!(
+        page.matches(r#"<div class="rail" aria-hidden="true">"#)
+            .count(),
+        1
+    );
     assert!(page.contains("Ready in 40 min"));
     assert!(page.contains("Serves 6"));
     assert!(!page.contains("Filed under") && !page.contains("ticket-box"));
