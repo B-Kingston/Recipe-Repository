@@ -2,7 +2,7 @@ use crate::auth::AuthUser;
 use crate::recipes::{
     LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
     stamp_added,
-    home, move_block, recipe_versions, record_version, update_block, update_recipe, view_version,
+    home, move_block, recipe_versions, record_version, restore_version, update_block, update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, stamp};
 use axum::Form;
@@ -315,6 +315,72 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         find_version(&db, "u1", "r", 3).await.unwrap().label,
         "Manual edit"
     );
+}
+
+#[tokio::test]
+async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
+    let db = database().await;
+    sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit) VALUES('i1','r','ingredient',0,'Flour','1','cup')")
+        .execute(&db).await.unwrap();
+    sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('s1','r','step',0,'Mix')")
+        .execute(&db).await.unwrap();
+    sqlx::query("INSERT INTO recipe_step_ingredients(id,step_id,position,text) VALUES('u1','s1',0,'Flour')")
+        .execute(&db).await.unwrap();
+    update_recipe(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path("r".into()),
+        Form(RecipeForm {
+            title: "Edited".into(),
+            description: String::new(),
+            servings: "4".into(),
+            prep_minutes: String::new(),
+            cook_minutes: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    delete_block(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path(("r".into(), "s1".into())),
+    )
+    .await
+    .unwrap();
+    // Another account cannot restore this recipe's versions.
+    assert!(matches!(
+        restore_version(
+            State(state(db.clone())),
+            AuthUser { id: "other".into() },
+            Path(("r".into(), 1)),
+        )
+        .await,
+        Err(AppError::NotFound)
+    ));
+    let original = find_version(&db, "u1", "r", 1).await.unwrap().snapshot;
+    restore_version(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path(("r".into(), 1)),
+    )
+    .await
+    .unwrap();
+    let restored = find_version(&db, "u1", "r", 4).await.unwrap();
+    assert_eq!(restored.label, "Restored version 1");
+    assert_eq!(restored.snapshot, original);
+    assert_eq!(restored.snapshot.title, "Test");
+    assert_eq!(restored.snapshot.steps[0].ingredients, vec!["Flour".to_string()]);
+    // The replaced recipe is still in the history.
+    assert_eq!(find_version(&db, "u1", "r", 3).await.unwrap().snapshot.steps.len(), 0);
+    // Restoring what is already current records nothing.
+    restore_version(
+        State(state(db.clone())),
+        AuthUser { id: "u1".into() },
+        Path(("r".into(), 1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recipe_versions(&db, "u1", "r").await.unwrap().len(), 4);
 }
 
 fn card(title: &str) -> LibraryCard {

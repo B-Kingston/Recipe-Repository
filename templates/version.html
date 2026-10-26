@@ -1,5 +1,6 @@
 {% extends "base.html" %}{% block title %}{{ snapshot.title }} · Version {{ version }} · Recipe Repository{% endblock %}{% block content %}
 <a class="back-link" href="/recipes/{{ recipe.id }}"><span aria-hidden="true">←</span> {{ recipe.title }}</a>
+{% include "version_tabs.html" %}
 <article class="recipe-sheet">
 <header class="page-header">
   <div class="page-header-copy">
@@ -19,11 +20,14 @@
 </div>
 <div class="card-actions">
   <div class="actions page-actions">
-    <a class="button primary" href="/recipes/{{ recipe.id }}">Back to current recipe</a>
+    <a class="button" href="/recipes/{{ recipe.id }}">Back to current recipe</a>
     <form class="inline" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/delete" data-confirm="Delete version {{ version }}? This saved copy cannot be restored afterwards." data-busy-label="Deleting…"><button class="quiet danger">Delete version</button></form>
   </div>
 </div>
-<p class="notice" role="note">This is a saved copy of the recipe from {{ created_display }}. It is read-only, and there is no restore.</p>
+<form class="notice version-restore" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/restore" data-confirm="Replace the current recipe with version {{ version }}? The current recipe stays in the history." data-busy-label="Replacing…">
+  <span>Saved copy from {{ created_display }}.</span>
+  <button class="primary" type="submit">Make this the current recipe</button>
+</form>
 
 <div class="card-body">
 <section class="recipe-section ingredients-section">

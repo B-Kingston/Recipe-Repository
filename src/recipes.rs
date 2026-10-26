@@ -467,6 +467,7 @@ pub(crate) async fn recipe_page(
         thumb_state: thumb_state.to_string(),
         thumb_options,
         versions,
+        active_version: 0,
         chat,
         notes,
     })
@@ -643,6 +644,86 @@ pub(crate) async fn find_version(
     })
 }
 
+/// Makes a saved version the current recipe: its details, ingredients, and
+/// steps replace the live ones, and the result is recorded as a new version,
+/// so the recipe it replaced stays in the history. Sources and the dish photo
+/// are not part of a snapshot and are kept.
+pub(crate) async fn restore_version(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, version)): Path<(String, i64)>,
+) -> Result<Response> {
+    let detail = find_version(&state.db, &user.id, &id, version).await?;
+    let snapshot = detail.snapshot;
+    let mut tx = state.db.begin().await?;
+    if recipe_snapshot(&mut tx, &user.id, &id).await? == snapshot {
+        tx.rollback().await?;
+        return Ok(redirect_recipe(&id));
+    }
+    sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=? WHERE user_id=? AND id=?")
+        .bind(&snapshot.title)
+        .bind(&snapshot.description)
+        .bind(snapshot.servings)
+        .bind(snapshot.prep_minutes)
+        .bind(snapshot.cook_minutes)
+        .bind(&user.id)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM recipe_blocks WHERE recipe_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    for (position, ingredient) in snapshot.ingredients.iter().enumerate() {
+        sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit,optional)VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind("ingredient")
+            .bind(position as i64)
+            .bind(&ingredient.name)
+            .bind(&ingredient.quantity)
+            .bind(&ingredient.unit)
+            .bind(if ingredient.optional { 1 } else { 0 })
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (position, step) in snapshot.steps.iter().enumerate() {
+        let step_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text)VALUES(?,?,?,?,?)",
+        )
+        .bind(&step_id)
+        .bind(&id)
+        .bind("step")
+        .bind(position as i64)
+        .bind(&step.text)
+        .execute(&mut *tx)
+        .await?;
+        for (ingredient_position, ingredient) in step.ingredients.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO recipe_step_ingredients(id,step_id,position,text)VALUES(?,?,?,?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&step_id)
+            .bind(ingredient_position as i64)
+            .bind(ingredient)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    invalidate_chart(&mut tx, &id).await?;
+    record_version(
+        &mut tx,
+        &user.id,
+        &id,
+        &format!("Restored version {}", detail.version),
+    )
+    .await?;
+    tx.commit().await?;
+    moments::spawn_recipe_refresh(&state, &user.id, &id);
+    Ok(redirect_recipe(&id))
+}
+
 pub(crate) async fn delete_version(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -686,8 +767,11 @@ pub(crate) async fn view_version(
         &flash,
     )
     .await?;
+    let versions = recipe_versions(&state.db, &user.id, &id).await?;
     render(VersionTemplate {
         notes,
+        versions,
+        active_version: detail.version,
         recipe,
         version: detail.version,
         label: detail.label,

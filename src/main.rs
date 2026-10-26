@@ -59,7 +59,7 @@ use htmx::{Flash, flash_redirect};
 use media::MediaEvidence;
 use recipes::{
     add_block, candidate_thumbnail, choose_thumbnail, delete_block, delete_page, delete_recipe,
-    delete_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_still,
+    delete_version, restore_version, discard_thumbnail, home, move_block, new_recipe, recipe_page, recipe_still,
     recipe_thumbnail, remove_thumbnail, start_moment_capture, start_thumbnail_recompute,
     update_block, update_recipe, upload_thumbnail, view_version,
 };
@@ -464,6 +464,8 @@ struct RecipeTemplate {
     can_find_moments: bool,
     thumb_options: Vec<DraftThumbView>,
     versions: Vec<recipes::VersionListRow>,
+    /// The highlighted version tab; 0 is Current.
+    active_version: i64,
     servings_value: String,
     prep_value: String,
     cook_value: String,
@@ -494,6 +496,9 @@ struct VersionTemplate {
     servings_value: String,
     prep_value: String,
     cook_value: String,
+    /// Every saved version, for the tabs above the card.
+    versions: Vec<recipes::VersionListRow>,
+    active_version: i64,
     /// The notes about this version.
     notes: notes::NotesPanel,
 }
@@ -1056,6 +1061,10 @@ fn routes(state: Arc<AppState>) -> Router {
         .route(
             "/recipes/{id}/versions/{version}/delete",
             post(delete_version),
+        )
+        .route(
+            "/recipes/{id}/versions/{version}/restore",
+            post(restore_version),
         )
         .route("/recipes/{id}/delete", get(delete_page).post(delete_recipe))
         .route("/recipes/{id}/blocks", post(add_block))
