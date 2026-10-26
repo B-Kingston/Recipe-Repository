@@ -1,8 +1,8 @@
 use crate::ai::{
-    DebugCardRow, DebugUrlState, SearchMode, apply_draft, cancel_draft, dedupe_sources, draft_page,
-    draft_thumbnail, generate_recipe, import_recipe, import_sources, normalize_generated,
-    parse_pi_response, recipe_schema, retry_guidance, social_video_in_prompt, strip_markdown_links,
-    system_recipe_prompt, validate_generated,
+    DebugCardRow, DebugUrlState, PromptRoute, SearchMode, apply_draft, cancel_draft,
+    dedupe_sources, draft_page, draft_thumbnail, generate_recipe, import_sources,
+    normalize_generated, parse_pi_response, recipe_schema, retry_guidance, route_prompt,
+    strip_markdown_links, system_recipe_prompt, validate_generated,
 };
 use crate::auth::setup_create;
 use crate::media::MediaChannels;
@@ -12,7 +12,7 @@ use crate::recipes::{
 };
 use crate::{
     AppError, AppState, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient,
-    IngredientUse, MediaImportForm, PromptForm, SetupForm, Source, ThumbnailPickForm, stamp,
+    IngredientUse, PromptForm, SetupForm, Source, ThumbnailPickForm, stamp,
 };
 use axum::{
     Form,
@@ -244,15 +244,11 @@ async fn response_body(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-fn import_form(
-    url: &str,
-    use_description: bool,
-    use_audio: bool,
-    use_ocr: bool,
-) -> MediaImportForm {
-    MediaImportForm {
-        url: url.into(),
-        notes: String::new(),
+/// The Add recipe card as posted, with its video tick boxes.
+fn card_form(prompt: &str, use_description: bool, use_audio: bool, use_ocr: bool) -> PromptForm {
+    PromptForm {
+        prompt: prompt.into(),
+        video_options: Some("on".into()),
         // Checkboxes serialize only when ticked; None means unticked.
         use_description: use_description.then(|| "on".into()),
         use_audio: use_audio.then(|| "on".into()),
@@ -301,11 +297,11 @@ fn media_channels_default_to_every_source_enabled() {
 #[tokio::test]
 async fn import_requires_a_ticked_evidence_source() {
     let state = state(database().await);
-    let url = "https://www.instagram.com/reel/AbCdEf123/";
-    let response = import_recipe(
+    let prompt = "https://www.instagram.com/reel/AbCdEf123/";
+    let response = generate_recipe(
         State(state.clone()),
         AuthUser { id: "u1".into() },
-        Form(import_form(url, false, false, false)),
+        Form(card_form(prompt, false, false, false)),
     )
     .await
     .unwrap();
@@ -314,19 +310,20 @@ async fn import_requires_a_ticked_evidence_source() {
         body.contains("Tick at least one source"),
         "expected the all-sources-unticked error, got: {body}"
     );
-    // The failed submission keeps the pasted URL and the (unticked) boxes.
-    assert!(body.contains(r#"value="https://www.instagram.com/reel/AbCdEf123/""#));
-    assert!(!body.contains("name=\"use_description\" checked"));
+    // The refused card keeps the prompt and the (unticked) boxes.
+    assert!(body.contains(&format!(">{prompt}</textarea>")));
+    assert!(!body.contains(r#"data-channel="caption" checked"#));
+    assert!(body.contains("<details class=\"advanced-options\" open>"));
 
     for (description, audio, ocr) in [
         (true, false, false),
         (false, true, false),
         (false, false, true),
     ] {
-        let response = import_recipe(
+        let response = generate_recipe(
             State(state.clone()),
             AuthUser { id: "u1".into() },
-            Form(import_form(url, description, audio, ocr)),
+            Form(card_form(prompt, description, audio, ocr)),
         )
         .await
         .unwrap();
@@ -339,50 +336,105 @@ async fn import_requires_a_ticked_evidence_source() {
 }
 
 #[test]
-fn a_reel_link_in_a_research_prompt_becomes_an_import() {
+fn a_video_link_anywhere_in_a_prompt_becomes_an_import() {
+    let video = |url: &str, notes: &str| PromptRoute::Video {
+        url: url.into(),
+        notes: notes.into(),
+    };
     assert_eq!(
-        social_video_in_prompt("make it vegan https://www.instagram.com/reel/AbC123/, please"),
-        Some((
-            "https://www.instagram.com/reel/AbC123/".into(),
-            "make it vegan please".into()
-        ))
+        route_prompt("make it vegan https://www.instagram.com/reel/AbC123/, please"),
+        video(
+            "https://www.instagram.com/reel/AbC123/",
+            "make it vegan please"
+        )
     );
     assert_eq!(
-        social_video_in_prompt("https://www.facebook.com/reel/42"),
-        Some(("https://www.facebook.com/reel/42".into(), String::new()))
+        route_prompt("https://www.facebook.com/reel/42"),
+        video("https://www.facebook.com/reel/42", "")
     );
-    // Ordinary recipe links, two links, or no link stay research prompts.
+    // Other links stay in the notes for the recipe model, line breaks kept.
     assert_eq!(
-        social_video_in_prompt("https://example.com/miso-pasta"),
-        None
-    );
-    assert_eq!(
-        social_video_in_prompt(
-            "https://www.instagram.com/reel/AbC123/ https://example.com/miso-pasta"
+        route_prompt(
+            "Like this, but vegetarian (https://www.instagram.com/reel/AbC123/)\n\nSauce from https://example.com/miso-pasta"
         ),
-        None
+        video(
+            "https://www.instagram.com/reel/AbC123/",
+            "Like this, but vegetarian\nSauce from https://example.com/miso-pasta"
+        )
     );
-    assert_eq!(social_video_in_prompt("spicy miso mushroom pasta"), None);
+    // The same video twice is one video.
+    assert_eq!(
+        route_prompt(
+            "https://www.instagram.com/reel/AbC123/ and again https://www.instagram.com/reel/AbC123/"
+        ),
+        video("https://www.instagram.com/reel/AbC123/", "and again")
+    );
+}
+
+#[test]
+fn prompts_without_one_video_are_researched_or_refused() {
+    assert_eq!(
+        route_prompt("spicy miso mushroom pasta"),
+        PromptRoute::Research
+    );
+    assert_eq!(
+        route_prompt("https://example.com/miso-pasta and https://example.org/ragu"),
+        PromptRoute::Research
+    );
+    // Not a video the importer reads: an Instagram profile, or plain http.
+    assert_eq!(
+        route_prompt("https://www.instagram.com/somecook/"),
+        PromptRoute::Research
+    );
+    assert_eq!(
+        route_prompt("http://www.instagram.com/reel/AbC123/"),
+        PromptRoute::Research
+    );
+    assert_eq!(
+        route_prompt("https://www.instagram.com/reel/AbC123/ https://www.facebook.com/reel/42"),
+        PromptRoute::TooManyVideos(2)
+    );
 }
 
 #[tokio::test]
-async fn research_form_sends_a_reel_link_to_the_video_import() {
+async fn the_card_sends_a_reel_link_to_the_video_import() {
     let state = state(database().await);
+    let prompt = "serves four https://www.instagram.com/reel/AbC123/";
     let response = generate_recipe(
-        State(state),
+        State(state.clone()),
         AuthUser { id: "u1".into() },
         Form(PromptForm {
-            prompt: "serves four https://www.instagram.com/reel/AbC123/".into(),
+            prompt: prompt.into(),
+            ..PromptForm::default()
         }),
     )
     .await
     .unwrap();
     let body = response_body(response).await;
     // No video cleaner is connected in tests, so the import stops on the
-    // video tab with the link and the remaining text kept.
-    assert!(body.contains(r#"id="add-video-panel" class="add-recipe-panel" data-add-panel="video" role="tabpanel" aria-labelledby="add-mode-video">"#));
-    assert!(body.contains(r#"value="https://www.instagram.com/reel/AbC123/""#));
-    assert!(body.contains(">serves four</textarea>"));
+    // card with the prompt kept as typed.
+    assert!(body.contains("AI provider is not connected. Choose one in Settings"));
+    assert!(body.contains(&format!(">{prompt}</textarea>")));
+    // A post without the tick boxes reads every part of the video.
+    assert!(body.contains(r#"data-channel="caption" checked"#));
+
+    let response = generate_recipe(
+        State(state),
+        AuthUser { id: "u1".into() },
+        Form(card_form(
+            "https://www.instagram.com/reel/AbC123/ https://www.facebook.com/reel/42",
+            true,
+            true,
+            true,
+        )),
+    )
+    .await
+    .unwrap();
+    assert!(
+        response_body(response)
+            .await
+            .contains("This card links 2 videos")
+    );
 }
 
 #[test]

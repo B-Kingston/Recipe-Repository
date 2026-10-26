@@ -70,11 +70,18 @@ a:hover { color: #000000; }
 .ticket-paper { --tooth: 6px; font-size: 14px; }
 .version-tab { border: 2px solid #000000; border-bottom: 0; }
 .version-tab.is-current { background: #000000; color: #ffffff; }
-.recipe-sheet .form-panel, .edit-form, .add-form, .chart-detail, .prompt-help, .thumb-picker { border: 1px solid #000000; }
+.recipe-sheet .form-panel, .edit-form, .add-form, .chart-detail, .thumb-picker { border: 1px solid #000000; }
 
-.view-toggle, .add-mode-switch { padding: 0; border: 2px solid #000000; border-radius: 10px; overflow: hidden; gap: 0; }
-.view-tab, .add-mode-tab { border-radius: 0; }
-.view-tab.is-active, .add-mode-tab.is-active { background: #000000; color: #ffffff; box-shadow: none; }
+.view-toggle { padding: 0; border: 2px solid #000000; border-radius: 10px; overflow: hidden; gap: 0; }
+.view-tab { border-radius: 0; }
+.view-tab.is-active { background: #000000; color: #ffffff; box-shadow: none; }
+
+/* Add recipe: slips lie straight with a black outline and a black clip. */
+.link-slip, .link-slip:nth-child(even) { border: 1.5px solid #000000; background: #ffffff; box-shadow: none; transform: none; }
+.link-slip::before, .link-slip::after { border-color: #000000; }
+.link-slip.is-refused { border-width: 2px; background: #ffffff; }
+.add-card h1 { font-size: 2.4rem; }
+.ruled-input { font-size: 19px; }
 
 .step-ingredient, .chart-additions span { border: 1.5px solid #000000; }
 .codex-status, .codex-status--connected, .codex-status--missing { border: 1.5px solid #000000; background: #ffffff; color: #000000; }

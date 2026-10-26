@@ -1,7 +1,7 @@
 use crate::media::{
-    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MAX_IMPORT_URL_CHARS, MediaChannels,
-    MediaDebug, MediaEvidence, VideoExtras, canonical_social_url, cleaner_prompt,
-    extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
+    MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MediaChannels, MediaDebug, MediaEvidence,
+    VideoExtras, canonical_social_url, cleaner_prompt, extract_social_evidence_debug,
+    recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{
     apply_draft_moments, carry_draft_chat, copy_draft_moment_pool, copy_draft_thumbnails,
@@ -14,9 +14,9 @@ use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
     DraftExpiredTemplate, DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT,
     GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView, MediaDebugCardView,
-    MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate, MediaDebugTemplate, MediaImportForm,
+    MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate, MediaDebugTemplate,
     MediaImportRunTemplate, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source,
-    generate_guidance, render, required, stamp, trim,
+    generate_guidance, render, required, stamp,
 };
 use axum::{
     Form,
@@ -50,200 +50,170 @@ pub(crate) async fn generate_page() -> Redirect {
     Redirect::to("/recipes/new")
 }
 
+/// The Add recipe card: one prompt that may hold an idea, recipe links, and
+/// a Facebook or Instagram video. `route_prompt` decides what it starts.
 pub(crate) async fn generate_recipe(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
     Form(f): Form<PromptForm>,
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
-    // A reel link cannot be researched on the web, so it takes the video
-    // import path with every source on; the rest of the text becomes notes.
-    if let Some((url, notes)) = social_video_in_prompt(&prompt) {
-        let on = || Some("on".to_string());
-        let form = MediaImportForm {
-            url,
-            notes,
-            use_description: on(),
-            use_audio: on(),
-            use_ocr: on(),
-        };
-        return import_recipe(State(s), user, Form(form)).await;
-    }
-    match create_draft(
-        &s,
-        &user,
-        None,
-        "generate",
-        &prompt,
-        DraftProvenance {
-            attribution: None,
-            evidence_json: None,
-            search_mode: None,
-        },
-    )
-    .await
-    {
-        Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
-        Err(e) => render(crate::AddRecipeTemplate {
-            prompt_error: e.to_string(),
-            guidance: generate_guidance(s.search_grounding).into(),
-            prompt,
-            video_error: String::new(),
-            url: String::new(),
-            notes: String::new(),
-            use_description: true,
-            use_audio: true,
-            use_ocr: true,
-            video_mode: false,
-            cleaner_configured: media_cleaner_configured(&s, &user.id).await,
-        })
-        .map(IntoResponse::into_response),
+    let channels = f.channels();
+    match route_prompt(&prompt) {
+        PromptRoute::Video { url, notes } => {
+            match start_import(&s, &user, &url, &notes, channels).await {
+                Ok(run_id) => Ok(Redirect::to(&format!("/ai/import/{run_id}")).into_response()),
+                Err(error) => add_page_error(&s, &user, error, prompt, channels).await,
+            }
+        }
+        PromptRoute::TooManyVideos(count) => {
+            let error = AppError::BadRequest(format!(
+                "This card links {count} videos. A recipe is read from one video: remove the others."
+            ));
+            add_page_error(&s, &user, error, prompt, channels).await
+        }
+        PromptRoute::Research => {
+            let draft = create_draft(
+                &s,
+                &user,
+                None,
+                "generate",
+                &prompt,
+                DraftProvenance {
+                    attribution: None,
+                    evidence_json: None,
+                    search_mode: None,
+                },
+            )
+            .await;
+            match draft {
+                Ok(id) => Ok(Redirect::to(&format!("/ai/drafts/{id}")).into_response()),
+                Err(error) => add_page_error(&s, &user, error, prompt, channels).await,
+            }
+        }
     }
 }
-/// The single Facebook or Instagram video link in a research prompt, with
-/// the remaining text as import notes. A prompt with any other link, or more
-/// than one, stays a research request.
-pub(crate) fn social_video_in_prompt(prompt: &str) -> Option<(String, String)> {
-    let mut links = prompt
-        .split_whitespace()
-        .filter(|word| word.starts_with("http://") || word.starts_with("https://"));
-    let link = links.next()?;
-    if links.next().is_some() {
-        return None;
+
+/// What an Add recipe prompt starts.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PromptRoute {
+    /// No video link: research the prompt as written.
+    Research,
+    /// One Facebook or Instagram video, read from the video. The rest of the
+    /// text, other links included, becomes the import notes.
+    Video { url: String, notes: String },
+    /// More than one different video link.
+    TooManyVideos(usize),
+}
+
+/// Sorts the links in a prompt as the Add recipe card's slips do
+/// (`web/src/add-recipe.ts`): a link `canonical_social_url` accepts is a
+/// video, any other is a page for the recipe model. The video link can sit
+/// anywhere in the text; the same video pasted twice counts once.
+pub(crate) fn route_prompt(prompt: &str) -> PromptRoute {
+    let mut videos: Vec<String> = Vec::new();
+    let mut lines = Vec::new();
+    for line in prompt.lines() {
+        let mut kept = Vec::new();
+        for word in line.split_whitespace() {
+            match prompt_link(word).and_then(|url| canonical_social_url(url).ok()) {
+                Some(video) => {
+                    if !videos.contains(&video) {
+                        videos.push(video);
+                    }
+                }
+                None => kept.push(word),
+            }
+        }
+        if !kept.is_empty() {
+            lines.push(kept.join(" "));
+        }
     }
-    let url = link.trim_end_matches([',', '.', ')', ';']);
-    canonical_social_url(url).ok()?;
-    let notes = prompt
-        .split_whitespace()
-        .filter(|word| *word != link)
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some((url.to_string(), notes))
+    match videos.len() {
+        0 => PromptRoute::Research,
+        1 => PromptRoute::Video {
+            url: videos.remove(0),
+            notes: lines.join("\n"),
+        },
+        count => PromptRoute::TooManyVideos(count),
+    }
+}
+
+/// The link a prompt word holds, without the punctuation around it.
+fn prompt_link(word: &str) -> Option<&str> {
+    let url = word
+        .trim_start_matches(['(', '<', '"', '\''])
+        .trim_end_matches([',', '.', ')', ';', '>', '"', '\'', '!', '?']);
+    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
 }
 
 pub(crate) async fn import_page() -> Redirect {
-    Redirect::to("/recipes/new?mode=video")
+    Redirect::to("/recipes/new")
 }
 
-/// Re-renders the combined add-recipe page with the video mode selected after
-/// an import error, keeping the pasted URL, notes, and tick-box state.
-fn render_import_error(
-    error: impl Into<String>,
-    url: &str,
-    notes: &str,
+/// The Add recipe card.
+pub(crate) async fn add_recipe_page(
+    s: &AppState,
+    user: &AuthUser,
+    error: String,
+    prompt: String,
     channels: MediaChannels,
-    search_grounding: bool,
-    cleaner_configured: bool,
-) -> Response {
-    match render(AddRecipeTemplate {
-        prompt_error: String::new(),
-        guidance: generate_guidance(search_grounding).into(),
-        prompt: String::new(),
-        video_error: error.into(),
-        url: url.to_string(),
-        notes: notes.to_string(),
+) -> Result<Html<String>> {
+    render(AddRecipeTemplate {
+        error,
+        guidance: generate_guidance(s.search_grounding).into(),
+        search_grounding: s.search_grounding,
+        prompt,
         use_description: channels.description,
         use_audio: channels.audio,
         use_ocr: channels.ocr,
-        video_mode: true,
-        cleaner_configured,
-    }) {
-        Ok(html) => html.into_response(),
-        Err(render_error) => render_error.into_response(),
-    }
+        cleaner_configured: media_cleaner_configured(s, &user.id).await,
+    })
 }
 
-pub(crate) async fn import_recipe(
-    State(s): State<Arc<AppState>>,
-    user: AuthUser,
-    Form(form): Form<MediaImportForm>,
+/// The Add recipe card again after a refusal, keeping the prompt as typed
+/// and the video tick boxes.
+async fn add_page_error(
+    s: &AppState,
+    user: &AuthUser,
+    error: AppError,
+    prompt: String,
+    channels: MediaChannels,
 ) -> Result<Response> {
-    let raw_url = trim(&form.url);
-    let notes = trim(&form.notes);
-    // Tick boxes choose which evidence channels run; an unticked box means
-    // the extractor skips that stage entirely.
-    let channels = MediaChannels {
-        description: form.use_description.is_some(),
-        audio: form.use_audio.is_some(),
-        ocr: form.use_ocr.is_some(),
-    };
-    let cleaner_configured = media_cleaner_configured(&s, &user.id).await;
-    if form.url.chars().count() > MAX_IMPORT_URL_CHARS
-        || form.notes.chars().count() > MAX_IMPORT_NOTES_CHARS
-    {
-        return Ok(render_import_error(
-            format!(
-                "Keep the URL under {MAX_IMPORT_URL_CHARS} characters and notes under {MAX_IMPORT_NOTES_CHARS} characters."
-            ),
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
-        ));
-    }
-    if raw_url.is_empty() {
-        return Ok(render_import_error(
-            "A Facebook or Instagram URL is required.",
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
-        ));
+    add_recipe_page(s, user, error.to_string(), prompt, channels)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+/// Checks a video import and starts it in the background, returning the run
+/// id for its progress page. Tick boxes choose which evidence channels run;
+/// an unticked box means the extractor skips that stage entirely.
+async fn start_import(
+    s: &Arc<AppState>,
+    user: &AuthUser,
+    raw_url: &str,
+    notes: &str,
+    channels: MediaChannels,
+) -> Result<String> {
+    if notes.chars().count() > MAX_IMPORT_NOTES_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "Keep the text around the video link under {MAX_IMPORT_NOTES_CHARS} characters."
+        )));
     }
     if !channels.any() {
-        return Ok(render_import_error(
-            "Tick at least one source under Advanced options: caption, speech, or on-screen text.",
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
+        return Err(AppError::BadRequest(
+            "Tick at least one source under Video options: caption, speech, or on-screen text."
+                .into(),
         ));
     }
-    let source_url = match canonical_social_url(&raw_url) {
-        Ok(source_url) => source_url,
-        Err(error) => {
-            return Ok(render_import_error(
-                error.to_string(),
-                &raw_url,
-                &notes,
-                channels,
-                s.search_grounding,
-                cleaner_configured,
-            ));
-        }
-    };
-    if let Err(error) = ensure_media_cleaner_configured(&s, &user.id).await {
-        return Ok(render_import_error(
-            error.to_string(),
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
-        ));
-    }
-    if let Err(error) = ensure_ai_configured(&s, &user).await {
-        return Ok(render_import_error(
-            error.to_string(),
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
-        ));
-    }
+    let source_url = canonical_social_url(raw_url)?;
+    ensure_media_cleaner_configured(s, &user.id).await?;
+    ensure_ai_configured(s, user).await?;
     prune_debug_runs(&s.media_debug_runs);
     if s.media_debug_runs.lock().len() >= DEBUG_RUN_LIMIT {
-        return Ok(render_import_error(
-            "There are already several media jobs running. Wait for one to finish and try again.",
-            &raw_url,
-            &notes,
-            channels,
-            s.search_grounding,
-            cleaner_configured,
+        return Err(AppError::BadRequest(
+            "There are already several media jobs running. Wait for one to finish and try again."
+                .into(),
         ));
     }
     let run_id = Uuid::new_v4().to_string();
@@ -270,9 +240,15 @@ pub(crate) async fn import_recipe(
         .insert(run_id.clone(), run.clone());
 
     tokio::spawn(run_media_import(
-        s, user, run, source_url, notes, channels, frames_dir,
+        s.clone(),
+        user.clone(),
+        run,
+        source_url,
+        notes.to_string(),
+        channels,
+        frames_dir,
     ));
-    Ok(Redirect::to(&format!("/ai/import/{run_id}")).into_response())
+    Ok(run_id)
 }
 
 async fn run_media_import(
@@ -2857,12 +2833,10 @@ pub(crate) async fn import_run_page(
     })
 }
 
-/// The add page in video mode with `source_url` filled in.
+/// The Add recipe card with `source_url` filled in.
 fn retry_url(source_url: &str) -> String {
     let mut url = reqwest::Url::parse("http://local/recipes/new").expect("static URL");
-    url.query_pairs_mut()
-        .append_pair("mode", "video")
-        .append_pair("url", source_url);
+    url.query_pairs_mut().append_pair("url", source_url);
     format!("{}?{}", url.path(), url.query().unwrap_or_default())
 }
 

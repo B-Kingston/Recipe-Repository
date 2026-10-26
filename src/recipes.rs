@@ -4,11 +4,10 @@ use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
 use crate::search::{self, Indexed};
 use crate::thumbs::{self, ThumbCandidate};
 use crate::{
-    AddRecipeQuery, AddRecipeTemplate, AppError, AppState, AuthUser, Block, BlockForm,
-    DeleteTemplate, Draft, HomeQuery, HomeTemplate, Recipe, RecipeForm, RecipeQuery,
-    RecipeSnapshot, RecipeTemplate, Result, SnapshotIngredient, SnapshotStep, Source,
-    VersionTemplate, ViewBlock, ViewStep, display_timestamp, generate_guidance, number,
-    option_number, render, required, stamp, trim,
+    AddRecipeQuery, AppError, AppState, AuthUser, Block, BlockForm, DeleteTemplate, Draft,
+    HomeQuery, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeSnapshot, RecipeTemplate,
+    Result, SnapshotIngredient, SnapshotStep, Source, VersionTemplate, ViewBlock, ViewStep,
+    display_timestamp, number, option_number, render, required, stamp, trim,
 };
 use axum::{
     Form,
@@ -340,19 +339,14 @@ pub(crate) async fn new_recipe(
     user: AuthUser,
     Query(query): Query<AddRecipeQuery>,
 ) -> Result<Html<String>> {
-    render(AddRecipeTemplate {
-        prompt_error: String::new(),
-        guidance: generate_guidance(state.search_grounding).into(),
-        prompt: String::new(),
-        video_error: String::new(),
-        url: query.url.unwrap_or_default(),
-        notes: String::new(),
-        use_description: true,
-        use_audio: true,
-        use_ocr: true,
-        video_mode: query.mode.as_deref() == Some("video"),
-        cleaner_configured: crate::ai::media_cleaner_configured(&state, &user.id).await,
-    })
+    crate::ai::add_recipe_page(
+        &state,
+        &user,
+        String::new(),
+        query.url.unwrap_or_default(),
+        crate::media::MediaChannels::default(),
+    )
+    .await
 }
 
 pub(crate) async fn recipe_page(

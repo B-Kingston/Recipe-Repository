@@ -29,6 +29,7 @@
     "src/pages.ts",
     "src/chrome.ts",
     "src/library.ts",
+    "src/add-recipe.ts",
     "src/recipe.ts",
     "src/chat.ts",
     "src/settings.ts",

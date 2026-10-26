@@ -1,65 +1,36 @@
 {% extends "base.html" %}{% block title %}Add recipe · Recipe Repository{% endblock %}{% block nav_add %} aria-current="page"{% endblock %}{% block content %}
 <section class="add-recipe" data-add-recipe>
-  <div class="form-intro">
-    <p class="eyebrow">Cookbook / Add recipe</p>
-    <h1>Add recipe</h1>
-    <p class="deck">Research an idea or import a recipe video. You review every draft before it is saved.</p>
-  </div>
-
-  <div class="add-mode-switch" role="tablist" aria-label="Recipe source">
-    <a id="add-mode-prompt" class="add-mode-tab{% if !video_mode %} is-active{% endif %}" href="/recipes/new" role="tab" aria-controls="add-prompt-panel" aria-selected="{% if !video_mode %}true{% else %}false{% endif %}" data-add-mode="prompt" hx-boost="false">Research a recipe</a>
-    <a id="add-mode-video" class="add-mode-tab{% if video_mode %} is-active{% endif %}" href="/recipes/new?mode=video" role="tab" aria-controls="add-video-panel" aria-selected="{% if video_mode %}true{% else %}false{% endif %}" data-add-mode="video" hx-boost="false">Import a video</a>
-  </div>
-
-  <div class="add-recipe-panels">
-    <section id="add-prompt-panel" class="add-recipe-panel" data-add-panel="prompt" role="tabpanel" aria-labelledby="add-mode-prompt"{% if video_mode %} hidden{% endif %}>
-      <div class="add-recipe-panel-heading">
-        <p class="eyebrow">Research from an idea</p>
-        <h2>Describe the recipe</h2>
-        <p class="muted">{{ guidance }}</p>
-      </div>
-      {% if prompt_error != "" %}<p class="error" role="alert">{{ prompt_error }}</p>{% endif %}
-      <form class="panel form-panel add-recipe-form add-recipe-form--prompt" method="post" action="/ai/generate" data-busy-label="Researching…">
-        <label for="recipe-prompt">What should this recipe be based on?<textarea id="recipe-prompt" name="prompt" required maxlength="4000" placeholder="A dish, loose idea, or recipe URL…">{{ prompt }}</textarea></label>
-        <div class="prompt-help">
-          <p><strong>You can include:</strong></p>
-          <ul>
-            <li>A simple idea — “spicy miso mushroom pasta”</li>
-            <li>A known recipe — “Ottolenghi’s confit tandoori chickpeas”</li>
-            <li>One or more recipe URLs to study and recreate</li>
-            <li>Constraints, substitutions, equipment, or serving size</li>
-            <li>An Instagram or Facebook reel link: it is imported from the video</li>
-          </ul>
-        </div>
-        <p class="actions form-actions"><a class="button" href="/">Cancel</a><button class="primary" type="submit">Research &amp; generate</button></p>
-      </form>
-    </section>
-
-    <section id="add-video-panel" class="add-recipe-panel" data-add-panel="video" role="tabpanel" aria-labelledby="add-mode-video"{% if !video_mode %} hidden{% endif %}>
-      <div class="add-recipe-panel-heading">
-        <p class="eyebrow">Recipe video import</p>
-        <h2>Import a video</h2>
-        <p class="muted">Paste a public Instagram or Facebook reel. The recipe is read from the caption, what is said, and the text on screen.</p>
-      </div>
-      {% if video_error != "" %}<p class="error" role="alert">{{ video_error }}</p>{% endif %}
-      {% if !cleaner_configured %}<p class="error">Video import needs a connected AI provider for the video cleaner. <a href="/settings">Set one up in Settings</a> first.</p>{% endif %}
-      <form class="panel form-panel add-recipe-form media-import-panel" method="post" action="/ai/import" data-busy-label="Starting…">
-        <label for="social-url">Reel or post link<input id="social-url" type="url" name="url" value="{{ url }}" required maxlength="2000" placeholder="https://www.instagram.com/reel/…" autocomplete="url"></label>
-        <label for="import-notes">Anything to change? <span class="field-help">Optional</span><textarea id="import-notes" class="short-textarea" name="notes" maxlength="4000" placeholder="e.g. make it vegetarian, it serves four…">{{ notes }}</textarea></label>
-        <details class="advanced-options"{% if !use_description || !use_audio || !use_ocr %} open{% endif %}>
-          <summary>Advanced options</summary>
-          <fieldset class="media-channels">
-            <legend>Read the recipe from</legend>
-            <label class="check-row"><input type="checkbox" name="use_description"{% if use_description %} checked{% endif %}> Caption<span class="field-help">The text under the post. Quickest.</span></label>
-            <label class="check-row"><input type="checkbox" name="use_audio"{% if use_audio %} checked{% endif %}> Speech<span class="field-help">A transcript of what is said. Slowest.</span></label>
-            <label class="check-row"><input type="checkbox" name="use_ocr"{% if use_ocr %} checked{% endif %}> On-screen text<span class="field-help">Ingredient cards and captions read from the frames.</span></label>
-            <p class="field-help">Unticked sources are not downloaded or read. Keep at least one.</p>
-          </fieldset>
-          <p class="field-help">Private, login-only, or region-blocked posts may not download. The video is processed on this server and deleted afterwards.</p>
-        </details>
-        <p class="actions form-actions"><a class="button" href="/">Cancel</a><button class="primary" type="submit">Import recipe</button></p>
-      </form>
-    </section>
-  </div>
+  <form class="recipe-sheet add-card" method="post" action="/ai/generate" data-busy-label="Researching…" data-video-busy-label="Starting…">
+    <div class="add-card-top">
+      <p class="eyebrow">Cookbook / Add recipe</p>
+      <span class="add-card-number" aria-hidden="true">No. ___</span>
+    </div>
+    <h1><label for="recipe-prompt">What are we cooking?</label></h1>
+    <p class="deck">{{ guidance }}</p>
+    <div class="card-rule" aria-hidden="true"></div>
+    {% if error != "" %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <textarea id="recipe-prompt" class="ruled-input" name="prompt" required maxlength="4000" placeholder="A dish, a recipe name, a recipe link, or a reel…" aria-describedby="add-card-hint">{{ prompt }}</textarea>
+    <div class="link-slips" data-link-slips data-page-note="{% if search_grounding %}studied &amp; cited{% else %}sent with your note{% endif %}" aria-live="polite" hidden></div>
+    <div class="video-options" data-video-options>
+      {% if !cleaner_configured %}<p class="error">Reading a video needs a connected AI provider for the video cleaner. <a href="/settings">Set one up in Settings</a> first.</p>{% endif %}
+      <details class="advanced-options"{% if !use_description || !use_audio || !use_ocr %} open{% endif %}>
+        <summary>Video options</summary>
+        <input type="hidden" name="video_options" value="on">
+        <fieldset class="media-channels">
+          <legend>Read a reel from</legend>
+          <label class="check-row"><input type="checkbox" name="use_description" data-channel="caption"{% if use_description %} checked{% endif %}> Caption<span class="field-help">The text under the post. Quickest.</span></label>
+          <label class="check-row"><input type="checkbox" name="use_audio" data-channel="speech"{% if use_audio %} checked{% endif %}> Speech<span class="field-help">A transcript of what is said. Slowest.</span></label>
+          <label class="check-row"><input type="checkbox" name="use_ocr" data-channel="on-screen text"{% if use_ocr %} checked{% endif %}> On-screen text<span class="field-help">Ingredient cards and captions read from the frames.</span></label>
+          <p class="field-help">Unticked sources are not downloaded or read. Keep at least one.</p>
+        </fieldset>
+        <p class="field-help">Used when the card links an Instagram or Facebook reel, one per recipe. Private, login-only, or region-blocked posts may not download. The video is processed on this server and deleted afterwards.</p>
+      </details>
+    </div>
+    <div class="add-card-actions">
+      <p class="add-card-hint" id="add-card-hint">Ideas, recipe names, links and reels: all on one card.</p>
+      <a class="button" href="/">Cancel</a>
+      <button class="primary" type="submit" data-add-submit data-video-label="Import recipe">Research &amp; generate</button>
+    </div>
+  </form>
 </section>
 {% endblock %}

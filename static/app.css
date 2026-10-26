@@ -986,33 +986,81 @@ body.auth-popup-open { overflow: hidden; }
 .chart-controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 0; }
 .print-standard { display: none; }
 
-/* Add recipe */
+/* Add recipe: a blank index card. The prompt is typed on ruled lines under
+   the red rule, and add-recipe.ts pins every link in it below as a slip (a
+   reel, or a page), each held on with a paper clip. */
 .add-recipe { width: min(100%, 780px); margin: 0 auto; }
-.add-recipe .form-intro { max-width: none; margin-bottom: 20px; }
-.add-mode-switch { display: flex; gap: 2px; margin: 0 0 22px; padding: 4px; border-radius: 12px; background: var(--wash); }
-.add-mode-tab {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  justify-content: center;
-  min-height: 44px;
-  padding: 0 14px;
-  border-radius: 9px;
-  color: var(--body);
-  font: 600 15px/1.2 var(--sans);
-  text-align: center;
-  text-decoration: none;
+.add-card { padding: 32px 40px 28px; }
+.add-card-top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.add-card-top .eyebrow { margin: 0; }
+.add-card-number { color: var(--muted); font: 15px/1 var(--type); white-space: nowrap; }
+.add-card h1 { margin: 10px 0 0; font: 700 2.3rem/1.15 var(--type); letter-spacing: -.01em; }
+.add-card h1 label { display: inline; margin: 0; font: inherit; }
+.add-card .deck { max-width: 40em; margin-top: 12px; font: 16px/1.6 var(--type); }
+.add-card .card-rule { margin-top: 22px; }
+.add-card .error { margin: 16px 0 0; }
+.ruled-input {
+  display: block;
+  min-height: 160px;
+  margin: 6px 0 0;
+  padding: 0 0 0 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent linear-gradient(transparent 31px, var(--lines) 31px) 0 0 / 100% 32px;
+  background-attachment: local;
+  font: 18px/32px var(--type);
 }
-.add-mode-tab:hover { color: var(--ink); }
-.add-mode-tab.is-active { background: var(--card); color: var(--ink); box-shadow: 0 1px 2px rgba(31, 41, 51, .14); }
-.add-recipe-panel-heading { margin: 0 0 14px; }
-.add-recipe-panel-heading h2 { margin: 0 0 6px; font-size: 1.5rem; }
-.add-recipe-panel-heading .muted { margin-bottom: 0; }
-.add-recipe-panel .form-panel { max-width: none; margin-top: 0; }
-.prompt-help { margin: 14px 0; padding: 14px 16px; border-radius: 12px; background: var(--soft); font-size: .94rem; }
-.prompt-help p { margin-bottom: 6px; }
-.prompt-help ul { margin: 0; padding-left: 1.2rem; }
-.prompt-help li { margin: 3px 0; }
+.ruled-input:focus { border: 0; box-shadow: inset 3px 0 var(--rule); }
+.ruled-input::placeholder { color: var(--muted); opacity: .8; }
+.link-slips { display: flex; flex-wrap: wrap; gap: 22px 18px; margin: 30px 0 6px; }
+.link-slips[hidden] { display: none; }
+.link-slip {
+  position: relative;
+  flex: 1 1 240px;
+  min-width: 0;
+  padding: 16px 16px 10px;
+  border: 1px solid #e3e0d6;
+  border-radius: 3px;
+  background: #fbfaf6;
+  box-shadow: 0 2px 6px rgba(31, 41, 51, .08);
+  font: 14px/1.45 var(--type);
+  transform: rotate(-.8deg);
+}
+.link-slip:nth-child(even) { transform: rotate(.7deg); }
+.link-slip::before, .link-slip::after { content: ""; position: absolute; border: 2px solid #8b949e; pointer-events: none; }
+.link-slip::before { top: -13px; left: 20px; width: 12px; height: 30px; border-radius: 7px; }
+.link-slip::after { top: -8px; left: 24px; width: 4px; height: 19px; border-bottom: 0; border-radius: 3px 3px 0 0; }
+.link-slip-kind { display: block; color: var(--rule-ink); font: 700 12px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase; }
+.link-slip.is-page .link-slip-kind { color: var(--muted); }
+.link-slip-url { display: block; margin: 3px 0 2px; font-weight: 700; overflow-wrap: anywhere; }
+.link-slip-what { display: block; color: var(--muted); font-size: 13.5px; }
+.link-slip.is-refused { border-color: #e7c3ca; background: #fbeef0; }
+.link-slip.is-refused .link-slip-what { color: var(--rule-ink); }
+.link-slip-actions { display: flex; flex-wrap: wrap; gap: 0 14px; margin-top: 4px; }
+.link-slip-actions button {
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 13.5px/1.2 var(--type);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.link-slip-actions button:hover { border: 0; background: transparent; color: var(--rule-ink); }
+.video-options[hidden] { display: none; }
+.video-options .error { margin: 18px 0 0; }
+.add-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 22px 0 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--lines);
+}
+.add-card-hint { flex: 1 1 220px; margin: 0; color: var(--muted); font: italic 14px/1.4 var(--type); }
 .media-channels { margin: 1rem 0 .4rem; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; }
 .media-channels legend { padding: 0 6px; color: var(--muted); font: 700 12px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase; }
 .media-channels .check-row { display: block; margin: .7rem 0; }
@@ -1142,6 +1190,7 @@ body.auth-popup-open { overflow: hidden; }
   .setup-page .setup-card { padding: 30px 22px; }
   .block, .panel, .form-panel { padding: 18px; }
   .recipe-sheet { padding: 26px 20px 28px; border-radius: var(--radius); }
+  .add-card h1 { font-size: 1.9rem; }
   .version-tabs { padding: 0 12px; }
   .ticket-rail { --rail-inset: 18px; column-gap: 24px; }
   .page-header h1 { font-size: 1.9rem; }
@@ -1164,7 +1213,7 @@ body.auth-popup-open { overflow: hidden; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .button, button, .top-nav a, .view-tab, .add-mode-tab {
+  .button, button, .top-nav a, .view-tab {
     transition: background-color .12s ease, border-color .12s ease, box-shadow .12s ease, color .12s ease;
   }
 }

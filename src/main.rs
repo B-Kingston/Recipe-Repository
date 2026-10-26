@@ -52,8 +52,8 @@ use auth::{
 use ai::{
     DebugRunMap, ModelSource, alter_draft, apply_draft, cached_model_catalogue, cancel_draft,
     discover_models, draft_page, draft_still, draft_thumbnail, forget_model_catalogue,
-    generate_page, generate_recipe, import_events, import_frame, import_page, import_recipe,
-    import_run_page, media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
+    generate_page, generate_recipe, import_events, import_frame, import_page, import_run_page,
+    media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
 };
 use htmx::{Flash, flash_redirect};
 use media::MediaEvidence;
@@ -537,16 +537,14 @@ struct DeleteTemplate {
 #[derive(Template)]
 #[template(path = "add_recipe.html")]
 struct AddRecipeTemplate {
-    prompt_error: String,
+    error: String,
     guidance: String,
+    /// Whether page links are researched and cited (worded on their slips).
+    search_grounding: bool,
     prompt: String,
-    video_error: String,
-    url: String,
-    notes: String,
     use_description: bool,
     use_audio: bool,
     use_ocr: bool,
-    video_mode: bool,
     cleaner_configured: bool,
 }
 #[derive(Template)]
@@ -801,9 +799,34 @@ struct BlockForm {
     optional: Option<String>,
     step_ingredients: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct PromptForm {
     prompt: String,
+    /// Sent by the Add recipe card along with its video tick boxes, so a
+    /// missing box reads as unticked. A post without it reads every channel.
+    #[serde(default)]
+    video_options: Option<String>,
+    // Tick boxes: present only when ticked.
+    #[serde(default)]
+    use_description: Option<String>,
+    #[serde(default)]
+    use_audio: Option<String>,
+    #[serde(default)]
+    use_ocr: Option<String>,
+}
+
+impl PromptForm {
+    /// The parts of a linked video to read.
+    fn channels(&self) -> media::MediaChannels {
+        if self.video_options.is_none() {
+            return media::MediaChannels::default();
+        }
+        media::MediaChannels {
+            description: self.use_description.is_some(),
+            audio: self.use_audio.is_some(),
+            ocr: self.use_ocr.is_some(),
+        }
+    }
 }
 /// Which dish-photo candidate (if any) the user chose on the draft preview.
 #[derive(Deserialize)]
@@ -836,19 +859,6 @@ pub(crate) fn image_response(jpeg: Vec<u8>) -> Response {
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct MediaImportForm {
-    url: String,
-    #[serde(default)]
-    notes: String,
-    // Tick boxes: present only when ticked, so None means "skip this channel".
-    #[serde(default)]
-    use_description: Option<String>,
-    #[serde(default)]
-    use_audio: Option<String>,
-    #[serde(default)]
-    use_ocr: Option<String>,
-}
 #[derive(Deserialize)]
 struct SettingsForm {
     #[serde(default)]
@@ -940,8 +950,7 @@ struct RecipeQuery {
 }
 #[derive(Deserialize)]
 struct AddRecipeQuery {
-    mode: Option<String>,
-    /// Prefills the video URL (the retry link of a stopped import).
+    /// Prefills the card (the retry link of a stopped import).
     url: Option<String>,
 }
 
@@ -1066,12 +1075,7 @@ fn routes(state: Arc<AppState>) -> Router {
         )
         .route("/recipes/{id}/blocks/{block_id}/delete", post(delete_block))
         .route("/ai/generate", get(generate_page).post(generate_recipe))
-        .route(
-            "/ai/import",
-            get(import_page)
-                .post(import_recipe)
-                .layer(DefaultBodyLimit::max(128 * 1024)),
-        )
+        .route("/ai/import", get(import_page))
         .route("/ai/import/{run_id}", get(import_run_page))
         .route("/ai/import/{run_id}/events", get(import_events))
         .route(
@@ -1315,9 +1319,9 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 fn generate_guidance(search_grounding: bool) -> &'static str {
     if search_grounding {
-        "Describe what you want to cook, name a recipe to recreate, or paste one or more recipe URLs. The assistant will research the web before preparing a complete draft."
+        "An idea, a recipe to recreate, recipe links, or an Instagram or Facebook reel. Links are researched, a reel is read from the video, and you review the draft before it is saved."
     } else {
-        "Describe what you want to cook or name a recipe to recreate. The assistant will prepare a complete draft for review."
+        "An idea, a recipe to recreate, or an Instagram or Facebook reel to read from the video. You review the draft before it is saved."
     }
 }
 
