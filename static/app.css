@@ -780,6 +780,55 @@ label > input[type=checkbox] { margin-right: 8px; }
 .step-moments-note { margin: 16px 0 0; }
 .step-moments-note p { margin: 0 0 8px; }
 
+/* Recipe chat: a drawer under the card actions. Questions sit on the right
+   in ink, answers on the left in the card's typewriter face. A saved change
+   leaves a divider: a zigzag rule (static/zigzag.svg, one rounded period
+   repeated) either side of a pill naming the change. */
+.chat-toggle.is-pressed { border-color: var(--ink); background: var(--ink); color: var(--on-ink); }
+.recipe-chat { margin: 18px 0 0; padding: 16px 18px 18px; border-radius: 12px; background: var(--soft); }
+.chat-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.chat-head .section-label { margin: 0; }
+.chat-empty { margin: 0 0 12px; }
+.chat-thread { max-height: 26rem; margin: 0 0 12px; padding: 0 4px 0 0; overflow-y: auto; list-style: none; -webkit-overflow-scrolling: touch; }
+.chat-turn { display: flex; flex-direction: column; margin: 10px 0; }
+.chat-question { align-items: flex-end; }
+.chat-answer { align-items: flex-start; }
+.chat-bubble { max-width: 88%; margin: 0; padding: 9px 13px; border-radius: 12px; white-space: pre-line; overflow-wrap: anywhere; }
+.chat-question .chat-bubble { border-bottom-right-radius: 4px; background: var(--ink); color: var(--on-ink); font: 15px/1.45 var(--sans); }
+.chat-answer .chat-bubble { border: 1px solid var(--border); border-bottom-left-radius: 4px; background: var(--card); font: 16px/1.5 var(--type); }
+.chat-bubble.is-pending { border-style: dashed; color: var(--muted); font-style: italic; }
+.chat-bubble.is-failed { border-color: #e7c3ca; color: var(--rule-ink); font-family: var(--sans); font-size: 15px; font-weight: 600; }
+.chat-proposal { max-width: 88%; margin-top: 6px; padding: 10px 13px; border: 1px solid var(--rule); border-radius: 12px; background: var(--card); }
+.chat-proposal p { margin: 0; }
+.chat-proposal .muted { margin-top: 4px; }
+.chat-proposal-label { color: var(--rule-ink); font: 700 12px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase; }
+.chat-proposal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.chat-change { display: flex; align-items: center; gap: 8px; margin: 18px 0; }
+.chat-change-line { flex: 1 1 0; min-width: 24px; height: 16px; background: url('/static/zigzag.svg') right center / 16px 16px repeat-x; }
+.chat-change-line + .chat-change-label + .chat-change-line { background-position: left center; }
+.chat-change-label { flex: 0 1 auto; padding: 3px 13px; border: 2px solid var(--muted); border-radius: 999px; color: var(--ink); font: 600 13px/1.3 var(--sans); text-align: center; }
+.chat-waiting { margin: 0 0 10px; }
+.chat-ask { display: flex; align-items: flex-end; gap: 8px; }
+.chat-ask textarea { flex: 1 1 auto; min-width: 0; min-height: 44px; margin: 0; resize: vertical; }
+.chat-keep, .chat-kept { margin: 2px 0 0; }
+.chat-keep button.compact { min-height: 32px; padding: 0 8px; color: var(--muted); font-size: 13px; }
+.chat-kept { color: var(--muted); font: 600 13px/1.3 var(--sans); }
+
+/* Notes: the cook's own index cards under the recipe, each dated and
+   tagged with what it is about (the whole recipe, or one version). */
+.recipe-notes { margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--lines); }
+.recipe-notes h2 { margin: 0 0 8px; color: var(--rule-ink); font-size: 13px; letter-spacing: .14em; text-transform: uppercase; }
+.note-list { margin: 0 0 8px; padding: 0; list-style: none; }
+.note { padding: 12px 0 14px; border-bottom: 1px solid var(--lines); }
+.note-meta { margin: 0 0 4px; color: var(--muted); font: 600 13px/1.3 var(--sans); }
+.note-body { margin: 0; font: 16px/1.55 var(--type); white-space: pre-line; overflow-wrap: anywhere; }
+.note-photo { display: inline-block; margin-top: 8px; border-radius: 10px; line-height: 0; cursor: zoom-in; }
+.note-photo img { max-width: min(100%, 280px); max-height: 220px; border-radius: 10px; object-fit: cover; }
+.note-photo:hover img, .note-photo:focus img { outline: 2px solid var(--ink); outline-offset: 2px; }
+.note-edit { margin-top: 6px; }
+.note-edit summary { display: inline-block; color: var(--muted); cursor: pointer; font: 600 13px/1.3 var(--sans); }
+.note-edit form { margin: 8px 0 0; padding: 14px 16px; border-radius: 12px; background: var(--soft); font-family: var(--sans); }
+
 .edit-form, .add-form { margin: 10px 0 14px; padding: 16px 18px; border-radius: 12px; background: var(--soft); font-family: var(--sans); }
 .edit-form > label:first-child, .add-form > input[type=hidden] + label { margin-top: 0; }
 .edit-danger { margin: .4rem 0 0; }

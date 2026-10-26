@@ -646,6 +646,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
             view: None,
             step: None,
         }),
+        crate::htmx::Flash::default(),
     )
     .await
     .unwrap()

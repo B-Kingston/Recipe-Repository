@@ -39,7 +39,13 @@
 <div class="card-actions">
   <div class="actions page-actions">
     {% if !chart_view && steps.len() > 0 %}<a class="button primary" data-chart-start href="/recipes/{{ recipe.id }}?view=chart&step=1" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">Start cooking</a>{% endif %}
-    <a class="button" href="/recipes/{{ recipe.id }}/ai/alter">Alter with AI</a>
+    {% if let Some(chat) = chat %}
+    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/drawer" hx-swap="innerHTML show:none">
+      <input type="hidden" name="open" value="{% if chat.open %}off{% else %}on{% endif %}">
+      <input type="hidden" name="back" value="{{ chat.back }}">
+      <button class="chat-toggle{% if chat.open %} is-pressed{% endif %}" aria-pressed="{{ chat.open }}">Ask</button>
+    </form>
+    {% endif %}
     <a class="button quiet" href="/recipes/{{ recipe.id }}?edit_meta=1#recipe-details">Edit</a>
     <a class="button quiet danger" href="/recipes/{{ recipe.id }}/delete">Delete</a>
   </div>
@@ -49,6 +55,7 @@
     <a class="view-tab{% if chart_view %} is-active{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart"{% if chart_view %} aria-current="page"{% endif %}>Flow chart</a>
   </nav>
 </div>
+{% if let Some(chat) = chat %}{% if chat.open %}{% include "recipe_chat.html" %}{% endif %}{% endif %}
 
 {% if !chart_view %}
 {% if edit_meta %}
@@ -151,6 +158,8 @@
   </details>
 </section>
 </div>
+
+{% include "recipe_notes.html" %}
 
 <section class="thumb-manage"{% if thumb_state == "pending" %} data-thumb-pending="{{ recipe.id }}"{% endif %}>
   <h2>Dish photo</h2>

@@ -1,4 +1,5 @@
 use crate::chart::{build_chart, infer_step_ingredients};
+use crate::htmx::Flash;
 use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
 use crate::search::{self, Indexed};
 use crate::thumbs::{self, ThumbCandidate};
@@ -359,6 +360,7 @@ pub(crate) async fn recipe_page(
     user: AuthUser,
     Path(id): Path<String>,
     Query(query): Query<RecipeQuery>,
+    flash: Flash,
 ) -> Result<Html<String>> {
     let recipe = find_recipe(&state.db, &user.id, &id).await?;
     let (ingredient_blocks, step_blocks): (Vec<Block>, Vec<Block>) = blocks(&state.db, &id)
@@ -438,6 +440,15 @@ pub(crate) async fn recipe_page(
     };
     let can_pick_video_frames = thumbs::enabled() && video_url.is_some();
     let versions = recipe_versions(&state.db, &user.id, &id).await?;
+    // The chat drawer's forms and poll come back to this view and step.
+    let back = match (chart_view, query.step) {
+        (true, Some(step)) => format!("/recipes/{id}?view=chart&step={step}"),
+        (true, None) => format!("/recipes/{id}?view=chart"),
+        (false, _) => format!("/recipes/{id}"),
+    };
+    let chat = crate::chat::panel(&state, &user, &id, back, &flash).await?;
+    let notes =
+        crate::notes::panel(&state, &user, &id, None, format!("/recipes/{id}"), &flash).await?;
     render(RecipeTemplate {
         servings_value: option_number(recipe.servings),
         prep_value: option_number(recipe.prep_minutes),
@@ -456,6 +467,8 @@ pub(crate) async fn recipe_page(
         thumb_state: thumb_state.to_string(),
         thumb_options,
         versions,
+        chat,
+        notes,
     })
 }
 
@@ -660,10 +673,21 @@ pub(crate) async fn view_version(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path((id, version)): Path<(String, i64)>,
+    flash: Flash,
 ) -> Result<Html<String>> {
     let recipe = find_recipe(&state.db, &user.id, &id).await?;
     let detail = find_version(&state.db, &user.id, &id, version).await?;
+    let notes = crate::notes::panel(
+        &state,
+        &user,
+        &id,
+        Some(detail.version),
+        format!("/recipes/{id}/versions/{}", detail.version),
+        &flash,
+    )
+    .await?;
     render(VersionTemplate {
+        notes,
         recipe,
         version: detail.version,
         label: detail.label,
@@ -1363,7 +1387,7 @@ pub(crate) async fn upload_thumbnail(
     let raw = uploaded
         .filter(|bytes| !bytes.is_empty())
         .ok_or_else(|| AppError::BadRequest("Choose an image file to upload.".into()))?;
-    let jpeg = normalize_upload_jpeg(&raw).await?;
+    let jpeg = normalize_upload_jpeg(&raw, DISH_PHOTO_FILTER).await?;
     // A manual upload replaces the photo and any pending frame picks.
     delete_recipe_thumbnails(&state.db, &id).await?;
     sqlx::query("UPDATE recipes SET thumbnail_jpeg=? WHERE id=? AND user_id=?")
@@ -1375,7 +1399,16 @@ pub(crate) async fn upload_thumbnail(
     Ok(redirect_recipe(&id))
 }
 
-async fn normalize_upload_jpeg(raw: &[u8]) -> Result<Vec<u8>> {
+/// The dish photo: a square 600 px crop.
+const DISH_PHOTO_FILTER: &str = "scale=600:600:force_original_aspect_ratio=increase,crop=600:600";
+/// A note photo keeps its shape, at most 1280 px on the longer side (even
+/// dimensions for the JPEG encoder).
+pub(crate) const NOTE_PHOTO_FILTER: &str = "scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2";
+
+/// Converts an uploaded image to a JPEG through the local ffmpeg install with
+/// `filter`; when ffmpeg is not installed but the upload already is a JPEG,
+/// it is kept as-is.
+pub(crate) async fn normalize_upload_jpeg(raw: &[u8], filter: &str) -> Result<Vec<u8>> {
     let dir = std::env::temp_dir().join(format!("kindle-recipes-upload-{}", Uuid::new_v4()));
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1397,7 +1430,7 @@ async fn normalize_upload_jpeg(raw: &[u8]) -> Result<Vec<u8>> {
         "-frames:v".into(),
         "1".into(),
         "-vf".into(),
-        "scale=600:600:force_original_aspect_ratio=increase,crop=600:600".into(),
+        filter.to_string(),
         "-q:v".into(),
         "3".into(),
         output.to_string_lossy().to_string(),
@@ -1999,6 +2032,525 @@ pub(crate) async fn recipe_still(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(crate::image_response(jpeg))
+}
+
+/// One stored recipe-chat row, in thread order.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct ChatMessage {
+    pub(crate) id: String,
+    pub(crate) role: String,
+    pub(crate) content: String,
+    pub(crate) status: String,
+    pub(crate) change_label: String,
+    pub(crate) change_state: String,
+    pub(crate) created_at: String,
+}
+
+/// A user's conversation about one recipe, oldest first. Every chat query is
+/// scoped by user id as well as recipe id, so a thread is only ever read by
+/// the account that wrote it.
+pub(crate) async fn chat_thread(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<Vec<ChatMessage>> {
+    Ok(sqlx::query_as(
+        "SELECT id,role,content,status,change_label,change_state,created_at
+         FROM recipe_chat_messages WHERE user_id=? AND recipe_id=? ORDER BY rowid",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Whether an answer or a change draft is still running in the thread.
+pub(crate) async fn chat_busy(db: &SqlitePool, user_id: &str, recipe_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM recipe_chat_messages
+         WHERE user_id=? AND recipe_id=? AND (status='pending' OR change_state='drafting'))",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_one(db)
+    .await?)
+}
+
+/// Stores a question and its pending answer together; returns the answer id.
+pub(crate) async fn start_chat_turn(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    question: &str,
+) -> Result<String> {
+    let answer_id = Uuid::new_v4().to_string();
+    let now = stamp();
+    let mut tx = db.begin().await?;
+    sqlx::query("INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,content,created_at)VALUES(?,?,?,'user',?,?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(recipe_id)
+        .bind(question)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,status,created_at)VALUES(?,?,?,'assistant','pending',?)")
+        .bind(&answer_id)
+        .bind(user_id)
+        .bind(recipe_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(answer_id)
+}
+
+/// Fills in a pending answer. Returns false when the row is gone (the chat
+/// was cleared while the model ran), so the caller stops there.
+pub(crate) async fn finish_chat_answer(
+    db: &SqlitePool,
+    answer_id: &str,
+    reply: &str,
+    change_request: &str,
+    change_label: &str,
+) -> Result<bool> {
+    let change_state = if change_request.is_empty() {
+        ""
+    } else {
+        "drafting"
+    };
+    Ok(sqlx::query(
+        "UPDATE recipe_chat_messages SET content=?,status='done',change_request=?,change_label=?,change_state=?
+         WHERE id=? AND status='pending'",
+    )
+    .bind(reply)
+    .bind(change_request)
+    .bind(change_label)
+    .bind(change_state)
+    .bind(answer_id)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Marks a pending answer as failed with the text to show in its place.
+/// `status` is "failed", or "needs_settings" when the fix is in Settings.
+pub(crate) async fn fail_chat_answer(
+    db: &SqlitePool,
+    answer_id: &str,
+    status: &str,
+    message: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE recipe_chat_messages SET content=?,status=? WHERE id=? AND status='pending'",
+    )
+    .bind(message)
+    .bind(status)
+    .bind(answer_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Moves a drafting change on to "ready" or "failed".
+pub(crate) async fn set_chat_change_state(
+    db: &SqlitePool,
+    answer_id: &str,
+    state: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE recipe_chat_messages SET change_state=? WHERE id=? AND change_state='drafting'",
+    )
+    .bind(state)
+    .bind(answer_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Deletes the user's whole conversation about a recipe. Drafts made from it
+/// stay reviewable on their own (their link is cleared by the foreign key).
+pub(crate) async fn clear_chat(db: &SqlitePool, user_id: &str, recipe_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM recipe_chat_messages WHERE user_id=? AND recipe_id=?")
+        .bind(user_id)
+        .bind(recipe_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Answers and drafts that were running when the app stopped can never
+/// finish; at startup they become failures the cook can ask again about.
+pub(crate) async fn fail_interrupted_chats(db: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "UPDATE recipe_chat_messages SET status='failed',content='The answer was interrupted. Ask again.'
+         WHERE status='pending'",
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "UPDATE recipe_chat_messages SET change_state='failed' WHERE change_state='drafting'",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// The newest live draft for each chat answer in a thread, keyed by answer id.
+pub(crate) async fn chat_drafts(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<HashMap<String, String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT chat_message_id,id FROM ai_drafts
+         WHERE user_id=? AND recipe_id=? AND chat_message_id IS NOT NULL AND expires_at >= ?
+         ORDER BY created_at, rowid",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .bind(Utc::now().to_rfc3339())
+    .fetch_all(db)
+    .await?;
+    // Later rows win, so an altered draft replaces the one it came from.
+    Ok(rows.into_iter().collect())
+}
+
+/// Links a freshly made draft to the chat answer that asked for it, unless
+/// the chat was cleared while the draft was made.
+pub(crate) async fn link_draft_to_chat(
+    db: &SqlitePool,
+    draft_id: &str,
+    answer_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ai_drafts SET chat_message_id=?1
+         WHERE id=?2 AND EXISTS(SELECT 1 FROM recipe_chat_messages WHERE id=?1)",
+    )
+    .bind(answer_id)
+    .bind(draft_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Carries a draft's chat link onto the draft that alters it, so saving the
+/// end of the chain still marks the chat.
+pub(crate) async fn carry_draft_chat(db: &SqlitePool, from: &str, to: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE ai_drafts SET chat_message_id=(SELECT chat_message_id FROM ai_drafts WHERE id=?1)
+         WHERE id=?2 AND EXISTS(SELECT 1 FROM ai_drafts WHERE id=?1 AND chat_message_id IS NOT NULL)",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// The recipe and chat answer a user's draft was made for, if it came from a chat.
+pub(crate) async fn draft_chat(
+    db: &SqlitePool,
+    user_id: &str,
+    draft_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT recipe_id,chat_message_id FROM ai_drafts
+         WHERE id=? AND user_id=? AND recipe_id IS NOT NULL AND chat_message_id IS NOT NULL",
+    )
+    .bind(draft_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Marks a chat change as discarded once no draft of it is left.
+pub(crate) async fn discard_chat_change(
+    db: &SqlitePool,
+    user_id: &str,
+    answer_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE recipe_chat_messages SET change_state='discarded'
+         WHERE id=?1 AND user_id=?2 AND change_state='ready'
+           AND NOT EXISTS(SELECT 1 FROM ai_drafts WHERE chat_message_id=?1)",
+    )
+    .bind(answer_id)
+    .bind(user_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Records, inside `apply_draft`'s transaction, that a change from the chat
+/// was saved: a divider row at this point in the thread, labelled with the
+/// model's name for the change (or a summary of what differs from `before`),
+/// and the answer marked applied. The other drafts of the same change go.
+/// Returns the label, or None when the chat was cleared meanwhile.
+pub(crate) async fn record_chat_change(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    recipe_id: &str,
+    answer_id: &str,
+    draft_id: &str,
+    before: &RecipeSnapshot,
+) -> Result<Option<String>> {
+    let model_label: Option<String> = sqlx::query_scalar(
+        "SELECT change_label FROM recipe_chat_messages
+         WHERE id=? AND user_id=? AND recipe_id=? AND role='assistant'",
+    )
+    .bind(answer_id)
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(model_label) = model_label else {
+        return Ok(None);
+    };
+    let after = recipe_snapshot(tx, user_id, recipe_id).await?;
+    let label = crate::chat::divider_label(&model_label, before, &after);
+    sqlx::query("INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,content,created_at)VALUES(?,?,?,'change',?,?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(recipe_id)
+        .bind(&label)
+        .bind(stamp())
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE recipe_chat_messages SET change_state='applied' WHERE id=?")
+        .bind(answer_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM draft_thumbnails WHERE draft_id IN
+           (SELECT id FROM ai_drafts WHERE chat_message_id=? AND user_id=? AND id<>?)",
+    )
+    .bind(answer_id)
+    .bind(user_id)
+    .bind(draft_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM ai_drafts WHERE chat_message_id=? AND user_id=? AND id<>?")
+        .bind(answer_id)
+        .bind(user_id)
+        .bind(draft_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Some(label))
+}
+
+/// One note on a recipe, without its photo bytes.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct RecipeNote {
+    pub(crate) id: String,
+    pub(crate) version: Option<i64>,
+    pub(crate) body: String,
+    pub(crate) has_photo: bool,
+    pub(crate) chat_message_id: Option<String>,
+    pub(crate) created_at: String,
+}
+
+/// The user's notes on a recipe, newest first. Like the chat, every note
+/// query is scoped by user id as well as recipe id.
+pub(crate) async fn recipe_notes(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<Vec<RecipeNote>> {
+    Ok(sqlx::query_as(
+        "SELECT id,version,body,photo_jpeg IS NOT NULL AS has_photo,chat_message_id,created_at
+         FROM recipe_notes WHERE user_id=? AND recipe_id=? ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?)
+}
+
+pub(crate) async fn find_note(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    note_id: &str,
+) -> Result<RecipeNote> {
+    sqlx::query_as(
+        "SELECT id,version,body,photo_jpeg IS NOT NULL AS has_photo,chat_message_id,created_at
+         FROM recipe_notes WHERE id=? AND user_id=? AND recipe_id=?",
+    )
+    .bind(note_id)
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)
+}
+
+/// Stores a note; returns its id. The caller has checked the recipe is the
+/// user's and that the note has text or a photo.
+pub(crate) async fn insert_note(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    version: Option<i64>,
+    body: &str,
+    photo: Option<&[u8]>,
+    chat_message_id: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = stamp();
+    sqlx::query("INSERT INTO recipe_notes(id,user_id,recipe_id,version,body,photo_jpeg,chat_message_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?)")
+        .bind(&id)
+        .bind(user_id)
+        .bind(recipe_id)
+        .bind(version)
+        .bind(body)
+        .bind(photo)
+        .bind(chat_message_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db)
+        .await?;
+    Ok(id)
+}
+
+/// Changes a note's text and the version it is about.
+pub(crate) async fn update_note(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    note_id: &str,
+    body: &str,
+    version: Option<i64>,
+) -> Result<()> {
+    sqlx::query("UPDATE recipe_notes SET body=?,version=?,updated_at=? WHERE id=? AND user_id=? AND recipe_id=?")
+        .bind(body)
+        .bind(version)
+        .bind(stamp())
+        .bind(note_id)
+        .bind(user_id)
+        .bind(recipe_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn delete_note(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    note_id: &str,
+) -> Result<()> {
+    let removed = sqlx::query("DELETE FROM recipe_notes WHERE id=? AND user_id=? AND recipe_id=?")
+        .bind(note_id)
+        .bind(user_id)
+        .bind(recipe_id)
+        .execute(db)
+        .await?
+        .rows_affected();
+    if removed == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
+
+/// A note's photo, served only to the note's owner.
+pub(crate) async fn note_photo_jpeg(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    note_id: &str,
+) -> Result<Option<Vec<u8>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT photo_jpeg FROM recipe_notes WHERE id=? AND user_id=? AND recipe_id=? AND photo_jpeg IS NOT NULL",
+    )
+    .bind(note_id)
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// A note as the chat's tools read it, photo bytes included.
+#[derive(Debug, Clone, FromRow)]
+pub(crate) struct ChatNoteRow {
+    pub(crate) version: Option<i64>,
+    pub(crate) body: String,
+    pub(crate) photo_jpeg: Option<Vec<u8>>,
+    pub(crate) created_at: String,
+}
+
+/// The newest `limit` notes on a recipe, for the chat.
+pub(crate) async fn chat_notes(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    limit: i64,
+) -> Result<Vec<ChatNoteRow>> {
+    Ok(sqlx::query_as(
+        "SELECT version,body,photo_jpeg,created_at FROM recipe_notes
+         WHERE user_id=? AND recipe_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// The chat answers in a thread that were kept as notes.
+pub(crate) async fn kept_chat_answers(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT chat_message_id FROM recipe_notes
+         WHERE user_id=? AND recipe_id=? AND chat_message_id IS NOT NULL",
+    )
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_all(db)
+    .await?;
+    Ok(ids.into_iter().collect())
+}
+
+/// The version matching the recipe as it is now. Every edit records a
+/// version, so that is the newest one; a recipe with no history yet gets its
+/// "Original recipe" version first.
+pub(crate) async fn current_version(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+) -> Result<i64> {
+    let mut tx = db.begin().await?;
+    find_recipe_tx(&mut tx, user_id, recipe_id).await?;
+    ensure_recipe_history(&mut tx, user_id, recipe_id).await?;
+    let version: i64 =
+        sqlx::query_scalar("SELECT MAX(version) FROM recipe_versions WHERE recipe_id=?")
+            .bind(recipe_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(version)
+}
+
+/// A finished chat answer's text, if it is the user's and on this recipe.
+pub(crate) async fn chat_answer_text(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    answer_id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT content FROM recipe_chat_messages
+         WHERE id=? AND user_id=? AND recipe_id=? AND role='assistant' AND status='done'",
+    )
+    .bind(answer_id)
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_optional(db)
+    .await?)
 }
 
 #[cfg(test)]
