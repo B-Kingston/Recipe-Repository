@@ -32,12 +32,14 @@ use uuid::Uuid;
 mod ai;
 mod auth;
 mod chart;
+mod chat;
 mod display;
 mod embeddings;
 mod htmx;
 mod media;
 mod media_worker;
 mod moments;
+mod notes;
 mod recipes;
 mod search;
 mod thumbs;
@@ -48,11 +50,10 @@ use auth::{
 };
 
 use ai::{
-    DebugRunMap, ModelSource, alter_draft, alter_page, alter_recipe, apply_draft,
-    cached_model_catalogue, cancel_draft, discover_models, draft_page, draft_still,
-    draft_thumbnail, forget_model_catalogue, generate_page, generate_recipe, import_events,
-    import_frame, import_page, import_recipe, import_run_page, media_debug_frame, media_debug_page,
-    media_debug_run_page, media_debug_start,
+    DebugRunMap, ModelSource, alter_draft, apply_draft, cached_model_catalogue, cancel_draft,
+    discover_models, draft_page, draft_still, draft_thumbnail, forget_model_catalogue,
+    generate_page, generate_recipe, import_events, import_frame, import_page, import_recipe,
+    import_run_page, media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
 };
 use htmx::{Flash, flash_redirect};
 use media::MediaEvidence;
@@ -466,6 +467,10 @@ struct RecipeTemplate {
     servings_value: String,
     prep_value: String,
     cook_value: String,
+    /// The recipe chat drawer; None when the user has the chat off.
+    chat: Option<chat::ChatPanel>,
+    /// The cook's notes on the recipe.
+    notes: notes::NotesPanel,
 }
 #[derive(Template)]
 #[template(path = "error.html")]
@@ -489,13 +494,15 @@ struct VersionTemplate {
     servings_value: String,
     prep_value: String,
     cook_value: String,
+    /// The notes about this version.
+    notes: notes::NotesPanel,
 }
 
 /// The editable recipe content captured in version history. Derived chart
 /// data and thumbnail bytes are intentionally excluded; they are not shown on
 /// the read-only version page and duplicating images per edit would make the
 /// history unbounded in size.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecipeSnapshot {
     pub(crate) schema_version: u8,
@@ -508,7 +515,7 @@ pub(crate) struct RecipeSnapshot {
     pub(crate) steps: Vec<SnapshotStep>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SnapshotIngredient {
     pub(crate) name: String,
     pub(crate) quantity: String,
@@ -516,7 +523,7 @@ pub(crate) struct SnapshotIngredient {
     pub(crate) optional: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SnapshotStep {
     pub(crate) text: String,
     pub(crate) ingredients: Vec<String>,
@@ -526,20 +533,6 @@ pub(crate) struct SnapshotStep {
 #[template(path = "delete.html")]
 struct DeleteTemplate {
     recipe: Recipe,
-}
-#[derive(Template)]
-#[template(path = "ai_form.html")]
-struct AiFormTemplate {
-    heading: String,
-    guidance: String,
-    action: String,
-    field_label: String,
-    placeholder: String,
-    show_tips: bool,
-    button: String,
-    cancel_url: String,
-    error: String,
-    prompt: String,
 }
 #[derive(Template)]
 #[template(path = "add_recipe.html")]
@@ -634,10 +627,13 @@ struct SettingsTemplate {
     ai_error: &'static str,
     cleaner_notice: &'static str,
     moments_notice: &'static str,
+    chat_notice: &'static str,
     search_notice: &'static str,
     account_notice: &'static str,
     /// Whether video step moments are captured and shown (global setting).
     step_moments: bool,
+    /// Whether the user has the recipe chat (the Ask drawer) on.
+    recipe_chat: bool,
     /// Whether the embedding sidecar is configured (`EMBEDDING_URL`).
     embeddings_configured: bool,
     /// The user's saved search choice: "embeddings", "bm25" or "shared".
@@ -895,6 +891,37 @@ struct StepMomentsForm {
     #[serde(default)]
     enabled: Option<String>,
 }
+#[derive(Deserialize)]
+struct RecipeChatForm {
+    #[serde(default)]
+    enabled: Option<String>,
+}
+/// A recipe-chat question. `back` is the page the drawer was on.
+#[derive(Deserialize)]
+struct ChatForm {
+    question: String,
+    #[serde(default)]
+    back: String,
+}
+/// A note's text and what it is about ("" whole recipe, "current", or a
+/// version number), returning to `back`.
+#[derive(Deserialize)]
+struct NoteForm {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    about: String,
+    #[serde(default)]
+    back: String,
+}
+/// Opens ("on") or closes the chat drawer, or clears the chat, returning to `back`.
+#[derive(Deserialize)]
+struct ChatDrawerForm {
+    #[serde(default)]
+    open: String,
+    #[serde(default)]
+    back: String,
+}
 /// Settings form for the video cleaner: a provider value ("" follows the
 /// active AI provider) and an optional model.
 #[derive(Deserialize)]
@@ -965,6 +992,7 @@ async fn main() -> anyhowless::Result<()> {
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     retire_codex_models(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
+    crate::recipes::fail_interrupted_chats(&db).await?;
     let removed_expired_drafts = sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
         .bind(stamp())
         .execute(&db)
@@ -1050,7 +1078,7 @@ fn routes(state: Arc<AppState>) -> Router {
             "/ai/import/{run_id}/frames/{url_index}/{file}",
             get(import_frame),
         )
-        .route("/recipes/{id}/ai/alter", get(alter_page).post(alter_recipe))
+        .route("/recipes/{id}/ai/alter", get(chat::alter_redirect))
         .route("/ai/drafts/{id}", get(draft_page))
         .route("/ai/drafts/{id}/alter", post(alter_draft))
         .route("/ai/drafts/{id}/apply", post(apply_draft))
@@ -1069,11 +1097,32 @@ fn routes(state: Arc<AppState>) -> Router {
             post(start_thumbnail_recompute),
         )
         .route("/recipes/{id}/moments/capture", post(start_moment_capture))
+        .route("/recipes/{id}/chat", post(chat::ask))
+        .route("/recipes/{id}/chat/drawer", post(chat::toggle_drawer))
+        .route("/recipes/{id}/chat/clear", post(chat::clear))
+        .route(
+            "/recipes/{id}/chat/{message_id}/note",
+            post(chat::keep_answer),
+        )
+        .route(
+            "/recipes/{id}/notes",
+            post(notes::add_note).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/recipes/{id}/notes/{note_id}", post(notes::update_note))
+        .route(
+            "/recipes/{id}/notes/{note_id}/delete",
+            post(notes::delete_note),
+        )
+        .route(
+            "/recipes/{id}/notes/{note_id}/photo",
+            get(notes::note_photo),
+        )
         .route("/recipes/{id}/candidate/{idx}", get(candidate_thumbnail))
         .route("/recipes/{id}/stills/{seconds}", get(recipe_still))
         .route("/settings", get(settings_page).post(update_settings))
         .route("/settings/media-cleaner", post(update_media_cleaner))
         .route("/settings/step-moments", post(update_step_moments))
+        .route("/settings/recipe-chat", post(update_recipe_chat))
         .route("/settings/search-engine", post(update_search_engine))
         .route("/settings/ai-logins", post(update_ai_logins))
         .route("/settings/endpoints", post(add_endpoint))
@@ -1205,6 +1254,8 @@ struct Draft {
     search_suggestions: String,
     base_updated_at: Option<String>,
     evidence_json: String,
+    /// The recipe-chat answer this draft was made for, if any.
+    chat_message_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1963,6 +2014,12 @@ async fn settings_page(
         } else {
             ""
         },
+        chat_notice: if flash.is("chat_saved") {
+            "Recipe chat saved."
+        } else {
+            ""
+        },
+        recipe_chat: chat::chat_enabled(&s.db, &user.id).await?,
         search_notice: if flash.is("search_saved") {
             "Search saved."
         } else {
@@ -2323,6 +2380,19 @@ async fn update_step_moments(
         "/settings#settings-moments",
         "moments_saved",
     ))
+}
+
+/// Switches the recipe chat on or off for the signed-in user. Off hides the
+/// Ask drawer on every recipe; stored conversations stay, so switching back
+/// on shows them again.
+async fn update_recipe_chat(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<RecipeChatForm>,
+) -> Result<Response> {
+    let value = if form.enabled.is_some() { "on" } else { "off" };
+    set_app_setting(&s.db, &user.id, chat::CHAT_SETTING, value).await?;
+    Ok(flash_redirect("/settings#settings-chat", "chat_saved"))
 }
 
 /// Saves the signed-in user's library search engine. "shared" follows the

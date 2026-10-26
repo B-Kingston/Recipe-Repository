@@ -1,0 +1,86 @@
+{# The recipe chat drawer (src/chat.rs). The question form, Clear, and the
+   poll swap only #recipe-chat; Save change and Discard reload the page,
+   since the card itself changes. A saved change leaves a divider in the
+   thread at the point the recipe changed. #}
+<section id="recipe-chat" class="recipe-chat" aria-labelledby="recipe-chat-title">
+  <div class="chat-head">
+    <h2 id="recipe-chat-title" class="section-label">Ask about this recipe</h2>
+    {% if !chat.messages.is_empty() %}
+    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/clear" data-confirm="Clear this conversation? It cannot be undone." hx-target="#recipe-chat" hx-select="#recipe-chat" hx-swap="outerHTML show:none">
+      <input type="hidden" name="back" value="{{ chat.back }}">
+      <button class="quiet compact">Clear conversation</button>
+    </form>
+    {% endif %}
+  </div>
+  {% if chat.notice != "" %}<p class="notice" role="status">{{ chat.notice }}</p>{% endif %}
+  {% if chat.messages.is_empty() %}
+  <p class="muted chat-empty">Ask about substitutions, timing, technique, or scaling, or tell it how the recipe went for pointers next time. It reads your notes on this recipe. Ask for a change, like “make it vegan” or “serve 6”, and it drafts one for you to preview and save. The recipe’s history keeps the version it replaces.</p>
+  {% else %}
+  <ol class="chat-thread" data-chat-thread>
+    {% for message in chat.messages %}
+    {% if message.role == "user" %}
+    <li class="chat-turn chat-question"><p class="chat-bubble">{{ message.content }}</p></li>
+    {% else if message.role == "change" %}
+    <li class="chat-change">
+      <span class="chat-change-line" aria-hidden="true"></span>
+      <span class="chat-change-label" title="Saved {{ message.time }}"><span class="visually-hidden">Recipe changed here: </span>{{ message.content }}</span>
+      <span class="chat-change-line" aria-hidden="true"></span>
+    </li>
+    {% else %}
+    <li class="chat-turn chat-answer">
+      {% if message.status == "pending" %}
+      <p class="chat-bubble is-pending">Thinking…</p>
+      {% else if message.status == "done" %}
+      <p class="chat-bubble">{{ message.content }}</p>
+      {% if message.kept %}
+      <p class="chat-kept"><a href="/recipes/{{ recipe.id }}#notes">Kept in notes</a></p>
+      {% else %}
+      <form class="chat-keep" method="post" action="/recipes/{{ recipe.id }}/chat/{{ message.id }}/note" data-busy-label="Keeping…" hx-swap="innerHTML show:none">
+        <input type="hidden" name="back" value="{{ chat.back }}">
+        <button class="quiet compact">Keep as note</button>
+      </form>
+      {% endif %}
+      {% if message.change_state != "" %}
+      <div class="chat-proposal">
+        <p class="chat-proposal-label">{% if message.change_label != "" %}{{ message.change_label }}{% else %}Suggested change{% endif %}</p>
+        {% if message.change_state == "drafting" %}
+        <p class="muted">Drafting the change…</p>
+        {% else if message.change_state == "ready" %}
+        {% if message.draft_id != "" %}
+        <div class="chat-proposal-actions">
+          <form class="inline" method="post" action="/ai/drafts/{{ message.draft_id }}/apply" data-busy-label="Saving…" hx-swap="innerHTML show:none"><button class="primary compact">Save change</button></form>
+          <a class="button compact" href="/ai/drafts/{{ message.draft_id }}">Preview</a>
+          <form class="inline" method="post" action="/ai/drafts/{{ message.draft_id }}/cancel" data-confirm="Discard this change?" data-busy-label="Discarding…" hx-swap="innerHTML show:none"><button class="quiet compact">Discard</button></form>
+        </div>
+        {% else %}
+        <p class="muted">This draft expired. Ask again to redo the change.</p>
+        {% endif %}
+        {% else if message.change_state == "applied" %}
+        <p class="muted">Saved to the recipe.</p>
+        {% else if message.change_state == "discarded" %}
+        <p class="muted">Discarded.</p>
+        {% else %}
+        <p class="muted">The change could not be drafted. Ask again to retry.</p>
+        {% endif %}
+      </div>
+      {% endif %}
+      {% else %}
+      <p class="chat-bubble is-failed" role="alert">{{ message.content }}{% if message.status == "needs_settings" %} <a href="/settings#settings-ai">Open Settings</a>{% endif %}</p>
+      {% endif %}
+    </li>
+    {% endif %}
+    {% endfor %}
+  </ol>
+  {% endif %}
+  {% if chat.poll_state != "" %}
+  {# Polls only this drawer, and swaps it in once something finished (the
+     state token in the response differs from this one). #}
+  <p class="muted chat-waiting">The assistant is working on it. <a href="{{ chat.back }}#recipe-chat">Check again</a><span hidden data-chat-state="{{ chat.poll_state }}" hx-get="{{ chat.back }}" hx-trigger="every 3s" hx-target="#recipe-chat" hx-select="#recipe-chat" hx-swap="outerHTML show:none" hx-indicator="this" data-swap-when-gone='[data-chat-state="{{ chat.poll_state }}"]' data-poll-unless-editing></span></p>
+  {% endif %}
+  <form class="chat-ask" method="post" action="/recipes/{{ recipe.id }}/chat" data-busy-label="Asking…" hx-target="#recipe-chat" hx-select="#recipe-chat" hx-swap="outerHTML show:none">
+    <input type="hidden" name="back" value="{{ chat.back }}">
+    <label class="visually-hidden" for="chat-question">Question about this recipe</label>
+    <textarea id="chat-question" name="question" rows="2" maxlength="{{ chat.max_question }}" required placeholder="Ask a question, or ask for a change" data-chat-question{% if chat.poll_state != "" %} disabled{% endif %}></textarea>
+    <button class="primary"{% if chat.poll_state != "" %} disabled{% endif %}>Ask</button>
+  </form>
+</section>

@@ -30,6 +30,7 @@
     "src/chrome.ts",
     "src/library.ts",
     "src/recipe.ts",
+    "src/chat.ts",
     "src/settings.ts",
     "src/auth-popup.ts",
     "src/codex-authorise.ts",

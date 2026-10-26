@@ -189,6 +189,15 @@
       <button class="primary" type="submit">Save step moments</button>
     </form>
   </div>
+  <div class="block" id="settings-chat">
+    <h2>Recipe chat <span class="codex-status{% if recipe_chat %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if recipe_chat %}&#10003; On{% else %}Off{% endif %}</span></h2>
+    <p class="muted block-note">An Ask button on every recipe opens a chat about that recipe. It answers with your AI setup above, and it is how you change a saved recipe with AI: ask for a change and save the draft it makes. Conversations are private to your account. Off hides the chat, and with it AI changes to saved recipes; saved conversations stay.</p>
+    {% if chat_notice != "" %}<p class="notice" role="status">{{ chat_notice }}</p>{% endif %}
+    <form method="post" action="/settings/recipe-chat" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
+      <label><input type="checkbox" name="enabled" value="on"{% if recipe_chat %} checked{% endif %}> Show the recipe chat</label>
+      <button class="primary" type="submit">Save recipe chat</button>
+    </form>
+  </div>
   <div class="block" id="settings-display">
     <h2>Display</h2>
     <p class="muted block-note">Colour, e-ink, or automatic: e-ink on Kindle browsers and colour everywhere else. Saved for this browser only.</p>

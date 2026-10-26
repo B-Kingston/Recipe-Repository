@@ -289,6 +289,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         State(state(db.clone())),
         AuthUser { id: "u1".into() },
         Path(("r".into(), 1)),
+        crate::htmx::Flash::default(),
     )
     .await
     .unwrap();

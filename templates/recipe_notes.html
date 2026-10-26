@@ -1,0 +1,42 @@
+{# The cook's notes (src/notes.rs), on the recipe page and on each version
+   page (`notes.fixed_version` set: only that version's notes, and new notes
+   are about it). Adding posts as a normal page load because it may carry a
+   photo; editing and deleting are ordinary boosted forms. #}
+<section class="recipe-notes" id="notes" aria-labelledby="notes-title">
+  <h2 id="notes-title">{% if notes.fixed_version.is_some() %}Notes about this version{% else %}Notes{% endif %}</h2>
+  <p class="muted block-note">{% if notes.fixed_version.is_some() %}What you noted when you made this version. Notes about the whole recipe are on the recipe card.{% else %}How it went, what to change next time, a photo of the result. A note is about the whole recipe, or about the version you cooked. Ask can read your notes.{% endif %}</p>
+  {% if notes.notice != "" %}<p class="notice" role="status">{{ notes.notice }}</p>{% endif %}
+  {% if !notes.notes.is_empty() %}
+  <ul class="note-list">
+    {% for note in notes.notes %}
+    <li class="note" id="note-{{ note.id }}">
+      <p class="note-meta"><time>{{ note.time }}</time> · {% match note.version_link %}{% when Some with (version) %}<a href="/recipes/{{ notes.recipe_id }}/versions/{{ version }}">{{ note.about }}</a>{% when None %}{{ note.about }}{% endmatch %}{% if note.from_chat %} · From the chat{% endif %}</p>
+      {% if note.body != "" %}<p class="note-body">{{ note.body }}</p>{% endif %}
+      {% if note.has_photo %}<a class="note-photo" href="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}/photo" data-still-viewer hx-boost="false"><img src="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}/photo" alt="Photo kept with this note, {{ note.time }}" loading="lazy"></a>{% endif %}
+      <details class="note-edit">
+        <summary>Edit</summary>
+        <form method="post" action="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}" hx-swap="innerHTML show:none">
+          <input type="hidden" name="back" value="{{ notes.back }}">
+          <label>Note<textarea class="compact-textarea" name="body" maxlength="4000">{{ note.body }}</textarea></label>
+          <label>About<select name="about">{% for choice in note.choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></label>
+          <p class="actions"><button class="primary">Save note</button><button class="danger" formaction="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}/delete" data-confirm="Delete this note{% if note.has_photo %} and its photo{% endif %}? This cannot be undone.">Delete note</button></p>
+        </form>
+      </details>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <details class="add-block"{% if notes.notes.is_empty() %} open{% endif %}>
+    <summary>Add note</summary>
+    <form class="add-form" method="post" action="/recipes/{{ notes.recipe_id }}/notes" enctype="multipart/form-data" hx-boost="false" data-busy-label="Saving…">
+      <input type="hidden" name="back" value="{{ notes.back }}">
+      <label>Note<textarea class="compact-textarea" name="body" maxlength="4000" placeholder="e.g. Too salty with a whole stock cube. Use half next time."></textarea></label>
+      <label>Photo <span class="field-help">(optional)</span><input type="file" name="photo" accept="image/*"></label>
+      {% match notes.fixed_version %}
+      {% when Some with (version) %}<input type="hidden" name="about" value="{{ version }}">
+      {% when None %}<label>About<select name="about">{% for choice in notes.choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></label>
+      {% endmatch %}
+      <p class="actions"><button class="primary">Add note</button></p>
+    </form>
+  </details>
+</section>

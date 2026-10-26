@@ -73,7 +73,7 @@ namespace Recipes {
     for (let index = 0; index < forms.length; index += 1) {
       if (!(forms[index] as HTMLElement).hidden) return true;
     }
-    return !!document.querySelector(".recipe-details-form");
+    return !!document.querySelector(".recipe-details-form, .note-edit[open]");
   }
 
   // When the server cannot be reached, a link falls back to a normal page

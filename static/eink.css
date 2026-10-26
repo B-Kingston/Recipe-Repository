@@ -100,3 +100,12 @@ a:hover { color: #000000; }
 /* The sign-in popup: plain white, outlined, no dimmed backdrop. */
 .auth-popup { background: #fff; }
 .auth-popup-card { border: 2px solid #000; background: #fff; box-shadow: none; }
+
+/* Recipe chat: outlines instead of fills, and a black zigzag divider. */
+.chat-question .chat-bubble { border: 2px solid #000000; background: #ffffff; color: #000000; }
+.chat-answer .chat-bubble, .chat-proposal { border: 2px solid #000000; }
+.chat-change-line { background-image: url('/static/zigzag-eink.svg'); }
+.chat-change-label { border-color: #000000; }
+.chat-toggle.is-pressed { border-width: 2px; }
+.note-photo img { filter: grayscale(1) contrast(1.1); }
+.note-edit form { border: 2px solid #000000; }

@@ -6,16 +6,20 @@ import {
   ModelRuntime,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { createProvider } from "@earendil-works/pi-ai";
+import { Type, createProvider } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
   Context,
+  ImageContent,
   Model,
   Models,
   MutableModels,
   SimpleStreamOptions,
   TextContent,
+  Tool,
+  ToolCall,
+  ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
@@ -46,7 +50,8 @@ export type WorkerErrorCode = "auth" | "configuration" | "input" | "output" | "w
 /** The fields a stdin request may carry. The host sends each as a string or
  * leaves it out; values are still trimmed and checked before use. */
 export interface RequestFields {
-  /** "listModels", "checkLogin", "cleanMedia", or absent for recipe generation. */
+  /** "listModels", "checkLogin", "cleanMedia", "chat", or absent for recipe
+   * generation. */
   command?: string;
   prompt?: string;
   systemPrompt?: string;
@@ -69,7 +74,7 @@ export interface PromptRequest extends RequestFields {
   prompt: string;
 }
 
-/** A recipe generation or cleanMedia request. */
+/** A recipe generation, cleanMedia, or chat request. */
 export interface GenerationRequest extends PromptRequest {
   systemPrompt: string;
 }
@@ -119,6 +124,50 @@ export interface ListModelsResponse {
 export interface CleanMediaResponse {
   cleanedText: string;
   model: string;
+}
+
+/** The model's chat answer: the reply to the cook's latest question, and a
+ * recipe change when the cook asked for one. */
+export interface ChatAnswer {
+  reply: string;
+  /** One instruction describing the whole change, or "" for a plain answer. */
+  change: string;
+  /** The model's one- or two-word name for the change, or "". The host checks
+   * its length before showing it. */
+  label: string;
+}
+
+/** The stdout line of chat: the answer, and the tools the model called. */
+export interface ChatResponse extends ChatAnswer {
+  toolCalls: string[];
+}
+
+/** A note the cook kept on the recipe, as the host sends it with a chat
+ * request (newest first). */
+export interface ChatNote {
+  /** The saved version the note is about; null for the whole recipe. */
+  version: number | null;
+  createdAt: string;
+  text: string;
+  hasPhoto: boolean;
+  /** The note's photo as a base64 JPEG, when the host sent it. */
+  photo: string | null;
+}
+
+/** A saved version of the recipe, as the host sends it with a chat request. */
+export interface ChatVersion {
+  version: number;
+  label: string;
+  createdAt: string;
+  recipe: unknown;
+}
+
+/** What the chat tools can read: the recipe's notes and saved versions. */
+export interface ChatLibrary {
+  notes: ChatNote[];
+  versions: ChatVersion[];
+  /** The version matching the current recipe; null when it has no history. */
+  currentVersion: number | null;
 }
 
 /** The stdout line of checkLogin: the provider accepted a fresh token. */
@@ -1063,6 +1112,251 @@ export function cleanedEvidence(text: string): string {
   return formatRecipeEvidence(extractJson(text));
 }
 
+/** Answers one recipe-chat turn with whichever backend the host routed the
+ * request to, without web search. The host's system prompt asks for a JSON
+ * object; see chatReply. */
+/** Answers one recipe-chat turn through whichever backend the host routed
+ * the request to, without web search. The model may call the chat tools to
+ * read the recipe's notes and versions, which the host sent along; the final
+ * reply is the JSON object chatReply reads. */
+async function chat(request: GenerationRequest & { library?: unknown }): Promise<void> {
+  const { call, canSeePhotos } = await chatModelCall(request);
+  const { text, toolCalls } = await chatWithTools(
+    call,
+    request.systemPrompt,
+    request.prompt,
+    chatLibrary(request.library),
+    canSeePhotos,
+  );
+  outputJson({ ...chatReply(text), toolCalls } satisfies ChatResponse);
+}
+
+/** One model call with the chat's running context. */
+export type ChatModelCall = (context: Context) => Promise<AssistantMessage>;
+
+/** The chat's model call through the request's backend. Every backend goes
+ * through pi-ai here, the native OpenAI and Anthropic endpoints included,
+ * since the chat needs tool calls rather than native web search. */
+async function chatModelCall(request: PromptRequest): Promise<{ call: ChatModelCall; canSeePhotos: boolean }> {
+  const reasoning = normalizeEffort(request.reasoningEffort);
+  if (!isEndpointRequest(request)) {
+    const subscription = subscriptionOf(request);
+    const modelRuntime = await subscriptionRuntime(request);
+    if (!(await modelRuntime.checkAuth(subscription.id))) {
+      throw new WorkerError("configuration", subscription.notLoggedIn);
+    }
+    const modelId = nonBlank(request.model) ?? subscription.defaultModel;
+    const model = modelRuntime.getModel(subscription.id, modelId);
+    if (!model) throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
+    return {
+      call: (context) => modelRuntime.completeSimple(model, context, { reasoning, maxRetries: 1 }),
+      canSeePhotos: model.input.includes("image"),
+    };
+  }
+  const spec = nonBlank(request.provider);
+  const apiKey = nonBlank(request.apiKey);
+  const modelId = nonBlank(request.model);
+  if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
+  if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
+    throw new WorkerError("configuration", "Missing API key for this AI provider.");
+  }
+  const models = piAiModels();
+  const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
+  return {
+    call: (context) => models.completeSimple(model, context, {
+      apiKey: apiKey ?? "none",
+      reasoning,
+      maxRetries: 1,
+      signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
+    }),
+    canSeePhotos: model.input.includes("image"),
+  };
+}
+
+/** Model turns that may call tools before the chat must answer. */
+const CHAT_TOOL_ROUNDS = 4;
+
+/** The chat's read-only tools. They answer from the request's library, so a
+ * lookup never leaves the worker. */
+export const CHAT_TOOLS: Tool[] = [
+  {
+    name: "recipe_notes",
+    description: "List the notes the cook has kept on this recipe, newest first: when each was written, whether it is about the whole recipe or one saved version, its text, and whether it has a photo.",
+    parameters: Type.Object({}),
+  },
+  {
+    name: "note_photo",
+    description: "Look at the photo attached to one of the cook's notes.",
+    parameters: Type.Object({
+      note: Type.Integer({ minimum: 1, description: "The note's number from recipe_notes." }),
+    }),
+  },
+  {
+    name: "recipe_version",
+    description: "Read one saved version of the recipe as JSON, to see exactly what the cook made when a note is about that version.",
+    parameters: Type.Object({
+      version: Type.Integer({ minimum: 1, description: "The version number." }),
+    }),
+  },
+];
+
+function finiteInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+/** The library the host sent, with anything malformed left out. */
+export function chatLibrary(value: unknown): ChatLibrary {
+  const fields = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const notes = (Array.isArray(fields.notes) ? fields.notes : []).flatMap((note): ChatNote[] => {
+    if (!note || typeof note !== "object") return [];
+    const raw = note as Record<string, unknown>;
+    const photo = typeof raw.photo === "string" && raw.photo ? raw.photo : null;
+    return [{
+      version: finiteInteger(raw.version),
+      createdAt: trimmedString(raw.createdAt),
+      text: typeof raw.text === "string" ? raw.text : "",
+      hasPhoto: raw.hasPhoto === true || photo !== null,
+      photo,
+    }];
+  });
+  const versions = (Array.isArray(fields.versions) ? fields.versions : []).flatMap((entry): ChatVersion[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const raw = entry as Record<string, unknown>;
+    const version = finiteInteger(raw.version);
+    if (version === null) return [];
+    return [{ version, label: trimmedString(raw.label), createdAt: trimmedString(raw.createdAt), recipe: raw.recipe ?? null }];
+  });
+  return { notes, versions, currentVersion: finiteInteger(fields.currentVersion) };
+}
+
+/** What a note is about, in words. */
+function noteSubject(library: ChatLibrary, version: number | null): string {
+  if (version === null) return "about the whole recipe";
+  const saved = library.versions.find((entry) => entry.version === version);
+  const label = saved?.label ? ` (${saved.label})` : "";
+  return version === library.currentVersion
+    ? `about version ${version}${label}, which is the current recipe`
+    : `about version ${version}${label}`;
+}
+
+/** The recipe_notes listing. */
+export function formatChatNotes(library: ChatLibrary): string {
+  if (library.notes.length === 0) return "The cook has not kept any notes on this recipe.";
+  return library.notes.map((note, index) => {
+    const header = [
+      `Note ${index + 1}`,
+      note.createdAt ? `written ${note.createdAt}` : "",
+      noteSubject(library, note.version),
+      note.hasPhoto ? "has a photo (note_photo)" : "",
+    ].filter(Boolean).join(" · ");
+    return note.text.trim() ? `${header}\n${note.text.trim()}` : `${header}\n(photo only)`;
+  }).join("\n\n");
+}
+
+/** Runs one chat tool call against the library. */
+export function runChatTool(library: ChatLibrary, call: ToolCall, canSeePhotos: boolean): ToolResultMessage {
+  const result = (text: string, isError = false, image?: ImageContent): ToolResultMessage => ({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: image ? [{ type: "text", text }, image] : [{ type: "text", text }],
+    isError,
+    timestamp: Date.now(),
+  });
+  if (call.name === "recipe_notes") return result(formatChatNotes(library));
+  if (call.name === "note_photo") {
+    const number = finiteInteger(call.arguments.note);
+    const note = number === null ? undefined : library.notes[number - 1];
+    if (!note) return result(`There is no note ${String(call.arguments.note)}. Call recipe_notes for the list.`, true);
+    if (!note.hasPhoto) return result(`Note ${number} has no photo.`, true);
+    if (!canSeePhotos) return result("This model cannot view photos; work from the note's text.", true);
+    if (!note.photo) return result(`The photo on note ${number} was too many to send; work from the note's text.`, true);
+    return result(`The photo on note ${number}:`, false, { type: "image", data: note.photo, mimeType: "image/jpeg" });
+  }
+  if (call.name === "recipe_version") {
+    const version = finiteInteger(call.arguments.version);
+    const saved = library.versions.find((entry) => entry.version === version);
+    if (!saved) {
+      const known = library.versions.map((entry) => entry.version).join(", ") || "none";
+      return result(`Version ${String(call.arguments.version)} is not available. Saved versions: ${known}.`, true);
+    }
+    return result(JSON.stringify({
+      version: saved.version,
+      label: saved.label,
+      savedAt: saved.createdAt,
+      current: saved.version === library.currentVersion,
+      recipe: saved.recipe,
+    }));
+  }
+  return result(`Unknown tool ${call.name}.`, true);
+}
+
+/** Runs the chat: the model may call the tools for up to CHAT_TOOL_ROUNDS
+ * turns, then must answer. Each call is logged by name (never photo bytes). */
+export async function chatWithTools(
+  call: ChatModelCall,
+  systemPrompt: string,
+  prompt: string,
+  library: ChatLibrary,
+  canSeePhotos: boolean,
+  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): Promise<{ text: string; toolCalls: string[] }> {
+  const context: Context = {
+    systemPrompt,
+    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+    tools: CHAT_TOOLS,
+  };
+  const toolCalls: string[] = [];
+  for (let round = 0; ; round += 1) {
+    const response = await call(context);
+    if (response.stopReason === "error" || response.stopReason === "aborted") {
+      throw new WorkerError("worker", response.errorMessage || "AI provider request failed.", { retryable: true });
+    }
+    if (response.stopReason === "length") {
+      throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
+    }
+    const calls = response.content.filter((part): part is ToolCall => part.type === "toolCall");
+    if (calls.length === 0) return { text: assistantText(response), toolCalls };
+    if (round === CHAT_TOOL_ROUNDS) {
+      throw new WorkerError("output", "The model kept calling tools without answering.");
+    }
+    context.messages.push(response);
+    for (const toolCall of calls) {
+      toolCalls.push(toolCall.name);
+      log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
+      const output = runChatTool(library, toolCall, canSeePhotos);
+      if (round === CHAT_TOOL_ROUNDS - 1) {
+        output.content.push({ type: "text", text: "That was the last lookup. Answer the cook now." });
+      }
+      context.messages.push(output);
+    }
+  }
+}
+
+function trimmedString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** The model's chat reply. A JSON object gives the answer and any change; a
+ * model that ignored the format and wrote prose has that prose taken as a
+ * plain answer. A label without a change is dropped. */
+export function chatReply(text: string): ChatAnswer {
+  let parsed: unknown = null;
+  try {
+    parsed = extractJson(text);
+  } catch {
+    // Not JSON: the whole reply is the answer.
+  }
+  const fields = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : null;
+  const reply = fields ? trimmedString(fields.reply) : text.trim();
+  if (!reply) throw new WorkerError("output", "The model returned an empty chat answer.");
+  const change = fields ? trimmedString(fields.change) : "";
+  const label = change && fields ? trimmedString(fields.label) : "";
+  return { reply, change, label };
+}
+
 /** One model call through the request's backend: a subscription, a native
  * OpenAI/Anthropic endpoint, or a pi-ai provider. Returns the reply text with
  * any web-search citations it gathered. */
@@ -1190,6 +1484,7 @@ async function main(): Promise<void> {
   if (isListModelsRequest(request)) return listModels(request);
   if (isCheckLoginRequest(request)) return checkLogin(request);
   if (request.command === "cleanMedia") return cleanMedia(request);
+  if (request.command === "chat") return chat(request);
   outputJson(await generateRecipe(request, searchModeOf(request), normalizeEffort(request.reasoningEffort)));
 }
 

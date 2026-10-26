@@ -10,6 +10,12 @@ import {
   catalogModelIds,
   completionContext,
   formatRecipeEvidence,
+  CHAT_TOOLS,
+  chatLibrary,
+  chatReply,
+  chatWithTools,
+  formatChatNotes,
+  runChatTool,
   cleanedEvidence,
   completeViaPiAi,
   generateRecipe,
@@ -29,8 +35,8 @@ import {
   verifiedSources,
   workerFailure,
 } from "./recipe-worker.ts";
-import type { Complete, CompletionOptions } from "./recipe-worker.ts";
-import type { Model } from "@earendil-works/pi-ai";
+import type { ChatLibrary, ChatModelCall, Complete, CompletionOptions } from "./recipe-worker.ts";
+import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
 
 /** What a fake fetch receives: the worker sends string headers and a JSON string body. */
 interface SentInit {
@@ -245,6 +251,158 @@ test("cleanedEvidence finds the JSON object between prose that contains braces",
   const object = JSON.stringify({ title: "Soup", steps: ["Simmer {gently}"] });
   const cleaned = cleanedEvidence(`Here it is: ${object} (see {ref})`);
   assert.equal(cleaned, "Dish: Soup\nMethod:\n1. Simmer {gently}");
+});
+
+test("chatReply reads the answer, the change, and its label from the JSON reply", () => {
+  const reply = chatReply("```json\n" + JSON.stringify({
+    reply: " I'll swap the eggs for tofu. ",
+    change: "Replace the 6 eggs with 400 g crumbled firm tofu.",
+    label: " Made vegan ",
+  }) + "\n```");
+  assert.deepEqual(reply, {
+    reply: "I'll swap the eggs for tofu.",
+    change: "Replace the 6 eggs with 400 g crumbled firm tofu.",
+    label: "Made vegan",
+  });
+});
+
+test("chatReply keeps a plain answer, drops a label with no change, and takes prose as the answer", () => {
+  assert.deepEqual(chatReply('{"reply":"Yes, about 1 kg.","change":"","label":"Tomatoes"}'), {
+    reply: "Yes, about 1 kg.",
+    change: "",
+    label: "",
+  });
+  assert.deepEqual(chatReply("Use about 1 kg of fresh tomatoes {chopped}."), {
+    reply: "Use about 1 kg of fresh tomatoes {chopped}.",
+    change: "",
+    label: "",
+  });
+});
+
+test("chatReply refuses an empty answer as retryable output", () => {
+  for (const text of ["", '{"reply":"  ","change":"Halve the salt"}']) {
+    assert.throws(() => chatReply(text), (error) => {
+      assert.ok(error instanceof WorkerError);
+      assert.equal(error.code, "output");
+      return true;
+    });
+  }
+});
+
+/** A chat library with a whole-recipe note, a note about the old version
+ * with a photo, and two saved versions. */
+function library(): ChatLibrary {
+  return chatLibrary({
+    notes: [
+      { version: null, createdAt: "26 Oct 2026, 09:00", text: "Kids want it milder.", hasPhoto: false, photo: null },
+      { version: 1, createdAt: "20 Oct 2026, 19:30", text: "Too salty.", hasPhoto: true, photo: "aGVsbG8=" },
+      { version: "2", text: 5 },
+      "junk",
+    ],
+    versions: [
+      { version: 2, label: "Chat: Less salt", createdAt: "21 Oct 2026, 10:00", recipe: { title: "Dal" } },
+      { version: 1, label: "Original recipe", createdAt: "19 Oct 2026, 10:00", recipe: { title: "Dal" } },
+      { label: "no number" },
+    ],
+    currentVersion: 2,
+  });
+}
+
+function toolCall(name: string, args: Record<string, unknown> = {}, id = `call-${name}`): ToolCall {
+  return { type: "toolCall", id, name, arguments: args as ToolCall["arguments"] };
+}
+
+function reply(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+  return { role: "assistant", content, stopReason, timestamp: 0 } as unknown as AssistantMessage;
+}
+
+function resultText(message: ReturnType<typeof runChatTool>): string {
+  return message.content.filter((part) => part.type === "text").map((part) => (part as { text: string }).text).join("\n");
+}
+
+test("chatLibrary keeps well-formed notes and versions and drops the rest", () => {
+  const parsed = library();
+  assert.equal(parsed.notes.length, 3);
+  assert.deepEqual(parsed.notes[2], { version: null, createdAt: "", text: "", hasPhoto: false, photo: null });
+  assert.deepEqual(parsed.versions.map((entry) => entry.version), [2, 1]);
+  assert.equal(parsed.currentVersion, 2);
+  assert.deepEqual(chatLibrary(undefined), { notes: [], versions: [], currentVersion: null });
+});
+
+test("recipe_notes lists each note with what it is about and its photo", () => {
+  const listing = formatChatNotes(library());
+  assert.match(listing, /^Note 1 · written 26 Oct 2026, 09:00 · about the whole recipe\nKids want it milder\./);
+  assert.match(listing, /Note 2 · written 20 Oct 2026, 19:30 · about version 1 \(Original recipe\) · has a photo \(note_photo\)\nToo salty\./);
+  assert.equal(formatChatNotes(chatLibrary({ notes: [] })), "The cook has not kept any notes on this recipe.");
+  const current = chatLibrary({ notes: [{ version: 2, text: "Better" }], versions: [{ version: 2, label: "Less salt" }], currentVersion: 2 });
+  assert.match(formatChatNotes(current), /about version 2 \(Less salt\), which is the current recipe/);
+});
+
+test("note_photo returns the photo only when there is one the model can see", () => {
+  const shown = runChatTool(library(), toolCall("note_photo", { note: 2 }), true);
+  assert.equal(shown.isError, false);
+  assert.deepEqual(shown.content[1], { type: "image", data: "aGVsbG8=", mimeType: "image/jpeg" });
+  assert.equal(runChatTool(library(), toolCall("note_photo", { note: 1 }), true).isError, true);
+  assert.equal(runChatTool(library(), toolCall("note_photo", { note: 9 }), true).isError, true);
+  const blind = runChatTool(library(), toolCall("note_photo", { note: 2 }), false);
+  assert.equal(blind.isError, true);
+  assert.match(resultText(blind), /cannot view photos/);
+  const withheld = chatLibrary({ notes: [{ version: null, text: "", hasPhoto: true, photo: null }] });
+  assert.match(resultText(runChatTool(withheld, toolCall("note_photo", { note: 1 }), true)), /work from the note's text/);
+});
+
+test("recipe_version returns a saved version, and unknown versions and tools are errors", () => {
+  const old = runChatTool(library(), toolCall("recipe_version", { version: 1 }), true);
+  assert.deepEqual(JSON.parse(resultText(old)), {
+    version: 1,
+    label: "Original recipe",
+    savedAt: "19 Oct 2026, 10:00",
+    current: false,
+    recipe: { title: "Dal" },
+  });
+  const missing = runChatTool(library(), toolCall("recipe_version", { version: 5 }), true);
+  assert.equal(missing.isError, true);
+  assert.match(resultText(missing), /Saved versions: 2, 1/);
+  assert.equal(runChatTool(library(), toolCall("delete_recipe"), true).isError, true);
+  assert.deepEqual(CHAT_TOOLS.map((tool) => tool.name), ["recipe_notes", "note_photo", "recipe_version"]);
+});
+
+test("chatWithTools runs the model's lookups, then returns its answer", async () => {
+  const contexts: Context[] = [];
+  const turns = [
+    reply([toolCall("recipe_notes")], "toolUse"),
+    reply([toolCall("note_photo", { note: 2 }), toolCall("recipe_version", { version: 1 }, "call-v1")], "toolUse"),
+    reply([{ type: "text", text: '{"reply":"Use half the salt.","change":"","label":""}' }]),
+  ];
+  const call: ChatModelCall = async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return turns.shift()!;
+  };
+  const logged: string[] = [];
+  const result = await chatWithTools(call, "system", "It was too salty", library(), true, (line) => logged.push(line));
+  assert.equal(result.text, '{"reply":"Use half the salt.","change":"","label":""}');
+  assert.deepEqual(result.toolCalls, ["recipe_notes", "note_photo", "recipe_version"]);
+  assert.equal(contexts.length, 3);
+  assert.deepEqual(contexts[0].tools, CHAT_TOOLS);
+  // The last turn saw the question, both assistant turns, and three results.
+  assert.deepEqual(contexts[2].messages.map((message) => message.role), ["user", "assistant", "toolResult", "assistant", "toolResult", "toolResult"]);
+  assert.equal(logged.length, 3);
+  assert.ok(logged.every((line) => !line.includes("aGVsbG8=")), "photo bytes are never logged");
+});
+
+test("chatWithTools stops a model that never answers and reports failed calls", async () => {
+  const looping: ChatModelCall = async () => reply([toolCall("recipe_notes")], "toolUse");
+  await assert.rejects(chatWithTools(looping, "s", "p", library(), true, () => {}), (error) => {
+    assert.ok(error instanceof WorkerError);
+    assert.equal(error.code, "output");
+    return true;
+  });
+  const failing: ChatModelCall = async () => ({ ...reply([], "error"), errorMessage: "overloaded" }) as AssistantMessage;
+  await assert.rejects(chatWithTools(failing, "s", "p", library(), true, () => {}), (error) => {
+    assert.ok(error instanceof WorkerError);
+    assert.equal(error.retryable, true);
+    return true;
+  });
 });
 
 test("formatRecipeEvidence rejects cleaner output without ingredients or steps", () => {

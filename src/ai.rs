@@ -4,10 +4,11 @@ use crate::media::{
     extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{
-    apply_draft_moments, copy_draft_moment_pool, copy_draft_thumbnails, delete_draft_thumbnails,
-    delete_expired_draft_thumbnails, draft_step_moments, draft_still_seconds, find_draft,
-    find_draft_still, find_draft_thumbnail_jpeg, find_draft_thumbnails, find_recipe,
-    recipe_snapshot, social_source_url, store_draft_moment_pool, store_draft_thumbnails,
+    apply_draft_moments, carry_draft_chat, copy_draft_moment_pool, copy_draft_thumbnails,
+    delete_draft_thumbnails, delete_expired_draft_thumbnails, draft_step_moments,
+    draft_still_seconds, find_draft, find_draft_still, find_draft_thumbnail_jpeg,
+    find_draft_thumbnails, find_recipe, recipe_snapshot, social_source_url,
+    store_draft_moment_pool, store_draft_thumbnails,
 };
 use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
@@ -609,81 +610,6 @@ async fn clean_media_evidence(
     Ok(evidence)
 }
 
-pub(crate) async fn alter_page(
-    State(s): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<String>,
-) -> Result<Html<String>> {
-    let recipe = find_recipe(&s.db, &user.id, &id).await?;
-    render(crate::AiFormTemplate {
-        heading: "Alter with AI".into(),
-        guidance: format!(
-            "Tell the assistant how to change “{}”. It will return a complete replacement recipe for review.",
-            recipe.title
-        ),
-        action: format!("/recipes/{id}/ai/alter"),
-        field_label: "What should change?".into(),
-        placeholder: ALTER_PLACEHOLDER.into(),
-        show_tips: false,
-        button: "Create altered draft".into(),
-        cancel_url: format!("/recipes/{id}"),
-        error: String::new(),
-        prompt: String::new(),
-    })
-}
-
-const ALTER_PLACEHOLDER: &str = "e.g. less salt, make it vegetarian";
-
-pub(crate) async fn alter_recipe(
-    State(s): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<String>,
-    Form(f): Form<PromptForm>,
-) -> Result<Response> {
-    let recipe = find_recipe(&s.db, &user.id, &id).await?;
-    let prompt = required(&f.prompt, "Comments")?;
-    let snapshot = {
-        let mut conn = s.db.acquire().await?;
-        recipe_snapshot(&mut conn, &user.id, &recipe.id).await?
-    };
-    let full = alteration_prompt(
-        &prompt,
-        &serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?,
-    );
-    match create_draft(
-        &s,
-        &user,
-        Some((&recipe.id, &recipe.updated_at)),
-        "alter",
-        &full,
-        DraftProvenance {
-            attribution: None,
-            evidence_json: None,
-            search_mode: None,
-        },
-    )
-    .await
-    {
-        Ok(draft) => {
-            match_new_draft(&s, &user, &draft).await;
-            Ok(Redirect::to(&format!("/ai/drafts/{draft}")).into_response())
-        }
-        Err(e) => render(crate::AiFormTemplate {
-            heading: "Alter with AI".into(),
-            guidance: "Tell the assistant what should change.".into(),
-            action: format!("/recipes/{id}/ai/alter"),
-            field_label: "What should change?".into(),
-            placeholder: ALTER_PLACEHOLDER.into(),
-            show_tips: false,
-            button: "Create altered draft".into(),
-            cancel_url: format!("/recipes/{id}"),
-            error: e.to_string(),
-            prompt,
-        })
-        .map(IntoResponse::into_response),
-    }
-}
-
 pub(crate) async fn draft_page(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
@@ -745,6 +671,7 @@ pub(crate) async fn alter_draft(
             // while the chain runs.
             copy_draft_thumbnails(&s.db, &id, &new_id).await?;
             copy_draft_moment_pool(&s.db, &id, &new_id).await?;
+            carry_draft_chat(&s.db, &id, &new_id).await?;
             match_new_draft(&s, &user, &new_id).await;
             Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response())
         }
@@ -756,6 +683,180 @@ pub(crate) async fn alter_draft(
 /// JSON they apply to.
 fn alteration_prompt(request: &str, recipe_json: &str) -> String {
     format!("User requested changes:\n{request}\n\nCurrent recipe JSON:\n{recipe_json}")
+}
+
+/// How the recipe chat answers. The recipe and the conversation ride in the
+/// prompt; the reply is a JSON object the worker reads with `chatReply`.
+pub(crate) const CHAT_SYSTEM_PROMPT: &str = r#"You are the cooking assistant inside a recipe app. The cook is looking at one of their saved recipes, given below as JSON, and asks you about it: substitutions, timing, technique, scaling, storage, serving ideas, and so on.
+
+Answer the latest question in plain text without Markdown: a few short sentences, or a short list with one item per line. Be practical and specific to this recipe, use its own units, and refer to its steps by number. If the question has nothing to do with cooking or this recipe, say briefly that you can only help with the recipe.
+
+The cook may also come back after cooking to say how it went ("it came out too salty", "the base was soggy", "it took twice as long") and ask what to do next time. Then read their notes first, work out the most likely causes from the recipe and what they describe, and give a short list of specific adjustments for next time, tied to the steps and amounts. Ask a question back only when you cannot tell what went wrong. Mention that they can save the adjustments as a change to the recipe, or keep your answer as a note.
+
+You have tools for what the cook has kept with this recipe. recipe_notes lists their notes: each is about the whole recipe or about one saved version, and some have a photo. note_photo shows a note's photo. recipe_version shows a saved version of the recipe. Read the notes whenever they could matter: the cook has cooked it before, asks about next time, mentions a note or photo, or asks what changed. A note about an older version describes that version, which may differ from the current recipe, so check the version before relying on its amounts.
+
+You can also change the recipe, but only when the cook asks you to change, adapt, or save something in it (for example "make it vegan", "scale it to 6", "use butter instead", "add that to the recipe"). A question such as "can I use butter?" is not a request: answer it, and you may offer to make the change. When the cook does ask for a change:
+- set "change" to one complete instruction describing every edit to make, specific enough to apply without reading the chat;
+- set "label" to a one- or two-word name for what changes, in sentence case, such as "Made vegan", "Serves 6", "Less salt", or "Butter swap";
+- in "reply", say briefly what you will change. The cook reviews the change before it is saved, so never say it has been saved.
+Otherwise set "change" and "label" to empty strings.
+
+When you have your answer, return only one JSON object, with no Markdown fences or text around it:
+{"reply": "your answer", "change": "", "label": ""}"#;
+
+/// The chat worker's answer to one question about a recipe.
+#[derive(Debug, Deserialize, PartialEq)]
+pub(crate) struct ChatReply {
+    pub(crate) reply: String,
+    /// The change the cook asked for, as one instruction; empty for a plain answer.
+    #[serde(default)]
+    pub(crate) change: String,
+    /// The model's one- or two-word name for the change.
+    #[serde(default)]
+    pub(crate) label: String,
+}
+
+/// Answers one recipe-chat turn through the user's AI setup (shared or own,
+/// like every generation), without web search. `library` is what the chat's
+/// tools read (see `chat::chat_library`); the log shows its notes' text and
+/// how many photos rode along, never the photo bytes. A retryable worker
+/// failure is tried once more; a refused login is not.
+pub(crate) async fn chat_reply(
+    state: &AppState,
+    user: &AuthUser,
+    prompt: &str,
+    library: &Value,
+) -> Result<ChatReply> {
+    let ai_user = crate::ai_account(&state.db, &user.id).await?;
+    let provider = crate::ai_provider(&state.db, &ai_user).await?;
+    let (backend, model) = resolve_backend(state, &ai_user, &provider).await?;
+    let effort =
+        crate::selected_effort(&state.db, &ai_user, crate::DEFAULT_REASONING_EFFORT).await?;
+    let provider = backend.label();
+    let tools_log = chat_library_log(library);
+    for attempt in 0..2 {
+        info!(
+            provider,
+            model,
+            reasoning_effort = %effort,
+            attempt,
+            prompt = %prompt,
+            system_prompt = %CHAT_SYSTEM_PROMPT,
+            library = %tools_log,
+            "LLM chat request"
+        );
+        let started = Instant::now();
+        let request = json!({
+            "command": "chat",
+            "prompt": prompt,
+            "systemPrompt": CHAT_SYSTEM_PROMPT,
+            "model": model,
+            "reasoningEffort": effort,
+            "searchMode": SearchMode::Off.as_str(),
+            "library": library,
+        });
+        let output = backend.run(state, request, PI_WORKER_TIMEOUT).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
+        if !output.status.success() {
+            let code = value["code"].as_str().unwrap_or("worker");
+            let message = value["error"].as_str().unwrap_or("no message");
+            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
+            if code == "configuration" || attempt == 1 || !retryable {
+                error!(code, message, retryable, status = %output.status, elapsed_ms, "LLM chat worker failed");
+                return Err(if code == "configuration" {
+                    AppError::AiNotConfigured
+                } else {
+                    AppError::Ai
+                });
+            }
+            warn!(code, message, retryable, status = %output.status, elapsed_ms, "LLM chat worker failed; retrying");
+            retry_backoff(attempt).await;
+            continue;
+        }
+        info!(
+            provider,
+            model,
+            reasoning_effort = %effort,
+            attempt,
+            elapsed_ms,
+            response = %value,
+            "LLM chat response"
+        );
+        return serde_json::from_value(value).map_err(|_| AppError::Ai);
+    }
+    Err(AppError::Ai)
+}
+
+/// The chat library as the log shows it: each note's text and whether a
+/// photo was sent with it, and the version numbers. Photo bytes stay out.
+pub(crate) fn chat_library_log(library: &Value) -> Value {
+    let notes: Vec<Value> = library["notes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|note| {
+            json!({
+                "version": note["version"],
+                "createdAt": note["createdAt"],
+                "text": note["text"],
+                "hasPhoto": note["hasPhoto"],
+                "photoSent": note["photo"].is_string(),
+            })
+        })
+        .collect();
+    let versions: Vec<Value> = library["versions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|version| version["version"].clone())
+        .collect();
+    json!({
+        "notes": notes,
+        "versions": versions,
+        "currentVersion": library["currentVersion"],
+    })
+}
+
+/// Drafts the change a chat answer proposed, through the alteration path
+/// (the one the draft page's "Alter this draft" uses), and links the draft
+/// to that answer. The draft is
+/// based on the recipe as it is now, so saving it after another edit is
+/// refused by `apply_draft`'s staleness guard.
+pub(crate) async fn draft_chat_change(
+    state: &AppState,
+    user: &AuthUser,
+    recipe_id: &str,
+    message_id: &str,
+    request: &str,
+) -> Result<String> {
+    let recipe = find_recipe(&state.db, &user.id, recipe_id).await?;
+    let snapshot = {
+        let mut conn = state.db.acquire().await?;
+        recipe_snapshot(&mut conn, &user.id, &recipe.id).await?
+    };
+    let full = alteration_prompt(
+        request,
+        &serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?,
+    );
+    let draft = create_draft(
+        state,
+        user,
+        Some((&recipe.id, &recipe.updated_at)),
+        "alter",
+        &full,
+        DraftProvenance {
+            attribution: None,
+            evidence_json: None,
+            search_mode: None,
+        },
+    )
+    .await?;
+    crate::recipes::link_draft_to_chat(&state.db, &draft, message_id).await?;
+    match_new_draft(state, user, &draft).await;
+    Ok(draft)
 }
 
 /// The imported video evidence stored with a draft; None for prompt-made drafts.
@@ -891,6 +992,8 @@ pub(crate) async fn apply_draft(
     let chart_json =
         serde_json::to_string(&ChartRecipe::from_generated(&recipe)).map_err(|_| AppError::Ai)?;
     let altering = draft.recipe_id.is_some();
+    // The recipe as it was before a change from the chat, for the divider.
+    let mut chat_before = None;
     let mut tx = s.db.begin().await?;
     let now = stamp();
     let recipe_id = if let Some(existing) = draft.recipe_id {
@@ -901,6 +1004,9 @@ pub(crate) async fn apply_draft(
             return render_draft_page(&s, &user, &id, STALE_BASE_MESSAGE, "").await;
         }
         crate::recipes::ensure_recipe_history(&mut tx, &user.id, &existing).await?;
+        if draft.chat_message_id.is_some() {
+            chat_before = Some(recipe_snapshot(&mut tx, &user.id, &existing).await?);
+        }
         sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
             .bind(&recipe.title)
             .bind(&recipe.description)
@@ -1014,12 +1120,22 @@ pub(crate) async fn apply_draft(
                 .await?;
         }
     }
-    let label = if altering {
-        "AI alteration applied"
-    } else {
-        "Recipe created with AI"
+    // A change from the chat marks its thread with a divider at this point.
+    let chat_label = match (draft.chat_message_id.as_deref(), &chat_before) {
+        (Some(message_id), Some(before)) => {
+            crate::recipes::record_chat_change(
+                &mut tx, &user.id, &recipe_id, message_id, &id, before,
+            )
+            .await?
+        }
+        _ => None,
     };
-    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, label).await?;
+    let label = match &chat_label {
+        Some(chat_label) => format!("Chat: {chat_label}"),
+        None if altering => "AI alteration applied".into(),
+        None => "Recipe created with AI".into(),
+    };
+    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, &label).await?;
     // Before the draft row goes: deleting it cascades its moment pool.
     apply_draft_moments(&mut tx, &id, &recipe_id, &step_ids).await?;
     sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
@@ -1032,6 +1148,11 @@ pub(crate) async fn apply_draft(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // A change from the chat returns to the chat, where its divider now shows.
+    if chat_label.is_some() {
+        crate::chat::open_drawer(&s.db, &user.id).await?;
+        return Ok(Redirect::to(&format!("/recipes/{recipe_id}#recipe-chat")).into_response());
+    }
     Ok(Redirect::to(&format!("/recipes/{recipe_id}")).into_response())
 }
 
@@ -1068,6 +1189,7 @@ pub(crate) async fn cancel_draft(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
+    let chat = crate::recipes::draft_chat(&s.db, &user.id, &id).await?;
     // Candidates carry no owner, so they are removed only when this user's draft was deleted.
     let removed = sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(&id)
@@ -1077,6 +1199,11 @@ pub(crate) async fn cancel_draft(
         .rows_affected();
     if removed > 0 {
         delete_draft_thumbnails(&s.db, &id).await?;
+    }
+    // A change drafted from the chat is discarded back into that chat.
+    if let Some((recipe_id, message_id)) = chat {
+        crate::recipes::discard_chat_change(&s.db, &user.id, &message_id).await?;
+        return Ok(Redirect::to(&format!("/recipes/{recipe_id}#recipe-chat")).into_response());
     }
     Ok(Redirect::to("/").into_response())
 }

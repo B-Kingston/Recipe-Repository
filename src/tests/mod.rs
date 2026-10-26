@@ -1,11 +1,13 @@
 mod ai;
 mod auth;
 mod chart;
+mod chat;
 mod config;
 mod display;
 mod htmx;
 mod media;
 mod moments;
+mod notes;
 mod recipes;
 mod search;
 mod settings;
