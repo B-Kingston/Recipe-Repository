@@ -799,11 +799,26 @@ label > input[type=checkbox] { margin-right: 8px; }
 .chat-answer .chat-bubble { border: 1px solid var(--border); border-bottom-left-radius: 4px; background: var(--card); font: 16px/1.5 var(--type); }
 .chat-bubble.is-pending { border-style: dashed; color: var(--muted); font-style: italic; }
 .chat-bubble.is-failed { border-color: #e7c3ca; color: var(--rule-ink); font-family: var(--sans); font-size: 15px; font-weight: 600; }
-.chat-proposal { max-width: 88%; margin-top: 6px; padding: 10px 13px; border: 1px solid var(--rule); border-radius: 12px; background: var(--card); }
+.chat-proposal { max-width: 100%; margin-top: 6px; padding: 10px 13px; border: 1px solid var(--rule); border-radius: 12px; background: var(--card); }
 .chat-proposal p { margin: 0; }
 .chat-proposal .muted { margin-top: 4px; }
 .chat-proposal-label { color: var(--rule-ink); font: 700 12px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase; }
 .chat-proposal-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.chat-proposal-summary { font: 500 13px/1.4 var(--sans); }
+.chat-diff-heading { margin: 12px 0 4px; color: var(--muted); font: 700 11px/1.3 var(--sans); letter-spacing: .12em; text-transform: uppercase; }
+.chat-diff { margin: 0; padding: 0; list-style: none; }
+.chat-diff-item { display: flex; gap: 8px; padding: 6px 0; border-top: 1px solid var(--lines); font: 15px/1.45 var(--type); }
+.chat-diff-item:first-child { border-top: 0; }
+.chat-diff-mark { flex: 0 0 1.1em; color: var(--muted); font: 700 15px/1.45 var(--sans); text-align: center; }
+.chat-diff-item.is-added .chat-diff-mark { color: #1d6b3a; }
+.chat-diff-item.is-removed .chat-diff-mark { color: var(--rule-ink); }
+.chat-diff-body { display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; min-width: 0; }
+.chat-diff-place { color: var(--muted); font: 600 12px/1.3 var(--sans); }
+.chat-diff-arrow { color: var(--muted); }
+.chat-diff-uses { font-size: 13px; }
+.chat-diff ins { padding: 0 2px; border-radius: 3px; background: #dff3e5; color: #164d2a; text-decoration: none; }
+.chat-diff del { padding: 0 2px; border-radius: 3px; background: #fbe4e8; color: #8a1c2e; text-decoration: line-through; }
+.chat-diff-item.is-removed .chat-diff-text del { background: none; }
 .chat-change { display: flex; align-items: center; gap: 8px; margin: 18px 0; }
 .chat-change-line { flex: 1 1 0; min-width: 24px; height: 16px; background: url('/static/zigzag.svg') right center / 16px 16px repeat-x; }
 .chat-change-line + .chat-change-label + .chat-change-line { background-position: left center; }

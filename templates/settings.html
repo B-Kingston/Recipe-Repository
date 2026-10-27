@@ -15,6 +15,7 @@
     {% else %}
     <p class="muted block-note">This account shares {{ shared_ai_owner }}'s AI logins, but {{ shared_ai_owner }} has not connected an AI provider yet. Use your own logins to connect one for this account.</p>
     {% endif %}
+    <p class="muted block-note">{% if shared_web_search != "" %}The recipe chat searches the web with {{ shared_ai_owner }}'s {{ shared_web_search }} key when the model has no search of its own.{% else %}The recipe chat searches the web only with models that have search built in: {{ shared_ai_owner }} has no search key.{% endif %}</p>
     {% if active_login_refused %}<p class="error" role="alert">The provider refused this sign-in: it has expired or was revoked. {{ shared_ai_owner }} needs to reconnect it in Settings, or you can use your own AI logins.</p>{% endif %}
     {% if ai_notice != "" %}<p class="notice" role="status">{{ ai_notice }}</p>{% endif %}
     <form method="post" action="/settings/ai-logins" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
@@ -178,6 +179,33 @@
       <button class="primary" type="submit">Save video cleaner</button>
     </form>
   </div>
+  <div class="block" id="settings-web-search">
+    <h2>Web search <span class="codex-status{% if web_search_label != "" %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if web_search_label != "" %}&#10003; {{ web_search_label }}{% else %}Built-in only{% endif %}</span></h2>
+    <p class="muted block-note">The recipe chat can look things up on the web. Codex, Claude, and OpenAI or Anthropic keys search on their own; every other model searches with the key you add here.{% if owns_shared_ai %} Shared: accounts using these AI logins use this key too.{% endif %}</p>
+    {% if web_search_notice != "" %}<p class="notice" role="status">{{ web_search_notice }}</p>{% endif %}
+    {% if web_search_label != "" %}
+    <div class="actions">
+      <span>{{ web_search_label }} <span class="muted">key {{ web_search_key_masked }}</span></span>
+      <form class="inline" method="post" action="/settings/web-search/delete" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
+        <button type="submit">Remove</button>
+      </form>
+    </div>
+    {% endif %}
+    <details class="add-block">
+      <summary>{% if web_search_label != "" %}Replace the search key{% else %}Add a search API key{% endif %}</summary>
+      <form method="post" action="/settings/web-search" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
+        <label for="web_search_provider">Search provider</label>
+        <select id="web_search_provider" name="provider">
+          {% for (key, label) in web_search_providers %}
+          <option value="{{ key }}">{{ label }}</option>
+          {% endfor %}
+        </select>
+        <label for="web_search_api_key">API key</label>
+        <input type="password" id="web_search_api_key" name="api_key" autocomplete="off">
+        <button class="primary" type="submit">Save search key</button>
+      </form>
+    </details>
+  </div>
   {% endif %}
   <div class="block" id="settings-moments">
     <h2>Video step moments <span class="codex-status{% if step_moments && embeddings_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if !embeddings_configured %}Needs embedding service{% else if step_moments %}&#10003; On{% else %}Off{% endif %}</span></h2>
@@ -212,6 +240,7 @@
       <form class="inline" method="post" action="/logout" hx-boost="false">
         <button type="submit">Sign out</button>
       </form>
+      <a class="button danger" href="/settings/delete-account">Delete account</a>
     </div>
   </div>
   <details class="block developer-tools"{% if search_notice != "" %} open{% endif %}>

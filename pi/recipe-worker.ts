@@ -30,8 +30,14 @@ import {
   nativeSearchPayload,
   normalizeSourceUrl,
   optionalSearchPayload,
+  responsesSearchPayload,
   webSearchCompleted,
 } from "./native-search.ts";
+import { WebSearchError, formatSearchResults, redact, webSearch, webSearchConfig } from "./web-search.ts";
+import type { WebSearchConfig } from "./web-search.ts";
+import { EDIT_TOOLS, copyDraft, draftChanged, isEditTool, recipeDraft, runEditTool } from "./recipe-edits.ts";
+import type { RecipeProposal } from "./recipe-edits.ts";
+export type { ProposedIngredient, ProposedStep, RecipeProposal } from "./recipe-edits.ts";
 import type { ResponsesItem, SourceLike } from "./native-search.ts";
 import { outputJson, readStdin, runMain } from "./cli.ts";
 
@@ -67,6 +73,12 @@ export interface RequestFields {
   provider?: string;
   apiBaseUrl?: string;
   apiKey?: string;
+  /** chat only: the account's search API key `{provider, apiKey}`, used when
+   * the model has no web search of its own. Never logged. */
+  webSearch?: unknown;
+  /** chat only: the recipe snapshot the edit tools work on; without it the
+   * chat cannot propose changes. */
+  recipe?: unknown;
 }
 
 /** A request that carries a user prompt. */
@@ -126,20 +138,25 @@ export interface CleanMediaResponse {
   model: string;
 }
 
-/** The model's chat answer: the reply to the cook's latest question, and a
- * recipe change when the cook asked for one. */
+/** The model's chat answer: the reply to the cook's latest question, and
+ * its one- or two-word name for the change it proposed, if any. */
 export interface ChatAnswer {
   reply: string;
-  /** One instruction describing the whole change, or "" for a plain answer. */
-  change: string;
-  /** The model's one- or two-word name for the change, or "". The host checks
-   * its length before showing it. */
+  /** "" without a proposal. The host checks its length before showing it. */
   label: string;
 }
 
-/** The stdout line of chat: the answer, and the tools the model called. */
+/** How a chat turn could search the web: the provider's own search
+ * ("hosted"), the account's search API key ("api"), or not at all. */
+export type ChatSearch = "hosted" | "api" | "none";
+
+/** The stdout line of chat: the answer, the tools the model called, how it
+ * could search, and the recipe as its edits left it (null when it made none,
+ * or none the cook would see). */
 export interface ChatResponse extends ChatAnswer {
   toolCalls: string[];
+  search: ChatSearch;
+  proposal: RecipeProposal | null;
 }
 
 /** A note the cook kept on the recipe, as the host sends it with a chat
@@ -1112,33 +1129,117 @@ export function cleanedEvidence(text: string): string {
   return formatRecipeEvidence(extractJson(text));
 }
 
-/** Answers one recipe-chat turn with whichever backend the host routed the
- * request to, without web search. The host's system prompt asks for a JSON
- * object; see chatReply. */
 /** Answers one recipe-chat turn through whichever backend the host routed
- * the request to, without web search. The model may call the chat tools to
- * read the recipe's notes and versions, which the host sent along; the final
- * reply is the JSON object chatReply reads. */
+ * the request to. The model may call the chat tools to read the recipe's
+ * notes and versions, which the host sent along, and search the web when the
+ * host allows it (see chatModelCall); the final reply is the JSON object
+ * chatReply reads. */
 async function chat(request: GenerationRequest & { library?: unknown }): Promise<void> {
-  const { call, canSeePhotos } = await chatModelCall(request);
-  const { text, toolCalls } = await chatWithTools(
-    call,
-    request.systemPrompt,
-    request.prompt,
-    chatLibrary(request.library),
+  outputJson(await answerChat(request));
+}
+
+/** The chat turn behind `chat`. With search on, the model gets one
+ * web_search tool: answered by a separate search call to the provider's own
+ * web search when the backend has one (`hostedSearch`), else through the
+ * account's search API key, else not offered. The chat loop itself never
+ * carries hosted search items, which pi-ai would drop when it replays a turn. */
+export async function answerChat(
+  request: GenerationRequest & { library?: unknown },
+  modelCall: typeof chatModelCall = chatModelCall,
+  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): Promise<ChatResponse> {
+  const searching = searchModeOf(request) !== "off";
+  const { call, canSeePhotos, hostedSearch } = await modelCall(request, searching);
+  const search = searching && !hostedSearch ? webSearchConfig(request.webSearch) : null;
+  const { text, toolCalls, proposal } = await chatWithTools(call, request.systemPrompt, request.prompt, chatLibrary(request.library), {
     canSeePhotos,
-  );
-  outputJson({ ...chatReply(text), toolCalls } satisfies ChatResponse);
+    search,
+    hostedSearch,
+    recipe: recipeDraft(request.recipe),
+    log,
+  });
+  let answer: ChatAnswer;
+  try {
+    answer = chatReply(text);
+  } catch (error) {
+    // Model output is logged in full like every response (never a key).
+    log(`chat reply unreadable (${toolCalls.length} tool calls): ${JSON.stringify(text.slice(0, 4000))}`);
+    throw error;
+  }
+  const mode: ChatSearch = hostedSearch ? "hosted" : search ? "api" : "none";
+  return { ...answer, label: proposal ? answer.label : "", toolCalls, search: mode, proposal };
+}
+
+/** How the provider's own web search is asked one question. */
+const HOSTED_SEARCH_PROMPT = "You look things up on the web for a cooking assistant. Search the web for the request, then reply in plain text: the facts that answer it, short and specific, then the URLs of the pages you used, one per line. Do not answer from memory without searching.";
+
+/** Answers one web_search call with a single request to the provider's own
+ * web search (`call` has it attached) and no other tools, so no turn is
+ * ever replayed. A failed, paused, or empty search is a WebSearchError,
+ * which the chat turns into an error result the model answers around. */
+export async function hostedSearchAnswer(call: ChatModelCall, query: string): Promise<string> {
+  const response = await call({
+    systemPrompt: HOSTED_SEARCH_PROMPT,
+    messages: [{ role: "user", content: `Search the web for: ${query}`, timestamp: Date.now() }],
+    tools: [],
+  });
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new WebSearchError(`The web search failed (${response.errorMessage || "provider error"}).`);
+  }
+  if ((response as AssistantMessage & { rawStopReason?: string }).rawStopReason === "pause_turn") {
+    throw new WebSearchError("The web search took too long and was paused.");
+  }
+  const text = withoutCiteTags(assistantText(response));
+  if (!text) throw new WebSearchError("The web search came back empty.");
+  return `Web search for "${query}":\n${text}`;
+}
+
+/** Text without the cite tags Claude's web search wraps around quotes. */
+function withoutCiteTags(text: string): string {
+  return text.replace(/<\/?cite\b[^>]*>/gi, "").replace(/[ \t]{2,}/g, " ").trim();
 }
 
 /** One model call with the chat's running context. */
 export type ChatModelCall = (context: Context) => Promise<AssistantMessage>;
 
+/** Searches Anthropic's server tool may run in one chat turn; well under the
+ * server's own loop limit, so the turn ends with an answer, not pause_turn. */
+const CHAT_HOSTED_SEARCHES = 4;
+
+/** The payload hook that attaches the provider's own web search to a chat
+ * request, or null when the backend has none. Subscriptions and the native
+ * OpenAI/Anthropic specs search on the provider's side; the pi-ai providers
+ * (Gemini, Mistral, custom servers, …) fall back to the search API tool. */
+export function chatSearchPayload(
+  api: string,
+  endpointSpec: string | null,
+): ((payload: unknown) => Record<string, unknown>) | null {
+  if (endpointSpec !== null && isPiAiSpec(endpointSpec)) return null;
+  if (api === "openai-responses" || api === "openai-codex-responses") return responsesSearchPayload;
+  if (api === "anthropic-messages") {
+    return (payload) => {
+      const body = anthropicSearchPayload(payload);
+      const tools = (body.tools as Record<string, unknown>[]).map((tool) =>
+        tool.type === "web_search_20250305" ? { ...tool, max_uses: CHAT_HOSTED_SEARCHES } : tool);
+      return { ...body, tools };
+    };
+  }
+  return null;
+}
+
 /** The chat's model call through the request's backend. Every backend goes
  * through pi-ai here, the native OpenAI and Anthropic endpoints included,
- * since the chat needs tool calls rather than native web search. */
-async function chatModelCall(request: PromptRequest): Promise<{ call: ChatModelCall; canSeePhotos: boolean }> {
+ * since the chat needs its own tool calls. With `searching`, a backend that
+ * has web search of its own also gets `hostedSearch`, a one-shot search call
+ * through the same model (see hostedSearchAnswer). */
+export async function chatModelCall(
+  request: PromptRequest,
+  searching: boolean,
+): Promise<{ call: ChatModelCall; canSeePhotos: boolean; hostedSearch: ((query: string) => Promise<string>) | null }> {
   const reasoning = normalizeEffort(request.reasoningEffort);
+  let complete: (context: Context, onPayload?: (payload: unknown) => Record<string, unknown>) => Promise<AssistantMessage>;
+  let model: Model<Api>;
+  let spec: string | null = null;
   if (!isEndpointRequest(request)) {
     const subscription = subscriptionOf(request);
     const modelRuntime = await subscriptionRuntime(request);
@@ -1146,35 +1247,50 @@ async function chatModelCall(request: PromptRequest): Promise<{ call: ChatModelC
       throw new WorkerError("configuration", subscription.notLoggedIn);
     }
     const modelId = nonBlank(request.model) ?? subscription.defaultModel;
-    const model = modelRuntime.getModel(subscription.id, modelId);
-    if (!model) throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
-    return {
-      call: (context) => modelRuntime.completeSimple(model, context, { reasoning, maxRetries: 1 }),
-      canSeePhotos: model.input.includes("image"),
-    };
-  }
-  const spec = nonBlank(request.provider);
-  const apiKey = nonBlank(request.apiKey);
-  const modelId = nonBlank(request.model);
-  if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
-  if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
-    throw new WorkerError("configuration", "Missing API key for this AI provider.");
-  }
-  const models = piAiModels();
-  const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
-  return {
-    call: (context) => models.completeSimple(model, context, {
+    const found = modelRuntime.getModel(subscription.id, modelId);
+    if (!found) throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
+    model = found;
+    complete = (context, onPayload) => modelRuntime.completeSimple(found, context, {
+      reasoning,
+      maxRetries: 1,
+      ...(onPayload ? { onPayload } : {}),
+    });
+  } else {
+    spec = nonBlank(request.provider);
+    const apiKey = nonBlank(request.apiKey);
+    const modelId = nonBlank(request.model);
+    if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
+    if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
+      throw new WorkerError("configuration", "Missing API key for this AI provider.");
+    }
+    const models = piAiModels();
+    const found = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
+    model = found;
+    complete = (context, onPayload) => models.completeSimple(found, context, {
       apiKey: apiKey ?? "none",
       reasoning,
       maxRetries: 1,
       signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
-    }),
+      ...(onPayload ? { onPayload } : {}),
+    });
+  }
+  const onPayload = searching ? chatSearchPayload(model.api, spec) : null;
+  return {
+    call: (context) => complete(context),
     canSeePhotos: model.input.includes("image"),
+    hostedSearch: onPayload ? (query) => hostedSearchAnswer((context) => complete(context, onPayload), query) : null,
   };
 }
 
-/** Model turns that may call tools before the chat must answer. */
-const CHAT_TOOL_ROUNDS = 4;
+/** The reply shown when the model ran out of tool turns mid-edit. */
+const CHAT_ROUNDS_OUT_REPLY = "I made the changes below but ran out of steps before I could finish explaining them. Check them carefully, then accept or deny them.";
+
+/** Model turns that may call tools before the chat must answer. Edits can
+ * take a few turns (read, change, check), on top of lookups and searches. */
+const CHAT_TOOL_ROUNDS = 8;
+/** Searches one chat answer may run; past these the tool tells the model to
+ * answer with what it found. */
+const CHAT_SEARCHES = 3;
 
 /** The chat's read-only tools. They answer from the request's library, so a
  * lookup never leaves the worker. */
@@ -1199,6 +1315,97 @@ export const CHAT_TOOLS: Tool[] = [
     }),
   },
 ];
+
+/** How the model hands over its finished reply. Claude in particular reaches
+ * for a tool to finish (it called made-up "json" tools when told to write a
+ * JSON object); a plain JSON or prose reply is still read as the answer. */
+export const ANSWER_TOOL: Tool = {
+  name: "answer",
+  description: "Give the cook your reply. Call it once, last, when you are done (after any lookups and edits).",
+  parameters: Type.Object({
+    reply: Type.String({ minLength: 1, description: "Your answer to the cook, in plain text." }),
+    label: Type.Optional(Type.String({ description: "A one- or two-word name for the edits you made, or empty without edits." })),
+  }),
+};
+
+/** The search tool for models without web search of their own; offered only
+ * when the account has a search API key. */
+export const WEB_SEARCH_TOOL: Tool = {
+  // Not "web_search": Anthropic gives that name to its own server tool, and
+  // Claude answered a client tool of that name with empty tool_use turns.
+  name: "search_web",
+  description: "Search the web. Returns what the pages say, with their URLs. Search only when it matters, at most a few times per answer.",
+  parameters: Type.Object({
+    query: Type.String({ minLength: 1, description: "What to search for." }),
+  }),
+};
+
+/** The answer tool's reply to a call without a reply. */
+function answerNeedsReply(call: ToolCall): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text: "Give answer your reply to the cook as `reply`." }],
+    isError: true,
+    timestamp: Date.now(),
+  };
+}
+
+/** The search tool's answer once an answer has used its searches. */
+function searchesUsed(call: ToolCall): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text: `That is the most searches for one answer (${CHAT_SEARCHES}). Answer now with what you found.` }],
+    isError: true,
+    timestamp: Date.now(),
+  };
+}
+
+/** Runs one web_search call through the account's search API. */
+export async function runWebSearchTool(
+  search: WebSearchConfig,
+  call: ToolCall,
+  fetchImpl: typeof fetch = globalThis.fetch,
+  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+): Promise<ToolResultMessage> {
+  return runSearchTool(
+    (query) => webSearch(search, query, fetchImpl).then((results) => formatSearchResults(query, results)),
+    call,
+    log,
+    search.apiKey,
+  );
+}
+
+/** Runs one web_search call through `searcher`. A failure is an error
+ * result the model can answer around, never a failed chat; `key` is
+ * redacted from anything logged or returned. */
+export async function runSearchTool(
+  searcher: (query: string) => Promise<string>,
+  call: ToolCall,
+  log: (line: string) => void,
+  key = "",
+): Promise<ToolResultMessage> {
+  const result = (text: string, isError = false): ToolResultMessage => ({
+    role: "toolResult",
+    toolCallId: call.id,
+    toolName: call.name,
+    content: [{ type: "text", text }],
+    isError,
+    timestamp: Date.now(),
+  });
+  const query = typeof call.arguments.query === "string" ? call.arguments.query.trim() : "";
+  if (!query) return result("Give search_web a query.", true);
+  try {
+    return result(await searcher(query));
+  } catch (error) {
+    const message = redact(error instanceof Error ? error.message : String(error), key);
+    log(`chat web search failed${error instanceof WebSearchError && error.auth ? " (key rejected)" : ""}: ${message}`);
+    return result(`${message} Answer without the web.`, true);
+  }
+}
 
 function finiteInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) ? value : null;
@@ -1288,27 +1495,66 @@ export function runChatTool(library: ChatLibrary, call: ToolCall, canSeePhotos: 
       recipe: saved.recipe,
     }));
   }
-  return result(`Unknown tool ${call.name}.`, true);
+  return result(`There is no tool ${call.name}. When you are done, call answer with your reply.`, true);
 }
 
-/** Runs the chat: the model may call the tools for up to CHAT_TOOL_ROUNDS
- * turns, then must answer. Each call is logged by name (never photo bytes). */
+/** What chatWithTools may use besides the model and the library. */
+export interface ChatToolOptions {
+  /** Whether note_photo may return images to this model. */
+  canSeePhotos?: boolean;
+  log?: (line: string) => void;
+  /** The search API key for the web_search tool. */
+  search?: WebSearchConfig | null;
+  fetchImpl?: typeof fetch;
+  /** Answers web_search through the provider's own search instead of the
+   * key. With neither, no web_search tool is offered. */
+  hostedSearch?: ((query: string) => Promise<string>) | null;
+  /** The recipe the edit tools change; null offers no edit tools. */
+  recipe?: RecipeProposal | null;
+}
+
+/** Runs the chat: the model may call the tools (web_search with a search
+ * key, the edit tools with a recipe) for up to CHAT_TOOL_ROUNDS turns, then
+ * must answer. Each call is logged by name and arguments (never photo bytes
+ * or the key). Edits change a copy of the recipe, returned as `proposal`
+ * when they changed anything the cook would see. */
 export async function chatWithTools(
   call: ChatModelCall,
   systemPrompt: string,
   prompt: string,
   library: ChatLibrary,
-  canSeePhotos: boolean,
-  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
-): Promise<{ text: string; toolCalls: string[] }> {
+  {
+    canSeePhotos = false,
+    log = (line) => process.stderr.write(`${line}\n`),
+    search = null,
+    fetchImpl = globalThis.fetch,
+    hostedSearch = null,
+    recipe = null,
+  }: ChatToolOptions = {},
+): Promise<{ text: string; toolCalls: string[]; proposal: RecipeProposal | null }> {
+  const draft = recipe ? copyDraft(recipe) : null;
+  const searcher = hostedSearch
+    ?? (search ? (query: string) => webSearch(search, query, fetchImpl).then((results) => formatSearchResults(query, results)) : null);
   const context: Context = {
     systemPrompt,
     messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-    tools: CHAT_TOOLS,
+    tools: [...CHAT_TOOLS, ...(searcher ? [WEB_SEARCH_TOOL] : []), ...(draft ? EDIT_TOOLS : []), ANSWER_TOOL],
   };
   const toolCalls: string[] = [];
+  let searches = 0;
+  let emptyRetried = false;
   for (let round = 0; ; round += 1) {
-    const response = await call(context);
+    let response = await call(context);
+    if (!emptyRetried && response.stopReason !== "error" && response.stopReason !== "aborted"
+      && !response.content.some((part) => part.type === "toolCall") && !assistantText(response).trim()) {
+      // Claude now and then ends a turn with stop_reason tool_use and no
+      // block pi-ai keeps. Nothing new goes into the context, so asking the
+      // same request again is safe; it is done once per answer.
+      emptyRetried = true;
+      const raw = (response as AssistantMessage & { rawStopReason?: string }).rawStopReason;
+      log(`chat answer had no text: stop=${response.stopReason} raw=${raw ?? "-"} blocks=${response.content.map((part) => part.type).join(",") || "none"} round=${round}; asking again`);
+      response = await call(context);
+    }
     if (response.stopReason === "error" || response.stopReason === "aborted") {
       throw new WorkerError("worker", response.errorMessage || "AI provider request failed.", { retryable: true });
     }
@@ -1316,17 +1562,51 @@ export async function chatWithTools(
       throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
     }
     const calls = response.content.filter((part): part is ToolCall => part.type === "toolCall");
-    if (calls.length === 0) return { text: assistantText(response), toolCalls };
+    const proposal = () => (recipe && draft && draftChanged(recipe, draft) ? draft : null);
+    if ((response as AssistantMessage & { rawStopReason?: string }).rawStopReason === "pause_turn") {
+      // Anthropic paused a long server-side search; pi-ai reports it as a
+      // plain stop, and what came so far is a preamble, not the answer.
+      throw new WorkerError("worker", "The provider paused the turn mid-search.", { retryable: true });
+    }
+    if (calls.length === 0) {
+      return { text: assistantText(response), toolCalls, proposal: proposal() };
+    }
+    const finish = calls.find((part) => part.name === ANSWER_TOOL.name
+      && typeof part.arguments.reply === "string" && part.arguments.reply.trim());
+    if (finish) {
+      // Edits called alongside the answer still count.
+      for (const toolCall of calls) {
+        if (toolCall === finish) continue;
+        toolCalls.push(toolCall.name);
+        log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
+        if (draft && isEditTool(toolCall.name)) runEditTool(draft, toolCall);
+      }
+      const label = typeof finish.arguments.label === "string" ? finish.arguments.label : "";
+      return { text: JSON.stringify({ reply: finish.arguments.reply, label }), toolCalls, proposal: proposal() };
+    }
     if (round === CHAT_TOOL_ROUNDS) {
+      // Edits made so far still reach the cook, who reviews them anyway.
+      const edited = proposal();
+      if (edited) {
+        return { text: JSON.stringify({ reply: CHAT_ROUNDS_OUT_REPLY, label: "" }), toolCalls, proposal: edited };
+      }
       throw new WorkerError("output", "The model kept calling tools without answering.");
     }
     context.messages.push(response);
     for (const toolCall of calls) {
       toolCalls.push(toolCall.name);
       log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
-      const output = runChatTool(library, toolCall, canSeePhotos);
+      const output = toolCall.name === ANSWER_TOOL.name
+        ? answerNeedsReply(toolCall)
+        : searcher && toolCall.name === WEB_SEARCH_TOOL.name
+        ? (searches += 1) > CHAT_SEARCHES
+          ? searchesUsed(toolCall)
+          : await runSearchTool(searcher, toolCall, log, search?.apiKey ?? "")
+        : draft && isEditTool(toolCall.name)
+          ? runEditTool(draft, toolCall)
+          : runChatTool(library, toolCall, canSeePhotos);
       if (round === CHAT_TOOL_ROUNDS - 1) {
-        output.content.push({ type: "text", text: "That was the last lookup. Answer the cook now." });
+        output.content.push({ type: "text", text: "That was the last lookup or edit. Call answer now with your reply." });
       }
       context.messages.push(output);
     }
@@ -1337,9 +1617,9 @@ function trimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-/** The model's chat reply. A JSON object gives the answer and any change; a
- * model that ignored the format and wrote prose has that prose taken as a
- * plain answer. A label without a change is dropped. */
+/** The model's chat reply. A JSON object gives the answer and the change's
+ * label; a model that ignored the format and wrote prose has that prose
+ * taken as the answer. The caller drops the label when nothing changed. */
 export function chatReply(text: string): ChatAnswer {
   let parsed: unknown = null;
   try {
@@ -1350,11 +1630,18 @@ export function chatReply(text: string): ChatAnswer {
   const fields = parsed && typeof parsed === "object" && !Array.isArray(parsed)
     ? parsed as Record<string, unknown>
     : null;
-  const reply = fields ? trimmedString(fields.reply) : text.trim();
-  if (!reply) throw new WorkerError("output", "The model returned an empty chat answer.");
-  const change = fields ? trimmedString(fields.change) : "";
-  const label = change && fields ? trimmedString(fields.label) : "";
-  return { reply, change, label };
+  const replyField = fields?.reply;
+  const reply = Array.isArray(replyField)
+    ? replyField.filter((line): line is string => typeof line === "string").map((line) => line.trim()).filter(Boolean).join("\n")
+    : fields && typeof replyField === "string"
+      ? replyField.trim()
+      : text.trim();
+  // Claude's web search can wrap quoted sources in <cite index="…"> tags;
+  // the chat shows plain text, and the sources go at the end as URLs.
+  const plainReply = withoutCiteTags(reply);
+  if (!plainReply) throw new WorkerError("output", "The model returned an empty chat answer.");
+  const label = fields ? trimmedString(fields.label) : "";
+  return { reply: plainReply, label };
 }
 
 /** One model call through the request's backend: a subscription, a native

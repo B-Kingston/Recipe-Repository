@@ -11,11 +11,17 @@ import {
   completionContext,
   formatRecipeEvidence,
   CHAT_TOOLS,
+  WEB_SEARCH_TOOL,
+  ANSWER_TOOL,
   chatLibrary,
+  chatSearchPayload,
+  answerChat,
+  hostedSearchAnswer,
   chatReply,
   chatWithTools,
   formatChatNotes,
   runChatTool,
+  runWebSearchTool,
   cleanedEvidence,
   completeViaPiAi,
   generateRecipe,
@@ -36,6 +42,8 @@ import {
   workerFailure,
 } from "./recipe-worker.ts";
 import type { ChatLibrary, ChatModelCall, Complete, CompletionOptions } from "./recipe-worker.ts";
+import { EDIT_TOOLS, recipeDraft } from "./recipe-edits.ts";
+import { WebSearchError } from "./web-search.ts";
 import type { AssistantMessage, Context, Model, ToolCall } from "@earendil-works/pi-ai";
 
 /** What a fake fetch receives: the worker sends string headers and a JSON string body. */
@@ -253,34 +261,20 @@ test("cleanedEvidence finds the JSON object between prose that contains braces",
   assert.equal(cleaned, "Dish: Soup\nMethod:\n1. Simmer {gently}");
 });
 
-test("chatReply reads the answer, the change, and its label from the JSON reply", () => {
-  const reply = chatReply("```json\n" + JSON.stringify({
-    reply: " I'll swap the eggs for tofu. ",
-    change: "Replace the 6 eggs with 400 g crumbled firm tofu.",
-    label: " Made vegan ",
-  }) + "\n```");
-  assert.deepEqual(reply, {
-    reply: "I'll swap the eggs for tofu.",
-    change: "Replace the 6 eggs with 400 g crumbled firm tofu.",
-    label: "Made vegan",
-  });
+test("chatReply reads the answer and the change's label from the JSON reply", () => {
+  const reply = chatReply("```json\n" + JSON.stringify({ reply: "Swapped the eggs for tofu.", label: "Egg-free" }) + "\n```");
+  assert.deepEqual(reply, { reply: "Swapped the eggs for tofu.", label: "Egg-free" });
 });
 
-test("chatReply keeps a plain answer, drops a label with no change, and takes prose as the answer", () => {
-  assert.deepEqual(chatReply('{"reply":"Yes, about 1 kg.","change":"","label":"Tomatoes"}'), {
-    reply: "Yes, about 1 kg.",
-    change: "",
-    label: "",
-  });
+test("chatReply takes prose that ignored the format as the answer", () => {
   assert.deepEqual(chatReply("Use about 1 kg of fresh tomatoes {chopped}."), {
     reply: "Use about 1 kg of fresh tomatoes {chopped}.",
-    change: "",
     label: "",
   });
 });
 
 test("chatReply refuses an empty answer as retryable output", () => {
-  for (const text of ["", '{"reply":"  ","change":"Halve the salt"}']) {
+  for (const text of ["", '{"reply":"  ","label":"Less salt"}']) {
     assert.throws(() => chatReply(text), (error) => {
       assert.ok(error instanceof WorkerError);
       assert.equal(error.code, "output");
@@ -372,18 +366,18 @@ test("chatWithTools runs the model's lookups, then returns its answer", async ()
   const turns = [
     reply([toolCall("recipe_notes")], "toolUse"),
     reply([toolCall("note_photo", { note: 2 }), toolCall("recipe_version", { version: 1 }, "call-v1")], "toolUse"),
-    reply([{ type: "text", text: '{"reply":"Use half the salt.","change":"","label":""}' }]),
+    reply([{ type: "text", text: '{"reply":"Use half the salt.","label":""}' }]),
   ];
   const call: ChatModelCall = async (context) => {
     contexts.push({ ...context, messages: [...context.messages] });
     return turns.shift()!;
   };
   const logged: string[] = [];
-  const result = await chatWithTools(call, "system", "It was too salty", library(), true, (line) => logged.push(line));
-  assert.equal(result.text, '{"reply":"Use half the salt.","change":"","label":""}');
+  const result = await chatWithTools(call, "system", "It was too salty", library(), { canSeePhotos: true, log: (line) => logged.push(line) });
+  assert.equal(result.text, '{"reply":"Use half the salt.","label":""}');
   assert.deepEqual(result.toolCalls, ["recipe_notes", "note_photo", "recipe_version"]);
   assert.equal(contexts.length, 3);
-  assert.deepEqual(contexts[0].tools, CHAT_TOOLS);
+  assert.deepEqual(contexts[0].tools, [...CHAT_TOOLS, ANSWER_TOOL]);
   // The last turn saw the question, both assistant turns, and three results.
   assert.deepEqual(contexts[2].messages.map((message) => message.role), ["user", "assistant", "toolResult", "assistant", "toolResult", "toolResult"]);
   assert.equal(logged.length, 3);
@@ -392,17 +386,111 @@ test("chatWithTools runs the model's lookups, then returns its answer", async ()
 
 test("chatWithTools stops a model that never answers and reports failed calls", async () => {
   const looping: ChatModelCall = async () => reply([toolCall("recipe_notes")], "toolUse");
-  await assert.rejects(chatWithTools(looping, "s", "p", library(), true, () => {}), (error) => {
+  await assert.rejects(chatWithTools(looping, "s", "p", library(), { log: () => {} }), (error) => {
     assert.ok(error instanceof WorkerError);
     assert.equal(error.code, "output");
     return true;
   });
   const failing: ChatModelCall = async () => ({ ...reply([], "error"), errorMessage: "overloaded" }) as AssistantMessage;
-  await assert.rejects(chatWithTools(failing, "s", "p", library(), true, () => {}), (error) => {
+  await assert.rejects(chatWithTools(failing, "s", "p", library(), { log: () => {} }), (error) => {
     assert.ok(error instanceof WorkerError);
     assert.equal(error.retryable, true);
     return true;
   });
+});
+
+test("chatSearchPayload uses the provider's own search only where it has one", () => {
+  const responses = chatSearchPayload("openai-codex-responses", null)!;
+  assert.deepEqual(responses({ tools: [{ type: "function", name: "recipe_notes" }] }).tools, [
+    { type: "function", name: "recipe_notes" },
+    { type: "web_search", search_context_size: "medium" },
+  ]);
+  assert.ok(chatSearchPayload("openai-responses", "openai"));
+  const anthropic = chatSearchPayload("anthropic-messages", "anthropic")!;
+  assert.deepEqual(anthropic({ tools: [{ name: "recipe_notes" }] }).tools, [
+    { name: "recipe_notes" },
+    { type: "web_search_20250305", name: "web_search", max_uses: 4 },
+  ]);
+  assert.ok(chatSearchPayload("anthropic-messages", null), "the Claude subscription searches itself");
+  // pi-ai providers fall back to the search API, even on an Anthropic-shaped API.
+  assert.equal(chatSearchPayload("anthropic-messages", "minimax"), null);
+  assert.equal(chatSearchPayload("openai-completions", "openai-compatible"), null);
+  assert.equal(chatSearchPayload("google-generative-ai", "google"), null);
+});
+
+test("chatWithTools offers web_search with a search key and answers it through the API", async () => {
+  const contexts: Context[] = [];
+  const turns = [
+    reply([toolCall("search_web", { query: "asafoetida substitute" })], "toolUse"),
+    reply([{ type: "text", text: '{"reply":"Use garlic powder.\\nhttps://example.com/hing","label":""}' }]),
+  ];
+  const call: ChatModelCall = async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return turns.shift()!;
+  };
+  const fetched: string[] = [];
+  const fetchImpl = (async (url: string | URL | Request) => {
+    fetched.push(String(url));
+    return new Response(JSON.stringify({ results: [{ title: "Hing", url: "https://example.com/hing", content: "Garlic powder works." }] }));
+  }) as typeof fetch;
+  const logged: string[] = [];
+  const result = await chatWithTools(call, "s", "No hing?", library(), {
+    canSeePhotos: true,
+    log: (line) => logged.push(line),
+    search: { provider: "tavily", apiKey: "tvly-secret" },
+    fetchImpl,
+  });
+  assert.deepEqual(result.toolCalls, ["search_web"]);
+  assert.deepEqual(contexts[0].tools, [...CHAT_TOOLS, WEB_SEARCH_TOOL, ANSWER_TOOL]);
+  assert.deepEqual(fetched, ["https://api.tavily.com/search"]);
+  const searchResult = contexts[1].messages[2] as ReturnType<typeof runChatTool>;
+  assert.match(resultText(searchResult), /1\. Hing\nhttps:\/\/example\.com\/hing\nGarlic powder works\./);
+  assert.ok(logged.every((line) => !line.includes("tvly-secret")), "the search key is never logged");
+
+  const without = await chatWithTools(async (context) => {
+    assert.deepEqual(context.tools, [...CHAT_TOOLS, ANSWER_TOOL]);
+    return reply([{ type: "text", text: "Plain." }]);
+  }, "s", "p", library(), { log: () => {} });
+  assert.equal(without.text, "Plain.");
+});
+
+test("a failed web search is an error result, not a failed chat", async () => {
+  const rejected = (async () => new Response("{}", { status: 401 })) as typeof fetch;
+  const logged: string[] = [];
+  const output = await runWebSearchTool({ provider: "exa", apiKey: "k" }, toolCall("search_web", { query: "q" }), rejected, (line) => logged.push(line));
+  assert.equal(output.isError, true);
+  assert.match(resultText(output), /Exa rejected the search API key\. Answer without the web\./);
+  assert.match(logged[0], /key rejected/);
+  const empty = await runWebSearchTool({ provider: "exa", apiKey: "k" }, toolCall("search_web", { query: " " }), rejected, () => {});
+  assert.equal(empty.isError, true);
+});
+
+test("chatWithTools offers the edit tools with a recipe and returns what they changed", async () => {
+  const recipe = recipeDraft({
+    title: "Dal",
+    ingredients: [{ name: "salt", quantity: "2", unit: "tsp" }],
+    steps: [{ text: "Simmer.", ingredients: ["2 tsp salt"] }],
+  })!;
+  const contexts: Context[] = [];
+  const turns = [
+    reply([
+      toolCall("change_ingredient", { ingredient: 1, quantity: "1" }),
+      toolCall("change_step", { step: 1, ingredients: ["1 tsp salt"] }, "call-step"),
+    ], "toolUse"),
+    reply([{ type: "text", text: '{"reply":"Halved the salt.","label":"Less salt"}' }]),
+  ];
+  const result = await chatWithTools(async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return turns.shift()!;
+  }, "s", "Too salty", library(), { log: () => {}, recipe });
+  assert.deepEqual(contexts[0].tools, [...CHAT_TOOLS, ...EDIT_TOOLS, ANSWER_TOOL]);
+  assert.deepEqual(result.toolCalls, ["change_ingredient", "change_step"]);
+  assert.deepEqual(result.proposal?.ingredients, [{ from: 0, name: "salt", quantity: "1", unit: "tsp", optional: false }]);
+  assert.deepEqual(result.proposal?.steps[0].ingredients, ["1 tsp salt"]);
+  assert.equal(recipe.ingredients[0].quantity, "2", "the recipe the host sent is not changed");
+
+  const untouched = await chatWithTools(async () => reply([{ type: "text", text: "Fine as is." }]), "s", "p", library(), { log: () => {}, recipe });
+  assert.equal(untouched.proposal, null);
 });
 
 test("formatRecipeEvidence rejects cleaner output without ingredients or steps", () => {
@@ -912,4 +1000,313 @@ test("workerFailure reports a refused login as a non-retryable auth failure", ()
 
 test("parseRequest accepts checkLogin without a prompt", () => {
   assert.equal(parseRequest(JSON.stringify({ command: "checkLogin" })).command, "checkLogin");
+});
+
+// ---------------------------------------------------------------------------
+// The recipe chat through pi-ai itself, with the provider's HTTP faked: what a
+// hosted-search round sends on the next request, and how a paused turn ends.
+
+/** A text/event-stream response of the given events, as the provider SDKs read it. */
+function sse(events: Record<string, unknown>[]): Response {
+  const body = events.map((event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+/** A fetch that answers each request with the next response and keeps the JSON bodies. */
+function scriptedFetch(responses: Response[], bodies: Record<string, unknown>[]): typeof fetch {
+  return (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    const next = responses.shift();
+    if (!next) throw new Error("no scripted response left");
+    return next;
+  }) as typeof fetch;
+}
+
+const SHORTBREAD = {
+  title: "Shortbread",
+  ingredients: [{ name: "butter", quantity: "200", unit: "g" }, { name: "sugar", quantity: "100", unit: "g" }],
+  steps: [{ text: "Cream the butter and sugar.", ingredients: ["200 g butter", "100 g sugar"] }],
+};
+
+const USAGE = { input_tokens: 10, output_tokens: 5, total_tokens: 15, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
+
+/** One Responses API turn whose output items are given in order. */
+function responsesTurn(id: string, items: Record<string, unknown>[]): Response {
+  const events: Record<string, unknown>[] = [{ type: "response.created", response: { id, status: "in_progress", output: [] } }];
+  items.forEach((item, index) => {
+    events.push({ type: "response.output_item.added", output_index: index, item: { ...item, ...(item.type === "function_call" ? { arguments: "" } : {}) } });
+    events.push({ type: "response.output_item.done", output_index: index, item });
+  });
+  events.push({ type: "response.completed", response: { id, status: "completed", output: items, usage: USAGE } });
+  return sse(events);
+}
+
+function answerItem(text: string): Record<string, unknown> {
+  return { type: "message", id: "msg_2", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+}
+
+/** One Anthropic Messages turn: content blocks in order, then the stop reason. */
+function anthropicStream(blocks: Record<string, unknown>[], stopReason: string): Response {
+  const events: Record<string, unknown>[] = [{
+    type: "message_start",
+    message: { id: "msg_1", type: "message", role: "assistant", content: [], model: "claude-sonnet-5-5", stop_reason: null, usage: { input_tokens: 10, output_tokens: 0 } },
+  }];
+  blocks.forEach((block, index) => {
+    if (block.type === "thinking") {
+      events.push({ type: "content_block_start", index, content_block: { type: "thinking", thinking: "", signature: "" } });
+      events.push({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: block.thinking } });
+      events.push({ type: "content_block_delta", index, delta: { type: "signature_delta", signature: block.signature } });
+    } else if (block.type === "text") {
+      events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+      events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: block.text } });
+    } else if (block.type === "tool_use" || block.type === "server_tool_use") {
+      events.push({ type: "content_block_start", index, content_block: { ...block, input: {} } });
+      events.push({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+    } else {
+      events.push({ type: "content_block_start", index, content_block: block });
+    }
+    events.push({ type: "content_block_stop", index });
+  });
+  events.push({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 20 } });
+  events.push({ type: "message_stop" });
+  return sse(events);
+}
+
+const SEARCH_BLOCKS = [
+  { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "vegan butter shortbread" } },
+  { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content: [{ type: "web_search_result", url: "https://example.com/vegan-butter", title: "Vegan butter", encrypted_content: "enc", page_age: null }] },
+];
+
+function anthropicChat(fetchImpl: typeof fetch): ChatModelCall {
+  const models = piAiModels();
+  const model = piAiModel(models, "anthropic", "claude-sonnet-5-5");
+  const onPayload = chatSearchPayload(model.api, "anthropic")!;
+  return (context) => models.completeSimple(model, context, { apiKey: "sk-ant-api03-test", reasoning: "low", maxRetries: 0, onPayload, fetch: fetchImpl });
+}
+
+test("a paused Anthropic turn is continued or failed, never saved as the answer", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const fetchImpl = scriptedFetch([
+    anthropicStream([{ type: "text", text: "Let me look that up." }, ...SEARCH_BLOCKS], "pause_turn"),
+    anthropicStream([{ type: "text", text: '{"reply":"Bake at 160C.","label":""}' }], "end_turn"),
+  ], bodies);
+  let outcome: string;
+  try {
+    const { text } = await chatWithTools(anthropicChat(fetchImpl), "system", "What temperature?", chatLibrary({}), { log: () => {} });
+    outcome = chatReply(text).reply;
+  } catch (error) {
+    outcome = error instanceof WorkerError && error.retryable ? "retryable failure" : String(error);
+  }
+  assert.notEqual(outcome, "Let me look that up.");
+});
+
+test("pi-ai reports a paused Anthropic turn as a plain stop, keeping the raw reason", async () => {
+  // Pins the behaviour the chat must handle itself: stopReason says "stop",
+  // only rawStopReason says the server paused mid-search.
+  const fetchImpl = scriptedFetch([anthropicStream([{ type: "text", text: "Let me look that up." }, ...SEARCH_BLOCKS], "pause_turn")], []);
+  const message = await anthropicChat(fetchImpl)({ systemPrompt: "s", messages: [{ role: "user", content: "q", timestamp: 0 }], tools: CHAT_TOOLS });
+  assert.equal(message.stopReason, "stop");
+  assert.equal((message as AssistantMessage & { rawStopReason?: string }).rawStopReason, "pause_turn");
+  assert.deepEqual(message.content.map((part) => part.type), ["text"], "the search blocks are not kept");
+});
+
+test("a model still editing when the rounds run out keeps its proposal", async () => {
+  const recipe = recipeDraft({ ...SHORTBREAD, ingredients: Array.from({ length: 12 }, (_, at) => ({ name: `item ${at + 1}`, quantity: "1", unit: "" })) })!;
+  let turn = 0;
+  const oneAtATime: ChatModelCall = async () => {
+    turn += 1;
+    return reply([toolCall("change_ingredient", { ingredient: turn, quantity: "2" }, `call-${turn}`)], "toolUse");
+  };
+  const result = await chatWithTools(oneAtATime, "s", "Double everything", chatLibrary({}), { log: () => {}, recipe });
+  assert.ok(result.proposal, "the edits made so far come back for the cook to review");
+});
+
+test("chatReply falls back to the text when the JSON has no usable reply", () => {
+  const lines = chatReply(JSON.stringify({ reply: ["Use less salt.", "Taste first."], label: "" }));
+  assert.match(lines.reply, /Use less salt/);
+});
+
+test("chatWithTools sends the edit tools only with a recipe and keeps search and edits apart", async () => {
+  const contexts: Context[] = [];
+  const turns = [
+    reply([toolCall("search_web", { query: "vegan butter" }), toolCall("change_ingredient", { ingredient: 1, name: "vegan butter" }, "call-edit")], "toolUse"),
+    reply([{ type: "text", text: '{"reply":"Swapped.","label":"Vegan butter"}' }]),
+  ];
+  const fetchImpl = (async () => new Response(JSON.stringify({ results: [] }))) as unknown as typeof fetch;
+  const result = await chatWithTools(async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return turns.shift()!;
+  }, "s", "p", chatLibrary({}), { log: () => {}, search: { provider: "exa", apiKey: "k" }, fetchImpl, recipe: recipeDraft(SHORTBREAD) });
+  assert.deepEqual(contexts[0].tools?.map((tool) => tool.name), [...CHAT_TOOLS, WEB_SEARCH_TOOL, ...EDIT_TOOLS, ANSWER_TOOL].map((tool) => tool.name));
+  const names = new Set(contexts[0].tools?.map((tool) => tool.name));
+  assert.equal(names.size, contexts[0].tools?.length, "no two tools share a name");
+  assert.equal(result.proposal?.ingredients[0].name, "vegan butter");
+  assert.match(resultText(contexts[1].messages[2] as ReturnType<typeof runChatTool>), /No web results/);
+  // An edit tool without a recipe is an unknown tool, not a crash.
+  const noRecipe = await chatWithTools(async (context) => context.messages.length === 1
+    ? reply([toolCall("remove_step", { step: 1 })], "toolUse")
+    : reply([{ type: "text", text: "Done." }]), "s", "p", chatLibrary({}), { log: () => {} });
+  assert.equal(noRecipe.proposal, null);
+});
+
+/** A chatModelCall stand-in with a scripted chat call and, optionally, a
+ * hosted searcher. */
+function fakeModelCall(call: ChatModelCall, hosted: ((query: string) => Promise<string>) | null, seen: boolean[]) {
+  return async (_request: unknown, searching: boolean) => {
+    seen.push(searching);
+    return { call, canSeePhotos: false, hostedSearch: searching ? hosted : null };
+  };
+}
+
+const CHAT_REQUEST = {
+  prompt: "Find a vegan butter and use it",
+  systemPrompt: "s",
+  searchMode: "gapfill",
+  webSearch: { provider: "exa", apiKey: "exa-key" },
+  recipe: { title: "Shortbread", ingredients: [{ name: "butter", quantity: "200", unit: "g" }], steps: [{ text: "Mix.", ingredients: ["200 g butter"] }] },
+};
+
+test("answerChat answers web_search with the provider's own search when it has one", async () => {
+  const contexts: Context[] = [];
+  const call: ChatModelCall = async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return context.messages.length === 1
+      ? reply([toolCall("search_web", { query: "vegan block butter" }), toolCall("change_ingredient", { ingredient: 1, name: "vegan block butter" }, "call-edit")], "toolUse")
+      : reply([{ type: "text", text: '{"reply":"Swapped.","label":"Vegan butter"}' }]);
+  };
+  const queries: string[] = [];
+  const seen: boolean[] = [];
+  const result = await answerChat(CHAT_REQUEST as never, fakeModelCall(call, async (query) => {
+    queries.push(query);
+    return `Web search for "${query}":\nBlock vegan butter bakes like butter.\nhttps://example.com/vegan-butter`;
+  }, seen) as never, () => {});
+  assert.deepEqual(seen, [true]);
+  assert.deepEqual(queries, ["vegan block butter"]);
+  assert.equal(result.search, "hosted");
+  assert.ok(contexts[0].tools?.some((tool) => tool.name === "search_web"));
+  assert.match(resultText(contexts[1].messages[2] as ReturnType<typeof runChatTool>), /example\.com\/vegan-butter/);
+  assert.equal(result.proposal?.ingredients[0].name, "vegan block butter");
+});
+
+test("answerChat uses the search key only without hosted search, and nothing with search off", async () => {
+  const plain: ChatModelCall = async (context) => {
+    assert.equal(context.tools?.some((tool) => tool.name === "search_web"), true);
+    return reply([{ type: "text", text: '{"reply":"Yes.","label":"x"}' }]);
+  };
+  const viaKey = await answerChat(CHAT_REQUEST as never, fakeModelCall(plain, null, []) as never, () => {});
+  assert.equal(viaKey.search, "api");
+  assert.equal(viaKey.label, "", "no edits, no label");
+  const off: ChatModelCall = async (context) => {
+    assert.equal(context.tools?.some((tool) => tool.name === "search_web"), false);
+    return reply([{ type: "text", text: "Yes." }]);
+  };
+  const seen: boolean[] = [];
+  const quiet = await answerChat({ ...CHAT_REQUEST, searchMode: "off" } as never, fakeModelCall(off, async () => "unused", seen) as never, () => {});
+  assert.deepEqual(seen, [false]);
+  assert.equal(quiet.search, "none");
+});
+
+test("a failed hosted search is an error result the model answers around", async () => {
+  const contexts: Context[] = [];
+  const call: ChatModelCall = async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return context.messages.length === 1
+      ? reply([toolCall("search_web", { query: "q" })], "toolUse")
+      : reply([{ type: "text", text: '{"reply":"From what I know, 160C.","label":""}' }]);
+  };
+  const result = await answerChat(CHAT_REQUEST as never, fakeModelCall(call, async () => {
+    throw new WebSearchError("The web search came back empty.");
+  }, []) as never, () => {});
+  assert.equal(result.reply, "From what I know, 160C.");
+  const output = contexts[1].messages[2] as ReturnType<typeof runChatTool>;
+  assert.equal(output.isError, true);
+  assert.match(resultText(output), /came back empty\. Answer without the web\./);
+});
+
+test("hostedSearchAnswer makes one search request and reads its text", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const fetchImpl = scriptedFetch([
+    anthropicStream([
+      ...SEARCH_BLOCKS,
+      { type: "text", text: 'Rest it <cite index="1-2">5 minutes</cite>.\nhttps://example.com/rest' },
+    ], "end_turn"),
+  ], bodies);
+  const text = await hostedSearchAnswer(anthropicChat(fetchImpl), "shakshuka resting time");
+  assert.equal(text, 'Web search for "shakshuka resting time":\nRest it 5 minutes.\nhttps://example.com/rest');
+  assert.equal(bodies.length, 1, "one request, nothing replayed");
+  const tools = bodies[0].tools as Record<string, unknown>[];
+  assert.deepEqual(tools, [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }], "only the hosted search tool");
+});
+
+test("hostedSearchAnswer refuses an empty, paused, or failed search", async () => {
+  const empty = scriptedFetch([anthropicStream([...SEARCH_BLOCKS], "tool_use")], []);
+  await assert.rejects(hostedSearchAnswer(anthropicChat(empty), "q"), (error) => error instanceof WebSearchError && /empty/.test(error.message));
+  const paused = scriptedFetch([anthropicStream([{ type: "text", text: "Let me look." }, ...SEARCH_BLOCKS], "pause_turn")], []);
+  await assert.rejects(hostedSearchAnswer(anthropicChat(paused), "q"), (error) => error instanceof WebSearchError && /paused/.test(error.message));
+  const failed: ChatModelCall = async () => ({ ...reply([], "error"), errorMessage: "400 tool not supported" }) as AssistantMessage;
+  await assert.rejects(hostedSearchAnswer(failed, "q"), /web search failed \(400 tool not supported\)/);
+});
+
+test("chatReply drops the cite tags Claude's web search puts around quotes", () => {
+  const text = JSON.stringify({ reply: 'Cover for <cite index="1-10">about 5 minutes</cite>, or <cite index="2-11">4-7 minutes</cite>.', label: "" });
+  assert.equal(chatReply(text).reply, "Cover for about 5 minutes, or 4-7 minutes.");
+  assert.equal(chatReply("Use <CITE index=\"3\">ghee</CITE>.").reply, "Use ghee.");
+});
+
+test("chatWithTools asks once more after an empty turn, and caps searches per answer", async () => {
+  const turns = [
+    reply([], "toolUse"),
+    reply([{ type: "text", text: '{"reply":"Rest it 5 minutes.","label":""}' }]),
+  ];
+  const logged: string[] = [];
+  const recovered = await chatWithTools(async () => turns.shift()!, "s", "p", chatLibrary({}), { log: (line) => logged.push(line) });
+  assert.equal(recovered.text, '{"reply":"Rest it 5 minutes.","label":""}');
+  assert.match(logged[0], /no text: stop=toolUse .*asking again/);
+
+  const queries: string[] = [];
+  const results: string[] = [];
+  let turn = 0;
+  const searchy: ChatModelCall = async (context) => {
+    const last = context.messages.at(-1) as ReturnType<typeof runChatTool> | undefined;
+    if (last?.role === "toolResult") results.push(resultText(last));
+    turn += 1;
+    return turn <= 4 ? reply([toolCall("search_web", { query: `q${turn}` }, `call-${turn}`)], "toolUse") : reply([{ type: "text", text: "Done." }]);
+  };
+  await chatWithTools(searchy, "s", "p", chatLibrary({}), {
+    log: () => {},
+    hostedSearch: async (query) => { queries.push(query); return `found ${query}`; },
+  });
+  assert.deepEqual(queries, ["q1", "q2", "q3"], "the fourth search is not run");
+  assert.match(results[3], /most searches for one answer \(3\)/);
+});
+
+test("the answer tool finishes the turn, with edits called alongside it", async () => {
+  const recipe = recipeDraft({ title: "Dal", ingredients: [{ name: "salt", quantity: "2", unit: "tsp" }], steps: [{ text: "Simmer.", ingredients: ["2 tsp salt"] }] })!;
+  let calls = 0;
+  const result = await chatWithTools(async () => {
+    calls += 1;
+    return reply([
+      toolCall("change_ingredient", { ingredient: 1, quantity: "1" }),
+      toolCall("answer", { reply: "Halved the salt.", label: "Less salt" }, "call-answer"),
+    ], "toolUse");
+  }, "s", "Too salty", chatLibrary({}), { log: () => {}, recipe });
+  assert.equal(calls, 1, "no further model call after answer");
+  assert.deepEqual(chatReply(result.text), { reply: "Halved the salt.", label: "Less salt" });
+  assert.deepEqual(result.toolCalls, ["change_ingredient"]);
+  assert.equal(result.proposal?.ingredients[0].quantity, "1");
+
+  // An empty answer and a made-up tool get pointed at a proper answer.
+  const contexts: Context[] = [];
+  const turns = [
+    reply([toolCall("answer", { reply: " " }), toolCall("json", {}, "call-json")], "toolUse"),
+    reply([toolCall("answer", { reply: "Done." }, "call-2")], "toolUse"),
+  ];
+  const second = await chatWithTools(async (context) => {
+    contexts.push({ ...context, messages: [...context.messages] });
+    return turns.shift()!;
+  }, "s", "p", chatLibrary({}), { log: () => {} });
+  assert.equal(chatReply(second.text).reply, "Done.");
+  const results = contexts[1].messages.slice(2).map((message) => resultText(message as ReturnType<typeof runChatTool>));
+  assert.match(results[0], /Give answer your reply/);
+  assert.match(results[1], /There is no tool json\. When you are done, call answer/);
 });

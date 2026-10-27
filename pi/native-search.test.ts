@@ -7,6 +7,7 @@ import {
   nativeSearchPayload,
   normalizeSourceUrl,
   optionalSearchPayload,
+  responsesSearchPayload,
 } from "./native-search.ts";
 
 test("nativeSearchPayload forces OpenAI hosted web search", () => {
@@ -23,6 +24,16 @@ test("optionalSearchPayload attaches web_search but leaves tool_choice free", ()
 
   assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "high" }]);
   assert.ok(!("tool_choice" in payload));
+});
+
+test("responsesSearchPayload adds web_search beside the function tools", () => {
+  const original = { model: "gpt-test", tools: [{ type: "function", name: "recipe_notes" }] };
+  const payload = responsesSearchPayload(original);
+
+  assert.deepEqual(payload.tools, [{ type: "function", name: "recipe_notes" }, { type: "web_search", search_context_size: "medium" }]);
+  assert.ok(!("tool_choice" in payload));
+  assert.equal(original.tools.length, 1);
+  assert.deepEqual(responsesSearchPayload({}).tools, [{ type: "web_search", search_context_size: "medium" }]);
 });
 
 test("SSE inspection requires a native call and collects citation annotations", async () => {

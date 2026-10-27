@@ -1161,3 +1161,466 @@ async fn an_ended_session_hands_over_to_a_remembered_account() {
         .unwrap();
     assert_eq!(left, 0);
 }
+
+/// Every table that holds an account's data, with the column whose value
+/// starts with the owner's user id once `seed_account` has filled it.
+const OWNED_TABLES: &[(&str, &str)] = &[
+    ("recipes", "id"),
+    ("recipe_blocks", "id"),
+    ("recipe_step_ingredients", "id"),
+    ("recipe_sources", "id"),
+    ("recipe_versions", "id"),
+    ("recipe_version_counters", "recipe_id"),
+    ("recipe_embeddings", "recipe_id"),
+    ("recipe_thumbnail_candidates", "recipe_id"),
+    ("recipe_moment_vectors", "recipe_id"),
+    ("recipe_moment_stills", "recipe_id"),
+    ("recipe_step_moments", "step_id"),
+    ("recipe_chat_messages", "id"),
+    ("recipe_notes", "id"),
+    ("ai_drafts", "id"),
+    ("draft_thumbnails", "draft_id"),
+    ("draft_moment_vectors", "draft_id"),
+    ("draft_moment_stills", "draft_id"),
+    ("draft_step_moments", "draft_id"),
+    ("app_settings", "user_id"),
+    ("ai_endpoints", "id"),
+    ("pi_credentials", "user_id"),
+    ("sessions", "user_id"),
+    ("users", "id"),
+];
+
+/// Seeds a row in every per-account table for `user_id`, each keyed by an id
+/// that starts with the user id: a recipe with its blocks, sources, history,
+/// search vector, photos, moments, chat, and note; an alteration draft and a
+/// new-recipe draft with thumbnails and moments; and settings and AI logins.
+async fn seed_account(db: &SqlitePool, user_id: &str) {
+    for statement in [
+        "INSERT INTO recipes(id,title,created_at,updated_at,user_id,thumbnail_jpeg)
+         VALUES(?1||'-recipe','Soup',?2,?2,?1,x'ffd8')",
+        "INSERT INTO recipe_blocks(id,recipe_id,section,position,text)
+         VALUES(?1||'-ingredient',?1||'-recipe','ingredient',0,'salt')",
+        "INSERT INTO recipe_blocks(id,recipe_id,section,position,text)
+         VALUES(?1||'-step',?1||'-recipe','step',0,'stir')",
+        "INSERT INTO recipe_step_ingredients(id,step_id,position,text)
+         VALUES(?1||'-use',?1||'-step',0,'salt')",
+        "INSERT INTO recipe_sources(id,recipe_id,position,url)
+         VALUES(?1||'-source',?1||'-recipe',0,'https://example.com/'||?1)",
+        "INSERT INTO recipe_versions(id,recipe_id,version,snapshot,created_at)
+         VALUES(?1||'-version',?1||'-recipe',1,'{}',?2)",
+        "INSERT INTO recipe_version_counters(recipe_id,last_version) VALUES(?1||'-recipe',1)",
+        "INSERT INTO recipe_embeddings(recipe_id,document,vector,updated_at)
+         VALUES(?1||'-recipe','Soup',x'00',?2)",
+        "INSERT INTO recipe_thumbnail_candidates(recipe_id,idx,seconds,jpeg)
+         VALUES(?1||'-recipe',0,1,x'ffd8')",
+        "INSERT INTO recipe_moment_vectors(recipe_id,kind,seconds,vector)
+         VALUES(?1||'-recipe','frame',1.0,x'00')",
+        "INSERT INTO recipe_moment_stills(recipe_id,seconds,jpeg) VALUES(?1||'-recipe',1,x'ffd8')",
+        "INSERT INTO recipe_step_moments(step_id,seconds,source) VALUES(?1||'-step',1,'frame')",
+        "INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,content,created_at)
+         VALUES(?1||'-chat',?1,?1||'-recipe','user','More salt?',?2)",
+        "INSERT INTO recipe_notes(id,user_id,recipe_id,body,photo_jpeg,chat_message_id,created_at,updated_at)
+         VALUES(?1||'-note',?1,?1||'-recipe','Good',x'ffd8',?1||'-chat',?2,?2)",
+        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,chat_message_id)
+         VALUES(?1||'-alter',?1||'-recipe','alter','{}','[]',?2,?2,?1,?1||'-chat')",
+        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id)
+         VALUES(?1||'-draft',NULL,'generate','{}','[]',?2,?2,?1)",
+        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES(?1||'-draft',0,1,x'ffd8')",
+        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES(?1||'-alter',0,1,x'ffd8')",
+        "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector)
+         VALUES(?1||'-draft','audio',1.0,x'00')",
+        "INSERT INTO draft_moment_stills(draft_id,seconds,jpeg) VALUES(?1||'-draft',1,x'ffd8')",
+        "INSERT INTO draft_step_moments(draft_id,step_index,seconds,source)
+         VALUES(?1||'-draft',0,1,'audio')",
+        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES(?1,'recipe_chat','on',?2)",
+        "INSERT INTO ai_endpoints(id,user_id,name,spec,base_url,api_key,created_at,updated_at)
+         VALUES(?1||'-endpoint',?1,'OpenAI API','openai','https://api.openai.com/v1','sk-test',?2,?2)",
+        "INSERT INTO pi_credentials(user_id,provider,credential_json,updated_at)
+         VALUES(?1,'openai-codex','{}',?2)",
+    ] {
+        let mut query = sqlx::query(statement).bind(user_id);
+        if statement.contains("?2") {
+            query = query.bind(stamp());
+        }
+        query.execute(db).await.unwrap();
+    }
+}
+
+/// Rows per table that belong to `user_id`.
+async fn owned_rows(db: &SqlitePool, user_id: &str) -> Vec<(&'static str, i64)> {
+    let mut counts = Vec::new();
+    for (table, column) in OWNED_TABLES {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} LIKE ?1 || '%'"
+        ))
+        .bind(user_id)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        counts.push((*table, count));
+    }
+    counts
+}
+
+#[tokio::test]
+async fn deleting_an_account_removes_everything_it_owns_and_nothing_else() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    add_account(&db, "bob", "bob-secret").await;
+    let bob = token(&sign_in(&app, "bob", "bob-secret").await).to_string();
+    let alice_elsewhere = sign_in(&app, "alice", "secret-pass").await;
+    seed_account(&db, &alice_id).await;
+    seed_account(&db, "bob-id").await;
+    state
+        .thumbnail_jobs
+        .lock()
+        .insert(format!("{alice_id}-recipe"));
+    state
+        .moment_jobs
+        .lock()
+        .insert(format!("{alice_id}-recipe"));
+    state.codex_flows.lock().insert(
+        "flow".into(),
+        crate::CodexFlow {
+            user_id: alice_id.clone(),
+            device_auth_id: String::new(),
+            user_code: String::new(),
+            expires_at: i64::MAX,
+        },
+    );
+    let alice_before = owned_rows(&db, &alice_id).await;
+    let bob_before = owned_rows(&db, "bob-id").await;
+    for (table, count) in alice_before.iter().chain(&bob_before) {
+        assert!(*count > 0, "{table} was not seeded");
+    }
+
+    // The confirmation page alone deletes nothing.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/settings/delete-account",
+            Some(&browser(&alice, &[&bob])),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_body(response).await;
+    assert!(body.contains("Delete account alice</button>"), "{body}");
+    assert!(body.contains(r#"action="/settings/delete-account" hx-boost="false" data-confirm="#));
+    assert!(body.contains(r#"href="/settings">Cancel</a>"#));
+    assert!(!body.contains("current_password"));
+    assert_eq!(owned_rows(&db, &alice_id).await, alice_before);
+
+    // Deleting signs this browser over to the remembered account.
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/settings/delete-account",
+            Some(&browser(&alice, &[&bob])),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/");
+    assert_eq!(
+        cookie_set(&response, "recipe_session").as_deref(),
+        Some(bob.as_str())
+    );
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        cookie_set(&response, "recipe_flash").as_deref(),
+        Some("account_deleted")
+    );
+    for (table, count) in owned_rows(&db, &alice_id).await {
+        assert_eq!(count, 0, "{table} still holds the deleted account's rows");
+    }
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM recipe_blocks WHERE recipe_id NOT IN (SELECT id FROM recipes))
+              + (SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id NOT IN (SELECT id FROM ai_drafts))
+              + (SELECT COUNT(*) FROM recipe_thumbnail_candidates WHERE recipe_id NOT IN (SELECT id FROM recipes))",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(orphans, 0);
+    assert_eq!(owned_rows(&db, "bob-id").await, bob_before);
+    assert!(state.thumbnail_jobs.lock().is_empty());
+    assert!(state.moment_jobs.lock().is_empty());
+    assert!(state.codex_flows.lock().is_empty());
+
+    // The library opens as bob with the notice; alice's other browser is out.
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/",
+            Some(&format!(
+                "recipe_session={bob}; recipe_flash=account_deleted"
+            )),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_body(response).await;
+    assert!(body.contains("Account deleted."), "{body}");
+    assert!(!body.contains("alice"), "the menu no longer lists alice");
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&alice_elsewhere)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/login");
+    let response = app
+        .clone()
+        .oneshot(post("/login", None, "username=alice&password=secret-pass"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "alice can no longer sign in"
+    );
+}
+
+#[tokio::test]
+async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldest() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    add_account(&db, "carol", "carol-secret").await;
+    add_account(&db, "bob", "bob-secret").await;
+    for (id, created_at) in [
+        (alice_id.as_str(), "2026-01-01T00:00:00+00:00"),
+        ("bob-id", "2026-02-01T00:00:00+00:00"),
+        ("carol-id", "2026-03-01T00:00:00+00:00"),
+    ] {
+        sqlx::query("UPDATE users SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('carol-id','ai_logins','own',?)")
+        .bind(stamp())
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(crate::ai_account(&db, "bob-id").await.unwrap(), alice_id);
+    assert_eq!(
+        crate::ai_account(&db, "carol-id").await.unwrap(),
+        "carol-id"
+    );
+
+    // An account that is not the shared one gets no warning.
+    let bob = token(&sign_in(&app, "bob", "bob-secret").await).to_string();
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/settings/delete-account",
+            Some(&browser(&bob, &[])),
+        ))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(!body.contains("AI logins are shared"), "{body}");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "/settings/delete-account",
+            Some(&browser(&alice, &[])),
+        ))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(
+        body.contains("This account’s AI logins are shared."),
+        "{body}"
+    );
+    assert!(
+        body.contains("bob uses them."),
+        "carol uses her own: {body}"
+    );
+    assert!(
+        body.contains("AI setup of bob, the next oldest account"),
+        "{body}"
+    );
+    assert!(body.contains("Delete account alice</button>"));
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/settings/delete-account",
+            Some(&browser(&alice, &[])),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/login");
+    let response = app
+        .clone()
+        .oneshot(request("/login", Some("recipe_flash=account_deleted")))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(body.contains("Account deleted."), "{body}");
+    assert_eq!(
+        crate::shared_ai_account(&db).await.unwrap(),
+        Some(("bob-id".to_string(), "bob".to_string()))
+    );
+    assert_eq!(crate::ai_account(&db, "bob-id").await.unwrap(), "bob-id");
+    assert_eq!(
+        crate::ai_account(&db, "carol-id").await.unwrap(),
+        "carol-id"
+    );
+    sqlx::query("DELETE FROM app_settings WHERE user_id='carol-id'")
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(crate::ai_account(&db, "carol-id").await.unwrap(), "bob-id");
+}
+
+#[tokio::test]
+async fn deleting_the_last_account_signs_out_and_leads_to_setup() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    seed_account(&db, &alice_id).await;
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/settings/delete-account",
+            Some(&browser(&alice, &[])),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/login");
+    assert_eq!(cookie_set(&response, "recipe_session").as_deref(), Some(""));
+    assert_eq!(
+        cookie_set(&response, "recipe_accounts").as_deref(),
+        Some("")
+    );
+    for (table, count) in owned_rows(&db, &alice_id).await {
+        assert_eq!(count, 0, "{table} still holds the deleted account's rows");
+    }
+    let response = app
+        .clone()
+        .oneshot(request("/login", Some("recipe_flash=account_deleted")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&response), "/setup");
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&alice, &[]))))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/setup");
+}
+
+/// `POST /logout` with the session cookie and the given extra headers.
+fn logout_with(cookie: &str, headers: &[(&str, &str)]) -> Request<Body> {
+    let mut request = post("/logout", Some(cookie), "");
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            header::HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    request
+}
+
+#[tokio::test]
+async fn forms_sent_from_another_origin_are_refused() {
+    let state = state(database().await);
+    let cookie = setup_alice(&state, "correct horse").await;
+    let app = routes(state);
+
+    for headers in [
+        vec![("sec-fetch-site", "cross-site")],
+        // Another port on the same host is the same site, and SameSite=Lax
+        // sends the cookie along: only the origin check stops it.
+        vec![("sec-fetch-site", "same-site")],
+        vec![
+            ("origin", "http://minibuntu:8082"),
+            ("host", "minibuntu:3000"),
+        ],
+        vec![("origin", "null"), ("host", "minibuntu:3000")],
+        vec![("origin", "http://minibuntu:3000")],
+    ] {
+        let response = app
+            .clone()
+            .oneshot(logout_with(&cookie, &headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+        assert!(set_cookie(&response).is_none(), "{headers:?}");
+        let body = response_body(response).await;
+        assert!(body.contains("sent from another site"), "{body}");
+    }
+    // The session survived every refused sign-out.
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Signing in from another site is refused too (login CSRF).
+    let mut login = post("/login", None, "username=alice&password=correct horse");
+    login
+        .headers_mut()
+        .insert("sec-fetch-site", "cross-site".parse().unwrap());
+    let response = app.clone().oneshot(login).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(set_cookie(&response).is_none());
+
+    // Links from elsewhere still open pages.
+    let mut page = request("/", Some(&cookie));
+    page.headers_mut()
+        .insert("sec-fetch-site", "cross-site".parse().unwrap());
+    assert_eq!(
+        app.clone().oneshot(page).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    for headers in [
+        vec![("sec-fetch-site", "same-origin")],
+        vec![("sec-fetch-site", "none")],
+        vec![
+            ("origin", "http://minibuntu:3000"),
+            ("host", "minibuntu:3000"),
+        ],
+        // Behind a TLS proxy the app sees plain HTTP and the browser's Host.
+        vec![
+            ("origin", "https://Recipes.example"),
+            ("host", "recipes.example"),
+        ],
+        // No header says where it came from: an old browser or a script.
+        vec![],
+    ] {
+        let session = sign_in(&app, "alice", "correct horse").await;
+        let response = app
+            .clone()
+            .oneshot(logout_with(&session, &headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{headers:?}");
+    }
+}
