@@ -847,11 +847,7 @@ async fn the_account_menu_creates_accounts_and_switches_between_them() {
         .unwrap();
     let body = response_body(response).await;
     assert!(body.contains("data-account-menu"), "{body}");
-    assert!(
-        body.contains(
-            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">alice</span>"
-        )
-    );
+    assert!(body.contains("<p><span class=\"account-name\">alice</span>"));
     assert!(body.contains("href=\"/accounts/new\""));
     assert!(!body.contains("Sign out of all accounts"));
 
@@ -924,11 +920,7 @@ async fn the_account_menu_creates_accounts_and_switches_between_them() {
         .unwrap();
     assert!(set_cookies(&response).is_empty(), "nothing changed");
     let body = response_body(response).await;
-    assert!(
-        body.contains(
-            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">bob</span>"
-        )
-    );
+    assert!(body.contains("<p><span class=\"account-name\">bob</span>"));
     assert!(body.contains(&format!("name=\"user_id\" value=\"{alice_id}\"")));
     assert!(body.contains("Sign out of all accounts"));
 
@@ -1135,11 +1127,7 @@ async fn an_ended_session_hands_over_to_a_remembered_account() {
         ]
     );
     let body = response_body(response).await;
-    assert!(
-        body.contains(
-            "<p class=\"ticket-bar ticket-head\"><span class=\"account-name\">alice</span>"
-        )
-    );
+    assert!(body.contains("<p><span class=\"account-name\">alice</span>"));
 
     // Signing out of all accounts ends every session the browser holds.
     let response = app

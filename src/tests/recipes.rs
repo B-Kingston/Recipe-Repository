@@ -1,10 +1,10 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
-    LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
-    home, move_block, recipe_versions, record_version, restore_version, stamp_added, update_block,
-    update_recipe, view_version,
+    LibraryCard, delete_block, delete_version, file_a_to_z, find_version, home, move_block,
+    plate_initial, recipe_page, recipe_versions, record_version, restore_version, stamp_added,
+    update_block, update_recipe, view_version,
 };
-use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, stamp};
+use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, RecipeQuery, stamp};
 use axum::Form;
 use axum::extract::{Path, Query, State};
 use parking_lot::Mutex;
@@ -414,7 +414,7 @@ fn card(title: &str) -> LibraryCard {
 }
 
 #[test]
-fn ticket_stamp_adds_the_time_only_when_dates_clash() {
+fn plate_stamp_adds_the_time_only_when_dates_clash() {
     let mut cards = vec![card("Dal"), card("Pho"), card("Ragu"), card("Old")];
     cards[0].created_at = "2026-10-15T09:05:00+00:00".into();
     cards[1].created_at = "2026-10-15T22:11:00+00:00".into();
@@ -473,13 +473,21 @@ fn library_card_shows_servings_and_total_time() {
     assert_eq!(dal.total_time(), "2 h");
 }
 
+#[test]
+fn plates_without_a_photo_show_the_first_letter_or_digit() {
+    assert_eq!(plate_initial("chicken adobo"), "C");
+    assert_eq!(plate_initial("  \u{201c}éclairs\u{201d}"), "É");
+    assert_eq!(plate_initial("10-minute soup"), "1");
+    assert_eq!(plate_initial("--"), "");
+}
+
 #[tokio::test]
-async fn library_tickets_print_ingredients_and_pack_long_lists() {
+async fn library_plates_list_ingredients_and_show_photos_in_the_well() {
     let db = database().await;
     let now = stamp();
     sqlx::query(
-        "INSERT INTO recipes(id,title,servings,prep_minutes,user_id,created_at,updated_at)
-         VALUES('big','Big stew',6,40,'u1',?,?)",
+        "INSERT INTO recipes(id,title,servings,prep_minutes,user_id,created_at,updated_at,thumbnail_jpeg)
+         VALUES('big','Big stew',6,40,'u1',?,?,X'FFD8FFD9')",
     )
     .bind(&now)
     .bind(&now)
@@ -495,17 +503,6 @@ async fn library_tickets_print_ingredients_and_pack_long_lists() {
     .execute(&db)
     .await
     .unwrap();
-    for position in 0..=TICKET_COLUMNS_AFTER {
-        sqlx::query(
-            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES(?,'big','ingredient',?,?)",
-        )
-        .bind(format!("b{position}"))
-        .bind(position as i64)
-        .bind(format!("Item {position}"))
-        .execute(&db)
-        .await
-        .unwrap();
-    }
     let page = home(
         State(state(db)),
         AuthUser { id: "u1".into() },
@@ -515,20 +512,71 @@ async fn library_tickets_print_ingredients_and_pack_long_lists() {
     .await
     .unwrap()
     .0;
-    // One rail hangs the whole library; later rows are pinned on in CSS.
+    assert_eq!(page.matches(r#"<article class="plate">"#).count(), 2);
+    assert!(page.contains(r#"<span class="visually-hidden">Ready in </span>40 min"#));
+    assert!(page.contains("Serves 6"));
+    // Ingredient names only, in recipe order; steps stay off the plate.
+    assert!(page.contains("Silken tofu, Chilli flakes <em>(optional)</em></p>"));
+    assert!(!page.contains("Blend everything"));
+    // The stew's photo fills its well; every plate keeps its initial
+    // underneath for recipes without a photo and for e-ink mode.
     assert_eq!(
-        page.matches(r#"<div class="rail" aria-hidden="true">"#)
+        page.matches(r#"<img class="plate-photo" src="/recipes/big/thumbnail""#)
             .count(),
         1
     );
-    assert!(page.contains("Ready in 40 min"));
-    assert!(page.contains("Serves 6"));
-    assert!(!page.contains("Filed under") && !page.contains("ticket-box"));
-    assert!(page.contains(
-        r#"<b class="ticket-qty">300 g</b> <span class="ticket-item">Silken tofu</span>"#
-    ));
-    assert!(page.contains("Chilli flakes <em>(optional)</em>"));
-    assert!(!page.contains("Blend everything"));
-    assert_eq!(page.matches(r#"class="ticket-items is-packed""#).count(), 1);
-    assert_eq!(page.matches(r#"class="ticket-items""#).count(), 1);
+    assert_eq!(page.matches(r#"class="plate-photo""#).count(), 1);
+    assert!(page.contains(r#"<span class="plate-initial">B</span>"#));
+}
+
+#[tokio::test]
+async fn recipe_plate_rim_carries_a_short_title_and_the_timings() {
+    let db = database().await;
+    let now = stamp();
+    sqlx::query(
+        "UPDATE recipes SET title='Dal makhani',servings=6,prep_minutes=20,cook_minutes=80 WHERE id='r'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recipes(id,title,user_id,created_at,updated_at)
+         VALUES('long','Brown butter gnocchi with crispy sage','u1',?,?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&db)
+    .await
+    .unwrap();
+    let s = state(db);
+    let page = |id: &'static str| {
+        let s = s.clone();
+        async move {
+            recipe_page(
+                State(s),
+                AuthUser { id: "u1".into() },
+                Path(id.into()),
+                Query(RecipeQuery {
+                    edit: None,
+                    edit_meta: None,
+                    view: None,
+                    step: None,
+                }),
+                crate::htmx::Flash::default(),
+            )
+            .await
+            .unwrap()
+            .0
+        }
+    };
+    let dal = page("r").await;
+    assert!(dal.contains(r##"startOffset="50%" text-anchor="middle">DAL MAKHANI</textPath>"##));
+    assert!(dal.contains("SERVES 6  \u{2605}  1 H 40 MIN</textPath>"));
+    assert!(dal.contains(r#"<span class="plate-initial" aria-hidden="true">D</span>"#));
+    assert!(!dal.contains("plate-photo"));
+    // Too long for the rim: the title stays in the heading only, and a
+    // recipe without timings leaves the rim plain.
+    let long = page("long").await;
+    assert!(!long.contains("BROWN BUTTER"));
+    assert!(!long.contains("plate-rim-text"));
 }

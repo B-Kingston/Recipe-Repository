@@ -84,8 +84,8 @@ pub(crate) async fn home(
     })
 }
 
-/// One library ticket: the fields home.html renders plus whether a dish
-/// photo exists. The listing query never loads the JPEG bytes themselves.
+/// One plate in the library: the fields home.html renders plus whether a
+/// dish photo exists. The listing query never loads the JPEG bytes themselves.
 #[derive(FromRow)]
 pub(crate) struct LibraryCard {
     pub(crate) id: String,
@@ -96,24 +96,20 @@ pub(crate) struct LibraryCard {
     pub(crate) cook_minutes: Option<i64>,
     pub(crate) has_thumbnail: bool,
     pub(crate) created_at: String,
-    /// The ingredient lines printed on the ticket, in recipe order; filled
+    /// The ingredient lines listed under the plate, in recipe order; filled
     /// by `attach_ingredients`.
     #[sqlx(skip)]
     pub(crate) ingredients: Vec<Block>,
-    /// When the recipe was added, as printed at the foot of the ticket;
+    /// When the recipe was added, as printed at the foot of the plate;
     /// filled by `stamp_added`.
     #[sqlx(skip)]
     pub(crate) added: String,
 }
 
-/// Ingredient lists longer than this print in two columns, so a big recipe
-/// makes a wider-packed ticket rather than a very long one.
-pub(crate) const TICKET_COLUMNS_AFTER: usize = 8;
-
 impl LibraryCard {
-    /// True when the ticket's ingredients print in two columns.
-    pub(crate) fn packed(&self) -> bool {
-        self.ingredients.len() > TICKET_COLUMNS_AFTER
+    /// The letter on the plate when there is no dish photo.
+    pub(crate) fn initial(&self) -> String {
+        plate_initial(&self.title)
     }
 
     /// "Serves 4", or empty when the recipe has no serving count.
@@ -127,14 +123,31 @@ impl LibraryCard {
     /// Prep plus cook time, such as "35 min" or "1 h 10 min"; empty when
     /// neither is set.
     pub(crate) fn total_time(&self) -> String {
-        let minutes = self.prep_minutes.unwrap_or(0).max(0) + self.cook_minutes.unwrap_or(0).max(0);
-        match (minutes / 60, minutes % 60) {
-            (0, 0) => String::new(),
-            (0, rest) => format!("{rest} min"),
-            (hours, 0) => format!("{hours} h"),
-            (hours, rest) => format!("{hours} h {rest} min"),
-        }
+        total_time(self.prep_minutes, self.cook_minutes)
     }
+}
+
+/// Prep plus cook time, such as "35 min" or "1 h 10 min"; empty when
+/// neither is set.
+pub(crate) fn total_time(prep_minutes: Option<i64>, cook_minutes: Option<i64>) -> String {
+    let minutes = prep_minutes.unwrap_or(0).max(0) + cook_minutes.unwrap_or(0).max(0);
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => String::new(),
+        (0, rest) => format!("{rest} min"),
+        (hours, 0) => format!("{hours} h"),
+        (hours, rest) => format!("{hours} h {rest} min"),
+    }
+}
+
+/// The letter a plate shows when the recipe has no dish photo (and in e-ink
+/// mode, which leaves photos out): the title's first letter or digit,
+/// upper-cased, or empty when it has neither.
+pub(crate) fn plate_initial(title: &str) -> String {
+    title
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default()
 }
 
 /// The letter a title is filed under: its first letter, upper-cased, or '#'
@@ -152,9 +165,9 @@ pub(crate) fn file_a_to_z(cards: &mut [LibraryCard]) {
     cards.sort_by_cached_key(|card| (file_letter(&card.title), card.title.to_lowercase()));
 }
 
-/// Stamps each ticket with the UTC date its recipe was added, e.g.
+/// Stamps each plate with the UTC date its recipe was added, e.g.
 /// "15 Oct 2026", adding the time ("15 Oct 2026, 22:11") when another
-/// ticket shares that date.
+/// plate shares that date.
 pub(crate) fn stamp_added(cards: &mut [LibraryCard]) {
     let added: Vec<Option<chrono::DateTime<Utc>>> = cards
         .iter()

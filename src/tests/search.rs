@@ -287,7 +287,7 @@ async fn without_an_embedding_service_search_falls_back_to_word_matches() {
     assert!(
         search_page(db, "chocolate")
             .await
-            .contains("No tickets match.")
+            .contains("No dishes match.")
     );
 }
 
