@@ -6,24 +6,26 @@
 //! A question stores a pending answer and runs the model on a background
 //! task; the page polls until it lands. The model can call tools to read the
 //! recipe's notes, their photos, and saved versions, which go to the worker
-//! with the request. When the cook asks for a change, the answer carries one
-//! instruction, which is drafted through the alteration path and saved from
-//! the chat through `apply_draft`, which keeps the version it replaces in the
-//! recipe's history. Saving it writes a divider into the thread (see
-//! `recipes::record_chat_change`), so the cook can see where the recipe
-//! changed when reading back. Any answer can be kept as a note.
+//! with the request, and to search the web. When the cook asks for a change,
+//! the model edits a copy of the recipe with the edit tools, and the answer
+//! carries the result as a proposal: the drawer lists every change (details,
+//! ingredients, and steps, with the changed words marked) under Accept and
+//! Deny. Accepting writes it in one transaction (`recipes::accept_chat_proposal`),
+//! keeps the version it replaces in the recipe's history, and writes a
+//! divider into the thread, so the cook can see where the recipe changed
+//! when reading back. Any answer can be kept as a note.
 
 use crate::ai;
 use crate::htmx::{Flash, flash_redirect};
 use crate::recipes::{
-    ChatMessage, ChatNoteRow, VersionListRow, chat_answer_text, chat_busy, chat_drafts, chat_notes,
-    chat_thread, clear_chat, fail_chat_answer, find_recipe, find_version, finish_chat_answer,
-    insert_note, kept_chat_answers, recipe_snapshot, recipe_versions, set_chat_change_state,
-    start_chat_turn,
+    AcceptOutcome, ChatMessage, ChatNoteRow, ProposalRow, VersionListRow, accept_chat_proposal,
+    chat_answer_text, chat_busy, chat_notes, chat_thread, clear_chat, decline_chat_proposal,
+    fail_chat_answer, find_recipe, find_recipe_tx, find_version, finish_chat_answer, insert_note,
+    kept_chat_answers, recipe_snapshot, recipe_versions, start_chat_turn,
 };
 use crate::{
-    AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, RecipeSnapshot, Result, app_setting,
-    display_timestamp, required, set_app_setting,
+    AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, ChatProposal, RecipeProposal,
+    RecipeSnapshot, Result, app_setting, display_timestamp, moments, required, set_app_setting,
 };
 use axum::{
     Form,
@@ -45,7 +47,10 @@ const DRAWER_SETTING: &str = "recipe_chat_drawer";
 
 pub(crate) const MAX_QUESTION_CHARS: usize = 1000;
 const MAX_REPLY_CHARS: usize = 6000;
-const MAX_CHANGE_CHARS: usize = 2000;
+/// The most ingredients or steps a proposal may have, and the longest text
+/// it may give one; past these it is refused rather than stored.
+const MAX_PROPOSAL_ITEMS: usize = 200;
+const MAX_PROPOSAL_TEXT_CHARS: usize = 4000;
 /// Earlier rows sent with each question; the recipe itself always goes whole.
 const HISTORY_ROWS: usize = 16;
 const MAX_HISTORY_ROW_CHARS: usize = 1500;
@@ -103,8 +108,8 @@ pub(crate) struct ChatView {
     pub(crate) status: String,
     pub(crate) change_state: String,
     pub(crate) change_label: String,
-    /// The newest live draft of the change, or empty (none yet, or expired).
-    pub(crate) draft_id: String,
+    /// The proposed change, listed for the cook; None without one.
+    pub(crate) proposal: Option<ProposalView>,
     pub(crate) time: String,
     /// The answer was kept as a note on the recipe.
     pub(crate) kept: bool,
@@ -123,10 +128,9 @@ pub(crate) async fn panel(
         return Ok(None);
     }
     let open = drawer_open(&state.db, &user.id).await?;
-    let (thread, mut drafts, kept) = if open {
+    let (thread, kept) = if open {
         (
             chat_thread(&state.db, &user.id, recipe_id).await?,
-            chat_drafts(&state.db, &user.id, recipe_id).await?,
             kept_chat_answers(&state.db, &user.id, recipe_id).await?,
         )
     } else {
@@ -134,14 +138,24 @@ pub(crate) async fn panel(
     };
     let poll_state = thread
         .iter()
-        .filter(|row| row.status == "pending" || row.change_state == "drafting")
-        .map(|row| format!("{}:{}:{}", row.id, row.status, row.change_state))
+        .filter(|row| row.status == "pending")
+        .map(|row| format!("{}:{}", row.id, row.status))
         .collect::<Vec<_>>()
         .join(",");
+    let updated_at = if thread.iter().any(|row| row.change_state == "ready") {
+        find_recipe(&state.db, &user.id, recipe_id)
+            .await?
+            .updated_at
+    } else {
+        String::new()
+    };
     let messages = thread
         .into_iter()
         .map(|row| ChatView {
-            draft_id: drafts.remove(&row.id).unwrap_or_default(),
+            proposal: (row.change_state == "ready")
+                .then(|| serde_json::from_str::<ChatProposal>(&row.proposal_json).ok())
+                .flatten()
+                .map(|proposal| proposal_view(&proposal, row.proposal_base != updated_at)),
             kept: kept.contains(&row.id),
             time: display_timestamp(&row.created_at),
             id: row.id,
@@ -158,6 +172,12 @@ pub(crate) async fn panel(
         "Conversation cleared."
     } else if flash.is("note_kept") {
         "Kept in this recipe's notes."
+    } else if flash.is("change_applied") {
+        "Change saved to the recipe."
+    } else if flash.is("change_declined") {
+        "Change denied. The recipe is as it was."
+    } else if flash.is("change_stale") {
+        "The recipe changed since this was proposed, so it was not saved. Ask again for a fresh proposal."
     } else {
         ""
     };
@@ -317,47 +337,145 @@ pub(crate) async fn keep_answer(
     Ok(flash_redirect(&format!("{back}#recipe-chat"), "note_kept"))
 }
 
-/// Runs one answer: the model call, then, when the cook asked for a change,
-/// the draft of it. A thread cleared meanwhile stops the run quietly.
+/// Runs one answer: the model call, with the recipe the edit tools work on.
+/// A proposal that passes `valid_proposal` is stored with the answer for the
+/// cook to accept or deny. A thread cleared meanwhile stops the run quietly.
 async fn answer(state: &AppState, user: &AuthUser, recipe_id: &str, answer_id: &str) -> Result<()> {
     let thread = chat_thread(&state.db, &user.id, recipe_id).await?;
-    let snapshot = {
+    let (snapshot, base) = {
         let mut conn = state.db.acquire().await?;
-        recipe_snapshot(&mut conn, &user.id, recipe_id).await?
+        let recipe = find_recipe_tx(&mut conn, &user.id, recipe_id).await?;
+        (
+            recipe_snapshot(&mut conn, &user.id, recipe_id).await?,
+            recipe.updated_at,
+        )
     };
     let recipe_json = serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?;
     let notes = chat_notes(&state.db, &user.id, recipe_id, CHAT_NOTES).await?;
     let versions = recipe_versions(&state.db, &user.id, recipe_id).await?;
     let library = chat_library(state, user, recipe_id, &notes, &versions).await?;
     let summary = library_summary(&notes, &versions);
-    let Some((prompt, question)) = chat_prompt(&recipe_json, &summary, &thread, answer_id) else {
+    let Some((prompt, _question)) = chat_prompt(&recipe_json, &summary, &thread, answer_id) else {
         return Ok(());
     };
-    let reply = ai::chat_reply(state, user, &prompt, &library).await?;
+    let reply = ai::chat_reply(state, user, &prompt, &library, &snapshot).await?;
     let reply_text = clip(reply.reply.trim(), MAX_REPLY_CHARS);
     if reply_text.is_empty() {
         return Err(AppError::Ai);
     }
-    let change = clip(reply.change.trim(), MAX_CHANGE_CHARS);
-    let label = if change.is_empty() {
-        String::new()
-    } else {
-        model_label(&reply.label)
-    };
-    if !finish_chat_answer(&state.db, answer_id, &reply_text, &change, &label).await?
-        || change.is_empty()
-    {
-        return Ok(());
-    }
-    let request = format!("{change}\n\nWhat the cook said in the recipe chat:\n{question}");
-    let next = match ai::draft_chat_change(state, user, recipe_id, answer_id, &request).await {
-        Ok(_) => "ready",
-        Err(error) => {
-            warn!(%error, "recipe chat change could not be drafted");
-            "failed"
+    let proposal = reply.proposal.filter(|proposal| {
+        let valid = valid_proposal(&snapshot, proposal);
+        if !valid {
+            warn!("recipe chat proposal was refused as invalid");
         }
+        valid
+    });
+    let label = model_label(&reply.label);
+    let json = match &proposal {
+        Some(after) => serde_json::to_string(&ChatProposal {
+            before: snapshot,
+            after: after.clone(),
+        })
+        .map_err(|_| AppError::Ai)?,
+        None => String::new(),
     };
-    set_chat_change_state(&state.db, answer_id, next).await
+    finish_chat_answer(
+        &state.db,
+        answer_id,
+        &reply_text,
+        proposal.as_ref().map(|_| ProposalRow {
+            label: &label,
+            json: &json,
+            base: &base,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Whether a proposal can be stored: a title, named ingredients, worded
+/// steps, sane numbers and sizes, every `from` naming a distinct item of the
+/// recipe the chat saw, and some change the cook would see.
+pub(crate) fn valid_proposal(before: &RecipeSnapshot, proposal: &RecipeProposal) -> bool {
+    let fits = |text: &str| text.chars().count() <= MAX_PROPOSAL_TEXT_CHARS;
+    let distinct = |froms: Vec<Option<usize>>, len: usize| {
+        let mut seen = BTreeSet::new();
+        froms
+            .into_iter()
+            .flatten()
+            .all(|from| from < len && seen.insert(from))
+    };
+    !proposal.title.trim().is_empty()
+        && fits(&proposal.title)
+        && fits(&proposal.description)
+        && [
+            proposal.servings,
+            proposal.prep_minutes,
+            proposal.cook_minutes,
+        ]
+        .iter()
+        .all(|value| value.is_none_or(|value| (0..=100_000).contains(&value)))
+        && proposal.ingredients.len() <= MAX_PROPOSAL_ITEMS
+        && proposal.steps.len() <= MAX_PROPOSAL_ITEMS
+        && proposal.ingredients.iter().all(|item| {
+            !item.name.trim().is_empty()
+                && fits(&item.name)
+                && fits(&item.quantity)
+                && fits(&item.unit)
+        })
+        && proposal.steps.iter().all(|step| {
+            !step.text.trim().is_empty()
+                && fits(&step.text)
+                && step.ingredients.len() <= MAX_PROPOSAL_ITEMS
+                && step.ingredients.iter().all(|line| fits(line))
+        })
+        && distinct(
+            proposal.ingredients.iter().map(|item| item.from).collect(),
+            before.ingredients.len(),
+        )
+        && distinct(
+            proposal.steps.iter().map(|step| step.from).collect(),
+            before.steps.len(),
+        )
+        && proposal.snapshot() != *before
+}
+
+/// Accepts the change an answer proposed. The card itself changes, so the
+/// whole page reloads, with the drawer showing the divider.
+pub(crate) async fn accept_change(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, message_id)): Path<(String, String)>,
+    Form(form): Form<ChatDrawerForm>,
+) -> Result<Response> {
+    ensure_enabled(&s.db, &user.id).await?;
+    let recipe = find_recipe(&s.db, &user.id, &id).await?;
+    let to = format!("{}#recipe-chat", return_target(&recipe.id, &form.back));
+    match accept_chat_proposal(&s.db, &user.id, &recipe.id, &message_id).await? {
+        AcceptOutcome::Applied => {
+            moments::spawn_recipe_refresh(&s, &user.id, &recipe.id);
+            Ok(flash_redirect(&to, "change_applied"))
+        }
+        AcceptOutcome::Stale => Ok(flash_redirect(&to, "change_stale")),
+        AcceptOutcome::Gone => Ok(Redirect::to(&to).into_response()),
+    }
+}
+
+/// Denies the change an answer proposed; the recipe stays as it is.
+pub(crate) async fn decline_change(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((id, message_id)): Path<(String, String)>,
+    Form(form): Form<ChatDrawerForm>,
+) -> Result<Response> {
+    ensure_enabled(&s.db, &user.id).await?;
+    let recipe = find_recipe(&s.db, &user.id, &id).await?;
+    let to = format!("{}#recipe-chat", return_target(&recipe.id, &form.back));
+    if decline_chat_proposal(&s.db, &user.id, &recipe.id, &message_id).await? {
+        Ok(flash_redirect(&to, "change_declined"))
+    } else {
+        Ok(Redirect::to(&to).into_response())
+    }
 }
 
 /// What the chat's tools read, as the worker request's `library`: the notes
@@ -468,8 +586,13 @@ pub(crate) fn chat_prompt(
         .filter_map(|row| match (row.role.as_str(), row.status.as_str()) {
             ("user", _) => Some(format!("Cook: {}", clip(&row.content, MAX_HISTORY_ROW_CHARS))),
             ("assistant", "done") => Some(format!(
-                "Assistant: {}",
-                clip(&row.content, MAX_HISTORY_ROW_CHARS)
+                "Assistant: {}{}",
+                clip(&row.content, MAX_HISTORY_ROW_CHARS),
+                match row.change_state.as_str() {
+                    "ready" => " [The changes proposed here await the cook's Accept or Deny; they are not in the recipe JSON above.]",
+                    "discarded" => " [The cook denied the changes proposed here; they were not saved and are not in the recipe JSON above.]",
+                    _ => "",
+                }
             )),
             ("change", _) => Some(format!(
                 "[The cook saved a change to the recipe here: {}. The recipe JSON above already includes it.]",
@@ -571,6 +694,363 @@ pub(crate) fn divider_label(
         change_summary(before, after)
     } else {
         label
+    }
+}
+
+/// A proposed change as the drawer lists it: only what differs, grouped
+/// into details, ingredients, and method.
+pub(crate) struct ProposalView {
+    pub(crate) details: Vec<DetailChange>,
+    pub(crate) ingredients: Vec<ItemChange>,
+    pub(crate) steps: Vec<ItemChange>,
+    /// e.g. "2 ingredients · 1 step"; what the change touches, in a line.
+    pub(crate) summary: String,
+    /// The recipe changed after the chat read it, so Accept would refuse.
+    pub(crate) stale: bool,
+}
+
+/// One changed detail, e.g. Servings 4 → 6.
+pub(crate) struct DetailChange {
+    pub(crate) name: &'static str,
+    pub(crate) before: String,
+    pub(crate) after: String,
+}
+
+/// One added, removed, changed, or moved ingredient or step.
+pub(crate) struct ItemChange {
+    /// "added", "removed", "changed", or "moved".
+    pub(crate) kind: &'static str,
+    /// "Step 3" for steps (the old number when removed); empty for ingredients.
+    pub(crate) place: String,
+    /// The text with the changed words marked: inserted words for an added
+    /// item, deleted ones for a removed item, both for a changed one.
+    pub(crate) words: Vec<Segment>,
+    /// A step's ingredient lines, marked the same way; empty when they did
+    /// not change.
+    pub(crate) uses: Vec<Segment>,
+    /// "was step 5" when the item also moved.
+    pub(crate) moved_from: String,
+}
+
+/// A run of words that stayed, were inserted, or were deleted.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Segment {
+    /// "same", "ins", or "del".
+    pub(crate) kind: &'static str,
+    pub(crate) text: String,
+}
+
+fn segment(kind: &'static str, text: impl Into<String>) -> Segment {
+    Segment {
+        kind,
+        text: text.into(),
+    }
+}
+
+/// Past this many words a side, a change is shown as old text then new text
+/// rather than word by word.
+const MAX_DIFF_WORDS: usize = 400;
+
+/// The words of `before` and `after` marked as kept, deleted, or inserted
+/// (a longest-common-subsequence diff), with neighbouring words of the same
+/// kind joined into one run.
+pub(crate) fn word_diff(before: &str, after: &str) -> Vec<Segment> {
+    let old: Vec<&str> = before.split_whitespace().collect();
+    let new: Vec<&str> = after.split_whitespace().collect();
+    let tokens = diff_tokens(&old, &new);
+    let mut runs: Vec<Segment> = Vec::new();
+    for (kind, word) in tokens {
+        match runs.last_mut() {
+            Some(run) if run.kind == kind => {
+                run.text.push(' ');
+                run.text.push_str(word);
+            }
+            _ => runs.push(segment(kind, word)),
+        }
+    }
+    runs
+}
+
+/// Each item of `old` and `new` marked kept, deleted, or inserted, by a
+/// longest-common-subsequence diff, deletions before the insertions that
+/// replace them. Past MAX_DIFF_WORDS a side, everything old is deleted and
+/// everything new inserted.
+fn diff_tokens<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(&'static str, &'a str)> {
+    let mut tokens = Vec::new();
+    if old.len() > MAX_DIFF_WORDS || new.len() > MAX_DIFF_WORDS {
+        tokens.extend(old.iter().map(|word| ("del", *word)));
+        tokens.extend(new.iter().map(|word| ("ins", *word)));
+        return tokens;
+    }
+    // lengths[i][j]: the longest common run of old[i..] and new[j..].
+    let mut lengths = vec![vec![0u16; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            lengths[i][j] = if old[i] == new[j] {
+                lengths[i + 1][j + 1] + 1
+            } else {
+                lengths[i + 1][j].max(lengths[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i] == new[j] {
+            tokens.push(("same", old[i]));
+            i += 1;
+            j += 1;
+        } else if i < old.len() && (j == new.len() || lengths[i + 1][j] >= lengths[i][j + 1]) {
+            tokens.push(("del", old[i]));
+            i += 1;
+        } else {
+            tokens.push(("ins", new[j]));
+            j += 1;
+        }
+    }
+    tokens
+}
+
+/// A step's ingredient lines, each marked kept, deleted, or inserted (a
+/// repeated line counts once per copy); empty when the lines are the same.
+fn uses_diff(before: &[String], after: &[String]) -> Vec<Segment> {
+    if before == after {
+        return Vec::new();
+    }
+    let old: Vec<&str> = before.iter().map(String::as_str).collect();
+    let new: Vec<&str> = after.iter().map(String::as_str).collect();
+    diff_tokens(&old, &new)
+        .into_iter()
+        .map(|(kind, line)| segment(kind, line))
+        .collect()
+}
+
+fn ingredient_line(name: &str, quantity: &str, unit: &str, optional: bool) -> String {
+    let line = [quantity, unit, name]
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if optional {
+        format!("{line} (optional)")
+    } else {
+        line
+    }
+}
+
+/// The positions (into `froms`) of the kept items that keep their order: the
+/// longest increasing run of origins. Every other kept item moved.
+fn in_order(froms: &[Option<usize>]) -> BTreeSet<usize> {
+    let kept: Vec<(usize, usize)> = froms
+        .iter()
+        .enumerate()
+        .filter_map(|(at, from)| from.map(|from| (at, from)))
+        .collect();
+    // best[k]: the longest increasing run ending at kept[k], and its previous.
+    let mut best: Vec<(usize, Option<usize>)> = Vec::with_capacity(kept.len());
+    for k in 0..kept.len() {
+        let mut entry = (1, None);
+        for p in 0..k {
+            if kept[p].1 < kept[k].1 && best[p].0 + 1 > entry.0 {
+                entry = (best[p].0 + 1, Some(p));
+            }
+        }
+        best.push(entry);
+    }
+    let mut ordered = BTreeSet::new();
+    // On a tie the run ending latest wins, so the item that jumped furthest
+    // forward is the one shown as moved.
+    let mut at = (0..best.len()).max_by_key(|&k| best[k].0);
+    while let Some(k) = at {
+        ordered.insert(kept[k].0);
+        at = best[k].1;
+    }
+    ordered
+}
+
+/// One section's changes in reading order: each proposed item that is new,
+/// changed, or moved, with each removed item where it used to be.
+fn section_changes<T>(
+    before: &[T],
+    after: &[(Option<usize>, T)],
+    numbered: Option<&'static str>,
+    text: impl Fn(&T) -> String,
+    uses: impl Fn(&T, &T) -> Vec<Segment>,
+) -> Vec<ItemChange>
+where
+    T: PartialEq,
+{
+    let froms: Vec<Option<usize>> = after.iter().map(|(from, _)| *from).collect();
+    let ordered = in_order(&froms);
+    let kept: BTreeSet<usize> = froms.iter().flatten().copied().collect();
+    let place =
+        |number: usize| numbered.map_or_else(String::new, |word| format!("{word} {number}"));
+    // A removed item has no new number, so it is named by its old one.
+    let removed_place = |number: usize| {
+        numbered.map_or_else(String::new, |word| {
+            format!("Was {} {number}", word.to_lowercase())
+        })
+    };
+    let mut removed = (0..before.len())
+        .filter(|index| !kept.contains(index))
+        .peekable();
+    let mut changes = Vec::new();
+    for (at, (from, item)) in after.iter().enumerate() {
+        // Removed items that sat before this one's origin go first; only items
+        // still in order say where that is.
+        if let Some(origin) = from.filter(|_| ordered.contains(&at)) {
+            while let Some(gone) = removed.next_if(|gone| gone < &origin) {
+                changes.push(removed_change(removed_place(gone + 1), text(&before[gone])));
+            }
+        }
+        match from {
+            None => changes.push(ItemChange {
+                kind: "added",
+                place: place(at + 1),
+                words: vec![segment("ins", text(item))],
+                uses: Vec::new(),
+                moved_from: String::new(),
+            }),
+            Some(origin) => {
+                let original = &before[*origin];
+                let moved = !ordered.contains(&at);
+                if original == item && !moved {
+                    continue;
+                }
+                let edited = original != item;
+                changes.push(ItemChange {
+                    kind: if edited { "changed" } else { "moved" },
+                    place: place(at + 1),
+                    words: if edited {
+                        word_diff(&text(original), &text(item))
+                    } else {
+                        vec![segment("same", text(item))]
+                    },
+                    uses: uses(original, item),
+                    moved_from: if moved {
+                        numbered.map_or_else(
+                            || "moved".to_string(),
+                            |word| format!("was {} {}", word.to_lowercase(), origin + 1),
+                        )
+                    } else {
+                        String::new()
+                    },
+                });
+            }
+        }
+    }
+    for gone in removed {
+        changes.push(removed_change(removed_place(gone + 1), text(&before[gone])));
+    }
+    changes
+}
+
+fn removed_change(place: String, text: String) -> ItemChange {
+    ItemChange {
+        kind: "removed",
+        place,
+        words: vec![segment("del", text)],
+        uses: Vec::new(),
+        moved_from: String::new(),
+    }
+}
+
+fn minutes(value: Option<i64>) -> String {
+    value.map_or_else(|| "none".to_string(), |minutes| format!("{minutes} min"))
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// Lists what a proposal changes, for the drawer.
+pub(crate) fn proposal_view(proposal: &ChatProposal, stale: bool) -> ProposalView {
+    let before = &proposal.before;
+    let after = &proposal.after;
+    let mut details = Vec::new();
+    if before.title != after.title.trim() {
+        details.push(DetailChange {
+            name: "Title",
+            before: before.title.clone(),
+            after: after.title.trim().to_string(),
+        });
+    }
+    if before.description.trim() != after.description.trim() {
+        let shown = |text: &str| match text.trim() {
+            "" => "none".to_string(),
+            text => text.to_string(),
+        };
+        details.push(DetailChange {
+            name: "Description",
+            before: shown(&before.description),
+            after: shown(&after.description),
+        });
+    }
+    if before.servings != after.servings {
+        let serves = |value: Option<i64>| {
+            value.map_or_else(|| "none".to_string(), |count| count.to_string())
+        };
+        details.push(DetailChange {
+            name: "Servings",
+            before: serves(before.servings),
+            after: serves(after.servings),
+        });
+    }
+    if before.prep_minutes != after.prep_minutes {
+        details.push(DetailChange {
+            name: "Prep",
+            before: minutes(before.prep_minutes),
+            after: minutes(after.prep_minutes),
+        });
+    }
+    if before.cook_minutes != after.cook_minutes {
+        details.push(DetailChange {
+            name: "Cook",
+            before: minutes(before.cook_minutes),
+            after: minutes(after.cook_minutes),
+        });
+    }
+    let snapshot = after.snapshot();
+    let ingredients = section_changes(
+        &before.ingredients,
+        &after
+            .ingredients
+            .iter()
+            .map(|item| item.from)
+            .zip(snapshot.ingredients)
+            .collect::<Vec<_>>(),
+        None,
+        |item| ingredient_line(&item.name, &item.quantity, &item.unit, item.optional),
+        |_, _| Vec::new(),
+    );
+    let steps = section_changes(
+        &before.steps,
+        &after
+            .steps
+            .iter()
+            .map(|item| item.from)
+            .zip(snapshot.steps)
+            .collect::<Vec<_>>(),
+        Some("Step"),
+        |step| step.text.clone(),
+        |old, new| uses_diff(&old.ingredients, &new.ingredients),
+    );
+    let mut parts = Vec::new();
+    if !details.is_empty() {
+        parts.push(plural(details.len(), "detail", "details"));
+    }
+    if !ingredients.is_empty() {
+        parts.push(plural(ingredients.len(), "ingredient", "ingredients"));
+    }
+    if !steps.is_empty() {
+        parts.push(plural(steps.len(), "step", "steps"));
+    }
+    ProposalView {
+        summary: parts.join(" · "),
+        details,
+        ingredients,
+        steps,
+        stale,
     }
 }
 

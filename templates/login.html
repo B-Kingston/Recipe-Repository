@@ -17,6 +17,7 @@
         <p class="deck">{% if adding %}Sign in to another account. This browser stays signed in to the ones it has, and the account menu switches between them.{% else %}Enter your username and password.{% endif %}</p>
       </div>
       <div class="compact-panel">
+        {% if notice != "" %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
         <form method="post" action="/login">
           <input type="hidden" name="next" value="{{ next }}">
           <label for="username">Username</label>

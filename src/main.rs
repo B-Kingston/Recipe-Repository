@@ -44,9 +44,9 @@ mod recipes;
 mod search;
 mod thumbs;
 use auth::{
-    AuthUser, auth_middleware, create_account, login, login_page, logout, logout_all,
-    new_account_page, reset_password, reset_password_page, setup_create, setup_page,
-    switch_account,
+    AuthUser, auth_middleware, create_account, delete_account, delete_account_page, login,
+    login_page, logout, logout_all, new_account_page, reset_password, reset_password_page,
+    setup_create, setup_page, switch_account,
 };
 
 use ai::{
@@ -185,6 +185,15 @@ pub(crate) struct Endpoint {
     pub(crate) auth_failed: bool,
 }
 
+/// An account's search API key, which the recipe chat uses to search the web
+/// for models that have no web search of their own.
+#[derive(Clone, FromRow)]
+pub(crate) struct WebSearchKey {
+    /// A `WEB_SEARCH_PROVIDERS` key, e.g. `brave`.
+    pub(crate) provider: String,
+    pub(crate) api_key: String,
+}
+
 #[derive(Debug, Error)]
 enum AppError {
     #[error("That page was not found.")]
@@ -211,6 +220,8 @@ enum AppError {
     CodexAuth(String),
     #[error("Claude authorisation failed: {0}")]
     ClaudeAuth(String),
+    #[error("This form was sent from another site, so it was refused.")]
+    CrossOrigin,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -248,6 +259,12 @@ impl IntoResponse for AppError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Recipe not created",
                 self.to_string(),
+                false,
+            ),
+            Self::CrossOrigin => (
+                StatusCode::FORBIDDEN,
+                "Request refused",
+                format!("{self} Open the page here and try again."),
                 false,
             ),
             Self::AiLoginRefused(message) => (
@@ -424,6 +441,8 @@ struct LoginTemplate {
     next: String,
     /// The browser already has a session, so this sign-in adds an account.
     adding: bool,
+    /// A one-time notice above the form (an account was just deleted).
+    notice: &'static str,
 }
 #[derive(Template)]
 #[template(path = "account_new.html")]
@@ -435,6 +454,16 @@ struct NewAccountTemplate {
 #[template(path = "password_reset.html")]
 struct ResetPasswordTemplate {
     error: String,
+}
+#[derive(Template)]
+#[template(path = "account_delete.html")]
+struct DeleteAccountTemplate {
+    username: String,
+    /// The account deleting is the shared one and other accounts exist: the
+    /// next oldest account's AI setup takes over. Its username, else empty.
+    successor: String,
+    /// Usernames of the other accounts that use the shared AI logins now.
+    sharing: Vec<String>,
 }
 #[derive(Template)]
 #[template(path = "display.html")]
@@ -534,6 +563,81 @@ pub(crate) struct SnapshotStep {
     pub(crate) ingredients: Vec<String>,
 }
 
+/// The recipe as the chat's edit tools left it (the worker's
+/// `RecipeProposal`): a snapshot whose ingredients and steps each name the
+/// item of the snapshot they came from (`from`), or None when new.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecipeProposal {
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    pub(crate) servings: Option<i64>,
+    pub(crate) prep_minutes: Option<i64>,
+    pub(crate) cook_minutes: Option<i64>,
+    pub(crate) ingredients: Vec<ProposedIngredient>,
+    pub(crate) steps: Vec<ProposedStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ProposedIngredient {
+    pub(crate) from: Option<usize>,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) quantity: String,
+    #[serde(default)]
+    pub(crate) unit: String,
+    #[serde(default)]
+    pub(crate) optional: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ProposedStep {
+    pub(crate) from: Option<usize>,
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) ingredients: Vec<String>,
+}
+
+impl RecipeProposal {
+    /// The proposed recipe as a snapshot, the way a saved version records it.
+    pub(crate) fn snapshot(&self) -> RecipeSnapshot {
+        RecipeSnapshot {
+            schema_version: 1,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            servings: self.servings,
+            prep_minutes: self.prep_minutes,
+            cook_minutes: self.cook_minutes,
+            ingredients: self
+                .ingredients
+                .iter()
+                .map(|ingredient| SnapshotIngredient {
+                    name: ingredient.name.clone(),
+                    quantity: ingredient.quantity.clone(),
+                    unit: ingredient.unit.clone(),
+                    optional: ingredient.optional,
+                })
+                .collect(),
+            steps: self
+                .steps
+                .iter()
+                .map(|step| SnapshotStep {
+                    text: step.text.clone(),
+                    ingredients: step.ingredients.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A stored chat proposal: the recipe the chat saw and what it proposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ChatProposal {
+    pub(crate) before: RecipeSnapshot,
+    pub(crate) after: RecipeProposal,
+}
+
 #[derive(Template)]
 #[template(path = "delete.html")]
 struct DeleteTemplate {
@@ -631,8 +735,17 @@ struct SettingsTemplate {
     cleaner_notice: &'static str,
     moments_notice: &'static str,
     chat_notice: &'static str,
+    web_search_notice: &'static str,
     search_notice: &'static str,
     account_notice: &'static str,
+    /// The search APIs a key can be added for, as (key, label).
+    web_search_providers: &'static [(&'static str, &'static str)],
+    /// The user's own search key: its provider's label and masked tail
+    /// (both empty when none is saved). The raw key never reaches the page.
+    web_search_label: &'static str,
+    web_search_key_masked: String,
+    /// The shared account's search provider label, empty when it has no key.
+    shared_web_search: &'static str,
     /// Whether video step moments are captured and shown (global setting).
     step_moments: bool,
     /// Whether the user has the recipe chat (the Ask drawer) on.
@@ -911,6 +1024,12 @@ struct RecipeChatForm {
     #[serde(default)]
     enabled: Option<String>,
 }
+#[derive(Deserialize)]
+struct WebSearchForm {
+    provider: String, // a WEB_SEARCH_PROVIDERS key
+    #[serde(default)]
+    api_key: String,
+}
 /// A recipe-chat question. `back` is the page the drawer was on.
 #[derive(Deserialize)]
 struct ChatForm {
@@ -1118,6 +1237,14 @@ fn routes(state: Arc<AppState>) -> Router {
             post(chat::keep_answer),
         )
         .route(
+            "/recipes/{id}/chat/{message_id}/accept",
+            post(chat::accept_change),
+        )
+        .route(
+            "/recipes/{id}/chat/{message_id}/deny",
+            post(chat::decline_change),
+        )
+        .route(
             "/recipes/{id}/notes",
             post(notes::add_note).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
@@ -1136,6 +1263,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings/media-cleaner", post(update_media_cleaner))
         .route("/settings/step-moments", post(update_step_moments))
         .route("/settings/recipe-chat", post(update_recipe_chat))
+        .route("/settings/web-search", post(add_web_search_key))
+        .route("/settings/web-search/delete", post(delete_web_search_key))
         .route("/settings/search-engine", post(update_search_engine))
         .route("/settings/ai-logins", post(update_ai_logins))
         .route("/settings/endpoints", post(add_endpoint))
@@ -1147,6 +1276,10 @@ fn routes(state: Arc<AppState>) -> Router {
         .route(
             "/settings/password",
             get(reset_password_page).post(reset_password),
+        )
+        .route(
+            "/settings/delete-account",
+            get(delete_account_page).post(delete_account),
         )
         .route("/accounts/new", get(new_account_page).post(create_account))
         .route("/accounts/switch", post(switch_account))
@@ -1186,6 +1319,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
+        .layer(middleware::from_fn(auth::same_origin_only))
         .layer(middleware::from_fn(htmx::htmx_layer))
         .with_state(state)
 }
@@ -1267,8 +1401,6 @@ struct Draft {
     search_suggestions: String,
     base_updated_at: Option<String>,
     evidence_json: String,
-    /// The recipe-chat answer this draft was made for, if any.
-    chat_message_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1686,7 +1818,7 @@ pub(crate) async fn shared_ai_account(db: &SqlitePool) -> Result<Option<(String,
 }
 
 /// Whether the user chose their own AI setup over the shared one.
-async fn uses_own_ai(db: &SqlitePool, user_id: &str) -> Result<bool> {
+pub(crate) async fn uses_own_ai(db: &SqlitePool, user_id: &str) -> Result<bool> {
     Ok(app_setting(db, user_id, AI_LOGINS_SETTING)
         .await?
         .as_deref()
@@ -1773,6 +1905,51 @@ pub(crate) async fn insert_endpoint(
         .execute(db)
         .await?;
     Ok(id)
+}
+
+/// The search APIs a web search key can be for, as (key, label). Keep in step
+/// with SEARCH_PROVIDERS in pi/web-search.ts, which holds each one's adapter.
+const WEB_SEARCH_PROVIDERS: &[(&str, &str)] = &[
+    ("brave", "Brave Search"),
+    ("exa", "Exa"),
+    ("tavily", "Tavily"),
+];
+
+/// The label of a web search provider key.
+fn web_search_label(provider: &str) -> &'static str {
+    WEB_SEARCH_PROVIDERS
+        .iter()
+        .find(|(key, _)| *key == provider)
+        .map_or("Web search", |(_, label)| label)
+}
+
+/// One account's own search API key, if it saved one.
+pub(crate) async fn web_search_key(db: &SqlitePool, user_id: &str) -> Result<Option<WebSearchKey>> {
+    Ok(
+        sqlx::query_as("SELECT provider,api_key FROM web_search_keys WHERE user_id=?")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await?,
+    )
+}
+
+/// Saves (or replaces) one account's search API key.
+async fn store_web_search_key(
+    db: &SqlitePool,
+    user_id: &str,
+    provider: &str,
+    api_key: &str,
+) -> Result<()> {
+    let now = stamp();
+    sqlx::query("INSERT INTO web_search_keys(user_id,provider,api_key,created_at,updated_at)VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET provider=excluded.provider, api_key=excluded.api_key, updated_at=excluded.updated_at")
+        .bind(user_id)
+        .bind(provider)
+        .bind(api_key)
+        .bind(&now)
+        .bind(&now)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn remove_endpoint(db: &SqlitePool, user_id: &str, id: &str) -> Result<()> {
@@ -1938,6 +2115,14 @@ async fn settings_page(
         user.id.as_str()
     };
     let active_login_refused = active_login_refused(&s.db, ai_user).await?;
+    let own_web_search = web_search_key(&s.db, &user.id).await?;
+    let shared_web_search = if uses_shared_ai {
+        web_search_key(&s.db, &shared_id)
+            .await?
+            .map_or("", |key| web_search_label(&key.provider))
+    } else {
+        ""
+    };
     let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
     let cleaner_provider = media_cleaner_setting(&s.db, &user.id)
         .await?
@@ -2033,6 +2218,19 @@ async fn settings_page(
             ""
         },
         recipe_chat: chat::chat_enabled(&s.db, &user.id).await?,
+        web_search_notice: match flash.0.as_str() {
+            "web_search_saved" => "Search key saved.",
+            "web_search_removed" => "Search key removed.",
+            _ => "",
+        },
+        web_search_providers: WEB_SEARCH_PROVIDERS,
+        web_search_label: own_web_search
+            .as_ref()
+            .map_or("", |key| web_search_label(&key.provider)),
+        web_search_key_masked: own_web_search
+            .as_ref()
+            .map_or_else(String::new, |key| mask_key(&key.api_key)),
+        shared_web_search,
         search_notice: if flash.is("search_saved") {
             "Search saved."
         } else {
@@ -2406,6 +2604,48 @@ async fn update_recipe_chat(
     let value = if form.enabled.is_some() { "on" } else { "off" };
     set_app_setting(&s.db, &user.id, chat::CHAT_SETTING, value).await?;
     Ok(flash_redirect("/settings#settings-chat", "chat_saved"))
+}
+
+/// Saves the signed-in user's own search API key, replacing any earlier one.
+/// The key is stored in the database and only its masked tail is rendered.
+async fn add_web_search_key(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<WebSearchForm>,
+) -> Result<Response> {
+    let provider = form.provider.trim();
+    if !WEB_SEARCH_PROVIDERS.iter().any(|(key, _)| *key == provider) {
+        return Err(AppError::BadRequest("Choose a search provider.".into()));
+    }
+    let api_key = trim(&form.api_key);
+    if api_key.is_empty() {
+        return Err(AppError::BadRequest("Enter the search API key.".into()));
+    }
+    // A key goes into an HTTP header, so only printable ASCII without spaces
+    // is a key at all; anything else would fail every search (and could be
+    // echoed back in the header error).
+    if api_key.len() > 512 || !api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AppError::BadRequest(
+            "That does not look like a search API key: paste the key alone, without spaces.".into(),
+        ));
+    }
+    store_web_search_key(&s.db, &user.id, provider, &api_key).await?;
+    Ok(flash_redirect(
+        "/settings#settings-web-search",
+        "web_search_saved",
+    ))
+}
+
+/// Removes the signed-in user's own search API key.
+async fn delete_web_search_key(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
+    sqlx::query("DELETE FROM web_search_keys WHERE user_id=?")
+        .bind(&user.id)
+        .execute(&s.db)
+        .await?;
+    Ok(flash_redirect(
+        "/settings#settings-web-search",
+        "web_search_removed",
+    ))
 }
 
 /// Saves the signed-in user's library search engine. "shared" follows the

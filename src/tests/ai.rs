@@ -941,6 +941,7 @@ async fn library_cards_flag_recipes_that_have_a_dish_photo() {
         home(
             State(s),
             AuthUser { id: "u1".into() },
+            crate::htmx::Flash::default(),
             axum::extract::Query(crate::HomeQuery::default()),
         )
         .await

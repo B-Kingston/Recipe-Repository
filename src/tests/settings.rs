@@ -1368,3 +1368,118 @@ async fn the_cleaner_model_is_a_select_that_keeps_the_saved_model() {
         "{html}"
     );
 }
+
+async fn save_search_key(
+    state: &Arc<AppState>,
+    user_id: &str,
+    provider: &str,
+    api_key: &str,
+) -> Result<axum::response::Response, AppError> {
+    crate::add_web_search_key(
+        State(state.clone()),
+        AuthUser { id: user_id.into() },
+        Form(crate::WebSearchForm {
+            provider: provider.into(),
+            api_key: api_key.into(),
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_search_key_is_saved_masked_replaced_and_removed() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    for (provider, key) in [
+        ("bing", "key-123456"),
+        ("exa", "  "),
+        ("", "key-123456"),
+        ("exa", "two words"),
+        ("exa", "key\u{7}bell"),
+    ] {
+        let result = save_search_key(&state, "u1", provider, key).await;
+        assert!(matches!(result, Err(AppError::BadRequest(_))), "{provider}");
+    }
+    assert!(crate::web_search_key(&db, "u1").await.unwrap().is_none());
+    assert!(settings_body(&state, "u1").await.contains("Built-in only"));
+
+    let response = save_search_key(&state, "u1", "exa", " exa-secret-key-9876 ")
+        .await
+        .unwrap();
+    assert_flash(
+        &response,
+        "/settings#settings-web-search",
+        "web_search_saved",
+    );
+    let html = settings_body_with(&state, "u1", "web_search_saved").await;
+    assert!(html.contains("Search key saved."), "{html}");
+    assert!(html.contains("&#10003; Exa"), "{html}");
+    assert!(html.contains("key ••••9876"), "{html}");
+    assert!(
+        !html.contains("exa-secret-key"),
+        "the key never reaches the page"
+    );
+
+    save_search_key(&state, "u1", "brave", "brave-key-1111")
+        .await
+        .unwrap();
+    let key = crate::web_search_key(&db, "u1").await.unwrap().unwrap();
+    assert_eq!(
+        (key.provider.as_str(), key.api_key.as_str()),
+        ("brave", "brave-key-1111")
+    );
+
+    let response = crate::delete_web_search_key(State(state.clone()), AuthUser { id: "u1".into() })
+        .await
+        .unwrap();
+    assert_flash(
+        &response,
+        "/settings#settings-web-search",
+        "web_search_removed",
+    );
+    assert!(crate::web_search_key(&db, "u1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_account_sharing_ai_logins_sees_the_shared_search_key_but_not_its_form() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
+    let html = settings_body(&state, "u2").await;
+    assert!(html.contains("alice has no search key"), "{html}");
+    save_search_key(&state, "u1", "tavily", "tvly-shared-4321")
+        .await
+        .unwrap();
+    let html = settings_body(&state, "u2").await;
+    assert!(html.contains("with alice's Tavily key"), "{html}");
+    assert!(!html.contains("settings-web-search"), "{html}");
+    assert!(!html.contains("4321"), "{html}");
+    assert!(
+        settings_body(&state, "u1")
+            .await
+            .contains("Shared: accounts using these AI logins use this key too.")
+    );
+}
+
+#[test]
+fn the_chat_searches_only_when_enabled_and_sends_the_key_it_has() {
+    use crate::ai::{SearchMode, chat_web_search};
+    let key = crate::WebSearchKey {
+        provider: "exa".into(),
+        api_key: "exa-key".into(),
+    };
+    let (mode, sent) = chat_web_search(false, Some(&key));
+    assert!(mode == SearchMode::Off);
+    assert!(sent.is_null());
+    let (mode, sent) = chat_web_search(true, None);
+    assert!(mode == SearchMode::GapFill);
+    assert!(sent.is_null());
+    let (mode, sent) = chat_web_search(true, Some(&key));
+    assert!(mode == SearchMode::GapFill);
+    assert_eq!(
+        sent,
+        serde_json::json!({ "provider": "exa", "apiKey": "exa-key" })
+    );
+}

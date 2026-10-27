@@ -1,7 +1,7 @@
 use crate::{
-    AppError, AppState, LoginForm, LoginQuery, LoginTemplate, NewAccountTemplate,
-    ResetPasswordForm, ResetPasswordTemplate, Result, SetupForm, SetupTemplate, SwitchAccountForm,
-    render, stamp, trim,
+    AppError, AppState, DeleteAccountTemplate, LoginForm, LoginQuery, LoginTemplate,
+    NewAccountTemplate, ResetPasswordForm, ResetPasswordTemplate, Result, SetupForm, SetupTemplate,
+    SwitchAccountForm, render, stamp, trim,
 };
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::PasswordHash};
 use axum::{
@@ -665,6 +665,7 @@ pub(crate) async fn switch_account(
 pub(crate) async fn login_page(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    flash: crate::htmx::Flash,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response> {
     if user_count(&state.db).await? == 0 {
@@ -675,6 +676,11 @@ pub(crate) async fn login_page(
         username: trim(query.username.as_deref().unwrap_or_default()),
         next: local_target(query.next.as_deref().unwrap_or("/")).to_string(),
         adding: !browser_sessions(&state.db, &headers).await?.is_empty(),
+        notice: if flash.is("account_deleted") {
+            "Account deleted."
+        } else {
+            ""
+        },
     })
     .map(IntoResponse::into_response)
 }
@@ -705,6 +711,7 @@ pub(crate) async fn login(
             username,
             next,
             adding: !browser_sessions(&state.db, &headers).await?.is_empty(),
+            notice: "",
         })
         .map(IntoResponse::into_response);
     };
@@ -820,6 +827,212 @@ pub(crate) async fn reset_password(
         Redirect::to("/settings#settings-account"),
     )
         .into_response())
+}
+
+/// The account that takes over the shared AI logins when `user_id`, the
+/// shared account, is deleted: the next oldest, as (id, username).
+async fn next_shared_ai_account(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<Option<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT id, username FROM users WHERE id <> ? ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// The confirmation page for deleting the signed-in account. When it is the
+/// shared account and others exist, it names the account whose AI setup the
+/// others switch to.
+pub(crate) async fn delete_account_page(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Html<String>> {
+    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+        .bind(&user.id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let owns_shared = crate::shared_ai_account(&state.db)
+        .await?
+        .is_some_and(|(id, _)| id == user.id);
+    let mut successor = String::new();
+    let mut sharing = Vec::new();
+    if owns_shared && let Some((_, name)) = next_shared_ai_account(&state.db, &user.id).await? {
+        successor = name;
+        let others: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, username FROM users WHERE id <> ? ORDER BY username COLLATE NOCASE, username",
+        )
+        .bind(&user.id)
+        .fetch_all(&state.db)
+        .await?;
+        for (id, name) in others {
+            if !crate::uses_own_ai(&state.db, &id).await? {
+                sharing.push(name);
+            }
+        }
+    }
+    render(DeleteAccountTemplate {
+        username,
+        successor,
+        sharing,
+    })
+}
+
+/// Deletes everything `user_id` owns and the account itself, in one
+/// transaction. Tables keyed by `user_id` without a foreign key to `users`
+/// are cleared explicitly; the rest go by cascade from `recipes`,
+/// `ai_drafts`, and `users`. Returns the ids of the deleted endpoints and
+/// recipes, so their in-memory state can be dropped.
+pub(crate) async fn delete_user(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut tx = db.begin().await?;
+    let endpoints: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM ai_endpoints WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let recipes: Vec<String> = sqlx::query_scalar("SELECT id FROM recipes WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    // Every statement binds the id once as ?1; never mix ? and ?N.
+    for statement in [
+        // No foreign keys: thumbnail candidates of the recipes and drafts.
+        "DELETE FROM recipe_thumbnail_candidates
+         WHERE recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1)",
+        "DELETE FROM draft_thumbnails WHERE draft_id IN
+           (SELECT id FROM ai_drafts WHERE user_id = ?1
+              OR recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1))",
+        // Cascades to draft_moment_vectors, draft_moment_stills, and
+        // draft_step_moments.
+        "DELETE FROM ai_drafts
+         WHERE user_id = ?1 OR recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1)",
+        "DELETE FROM recipe_notes WHERE user_id = ?1",
+        "DELETE FROM recipe_chat_messages WHERE user_id = ?1",
+        // Cascades to recipe_blocks (and so recipe_step_ingredients and
+        // recipe_step_moments), recipe_sources, recipe_versions,
+        // recipe_version_counters, recipe_embeddings, recipe_moment_vectors,
+        // recipe_moment_stills, recipe_chat_messages, and recipe_notes.
+        "DELETE FROM recipes WHERE user_id = ?1",
+        "DELETE FROM app_settings WHERE user_id = ?1",
+        "DELETE FROM ai_endpoints WHERE user_id = ?1",
+        "DELETE FROM pi_credentials WHERE user_id = ?1",
+        "DELETE FROM sessions WHERE user_id = ?1",
+        // Cascades to every other table keyed to the user by a foreign key.
+        "DELETE FROM users WHERE id = ?1",
+    ] {
+        sqlx::query(statement)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok((endpoints, recipes))
+}
+
+/// Deletes the signed-in (active) account and everything it owns, after the
+/// confirmation page. Every session of the account ends, on every browser.
+/// This browser falls back to its next remembered account and opens the
+/// library; with none, both cookies are cleared and the sign-in page opens
+/// (which goes on to `/setup` when no account is left).
+pub(crate) async fn delete_account(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let sessions = browser_sessions(&state.db, &headers).await?;
+    let (endpoints, recipes) = delete_user(&state.db, &user.id).await?;
+    for endpoint in &endpoints {
+        crate::ai::forget_model_catalogue(&state, endpoint);
+    }
+    {
+        let mut thumbnail_jobs = state.thumbnail_jobs.lock();
+        let mut moment_jobs = state.moment_jobs.lock();
+        for recipe in &recipes {
+            thumbnail_jobs.remove(recipe);
+            moment_jobs.remove(recipe);
+        }
+    }
+    state
+        .codex_flows
+        .lock()
+        .retain(|_, flow| flow.user_id != user.id);
+    state
+        .claude_flows
+        .lock()
+        .retain(|_, flow| flow.user_id != user.id);
+    tracing::info!(user_id = %user.id, recipes = recipes.len(), "Account deleted");
+    let others: Vec<&str> = sessions
+        .iter()
+        .filter(|session| session.user_id != user.id)
+        .map(|session| session.token.as_str())
+        .collect();
+    let flash = crate::htmx::flash_cookie("account_deleted");
+    match others.split_first() {
+        Some((next, rest)) => {
+            let [session, accounts] = browser_cookies(next, rest)?.0;
+            Ok((
+                AppendHeaders([session, accounts, (header::SET_COOKIE, flash)]),
+                Redirect::to("/"),
+            )
+                .into_response())
+        }
+        None => {
+            let [session, accounts] = cleared_cookies().0;
+            Ok((
+                AppendHeaders([session, accounts, (header::SET_COOKIE, flash)]),
+                Redirect::to("/login"),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Refuses a state-changing request another site made the browser send.
+/// The session cookie is `SameSite=Lax`, which still lets a page on the same
+/// host under another port (a different origin but the same site) post a form
+/// here with it, so every route checks the request's own origin, the way Go's
+/// `CrossOriginProtection` does: `Sec-Fetch-Site` when the browser sends it,
+/// else `Origin` against `Host`. A request with neither (an old browser, a
+/// script) is let through; it carries no proof of a forgery.
+pub(crate) async fn same_origin_only(req: Request, next: Next) -> Result<Response> {
+    let safe = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if !safe && !same_origin(req.headers()) {
+        tracing::warn!(
+            method = %req.method(),
+            path = %req.uri().path(),
+            "Cross-origin request refused"
+        );
+        return Err(AppError::CrossOrigin);
+    }
+    Ok(next.run(req).await)
+}
+
+/// True unless the headers show the request came from another origin.
+/// `none` is a request the user started (a bookmark, the address bar).
+fn same_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return matches!(site.as_bytes(), b"same-origin" | b"none");
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    // Behind a TLS proxy the app sees plain HTTP, so only the authority is
+    // compared; the proxy passes the browser's `Host` through.
+    let authority = origin.to_str().ok().and_then(|origin| {
+        origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+    });
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok());
+    matches!((authority, host), (Some(authority), Some(host)) if authority.eq_ignore_ascii_case(host))
 }
 
 /// Admits a request with a live session cookie, puts its user into the

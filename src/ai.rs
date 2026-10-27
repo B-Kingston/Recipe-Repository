@@ -4,10 +4,9 @@ use crate::media::{
     recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{
-    apply_draft_moments, carry_draft_chat, copy_draft_moment_pool, copy_draft_thumbnails,
-    delete_draft_thumbnails, delete_expired_draft_thumbnails, draft_step_moments,
-    draft_still_seconds, find_draft, find_draft_still, find_draft_thumbnail_jpeg,
-    find_draft_thumbnails, find_recipe, recipe_snapshot, social_source_url,
+    apply_draft_moments, copy_draft_moment_pool, copy_draft_thumbnails, delete_draft_thumbnails,
+    delete_expired_draft_thumbnails, draft_step_moments, draft_still_seconds, find_draft,
+    find_draft_still, find_draft_thumbnail_jpeg, find_draft_thumbnails, social_source_url,
     store_draft_moment_pool, store_draft_thumbnails,
 };
 use crate::{
@@ -647,7 +646,6 @@ pub(crate) async fn alter_draft(
             // while the chain runs.
             copy_draft_thumbnails(&s.db, &id, &new_id).await?;
             copy_draft_moment_pool(&s.db, &id, &new_id).await?;
-            carry_draft_chat(&s.db, &id, &new_id).await?;
             match_new_draft(&s, &user, &new_id).await;
             Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response())
         }
@@ -662,46 +660,53 @@ fn alteration_prompt(request: &str, recipe_json: &str) -> String {
 }
 
 /// How the recipe chat answers. The recipe and the conversation ride in the
-/// prompt; the reply is a JSON object the worker reads with `chatReply`.
+/// prompt; the model finishes with the worker's `answer` tool (a JSON or prose
+/// reply is still read, by `chatReply`).
 pub(crate) const CHAT_SYSTEM_PROMPT: &str = r#"You are the cooking assistant inside a recipe app. The cook is looking at one of their saved recipes, given below as JSON, and asks you about it: substitutions, timing, technique, scaling, storage, serving ideas, and so on.
 
 Answer the latest question in plain text without Markdown: a few short sentences, or a short list with one item per line. Be practical and specific to this recipe, use its own units, and refer to its steps by number. If the question has nothing to do with cooking or this recipe, say briefly that you can only help with the recipe.
 
-The cook may also come back after cooking to say how it went ("it came out too salty", "the base was soggy", "it took twice as long") and ask what to do next time. Then read their notes first, work out the most likely causes from the recipe and what they describe, and give a short list of specific adjustments for next time, tied to the steps and amounts. Ask a question back only when you cannot tell what went wrong. Mention that they can save the adjustments as a change to the recipe, or keep your answer as a note.
+The cook may also come back after cooking to say how it went ("it came out too salty", "the base was soggy", "it took twice as long") and ask what to do next time. Then read their notes first, work out the most likely causes from the recipe and what they describe, and give a short list of specific adjustments for next time, tied to the steps and amounts. Ask a question back only when you cannot tell what went wrong. Mention that you can make the adjustments in the recipe, or that they can keep your answer as a note.
 
 You have tools for what the cook has kept with this recipe. recipe_notes lists their notes: each is about the whole recipe or about one saved version, and some have a photo. note_photo shows a note's photo. recipe_version shows a saved version of the recipe. Read the notes whenever they could matter: the cook has cooked it before, asks about next time, mentions a note or photo, or asks what changed. A note about an older version describes that version, which may differ from the current recipe, so check the version before relying on its amounts.
 
-You can also change the recipe, but only when the cook asks you to change, adapt, or save something in it (for example "make it vegan", "scale it to 6", "use butter instead", "add that to the recipe"). A question such as "can I use butter?" is not a request: answer it, and you may offer to make the change. When the cook does ask for a change:
-- set "change" to one complete instruction describing every edit to make, specific enough to apply without reading the chat;
-- set "label" to a one- or two-word name for what changes, in sentence case, such as "Made vegan", "Serves 6", "Less salt", or "Butter swap";
-- in "reply", say briefly what you will change. The cook reviews the change before it is saved, so never say it has been saved.
-Otherwise set "change" and "label" to empty strings.
+You may also be able to search the web with search_web. Search when the answer depends on facts you are not sure of: a particular product or brand, an unfamiliar ingredient or regional dish, a safe cooking temperature, a substitution ratio you would otherwise guess. Do not search for what the recipe, the notes, or ordinary cooking knowledge already answers, and search at most a few times per answer. When you used what you found, end the reply with the pages you relied on, one URL per line.
 
-When you have your answer, return only one JSON object, with no Markdown fences or text around it:
-{"reply": "your answer", "change": "", "label": ""}"#;
+show_recipe shows the recipe as your edits have left it, numbered; it changes nothing. You can also edit the recipe with the edit tools (change_details, add_ingredient, change_ingredient, remove_ingredient, move_ingredient, add_step, change_step, remove_step, move_step), but only when the cook asks you to change, adapt, or save something in it (for example "make it vegan", "scale it to 6", "use butter instead", "add that to the recipe"). A question such as "can I use butter?" is not a request: answer it, and you may offer to make the change. The edits do not save anything: the cook sees every change you made and accepts or denies them all together. When the cook asks for a change:
+- make every edit it needs, so the recipe reads correctly as a whole: when an ingredient's amount or name changes, change the ingredient lines of the steps that list it too, and rewrite step text that mentions it;
+- ingredients and steps are numbered from 1 in their current order, and each edit tool answers with the list as it now stands, so use those numbers for the next edit;
+- keep everything the cook did not ask to change exactly as it is, and never call an edit tool to look at the recipe or to test it: use show_recipe;
+- give answer a "label": a one- or two-word name for what changes, in sentence case, such as "Made vegan", "Serves 6", "Less salt", or "Butter swap";
+- in the reply, say briefly what you changed and why, and that the cook can accept or deny it below. Never say the recipe has been saved.
+Without edits, leave the label empty.
+
+When you are done, call the answer tool once, last, with your reply (and the label when you made edits). Do not write the reply as text outside it, and call no other tool to finish."#;
 
 /// The chat worker's answer to one question about a recipe.
 #[derive(Debug, Deserialize, PartialEq)]
 pub(crate) struct ChatReply {
     pub(crate) reply: String,
-    /// The change the cook asked for, as one instruction; empty for a plain answer.
-    #[serde(default)]
-    pub(crate) change: String,
-    /// The model's one- or two-word name for the change.
+    /// The model's one- or two-word name for its proposal.
     #[serde(default)]
     pub(crate) label: String,
+    /// The recipe as the model's edit tools left it; None without edits.
+    #[serde(default)]
+    pub(crate) proposal: Option<crate::RecipeProposal>,
 }
 
 /// Answers one recipe-chat turn through the user's AI setup (shared or own,
-/// like every generation), without web search. `library` is what the chat's
-/// tools read (see `chat::chat_library`); the log shows its notes' text and
-/// how many photos rode along, never the photo bytes. A retryable worker
-/// failure is tried once more; a refused login is not.
+/// like every generation). `library` is what the chat's tools read (see
+/// `chat::chat_library`), and `recipe` is what its edit tools change; the log shows its notes' text and how many photos
+/// rode along, never the photo bytes. With `PI_SEARCH_ENABLED` the model may
+/// search the web: with its provider's own search, or else with the AI
+/// account's search API key (`chat_web_search`). A retryable worker failure
+/// is tried once more; a refused login is not.
 pub(crate) async fn chat_reply(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
     library: &Value,
+    recipe: &crate::RecipeSnapshot,
 ) -> Result<ChatReply> {
     let ai_user = crate::ai_account(&state.db, &user.id).await?;
     let provider = crate::ai_provider(&state.db, &ai_user).await?;
@@ -710,11 +715,18 @@ pub(crate) async fn chat_reply(
         crate::selected_effort(&state.db, &ai_user, crate::DEFAULT_REASONING_EFFORT).await?;
     let provider = backend.label();
     let tools_log = chat_library_log(library);
+    let search_key = crate::web_search_key(&state.db, &ai_user).await?;
+    let (search_mode, web_search) = chat_web_search(state.search_grounding, search_key.as_ref());
+    let search_key_provider = search_key
+        .as_ref()
+        .map_or("none", |key| key.provider.as_str());
     for attempt in 0..2 {
         info!(
             provider,
             model,
             reasoning_effort = %effort,
+            search_mode = search_mode.as_str(),
+            search_key = search_key_provider,
             attempt,
             prompt = %prompt,
             system_prompt = %CHAT_SYSTEM_PROMPT,
@@ -728,8 +740,10 @@ pub(crate) async fn chat_reply(
             "systemPrompt": CHAT_SYSTEM_PROMPT,
             "model": model,
             "reasoningEffort": effort,
-            "searchMode": SearchMode::Off.as_str(),
+            "searchMode": search_mode.as_str(),
+            "webSearch": web_search,
             "library": library,
+            "recipe": recipe,
         });
         let output = backend.run(state, request, PI_WORKER_TIMEOUT).await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -764,6 +778,23 @@ pub(crate) async fn chat_reply(
     Err(AppError::Ai)
 }
 
+/// The chat's search posture: `GapFill` (search allowed, never required)
+/// when web search is enabled, and the search API key the worker falls back
+/// to for a model without search of its own, or null.
+pub(crate) fn chat_web_search(
+    enabled: bool,
+    key: Option<&crate::WebSearchKey>,
+) -> (SearchMode, Value) {
+    if !enabled {
+        return (SearchMode::Off, Value::Null);
+    }
+    let key = key.map_or(
+        Value::Null,
+        |key| json!({ "provider": key.provider, "apiKey": key.api_key }),
+    );
+    (SearchMode::GapFill, key)
+}
+
 /// The chat library as the log shows it: each note's text and whether a
 /// photo was sent with it, and the version numbers. Photo bytes stay out.
 pub(crate) fn chat_library_log(library: &Value) -> Value {
@@ -794,45 +825,6 @@ pub(crate) fn chat_library_log(library: &Value) -> Value {
         "versions": versions,
         "currentVersion": library["currentVersion"],
     })
-}
-
-/// Drafts the change a chat answer proposed, through the alteration path
-/// (the one the draft page's "Alter this draft" uses), and links the draft
-/// to that answer. The draft is
-/// based on the recipe as it is now, so saving it after another edit is
-/// refused by `apply_draft`'s staleness guard.
-pub(crate) async fn draft_chat_change(
-    state: &AppState,
-    user: &AuthUser,
-    recipe_id: &str,
-    message_id: &str,
-    request: &str,
-) -> Result<String> {
-    let recipe = find_recipe(&state.db, &user.id, recipe_id).await?;
-    let snapshot = {
-        let mut conn = state.db.acquire().await?;
-        recipe_snapshot(&mut conn, &user.id, &recipe.id).await?
-    };
-    let full = alteration_prompt(
-        request,
-        &serde_json::to_string(&snapshot).map_err(|_| AppError::Ai)?,
-    );
-    let draft = create_draft(
-        state,
-        user,
-        Some((&recipe.id, &recipe.updated_at)),
-        "alter",
-        &full,
-        DraftProvenance {
-            attribution: None,
-            evidence_json: None,
-            search_mode: None,
-        },
-    )
-    .await?;
-    crate::recipes::link_draft_to_chat(&state.db, &draft, message_id).await?;
-    match_new_draft(state, user, &draft).await;
-    Ok(draft)
 }
 
 /// The imported video evidence stored with a draft; None for prompt-made drafts.
@@ -968,8 +960,6 @@ pub(crate) async fn apply_draft(
     let chart_json =
         serde_json::to_string(&ChartRecipe::from_generated(&recipe)).map_err(|_| AppError::Ai)?;
     let altering = draft.recipe_id.is_some();
-    // The recipe as it was before a change from the chat, for the divider.
-    let mut chat_before = None;
     let mut tx = s.db.begin().await?;
     let now = stamp();
     let recipe_id = if let Some(existing) = draft.recipe_id {
@@ -980,9 +970,6 @@ pub(crate) async fn apply_draft(
             return render_draft_page(&s, &user, &id, STALE_BASE_MESSAGE, "").await;
         }
         crate::recipes::ensure_recipe_history(&mut tx, &user.id, &existing).await?;
-        if draft.chat_message_id.is_some() {
-            chat_before = Some(recipe_snapshot(&mut tx, &user.id, &existing).await?);
-        }
         sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
             .bind(&recipe.title)
             .bind(&recipe.description)
@@ -1096,22 +1083,12 @@ pub(crate) async fn apply_draft(
                 .await?;
         }
     }
-    // A change from the chat marks its thread with a divider at this point.
-    let chat_label = match (draft.chat_message_id.as_deref(), &chat_before) {
-        (Some(message_id), Some(before)) => {
-            crate::recipes::record_chat_change(
-                &mut tx, &user.id, &recipe_id, message_id, &id, before,
-            )
-            .await?
-        }
-        _ => None,
+    let label = if altering {
+        "AI alteration applied"
+    } else {
+        "Recipe created with AI"
     };
-    let label = match &chat_label {
-        Some(chat_label) => format!("Chat: {chat_label}"),
-        None if altering => "AI alteration applied".into(),
-        None => "Recipe created with AI".into(),
-    };
-    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, &label).await?;
+    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, label).await?;
     // Before the draft row goes: deleting it cascades its moment pool.
     apply_draft_moments(&mut tx, &id, &recipe_id, &step_ids).await?;
     sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
@@ -1124,11 +1101,6 @@ pub(crate) async fn apply_draft(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    // A change from the chat returns to the chat, where its divider now shows.
-    if chat_label.is_some() {
-        crate::chat::open_drawer(&s.db, &user.id).await?;
-        return Ok(Redirect::to(&format!("/recipes/{recipe_id}#recipe-chat")).into_response());
-    }
     Ok(Redirect::to(&format!("/recipes/{recipe_id}")).into_response())
 }
 
@@ -1165,7 +1137,6 @@ pub(crate) async fn cancel_draft(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    let chat = crate::recipes::draft_chat(&s.db, &user.id, &id).await?;
     // Candidates carry no owner, so they are removed only when this user's draft was deleted.
     let removed = sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(&id)
@@ -1175,11 +1146,6 @@ pub(crate) async fn cancel_draft(
         .rows_affected();
     if removed > 0 {
         delete_draft_thumbnails(&s.db, &id).await?;
-    }
-    // A change drafted from the chat is discarded back into that chat.
-    if let Some((recipe_id, message_id)) = chat {
-        crate::recipes::discard_chat_change(&s.db, &user.id, &message_id).await?;
-        return Ok(Redirect::to(&format!("/recipes/{recipe_id}#recipe-chat")).into_response());
     }
     Ok(Redirect::to("/").into_response())
 }

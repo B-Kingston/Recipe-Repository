@@ -1,0 +1,13 @@
+{# One ingredient or step in a chat proposal (recipe_chat.html); reads a
+   `change` (chat::ItemChange). #}
+<li class="chat-diff-item is-{{ change.kind }}">
+  <span class="chat-diff-mark" aria-hidden="true">{% if change.kind == "added" %}+{% else if change.kind == "removed" %}−{% else if change.kind == "moved" %}↕{% else %}~{% endif %}</span>
+  <span class="visually-hidden">{% if change.kind == "added" %}Added{% else if change.kind == "removed" %}Removed{% else if change.kind == "moved" %}Moved{% else %}Changed{% endif %}: </span>
+  <span class="chat-diff-body">
+    {% if change.place != "" || change.moved_from != "" %}<span class="chat-diff-place">{{ change.place }}{% if change.moved_from != "" %} <span class="muted">({{ change.moved_from }})</span>{% endif %}</span>{% endif %}
+    <span class="chat-diff-text">{% for run in change.words %}{% if run.kind == "ins" %}<ins>{{ run.text }}</ins>{% else if run.kind == "del" %}<del>{{ run.text }}</del>{% else %}{{ run.text }}{% endif %}{% if !loop.last %} {% endif %}{% endfor %}</span>
+    {% if !change.uses.is_empty() %}
+    <span class="chat-diff-uses"><span class="muted">Uses:</span> {% for line in change.uses %}{% if line.kind == "ins" %}<ins>{{ line.text }}</ins>{% else if line.kind == "del" %}<del>{{ line.text }}</del>{% else %}{{ line.text }}{% endif %}{% if !loop.last %}; {% endif %}{% endfor %}</span>
+    {% endif %}
+  </span>
+</li>

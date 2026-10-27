@@ -164,6 +164,15 @@ export function optionalSearchPayload(payload: unknown): Record<string, unknown>
   };
 }
 
+/** Adds the hosted web_search tool beside a Responses payload's own function
+ * tools, without forcing it. The recipe chat uses it for Codex and OpenAI
+ * endpoints, where the model also has its lookup tools. */
+export function responsesSearchPayload(payload: unknown): Record<string, unknown> {
+  const body = requestPayload(payload, "Responses");
+  const tools: unknown[] = Array.isArray(body.tools) ? body.tools : [];
+  return { ...body, tools: [...tools, { type: "web_search", search_context_size: "medium" }] };
+}
+
 /** Attaches Anthropic's server-side web_search tool to a Messages API payload.
  * The tool is never forced with tool_choice: Anthropic rejects a forced tool
  * while extended thinking is on. Grounded mode relies on the prompt and on the

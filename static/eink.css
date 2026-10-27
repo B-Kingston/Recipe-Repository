@@ -116,3 +116,7 @@ a:hover { color: #000000; }
 .chat-toggle.is-pressed { border-width: 2px; }
 .note-photo img { filter: grayscale(1) contrast(1.1); }
 .note-edit form { border: 2px solid #000000; }
+.chat-diff ins { background: none; color: #000000; font-weight: 700; text-decoration: underline; }
+.chat-diff del { background: none; color: #000000; text-decoration: line-through; }
+.chat-diff-mark, .chat-diff-item.is-added .chat-diff-mark, .chat-diff-item.is-removed .chat-diff-mark { color: #000000; }
+.chat-diff-item { border-top-color: #000000; }

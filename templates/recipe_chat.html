@@ -1,7 +1,9 @@
-{# The recipe chat drawer (src/chat.rs). The question form, Clear, and the
-   poll swap only #recipe-chat; Save change and Discard reload the page,
-   since the card itself changes. A saved change leaves a divider in the
-   thread at the point the recipe changed. #}
+{# The recipe chat drawer (src/chat.rs). The question form, Clear, Deny,
+   and the poll swap only #recipe-chat; Accept reloads the page, since the
+   card itself changes. A proposal lists only what differs: details as
+   before → after, ingredients and steps with inserted words in <ins> and
+   deleted ones in <del> (and a + / − marker, so it reads in e-ink too).
+   A saved change leaves a divider in the thread where the recipe changed. #}
 <section id="recipe-chat" class="recipe-chat" aria-labelledby="recipe-chat-title">
   <div class="chat-head">
     <h2 id="recipe-chat-title" class="section-label">Ask about this recipe</h2>
@@ -14,7 +16,7 @@
   </div>
   {% if chat.notice != "" %}<p class="notice" role="status">{{ chat.notice }}</p>{% endif %}
   {% if chat.messages.is_empty() %}
-  <p class="muted chat-empty">Ask about substitutions, timing, technique, or scaling, or tell it how the recipe went for pointers next time. It reads your notes on this recipe. Ask for a change, like “make it vegan” or “serve 6”, and it drafts one for you to preview and save. The recipe’s history keeps the version it replaces.</p>
+  <p class="muted chat-empty">Ask about substitutions, timing, technique, or scaling, or tell it how the recipe went for pointers next time. It reads your notes on this recipe. Ask for a change, like “make it vegan” or “serve 6”, and it shows you every edit to accept or deny. The recipe’s history keeps the version it replaces.</p>
   {% else %}
   <ol class="chat-thread" data-chat-thread>
     {% for message in chat.messages %}
@@ -43,24 +45,60 @@
       {% if message.change_state != "" %}
       <div class="chat-proposal">
         <p class="chat-proposal-label">{% if message.change_label != "" %}{{ message.change_label }}{% else %}Suggested change{% endif %}</p>
-        {% if message.change_state == "drafting" %}
-        <p class="muted">Drafting the change…</p>
-        {% else if message.change_state == "ready" %}
-        {% if message.draft_id != "" %}
-        <div class="chat-proposal-actions">
-          <form class="inline" method="post" action="/ai/drafts/{{ message.draft_id }}/apply" data-busy-label="Saving…" hx-swap="innerHTML show:none"><button class="primary compact">Save change</button></form>
-          <a class="button compact" href="/ai/drafts/{{ message.draft_id }}">Preview</a>
-          <form class="inline" method="post" action="/ai/drafts/{{ message.draft_id }}/cancel" data-confirm="Discard this change?" data-busy-label="Discarding…" hx-swap="innerHTML show:none"><button class="quiet compact">Discard</button></form>
-        </div>
-        {% else %}
-        <p class="muted">This draft expired. Ask again to redo the change.</p>
+        {% if message.change_state == "ready" %}
+        {% match message.proposal %}
+        {% when Some with (proposal) %}
+        <p class="muted chat-proposal-summary">{{ proposal.summary }}</p>
+        {% if !proposal.details.is_empty() %}
+        <h3 class="chat-diff-heading">Details</h3>
+        <ul class="chat-diff">
+          {% for detail in proposal.details %}
+          <li class="chat-diff-item is-changed"><span class="chat-diff-place">{{ detail.name }}</span> <del>{{ detail.before }}</del> <span class="chat-diff-arrow" aria-label="becomes">→</span> <ins>{{ detail.after }}</ins></li>
+          {% endfor %}
+        </ul>
         {% endif %}
+        {% if !proposal.ingredients.is_empty() %}
+        <h3 class="chat-diff-heading">Ingredients</h3>
+        <ul class="chat-diff">
+          {% for change in proposal.ingredients %}{% include "recipe_chat_change.html" %}{% endfor %}
+        </ul>
+        {% endif %}
+        {% if !proposal.steps.is_empty() %}
+        <h3 class="chat-diff-heading">Method</h3>
+        <ul class="chat-diff">
+          {% for change in proposal.steps %}{% include "recipe_chat_change.html" %}{% endfor %}
+        </ul>
+        {% endif %}
+        {% if proposal.stale %}
+        <p class="muted" role="note">The recipe has changed since this was suggested, so it can no longer be saved. Ask again for a fresh change.</p>
+        {% endif %}
+        <div class="chat-proposal-actions">
+          {% if !proposal.stale %}
+          <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/{{ message.id }}/accept" data-busy-label="Saving…" hx-swap="innerHTML show:none">
+            <input type="hidden" name="back" value="{{ chat.back }}">
+            <button class="primary compact">Accept</button>
+          </form>
+          {% endif %}
+          <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/{{ message.id }}/deny" data-busy-label="Denying…" hx-target="#recipe-chat" hx-select="#recipe-chat" hx-swap="outerHTML show:none">
+            <input type="hidden" name="back" value="{{ chat.back }}">
+            <button class="compact">{% if proposal.stale %}Dismiss{% else %}Deny{% endif %}</button>
+          </form>
+        </div>
+        {% when None %}
+        <p class="muted">This change can no longer be shown. Ask again to redo it.</p>
+        <div class="chat-proposal-actions">
+          <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/{{ message.id }}/deny" hx-target="#recipe-chat" hx-select="#recipe-chat" hx-swap="outerHTML show:none">
+            <input type="hidden" name="back" value="{{ chat.back }}">
+            <button class="compact">Dismiss</button>
+          </form>
+        </div>
+        {% endmatch %}
         {% else if message.change_state == "applied" %}
         <p class="muted">Saved to the recipe.</p>
         {% else if message.change_state == "discarded" %}
-        <p class="muted">Discarded.</p>
+        <p class="muted">Denied. The recipe was left as it was.</p>
         {% else %}
-        <p class="muted">The change could not be drafted. Ask again to retry.</p>
+        <p class="muted">This change was not made. Ask again to retry.</p>
         {% endif %}
       </div>
       {% endif %}

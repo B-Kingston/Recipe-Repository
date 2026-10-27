@@ -252,6 +252,7 @@ async fn search_page(db: SqlitePool, query: &str) -> String {
     home(
         State(state(db)),
         AuthUser { id: "u1".into() },
+        crate::htmx::Flash::default(),
         Query(HomeQuery {
             q: Some(query.into()),
         }),

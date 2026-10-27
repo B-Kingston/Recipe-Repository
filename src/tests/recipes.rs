@@ -509,6 +509,7 @@ async fn library_tickets_print_ingredients_and_pack_long_lists() {
     let page = home(
         State(state(db)),
         AuthUser { id: "u1".into() },
+        crate::htmx::Flash::default(),
         Query(HomeQuery::default()),
     )
     .await

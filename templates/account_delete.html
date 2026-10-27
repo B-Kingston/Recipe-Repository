@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}Delete account · Recipe Repository{% endblock %}{% block nav_settings %} aria-current="page"{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Account</p>
+  <h1>Delete account {{ username }}?</h1>
+  <p class="deck">Everything this account owns is deleted for good: every recipe with its notes and photos, chats, drafts, and versions, and every AI login, API key, search key, and setting. This cannot be undone.</p>
+</div>
+<div class="compact-panel">
+  {% if !successor.is_empty() %}
+  <div class="notice" role="alert">
+    <p><strong>This account’s AI logins are shared.</strong> {% if sharing.is_empty() %}No other account uses them now, but{% else %}{{ sharing.join(", ") }} use{% if sharing.len() == 1 %}s{% endif %} them. Once this account is deleted, those accounts switch to the AI setup of {{ successor }}, the next oldest account, and{% endif %} {{ successor }} becomes the account whose AI logins are shared. If {{ successor }} has no AI login of its own, AI features stop for the sharing accounts until one is added in Settings.</p>
+  </div>
+  {% endif %}
+  <p>Other accounts and their libraries are not touched. This browser signs out of {{ username }} and moves to another account it is signed in to, if any.</p>
+  {# The active account changes, so the whole page reloads. #}
+  <form method="post" action="/settings/delete-account" hx-boost="false" data-confirm="Delete account {{ username }} and everything it owns? This cannot be undone." data-busy-label="Deleting…">
+    <p class="actions">
+      <a class="button" href="/settings">Cancel</a>
+      <button class="button danger" type="submit">Delete account {{ username }}</button>
+    </p>
+  </form>
+</div>
+{% endblock %}

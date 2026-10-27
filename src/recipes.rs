@@ -4,10 +4,10 @@ use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
 use crate::search::{self, Indexed};
 use crate::thumbs::{self, ThumbCandidate};
 use crate::{
-    AddRecipeQuery, AppError, AppState, AuthUser, Block, BlockForm, DeleteTemplate, Draft,
-    HomeQuery, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeSnapshot, RecipeTemplate,
-    Result, SnapshotIngredient, SnapshotStep, Source, VersionTemplate, ViewBlock, ViewStep,
-    display_timestamp, number, option_number, render, required, stamp, trim,
+    AddRecipeQuery, AppError, AppState, AuthUser, Block, BlockForm, ChatProposal, DeleteTemplate,
+    Draft, HomeQuery, HomeTemplate, Recipe, RecipeForm, RecipeQuery, RecipeSnapshot,
+    RecipeTemplate, Result, SnapshotIngredient, SnapshotStep, Source, VersionTemplate, ViewBlock,
+    ViewStep, display_timestamp, number, option_number, render, required, stamp, trim,
 };
 use axum::{
     Form,
@@ -16,7 +16,11 @@ use axum::{
 };
 use chrono::Utc;
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
-use std::{collections::HashMap, os::unix::fs::DirBuilderExt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    os::unix::fs::DirBuilderExt,
+    sync::Arc,
+};
 use uuid::Uuid;
 
 /// Version label for a block change, e.g. "Step added" or "Ingredient edited".
@@ -35,6 +39,7 @@ fn block_label(section: &str, action: &str) -> String {
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
+    flash: Flash,
     Query(params): Query<HomeQuery>,
 ) -> Result<Html<String>> {
     let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
@@ -47,7 +52,12 @@ pub(crate) async fn home(
     .fetch_all(&state.db)
     .await?;
     let (mut recipes, results, notice) = if query.is_empty() {
-        (cards, false, String::new())
+        let notice = if flash.is("account_deleted") {
+            "Account deleted. This browser switched to your next account.".to_string()
+        } else {
+            String::new()
+        };
+        (cards, false, notice)
     } else {
         let outcome = search::search(&state, &user.id, &query).await?;
         let mut by_id: HashMap<String, LibraryCard> = cards
@@ -1363,6 +1373,15 @@ pub(crate) async fn store_recipe_thumbnails(
     candidates: &[ThumbCandidate],
 ) -> Result<()> {
     let mut tx = db.begin().await?;
+    // The run outlives its recipe when the recipe or its account is deleted
+    // meanwhile; the candidates table has no foreign key to stop it.
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM recipes WHERE id=?")
+        .bind(recipe_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
     sqlx::query("DELETE FROM recipe_thumbnail_candidates WHERE recipe_id=?")
         .bind(recipe_id)
         .execute(&mut *tx)
@@ -2121,6 +2140,10 @@ pub(crate) struct ChatMessage {
     pub(crate) status: String,
     pub(crate) change_label: String,
     pub(crate) change_state: String,
+    /// A proposed change (`ChatProposal` JSON), or empty.
+    pub(crate) proposal_json: String,
+    /// The recipe's `updated_at` when the chat read it for that proposal.
+    pub(crate) proposal_base: String,
     pub(crate) created_at: String,
 }
 
@@ -2133,7 +2156,7 @@ pub(crate) async fn chat_thread(
     recipe_id: &str,
 ) -> Result<Vec<ChatMessage>> {
     Ok(sqlx::query_as(
-        "SELECT id,role,content,status,change_label,change_state,created_at
+        "SELECT id,role,content,status,change_label,change_state,proposal_json,proposal_base,created_at
          FROM recipe_chat_messages WHERE user_id=? AND recipe_id=? ORDER BY rowid",
     )
     .bind(user_id)
@@ -2142,11 +2165,11 @@ pub(crate) async fn chat_thread(
     .await?)
 }
 
-/// Whether an answer or a change draft is still running in the thread.
+/// Whether an answer is still running in the thread.
 pub(crate) async fn chat_busy(db: &SqlitePool, user_id: &str, recipe_id: &str) -> Result<bool> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM recipe_chat_messages
-         WHERE user_id=? AND recipe_id=? AND (status='pending' OR change_state='drafting'))",
+         WHERE user_id=? AND recipe_id=? AND status='pending')",
     )
     .bind(user_id)
     .bind(recipe_id)
@@ -2183,28 +2206,36 @@ pub(crate) async fn start_chat_turn(
     Ok(answer_id)
 }
 
-/// Fills in a pending answer. Returns false when the row is gone (the chat
-/// was cleared while the model ran), so the caller stops there.
+/// A change the chat proposes with an answer: the label, the stored
+/// `ChatProposal` JSON, and the recipe's `updated_at` when the chat read it.
+pub(crate) struct ProposalRow<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) json: &'a str,
+    pub(crate) base: &'a str,
+}
+
+/// Fills in a pending answer, with the change it proposes (awaiting the cook
+/// as `ready`). Returns false when the row is gone (the chat was cleared
+/// while the model ran), so the caller stops there.
 pub(crate) async fn finish_chat_answer(
     db: &SqlitePool,
     answer_id: &str,
     reply: &str,
-    change_request: &str,
-    change_label: &str,
+    proposal: Option<ProposalRow<'_>>,
 ) -> Result<bool> {
-    let change_state = if change_request.is_empty() {
-        ""
-    } else {
-        "drafting"
+    let (label, json, base, change_state) = match &proposal {
+        Some(row) => (row.label, row.json, row.base, "ready"),
+        None => ("", "", "", ""),
     };
     Ok(sqlx::query(
-        "UPDATE recipe_chat_messages SET content=?,status='done',change_request=?,change_label=?,change_state=?
+        "UPDATE recipe_chat_messages SET content=?,status='done',change_label=?,change_state=?,proposal_json=?,proposal_base=?
          WHERE id=? AND status='pending'",
     )
     .bind(reply)
-    .bind(change_request)
-    .bind(change_label)
+    .bind(label)
     .bind(change_state)
+    .bind(json)
+    .bind(base)
     .bind(answer_id)
     .execute(db)
     .await?
@@ -2231,24 +2262,7 @@ pub(crate) async fn fail_chat_answer(
     Ok(())
 }
 
-/// Moves a drafting change on to "ready" or "failed".
-pub(crate) async fn set_chat_change_state(
-    db: &SqlitePool,
-    answer_id: &str,
-    state: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE recipe_chat_messages SET change_state=? WHERE id=? AND change_state='drafting'",
-    )
-    .bind(state)
-    .bind(answer_id)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Deletes the user's whole conversation about a recipe. Drafts made from it
-/// stay reviewable on their own (their link is cleared by the foreign key).
+/// Deletes the user's whole conversation about a recipe, proposals included.
 pub(crate) async fn clear_chat(db: &SqlitePool, user_id: &str, recipe_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM recipe_chat_messages WHERE user_id=? AND recipe_id=?")
         .bind(user_id)
@@ -2258,8 +2272,9 @@ pub(crate) async fn clear_chat(db: &SqlitePool, user_id: &str, recipe_id: &str) 
     Ok(())
 }
 
-/// Answers and drafts that were running when the app stopped can never
-/// finish; at startup they become failures the cook can ask again about.
+/// Answers that were running when the app stopped can never finish; at
+/// startup they become failures the cook can ask again about. (Changes
+/// drafted by the chat before it proposed edits fail the same way.)
 pub(crate) async fn fail_interrupted_chats(db: &SqlitePool) -> Result<()> {
     sqlx::query(
         "UPDATE recipe_chat_messages SET status='failed',content='The answer was interrupted. Ask again.'
@@ -2275,147 +2290,218 @@ pub(crate) async fn fail_interrupted_chats(db: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// The newest live draft for each chat answer in a thread, keyed by answer id.
-pub(crate) async fn chat_drafts(
+/// Denies a proposal that awaits the cook; false when there was none.
+pub(crate) async fn decline_chat_proposal(
     db: &SqlitePool,
     user_id: &str,
     recipe_id: &str,
-) -> Result<HashMap<String, String>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT chat_message_id,id FROM ai_drafts
-         WHERE user_id=? AND recipe_id=? AND chat_message_id IS NOT NULL AND expires_at >= ?
-         ORDER BY created_at, rowid",
-    )
-    .bind(user_id)
-    .bind(recipe_id)
-    .bind(Utc::now().to_rfc3339())
-    .fetch_all(db)
-    .await?;
-    // Later rows win, so an altered draft replaces the one it came from.
-    Ok(rows.into_iter().collect())
-}
-
-/// Links a freshly made draft to the chat answer that asked for it, unless
-/// the chat was cleared while the draft was made.
-pub(crate) async fn link_draft_to_chat(
-    db: &SqlitePool,
-    draft_id: &str,
     answer_id: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE ai_drafts SET chat_message_id=?1
-         WHERE id=?2 AND EXISTS(SELECT 1 FROM recipe_chat_messages WHERE id=?1)",
-    )
-    .bind(answer_id)
-    .bind(draft_id)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Carries a draft's chat link onto the draft that alters it, so saving the
-/// end of the chain still marks the chat.
-pub(crate) async fn carry_draft_chat(db: &SqlitePool, from: &str, to: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE ai_drafts SET chat_message_id=(SELECT chat_message_id FROM ai_drafts WHERE id=?1)
-         WHERE id=?2 AND EXISTS(SELECT 1 FROM ai_drafts WHERE id=?1 AND chat_message_id IS NOT NULL)",
-    )
-    .bind(from)
-    .bind(to)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// The recipe and chat answer a user's draft was made for, if it came from a chat.
-pub(crate) async fn draft_chat(
-    db: &SqlitePool,
-    user_id: &str,
-    draft_id: &str,
-) -> Result<Option<(String, String)>> {
-    Ok(sqlx::query_as(
-        "SELECT recipe_id,chat_message_id FROM ai_drafts
-         WHERE id=? AND user_id=? AND recipe_id IS NOT NULL AND chat_message_id IS NOT NULL",
-    )
-    .bind(draft_id)
-    .bind(user_id)
-    .fetch_optional(db)
-    .await?)
-}
-
-/// Marks a chat change as discarded once no draft of it is left.
-pub(crate) async fn discard_chat_change(
-    db: &SqlitePool,
-    user_id: &str,
-    answer_id: &str,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    Ok(sqlx::query(
         "UPDATE recipe_chat_messages SET change_state='discarded'
-         WHERE id=?1 AND user_id=?2 AND change_state='ready'
-           AND NOT EXISTS(SELECT 1 FROM ai_drafts WHERE chat_message_id=?1)",
-    )
-    .bind(answer_id)
-    .bind(user_id)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Records, inside `apply_draft`'s transaction, that a change from the chat
-/// was saved: a divider row at this point in the thread, labelled with the
-/// model's name for the change (or a summary of what differs from `before`),
-/// and the answer marked applied. The other drafts of the same change go.
-/// Returns the label, or None when the chat was cleared meanwhile.
-pub(crate) async fn record_chat_change(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    user_id: &str,
-    recipe_id: &str,
-    answer_id: &str,
-    draft_id: &str,
-    before: &RecipeSnapshot,
-) -> Result<Option<String>> {
-    let model_label: Option<String> = sqlx::query_scalar(
-        "SELECT change_label FROM recipe_chat_messages
-         WHERE id=? AND user_id=? AND recipe_id=? AND role='assistant'",
+         WHERE id=? AND user_id=? AND recipe_id=? AND change_state='ready'",
     )
     .bind(answer_id)
     .bind(user_id)
     .bind(recipe_id)
-    .fetch_optional(&mut **tx)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
+/// Moves a section's rows to negative positions, keeping their order, so
+/// they can be renumbered without tripping `UNIQUE(recipe_id, section,
+/// position)`.
+async fn park_section(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    recipe_id: &str,
+    section: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE recipe_blocks SET position=-1-position WHERE recipe_id=? AND section=?")
+        .bind(recipe_id)
+        .bind(section)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// What accepting a proposal did.
+pub(crate) enum AcceptOutcome {
+    /// Saved, with its divider and version.
+    Applied,
+    /// The recipe changed after the chat read it, so the proposal no longer
+    /// describes it.
+    Stale,
+    /// The proposal was decided (or cleared) meanwhile.
+    Gone,
+}
+
+/// Applies an accepted proposal in one transaction: the details, then each
+/// ingredient and step. An item the proposal kept (`from`) keeps its stored
+/// row, and with it its step moments; removed items are deleted and new ones
+/// inserted. Refuses (Stale) when the recipe changed since the chat read it.
+/// The chat's thread gets its divider and the history a `Chat: <label>`
+/// version; a changed ingredient list or method drops the AI chart like any
+/// other block edit.
+pub(crate) async fn accept_chat_proposal(
+    db: &SqlitePool,
+    user_id: &str,
+    recipe_id: &str,
+    answer_id: &str,
+) -> Result<AcceptOutcome> {
+    let mut tx = db.begin().await?;
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT change_label,proposal_json,proposal_base FROM recipe_chat_messages
+         WHERE id=? AND user_id=? AND recipe_id=? AND role='assistant'
+           AND change_state='ready' AND proposal_json<>''",
+    )
+    .bind(answer_id)
+    .bind(user_id)
+    .bind(recipe_id)
+    .fetch_optional(&mut *tx)
     .await?;
-    let Some(model_label) = model_label else {
-        return Ok(None);
+    let Some((model_label, json, base)) = row else {
+        return Ok(AcceptOutcome::Gone);
     };
-    let after = recipe_snapshot(tx, user_id, recipe_id).await?;
-    let label = crate::chat::divider_label(&model_label, before, &after);
+    let ChatProposal { before, after } = serde_json::from_str(&json)
+        .map_err(|error| AppError::Internal(format!("Could not read a chat proposal: {error}")))?;
+    let recipe = find_recipe_tx(&mut tx, user_id, recipe_id).await?;
+    let (ingredients, steps): (Vec<Block>, Vec<Block>) = blocks(&mut *tx, recipe_id)
+        .await?
+        .into_iter()
+        .partition(|block| block.section == "ingredient");
+    if recipe.updated_at != base
+        || ingredients.len() != before.ingredients.len()
+        || steps.len() != before.steps.len()
+    {
+        return Ok(AcceptOutcome::Stale);
+    }
+    ensure_recipe_history(&mut tx, user_id, recipe_id).await?;
+    sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE user_id=? AND id=?")
+        .bind(after.title.trim())
+        .bind(after.description.trim())
+        .bind(after.servings)
+        .bind(after.prep_minutes)
+        .bind(after.cook_minutes)
+        .bind(stamp())
+        .bind(user_id)
+        .bind(recipe_id)
+        .execute(&mut *tx)
+        .await?;
+    // Ingredients: keep, update, and reorder the rows the proposal kept.
+    let kept: HashSet<usize> = after
+        .ingredients
+        .iter()
+        .filter_map(|item| item.from)
+        .collect();
+    for (index, block) in ingredients.iter().enumerate() {
+        if !kept.contains(&index) {
+            sqlx::query("DELETE FROM recipe_blocks WHERE id=?")
+                .bind(&block.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    // Positions are unique per section, so the kept rows step aside (to
+    // negative positions) before any takes its new place.
+    park_section(&mut tx, recipe_id, "ingredient").await?;
+    let mut placed = HashSet::new();
+    for (position, item) in after.ingredients.iter().enumerate() {
+        let existing = item
+            .from
+            .filter(|from| placed.insert(*from))
+            .and_then(|from| ingredients.get(from));
+        match existing {
+            Some(block) => {
+                sqlx::query("UPDATE recipe_blocks SET position=?,text=?,quantity=?,unit=?,optional=? WHERE id=?")
+                    .bind(position as i64)
+                    .bind(item.name.trim())
+                    .bind(item.quantity.trim())
+                    .bind(item.unit.trim())
+                    .bind(item.optional)
+                    .bind(&block.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit,optional) VALUES(?,?,'ingredient',?,?,?,?,?)")
+                    .bind(Uuid::new_v4().to_string())
+                    .bind(recipe_id)
+                    .bind(position as i64)
+                    .bind(item.name.trim())
+                    .bind(item.quantity.trim())
+                    .bind(item.unit.trim())
+                    .bind(item.optional)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+    }
+    // Steps the same way, with their ingredient lines.
+    let kept: HashSet<usize> = after.steps.iter().filter_map(|item| item.from).collect();
+    for (index, block) in steps.iter().enumerate() {
+        if !kept.contains(&index) {
+            sqlx::query("DELETE FROM recipe_blocks WHERE id=?")
+                .bind(&block.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    // Positions are unique per section, so the kept rows step aside (to
+    // negative positions) before any takes its new place.
+    park_section(&mut tx, recipe_id, "step").await?;
+    let mut placed = HashSet::new();
+    for (position, item) in after.steps.iter().enumerate() {
+        let existing = item
+            .from
+            .filter(|from| placed.insert(*from))
+            .and_then(|from| steps.get(from));
+        let step_id = match existing {
+            Some(block) => {
+                sqlx::query("UPDATE recipe_blocks SET position=?,text=? WHERE id=?")
+                    .bind(position as i64)
+                    .bind(item.text.trim())
+                    .bind(&block.id)
+                    .execute(&mut *tx)
+                    .await?;
+                block.id.clone()
+            }
+            None => {
+                let step_id = Uuid::new_v4().to_string();
+                sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES(?,?,'step',?,?)")
+                    .bind(&step_id)
+                    .bind(recipe_id)
+                    .bind(position as i64)
+                    .bind(item.text.trim())
+                    .execute(&mut *tx)
+                    .await?;
+                step_id
+            }
+        };
+        replace_step_ingredients(&mut tx, &step_id, &item.ingredients.join("\n")).await?;
+    }
+    let proposed = after.snapshot();
+    if before.ingredients != proposed.ingredients || before.steps != proposed.steps {
+        invalidate_chart(&mut tx, recipe_id).await?;
+    }
+    let saved = recipe_snapshot(&mut tx, user_id, recipe_id).await?;
+    let label = crate::chat::divider_label(&model_label, &before, &saved);
     sqlx::query("INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,content,created_at)VALUES(?,?,?,'change',?,?)")
         .bind(Uuid::new_v4().to_string())
         .bind(user_id)
         .bind(recipe_id)
         .bind(&label)
         .bind(stamp())
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE recipe_chat_messages SET change_state='applied' WHERE id=?")
         .bind(answer_id)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "DELETE FROM draft_thumbnails WHERE draft_id IN
-           (SELECT id FROM ai_drafts WHERE chat_message_id=? AND user_id=? AND id<>?)",
-    )
-    .bind(answer_id)
-    .bind(user_id)
-    .bind(draft_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query("DELETE FROM ai_drafts WHERE chat_message_id=? AND user_id=? AND id<>?")
-        .bind(answer_id)
-        .bind(user_id)
-        .bind(draft_id)
-        .execute(&mut **tx)
-        .await?;
-    Ok(Some(label))
+    record_version(&mut tx, user_id, recipe_id, &format!("Chat: {label}")).await?;
+    tx.commit().await?;
+    Ok(AcceptOutcome::Applied)
 }
 
 /// One note on a recipe, without its photo bytes.
