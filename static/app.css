@@ -128,51 +128,28 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
 .brand-mark-well { stroke: var(--cobalt); stroke-width: 1.4; opacity: .45; }
 .brand-mark-chip { fill: var(--chip-black); }
 
-/* Header: a white enamel notch hanging from the top of the window, like
-   a laptop's camera notch: square where it meets the edge, rounded below,
-   and flared into the edge by two concave corners. The bar itself is a
-   transparent sticky strip that lets clicks through around it. */
+/* Header: a white enamel bar floating just below the top of the window,
+   rimmed in cobalt on a darker lip. The bar itself is a transparent sticky
+   strip that lets clicks through around it. */
 .utility-bar {
   position: sticky;
   top: 0;
   z-index: 10;
-  padding: 0 32px;
+  padding: 10px 32px 0;
   pointer-events: none;
 }
 .utility-inner {
-  --notch-rim: var(--cobalt);
-  --notch-flare: 18px;
-  --notch-line: 2.5px;
-  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  width: min(calc(100% - 2 * var(--notch-flare) - 24px), 1024px);
+  width: min(100%, 1024px);
   margin: 0 auto;
-  padding: 8px 7px 6px 18px;
-  border: var(--notch-line) solid var(--notch-rim);
-  border-top: 0;
-  border-radius: 0 0 30px 30px;
+  padding: 6px 7px 6px 18px;
+  border-radius: 28px;
   background: var(--card);
-  box-shadow: 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
+  box-shadow: inset 0 0 0 2.5px var(--cobalt), 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
   pointer-events: auto;
-}
-.utility-inner::before,
-.utility-inner::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  width: var(--notch-flare);
-  height: var(--notch-flare);
-}
-.utility-inner::before {
-  right: calc(100% + var(--notch-line));
-  background: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) var(--notch-flare), var(--card) var(--notch-flare));
-}
-.utility-inner::after {
-  left: calc(100% + var(--notch-line));
-  background: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) var(--notch-flare), var(--card) var(--notch-flare));
 }
 .brand {
   display: inline-flex;
@@ -722,6 +699,55 @@ label > input[type=checkbox] { margin-right: 8px; }
 .page-header-copy { flex: 1 1 380px; min-width: 0; }
 .page-header h1 { margin: 0; font-size: 2.7rem; overflow-wrap: anywhere; }
 .page-header .deck { max-width: 38em; margin-top: 14px; font-size: 18px; }
+.plate-disc {
+  position: relative;
+  display: block;
+  padding: 3px;
+  border: 9px solid var(--cobalt);
+  border-radius: 50%;
+  background: #ffffff;
+}
+.plate-well {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 38%, #ffffff 0, var(--card) 45%, #e9edf3 100%);
+  box-shadow: inset 0 -6px 14px rgba(20, 44, 120, .08), inset 0 0 0 1px rgba(20, 44, 120, .08);
+}
+.plate-initial {
+  color: var(--cobalt);
+  font: 800 64px/1 var(--display);
+  font-variation-settings: "opsz" 96;
+  text-transform: uppercase;
+}
+.plate-photo {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 50% 50%;
+  border-radius: 50%;
+}
+/* A chip knocked out of the rim, at a point on the rim given as fractions
+   of the plate's padding box. */
+.plate-disc::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  width: 10px;
+  height: 7px;
+  border-radius: 60% 40% 55% 45%;
+  background: var(--chip-black);
+  pointer-events: none;
+}
 .hero-plate { position: relative; flex: none; width: 240px; height: 240px; }
 .hero-plate .plate-disc {
   width: 240px;
@@ -1277,7 +1303,7 @@ body.auth-popup-open { overflow: hidden; }
 
 @media (max-width: 760px) {
   .utility-bar { padding: 0 16px; }
-  .utility-inner { --notch-flare: 14px; padding-left: 16px; }
+  .utility-inner { padding-left: 16px; }
   .top-nav a { padding: 0 12px; font-size: 14px; }
   .app-shell { padding: 0 16px; }
   .paper { padding: 22px 0 56px; }
