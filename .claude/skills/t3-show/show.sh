@@ -19,7 +19,7 @@ set -euo pipefail
 
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
-STATE=target/.show-state
+STATE=$(git rev-parse --git-dir)/t3-show-state
 NODE_IMAGE=node:22.23.4-bookworm-slim
 HEALTH=http://localhost:3000/healthz
 

@@ -48,7 +48,10 @@ when needed.
    `runtime: 'server'` can be driven from here. A tab in the user's local
    desktop app cannot; never pass its `tabId` to a `preview_*` tool.
 2. No usable server tab: `mcp__t3-code__preview_open` with no `url`
-   (`open: true`), then go on with its returned `tabId`.
+   (`open: true`), then go on with its returned `tabId`. If it fails because
+   AppArmor blocks T3's browser sandbox, stop and ask the user to run
+   `sudo env "PATH=$PATH" t3 browser setup` once on minibuntu; never run sudo
+   yourself. Give them the URL meanwhile.
 3. `mcp__t3-code__preview_navigate` with
    `target: {kind: "environment-port", port: 3000, path: "/<path>"}` and the
    `tabId`. The environment port reaches the app on this machine wherever the
