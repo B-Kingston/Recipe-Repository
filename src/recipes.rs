@@ -127,14 +127,31 @@ impl LibraryCard {
     /// Prep plus cook time, such as "35 min" or "1 h 10 min"; empty when
     /// neither is set.
     pub(crate) fn total_time(&self) -> String {
-        let minutes = self.prep_minutes.unwrap_or(0).max(0) + self.cook_minutes.unwrap_or(0).max(0);
-        match (minutes / 60, minutes % 60) {
-            (0, 0) => String::new(),
-            (0, rest) => format!("{rest} min"),
-            (hours, 0) => format!("{hours} h"),
-            (hours, rest) => format!("{hours} h {rest} min"),
-        }
+        total_time(self.prep_minutes, self.cook_minutes)
     }
+}
+
+/// Prep plus cook time, such as "35 min" or "1 h 10 min"; empty when
+/// neither is set.
+pub(crate) fn total_time(prep_minutes: Option<i64>, cook_minutes: Option<i64>) -> String {
+    let minutes = prep_minutes.unwrap_or(0).max(0) + cook_minutes.unwrap_or(0).max(0);
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => String::new(),
+        (0, rest) => format!("{rest} min"),
+        (hours, 0) => format!("{hours} h"),
+        (hours, rest) => format!("{hours} h {rest} min"),
+    }
+}
+
+/// The letter the recipe page's plate shows when the recipe has no dish
+/// photo (and in e-ink mode, which leaves photos out): the title's first letter or digit,
+/// upper-cased, or empty when it has neither.
+pub(crate) fn plate_initial(title: &str) -> String {
+    title
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default()
 }
 
 /// The letter a title is filed under: its first letter, upper-cased, or '#'

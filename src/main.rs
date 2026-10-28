@@ -503,6 +503,40 @@ struct RecipeTemplate {
     /// The cook's notes on the recipe.
     notes: notes::NotesPanel,
 }
+/// Titles up to this many characters run around the top of the recipe
+/// page's plate rim; longer ones would not fit and leave it plain.
+const RIM_TITLE_MAX: usize = 26;
+
+impl RecipeTemplate {
+    /// The letter in the plate's well when there is no dish photo.
+    fn plate_initial(&self) -> String {
+        recipes::plate_initial(&self.recipe.title)
+    }
+
+    /// The title as printed around the top of the plate rim, or empty when
+    /// it is too long to fit.
+    fn rim_title(&self) -> String {
+        let title = self.recipe.title.trim();
+        if title.chars().count() > RIM_TITLE_MAX {
+            return String::new();
+        }
+        title.to_uppercase()
+    }
+
+    /// Servings and total time, as printed around the bottom of the rim,
+    /// e.g. "SERVES 4  ★  35 MIN".
+    fn rim_facts(&self) -> String {
+        let mut facts = Vec::new();
+        if let Some(servings) = self.recipe.servings.filter(|servings| *servings > 0) {
+            facts.push(format!("SERVES {servings}"));
+        }
+        let time = recipes::total_time(self.recipe.prep_minutes, self.recipe.cook_minutes);
+        if !time.is_empty() {
+            facts.push(time.to_uppercase());
+        }
+        facts.join("  \u{2605}  ")
+    }
+}
 #[derive(Template)]
 #[template(path = "error.html")]
 struct ErrorTemplate {

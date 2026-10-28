@@ -3,11 +3,31 @@
 {% include "version_tabs.html" %}
 <article class="recipe-sheet">
 <header class="page-header">
+  {# The dish on a big plate: the photo fills the well (the initial shows
+     without one, and in e-ink mode), and the rim carries the title, when it
+     is short enough to fit, and the servings and time. #}
+  <div class="hero-plate">
+    <div class="plate-disc">
+      <div class="plate-well">
+        <span class="plate-initial" aria-hidden="true">{{ plate_initial() }}</span>
+        {% if has_photo %}<img class="plate-photo" src="/recipes/{{ recipe.id }}/thumbnail" alt="Dish photo">{% endif %}
+      </div>
+    </div>
+    {% if rim_title() != "" || rim_facts() != "" %}
+    <svg class="plate-rim-text" viewBox="0 0 240 240" aria-hidden="true" focusable="false">
+      <defs>
+        <path id="rim-top" d="M 21,120 A 99,99 0 0 1 219,120"/>
+        <path id="rim-bottom" d="M 8,120 A 112,112 0 0 0 232,120"/>
+      </defs>
+      {% if rim_title() != "" %}<text font-size="13.5"><textPath href="#rim-top" xlink:href="#rim-top" startOffset="50%" text-anchor="middle">{{ rim_title() }}</textPath></text>{% endif %}
+      {% if rim_facts() != "" %}<text class="rim-facts" font-size="11"><textPath href="#rim-bottom" xlink:href="#rim-bottom" startOffset="50%" text-anchor="middle">{{ rim_facts() }}</textPath></text>{% endif %}
+    </svg>
+    {% endif %}
+  </div>
   <div class="page-header-copy">
     <h1>{{ recipe.title }}</h1>
     {% if recipe.description != "" %}<p class="deck">{{ recipe.description }}</p>{% endif %}
   </div>
-  {% if has_photo %}<img class="hero-photo" src="/recipes/{{ recipe.id }}/thumbnail" alt="Dish photo">{% endif %}
 </header>
 <div class="card-rule" aria-hidden="true"></div>
 <div class="recipe-facts">
@@ -110,7 +130,7 @@
   <li class="step-group">
     <article class="block step-block">
       <a class="block-link" data-edit-block="{{ step.block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}#edit-{{ step.block.id }}">
-        <span class="block-index">{{ step.block.position + 1 }}.</span><span class="block-text">{{ step.block.text }}</span>
+        <span class="block-index">{{ step.block.position + 1 }}</span><span class="block-text">{{ step.block.text }}</span>
       </a>
       <form id="edit-{{ step.block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}" hx-swap="innerHTML show:none" {% if !step.block.editing %}hidden{% endif %}>
         <label>Step<textarea name="text" required>{{ step.block.text }}</textarea></label>

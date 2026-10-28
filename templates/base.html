@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#eceef0">
+  <meta name="theme-color" content="#e6eaef">
   <title>{% block title %}Recipe Repository{% endblock %}</title>
   {# htmx swaps whole pages in place (hx-boost on the body). Snapshots of
      pages are never kept in localStorage: another account may use this
@@ -19,8 +19,9 @@
 <body hx-boost="true" hx-indicator="body">
   <header class="utility-bar">
     <div class="utility-inner">
+      <span class="utility-glass" aria-hidden="true"></span>
       <a class="brand" href="/" aria-label="Recipe Repository home">
-        <svg class="brand-mark" width="28" height="22" viewBox="0 0 28 22" aria-hidden="true" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg>
+        <svg class="brand-mark" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true" focusable="false"><circle class="brand-mark-rim" cx="15" cy="15" r="12.5"/><circle class="brand-mark-well" cx="15" cy="15" r="7"/><path class="brand-mark-chip" d="M22.3 5.3c1.2-.9 2.9-.6 3.4.5-.6 1.1-2.3 1.6-3.5.9z"/></svg>
         <span class="brand-text">Recipe Repository</span>
       </a>
       <div class="utility-end">
@@ -37,13 +38,13 @@
             <span class="visually-hidden">Account: {{ menu.username }}</span>
           </summary>
           <div class="account-panel">
-            <div class="ticket-paper account-ticket">
-              <div class="ticket-bars">
-                <p class="ticket-bar ticket-head"><span class="account-name">{{ menu.username }}</span></p>
-                <p class="ticket-bar">Signed in</p>
+            <div class="account-card">
+              <div class="account-head">
+                <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
+                <p><span class="account-name">{{ menu.username }}</span><span class="account-state">Signed in</span></p>
               </div>
               {% if !menu.others.is_empty() %}
-              <p class="ticket-label">Switch account:</p>
+              <p class="account-label">Switch account</p>
               <ul class="account-list">
                 {% for account in menu.others %}
                 <li>

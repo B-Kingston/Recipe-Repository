@@ -1,6 +1,6 @@
 {% extends "base.html" %}{% block title %}Recipes · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
 <section id="all-recipes">
-  <div class="section-heading search-heading">
+  <div class="library-sign">
     <div id="search-title">
       {% if results %}
       <p class="eyebrow">Search</p>
@@ -18,7 +18,7 @@
     <form class="search-form" method="get" action="/" role="search" data-live-search hx-get="/" hx-trigger="submit" hx-target="#search-results" hx-select="#search-results" hx-select-oob="#search-title" hx-swap="outerHTML show:none" hx-replace-url="true" hx-sync="this:replace">
       <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
       <label class="visually-hidden" for="search-q">Search recipes</label>
-      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search the rail" hx-get="/" hx-trigger="input changed delay:350ms" hx-sync="closest form:replace">
+      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search by dish or ingredient" hx-get="/" hx-trigger="input changed delay:350ms" hx-sync="closest form:replace">
       <button class="primary" type="submit">Search</button>
     </form>
   </div>
@@ -29,23 +29,22 @@
 
   {% if recipes.len() == 0 && results %}
   <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
-    <h2>No tickets match.</h2>
-    <p>Nothing on your rail is close to “{{ query }}”. Try different words.</p>
+    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 30 30" focusable="false"><circle class="brand-mark-rim" cx="15" cy="15" r="12.5"/><circle class="brand-mark-well" cx="15" cy="15" r="7"/><path class="brand-mark-chip" d="M22.3 5.3c1.2-.9 2.9-.6 3.4.5-.6 1.1-2.3 1.6-3.5.9z"/></svg></span>
+    <h2>No dishes match.</h2>
+    <p>Nothing in your library is close to “{{ query }}”. Try different words.</p>
   </div>
   {% endif %}
   {% if recipes.len() == 0 && !results %}
   <div class="empty-state">
-    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 28 22" focusable="false"><rect x="1" y="1" width="26" height="20" rx="3"/><path class="brand-mark-rule" d="M4 6.5h20"/><path class="brand-mark-lines" d="M4 11h20M4 15.5h14"/></svg></span>
-    <h2>The rail is empty.</h2>
+    <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 30 30" focusable="false"><circle class="brand-mark-rim" cx="15" cy="15" r="12.5"/><circle class="brand-mark-well" cx="15" cy="15" r="7"/><path class="brand-mark-chip" d="M22.3 5.3c1.2-.9 2.9-.6 3.4.5-.6 1.1-2.3 1.6-3.5.9z"/></svg></span>
+    <h2>No recipes yet.</h2>
     <p>Describe a dish, mention a recipe you love, or paste a link to research.</p>
     <div class="actions centered"><a class="button primary" href="/recipes/new">Add recipe</a></div>
   </div>
   {% endif %}
 
-  {# One rail across the top; app.css pins every later row to the wall. #}
-  <div class="ticket-rail">
-  {% if recipes.len() > 0 %}<div class="rail" aria-hidden="true"></div>{% endif %}
+  {# Every recipe is an order ticket pinned to the wall on its own pushpin. #}
+  <div class="ticket-board">
   {% for recipe in recipes %}
     <article class="ticket">
       <div class="ticket-paper">

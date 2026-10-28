@@ -31,11 +31,13 @@
     <form class="add-form" method="post" action="/recipes/{{ notes.recipe_id }}/notes" enctype="multipart/form-data" hx-boost="false" data-busy-label="Saving…">
       <input type="hidden" name="back" value="{{ notes.back }}">
       <label>Note<textarea class="compact-textarea" name="body" maxlength="4000" placeholder="e.g. Too salty with a whole stock cube. Use half next time."></textarea></label>
-      <label>Photo <span class="field-help">(optional)</span><input type="file" name="photo" accept="image/*"></label>
-      {% match notes.fixed_version %}
-      {% when Some with (version) %}<input type="hidden" name="about" value="{{ version }}">
-      {% when None %}<label>About<select name="about">{% for choice in notes.choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></label>
-      {% endmatch %}
+      <div class="field-pair">
+        <label>Photo <span class="field-help">(optional)</span><input type="file" name="photo" accept="image/*"></label>
+        {% match notes.fixed_version %}
+        {% when Some with (version) %}<input type="hidden" name="about" value="{{ version }}">
+        {% when None %}<label>About<select name="about">{% for choice in notes.choices %}<option value="{{ choice.value }}"{% if choice.selected %} selected{% endif %}>{{ choice.label }}</option>{% endfor %}</select></label>
+        {% endmatch %}
+      </div>
       <p class="actions"><button class="primary">Add note</button></p>
     </form>
   </details>

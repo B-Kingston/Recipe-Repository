@@ -56,7 +56,7 @@
     <ol class="step-list">
     {% for step in recipe.steps %}
     <li class="step-group">
-      <div class="block step-block"><span class="block-index">{{ loop.index }}.</span><span class="block-text">{{ step.text }}</span></div>
+      <div class="block step-block"><span class="block-index">{{ loop.index }}</span><span class="block-text">{{ step.text }}</span></div>
       {% if step.ingredients.len() > 0 %}
       <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}"><span class="step-ingredients-label">Add</span>{% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}</div>
       {% endif %}

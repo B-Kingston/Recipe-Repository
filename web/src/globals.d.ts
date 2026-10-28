@@ -21,8 +21,7 @@ interface HtmxDetail {
 
 type HtmxEvent = CustomEvent<HtmxDetail>;
 
-/** One remembered curl filter per library ticket (see library.ts). */
+/** Features already set up on an element (see dom.ts firstTime). */
 interface HTMLElement {
-  recipeCurl?: Recipes.TicketCurl;
   recipeReady?: { [feature: string]: boolean };
 }
