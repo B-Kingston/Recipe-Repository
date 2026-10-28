@@ -7,7 +7,7 @@
       <h1>Results for “{{ query }}”</h1>
       {% else %}
       <h1>Recipes</h1>
-      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} dish{% if recipes.len() != 1 %}es{% endif %}, filed A to Z</p>{% endif %}
+      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} ticket{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
       {% endif %}
     </div>
     {# Searches as you type: a pause of 350 ms (or Enter) fetches the library
@@ -43,35 +43,36 @@
   </div>
   {% endif %}
 
-  {% if recipes.len() > 0 %}
-  {# Every recipe on its own plate. The dish photo is cropped to the well;
-     the initial underneath shows when there is no photo, or when e-ink mode
-     leaves photos out. The title link covers the whole plate. #}
-  <div class="plate-rack">
+  {# Every recipe is an order ticket pinned to the wall on its own pushpin. #}
+  <div class="ticket-board">
   {% for recipe in recipes %}
-    <article class="plate">
-      <div class="plate-disc" aria-hidden="true">
-        <div class="plate-well">
-          <span class="plate-initial">{{ recipe.initial() }}</span>
-          {% if recipe.has_thumbnail %}<img class="plate-photo" src="/recipes/{{ recipe.id }}/thumbnail" alt="" loading="lazy">{% endif %}
+    <article class="ticket">
+      <div class="ticket-paper">
+        <div class="ticket-bars">
+          <h2 class="ticket-bar ticket-head"><a class="ticket-link" href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a>{% if recipe.has_thumbnail %}<button type="button" class="ticket-thumb-toggle" data-ticket-photo aria-expanded="false" aria-label="Show dish photo"><img class="ticket-thumb" src="/recipes/{{ recipe.id }}/thumbnail" alt=""></button>{% endif %}</h2>
+          {% if recipe.total_time() != "" %}<p class="ticket-bar">Ready in {{ recipe.total_time() }}</p>{% endif %}
+          {% if recipe.serves() != "" %}<p class="ticket-bar">{{ recipe.serves() }}</p>{% endif %}
         </div>
+        {% if recipe.has_thumbnail %}<img class="ticket-photo" src="/recipes/{{ recipe.id }}/thumbnail" alt="" data-ticket-photo>{% endif %}
+        {% if recipe.description != "" %}
+        <div class="ticket-note">
+          <svg class="ticket-note-icon" viewBox="0 0 18 18" aria-hidden="true" focusable="false"><circle cx="9" cy="9" r="9"/><path d="M9 4.6v5.4"/><circle class="ticket-note-dot" cx="9" cy="13.3" r="1.3"/></svg>
+          <p>{{ recipe.description }}</p>
+        </div>
+        {% endif %}
+        {% if !recipe.ingredients.is_empty() %}
+        <p class="ticket-label">Ingredients:</p>
+        <ul class="ticket-items{% if recipe.packed() %} is-packed{% endif %}">
+          {% for item in recipe.ingredients %}
+          <li><b class="ticket-qty">{{ item.quantity }}{% if item.unit != "" %} {{ item.unit }}{% endif %}</b> <span class="ticket-item">{{ item.text }}{% if item.optional != 0 %} <em>(optional)</em>{% endif %}</span></li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+        {% if recipe.added != "" %}<p class="ticket-added"><time datetime="{{ recipe.created_at }}">{{ recipe.added }}</time></p>{% endif %}
       </div>
-      <h2 class="plate-title"><a class="plate-link" href="/recipes/{{ recipe.id }}">{{ recipe.title }}</a></h2>
-      {% if recipe.total_time() != "" || recipe.serves() != "" %}
-      <ul class="badges">
-        {% if recipe.total_time() != "" %}<li class="badge"><span class="visually-hidden">Ready in </span>{{ recipe.total_time() }}</li>{% endif %}
-        {% if recipe.serves() != "" %}<li class="badge is-outline">{{ recipe.serves() }}</li>{% endif %}
-      </ul>
-      {% endif %}
-      {% if recipe.description != "" %}<p class="plate-description">{{ recipe.description }}</p>{% endif %}
-      {% if !recipe.ingredients.is_empty() %}
-      <p class="plate-ingredients"><span class="visually-hidden">Ingredients: </span>{% for item in recipe.ingredients %}{{ item.text }}{% if item.optional != 0 %} <em>(optional)</em>{% endif %}{% if !loop.last %}, {% endif %}{% endfor %}</p>
-      {% endif %}
-      {% if recipe.added != "" %}<p class="plate-added">Added <time datetime="{{ recipe.created_at }}">{{ recipe.added }}</time></p>{% endif %}
     </article>
   {% endfor %}
   </div>
-  {% endif %}
   </div>
 </section>
 {% endblock %}

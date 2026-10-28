@@ -1,8 +1,9 @@
-/* Enamelware: the kitchen is speckled camp enamel. Every recipe is served on
-   a cobalt-rimmed plate (its dish photo fills the well, or its initial does),
+/* Enamelware: the kitchen is speckled camp enamel. The library pins every
+   recipe to the wall as an order ticket, the recipe page serves it on a
+   cobalt-rimmed plate (its dish photo fills the well, or its initial does),
    headings hang on an enamel sign held up with rivets, and panels are white
    enamel trays with a cobalt rim and a darker lip. Bricolage Grotesque
-   carries the headings and plates; Atkinson Hyperlegible carries everything
+   carries the headings, plates, and ticket titles; Atkinson Hyperlegible carries everything
    read while cooking. The palette lives in custom properties so e-ink mode
    (static/eink.css, loaded through /display.css) can swap it for pure black
    on white. */
@@ -127,28 +128,51 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
 .brand-mark-well { stroke: var(--cobalt); stroke-width: 1.4; opacity: .45; }
 .brand-mark-chip { fill: var(--chip-black); }
 
-/* Header: a white enamel strip with a cobalt rim, floating over the
-   counter. The bar itself is a transparent sticky strip that lets clicks
-   through around it. */
+/* Header: a white enamel notch hanging from the top of the window, like
+   a laptop's camera notch: square where it meets the edge, rounded below,
+   and flared into the edge by two concave corners. The bar itself is a
+   transparent sticky strip that lets clicks through around it. */
 .utility-bar {
   position: sticky;
   top: 0;
   z-index: 10;
-  padding: 14px 32px 0;
+  padding: 0 32px;
   pointer-events: none;
 }
 .utility-inner {
+  --notch-rim: var(--cobalt);
+  --notch-flare: 18px;
+  --notch-line: 2.5px;
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  width: min(100%, 1096px);
+  width: min(calc(100% - 2 * var(--notch-flare) - 24px), 1024px);
   margin: 0 auto;
-  padding: 6px 7px 6px 18px;
-  border-radius: 999px;
+  padding: 8px 7px 6px 18px;
+  border: var(--notch-line) solid var(--notch-rim);
+  border-top: 0;
+  border-radius: 0 0 30px 30px;
   background: var(--card);
-  box-shadow: inset 0 0 0 2.5px var(--cobalt), 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
+  box-shadow: 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
   pointer-events: auto;
+}
+.utility-inner::before,
+.utility-inner::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: var(--notch-flare);
+  height: var(--notch-flare);
+}
+.utility-inner::before {
+  right: calc(100% + var(--notch-line));
+  background: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) var(--notch-flare), var(--card) var(--notch-flare));
+}
+.utility-inner::after {
+  left: calc(100% + var(--notch-line));
+  background: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) calc(var(--notch-flare) - var(--notch-line)), var(--notch-rim) var(--notch-flare), var(--card) var(--notch-flare));
 }
 .brand {
   display: inline-flex;
@@ -353,7 +377,39 @@ input[type=checkbox], input[type=radio] {
   box-shadow: none;
   vertical-align: -3px;
 }
-input[type=file] { padding: .5rem; }
+/* File inputs: the picker button is a small cobalt-rimmed pill inside the
+   field, like the other buttons. The two pseudo-elements stay in separate
+   rules, since a browser that knows only one drops a combined rule. */
+input[type=file] { padding: 6px 8px; color: var(--muted); font-size: 15px; cursor: pointer; }
+input[type=file]::-webkit-file-upload-button {
+  min-height: 34px;
+  margin-right: 12px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--cobalt-wash);
+  box-shadow: inset 0 0 0 2px var(--cobalt);
+  color: var(--cobalt-deep);
+  cursor: pointer;
+  font: 700 14px/1.2 var(--sans);
+}
+input[type=file]::file-selector-button {
+  min-height: 34px;
+  margin-right: 12px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--cobalt-wash);
+  box-shadow: inset 0 0 0 2px var(--cobalt);
+  color: var(--cobalt-deep);
+  cursor: pointer;
+  font: 700 14px/1.2 var(--sans);
+}
+input[type=file]:hover::-webkit-file-upload-button { background: var(--cobalt-pale); }
+input[type=file]:hover::file-selector-button { background: var(--cobalt-pale); }
+/* Two short fields on one row, stacking when the form is narrow. */
+.field-pair { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 16px; }
+.field-pair > label { flex: 1 1 240px; min-width: 0; }
 fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 legend { padding: 0; }
 .inline input { display: inline-block; width: 7rem; }
@@ -412,7 +468,7 @@ label > input[type=checkbox] { margin-right: 8px; }
 .developer-tools summary { cursor: pointer; font: 700 1.3rem/1.2 var(--display); }
 .developer-tools[open] summary { margin-bottom: .6rem; }
 
-/* Library: an enamel sign, then the plate rack. */
+/* Library: an enamel sign, then the pinned tickets. */
 .section-heading {
   display: flex;
   flex-wrap: wrap;
@@ -462,117 +518,148 @@ label > input[type=checkbox] { margin-right: 8px; }
 .search-form input::placeholder { color: var(--muted); }
 .search-form button { flex: none; min-height: 42px; }
 
-/* The plate rack: every recipe on its own enamel plate. The dish photo
-   fills the well (cropped to the circle); without one the well shows the
-   title's initial, which also stands in when e-ink mode hides photos. */
-.plate-rack {
+/* The board: recipes hang as kitchen order tickets, each pinned to the wall
+   with a pushpin (::before) and swinging from it, to the other side on
+   hover. */
+.ticket-board {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
-  gap: 40px 28px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 40px 32px;
   margin-top: 44px;
 }
-.plate {
-  position: relative;
-  padding: 8px 8px 16px;
-  border-radius: 26px;
-  text-align: center;
+@media (min-width: 600px) {
+  .ticket-board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
-.plate:focus-within { box-shadow: 0 0 0 3px var(--red); }
-.plate-disc {
-  position: relative;
-  display: block;
-  width: 176px;
-  height: 176px;
-  margin: 0 auto 16px;
-  padding: 3px;
-  border: 9px solid var(--cobalt);
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: 0 4px 0 rgba(20, 44, 120, .16), 0 12px 18px rgba(20, 44, 120, .16);
+@media (min-width: 1000px) {
+  .ticket-board { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
-.plate-well {
+
+.ticket {
+  --tilt: 0deg;
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  z-index: 1;
+  align-self: start;
+  justify-self: center;
   width: 100%;
-  height: 100%;
-  overflow: hidden;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 38%, #ffffff 0, var(--card) 45%, #e9edf3 100%);
-  box-shadow: inset 0 -6px 14px rgba(20, 44, 120, .08), inset 0 0 0 1px rgba(20, 44, 120, .08);
+  max-width: 340px;
+  transform: rotate(calc(var(--tilt) * 2));
+  transform-origin: 50% 14px;
+  filter: drop-shadow(0 1px 1px rgba(20, 44, 120, .16)) drop-shadow(0 12px 14px rgba(20, 44, 120, .14));
+  scroll-margin-top: 60px;
 }
-.plate-initial {
-  color: var(--cobalt);
-  font: 800 64px/1 var(--display);
-  font-variation-settings: "opsz" 96;
-  text-transform: uppercase;
-}
-.plate-photo {
-  position: absolute;
-  top: 0;
-  left: 0;
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  object-position: 50% 50%;
-  border-radius: 50%;
-}
-/* A chip knocked out of the rim, on four plates in every five. The spots
-   are points on the rim, as fractions of the plate's padding box. */
-.plate-disc::after {
+/* Tickets hang slightly askew, in a five-ticket cycle so rows don't repeat. */
+.ticket:nth-of-type(5n+1) { --tilt: -1deg; }
+.ticket:nth-of-type(5n+2) { --tilt: .6deg; }
+.ticket:nth-of-type(5n+3) { --tilt: -.4deg; }
+.ticket:nth-of-type(5n+4) { --tilt: .85deg; }
+.ticket:nth-of-type(5n) { --tilt: -.2deg; }
+.ticket::before {
   content: "";
   position: absolute;
-  z-index: 1;
-  width: 10px;
-  height: 7px;
-  border-radius: 60% 40% 55% 45%;
-  background: var(--chip-black);
+  z-index: 3;
+  top: 5px;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin-left: -9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 32%, #f3a3b0 0 14%, #c7344d 34%, #8a1d30 78%);
+  box-shadow: 0 3px 3px rgba(17, 26, 34, .35), 2px 6px 6px rgba(17, 26, 34, .18);
   pointer-events: none;
 }
-.plate:nth-child(5n+1) .plate-disc::after { top: 7.6%; left: 81%; transform: rotate(30deg); }
-.plate:nth-child(5n+2) .plate-disc::after { display: none; }
-.plate:nth-child(5n+3) .plate-disc::after { top: 29.7%; left: -2.5%; transform: rotate(-20deg); }
-.plate:nth-child(5n+4) .plate-disc::after { top: 65.8%; left: 96%; transform: rotate(70deg); }
-.plate:nth-child(5n) .plate-disc::after { top: 97.5%; left: 28.5%; transform: rotate(10deg); }
-@media (prefers-reduced-motion: no-preference) {
-  .plate-disc { transition: transform .16s ease, box-shadow .16s ease; }
-}
 @media (hover: hover) {
-  .plate:hover .plate-disc { transform: translateY(-4px); box-shadow: 0 8px 0 rgba(20, 44, 120, .14), 0 20px 26px rgba(20, 44, 120, .2); }
+  .ticket:hover {
+    transform: rotate(calc(var(--tilt) * -2));
+    filter: drop-shadow(0 2px 2px rgba(20, 44, 120, .18)) drop-shadow(0 18px 20px rgba(20, 44, 120, .18));
+  }
 }
-.plate-title { margin: 0; color: var(--ink-strong); font: 700 20px/1.18 var(--display); font-variation-settings: "opsz" 24; overflow-wrap: anywhere; }
-.plate-link { color: inherit; text-decoration: none; }
-.plate-link:hover { color: var(--cobalt); }
-.plate-link:focus-visible { outline: 0; }
-/* The title link covers the whole plate. */
-.plate-link::after { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; z-index: 2; border-radius: 26px; }
-.badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 10px 0 8px; padding: 0; list-style: none; }
-.badge {
-  display: inline-block;
-  padding: 3px 11px;
-  border-radius: 999px;
-  background: var(--cobalt);
-  color: var(--on-ink);
-  font: 700 13px/1.35 var(--sans);
-  white-space: nowrap;
+@media (prefers-reduced-motion: no-preference) {
+  .ticket { transition: transform .18s ease, filter .18s ease; }
 }
-.badge.is-outline { background: var(--card); box-shadow: inset 0 0 0 2px var(--cobalt); color: var(--cobalt-deep); }
-.plate-description, .plate-ingredients {
-  display: -webkit-box;
-  max-width: 30ch;
-  margin: 0 auto;
-  overflow: hidden;
-  font-size: 14.5px;
-  line-height: 1.5;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+.ticket:focus-within .ticket-paper { box-shadow: inset 0 0 0 3px var(--red); }
+/* The paper has serrated top and bottom edges and straight sides: a mask
+   of --tooth wide teeth (half as deep) above and below a full-width
+   rectangle. */
+.ticket-paper {
+  --tooth: 10px;
+  position: relative;
+  padding: 31px 20px 22px;
+  background: var(--card);
+  color: var(--ink-strong);
+  font: 14px/1.45 var(--sans);
+  -webkit-mask:
+    linear-gradient(#000, #000) 50% 50% / 100% calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x;
+  mask:
+    linear-gradient(#000, #000) 50% 50% / 100% calc(100% - var(--tooth)) no-repeat,
+    linear-gradient(135deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, transparent 50%, #000 50%) 0 0 / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(135deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x,
+    linear-gradient(225deg, #000 50%, transparent 50%) 0 100% / var(--tooth) var(--tooth) repeat-x;
 }
-.plate-description { margin-bottom: 6px; color: var(--body); }
-.plate-ingredients { color: var(--muted); }
-.plate-ingredients em { font-style: italic; }
-.plate-added { margin: 8px 0 0; color: var(--muted); font-size: 12.5px; }
+.ticket-bars { display: grid; gap: 6px; }
+.ticket-bar { margin: 0; padding: 6px 11px; background: var(--cobalt); color: var(--on-ink); font: 700 14px/1.3 var(--sans); }
+.ticket-head { display: flex; align-items: center; gap: 10px; font: 700 16.5px/1.25 var(--display); }
+.ticket-link { flex: 1 1 auto; min-width: 0; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.ticket-link:hover { color: var(--on-ink); }
+.ticket-link:focus-visible { outline: 0; }
+/* The title link covers the whole ticket. */
+.ticket-link::after { content: ""; position: absolute; top: 0; right: 0; bottom: 0; left: 0; }
+/* The thumbnail sits above the title link's cover so it can be clicked.
+   Hovering it grows the full photo out of it to cover the top of the ticket
+   (it stays while hovered); clicking either pins the photo open or closes it. */
+.ticket-thumb-toggle { position: relative; z-index: 1; flex: none; display: block; min-height: 0; margin: -3px -6px -3px 0; padding: 0; border: 0; border-radius: 6px; background: none; box-shadow: none; cursor: pointer; }
+.ticket-thumb { display: block; width: 38px; height: 38px; object-fit: cover; border-radius: 6px; }
+.ticket-photo {
+  position: absolute;
+  z-index: 2;
+  top: 31px;
+  left: 20px;
+  display: block;
+  width: calc(100% - 40px);
+  height: auto;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  border-radius: 12px;
+  /* A paper-coloured mat wide enough to fill the corners, so the bars under
+     the photo don't show around its curves. */
+  box-shadow: 0 0 0 6px var(--card);
+  cursor: pointer;
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(.12);
+  transform-origin: 100% 0;
+  transition: transform .2s ease, opacity .2s ease, visibility 0s .2s;
+}
+.ticket.is-photo-open .ticket-photo { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+/* Only where hover is real: a tap leaves a sticky :hover behind, which would
+   hold the photo open after the tap that closes it. */
+@media (hover: hover) {
+  .ticket:has(.ticket-thumb-toggle:hover) .ticket-photo,
+  .ticket:has(.ticket-photo:hover) .ticket-photo { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+}
+@media (prefers-reduced-motion: reduce) { .ticket-photo { transition: none; } }
+.ticket-label { margin: 14px 0 5px; font: 700 14px/1.2 var(--sans); }
+.ticket-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; }
+.ticket-note-icon { flex: none; width: 16px; height: 16px; margin-top: 2px; fill: var(--cobalt); }
+.ticket-note-icon path { fill: none; stroke: var(--on-ink); stroke-width: 2.2; stroke-linecap: round; }
+.ticket-note-icon .ticket-note-dot { fill: var(--on-ink); }
+.ticket-note p { display: -webkit-box; margin: 0; overflow: hidden; font-weight: 700; -webkit-box-orient: vertical; -webkit-line-clamp: 4; }
+/* Short lists line the amounts up in a column; an amount wider than the
+   column widens its own row instead of wrapping, up to half the ticket.
+   Long lists (is-packed) run each line together and flow down two columns
+   to keep the ticket short. */
+.ticket-items { margin: 0; padding: 0; list-style: none; }
+.ticket-items li { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; }
+.ticket-qty { flex: 0 0 auto; min-width: 4.4em; max-width: 50%; font-weight: 700; overflow-wrap: anywhere; }
+.ticket-item { flex: 1 1 0; min-width: 0; }
+.ticket-items em { color: var(--muted); }
+.ticket-items.is-packed { -webkit-column-count: 2; column-count: 2; -webkit-column-gap: 14px; column-gap: 14px; font-size: 13px; }
+.ticket-items.is-packed li { display: block; -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
+.ticket-added { margin: 14px 0 0; color: var(--muted); font-size: 12px; letter-spacing: .02em; }
 
 .empty-state {
   margin-top: 32px;
@@ -1189,8 +1276,8 @@ body.auth-popup-open { overflow: hidden; }
 .debug-final-list li { margin: 3px 0; }
 
 @media (max-width: 760px) {
-  .utility-bar { padding: 10px 16px 0; }
-  .utility-inner { width: 100%; padding-left: 16px; }
+  .utility-bar { padding: 0 16px; }
+  .utility-inner { --notch-flare: 14px; padding-left: 16px; }
   .top-nav a { padding: 0 12px; font-size: 14px; }
   .app-shell { padding: 0 16px; }
   .paper { padding: 22px 0 56px; }
@@ -1198,7 +1285,7 @@ body.auth-popup-open { overflow: hidden; }
   .section-heading h1 { font-size: 1.9rem; }
   .library-sign { grid-template-columns: minmax(0, 1fr); padding: 26px 26px 26px; border-radius: 22px; }
   .library-sign h1 { font-size: 2.3rem; }
-  .plate-rack { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 30px 14px; margin-top: 32px; }
+  .ticket-board { margin-top: 32px; }
   .setup-page { padding: 16px; }
   .setup-page .setup-card { padding: 30px 22px; }
   .block, .panel, .form-panel { padding: 18px; }
@@ -1221,11 +1308,6 @@ body.auth-popup-open { overflow: hidden; }
   .import-found { grid-template-columns: 1fr; }
 }
 @media (max-width: 420px) {
-  .plate-rack { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .plate { padding: 4px 2px 12px; }
-  .plate-disc { width: 136px; height: 136px; border-width: 7px; }
-  .plate-initial { font-size: 50px; }
-  .plate-title { font-size: 17.5px; }
   .hero-plate, .hero-plate .plate-disc, .plate-rim-text { width: 220px; height: 220px; }
   .hero-plate .plate-disc { border-width: 26px; }
 }

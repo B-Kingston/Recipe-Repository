@@ -1,8 +1,8 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
-    LibraryCard, delete_block, delete_version, file_a_to_z, find_version, home, move_block,
-    plate_initial, recipe_page, recipe_versions, record_version, restore_version, stamp_added,
-    update_block, update_recipe, view_version,
+    LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
+    home, move_block, plate_initial, recipe_page, recipe_versions, record_version, restore_version,
+    stamp_added, update_block, update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, RecipeQuery, stamp};
 use axum::Form;
@@ -414,7 +414,7 @@ fn card(title: &str) -> LibraryCard {
 }
 
 #[test]
-fn plate_stamp_adds_the_time_only_when_dates_clash() {
+fn ticket_stamp_adds_the_time_only_when_dates_clash() {
     let mut cards = vec![card("Dal"), card("Pho"), card("Ragu"), card("Old")];
     cards[0].created_at = "2026-10-15T09:05:00+00:00".into();
     cards[1].created_at = "2026-10-15T22:11:00+00:00".into();
@@ -474,7 +474,7 @@ fn library_card_shows_servings_and_total_time() {
 }
 
 #[test]
-fn plates_without_a_photo_show_the_first_letter_or_digit() {
+fn recipe_plates_without_a_photo_show_the_first_letter_or_digit() {
     assert_eq!(plate_initial("chicken adobo"), "C");
     assert_eq!(plate_initial("  \u{201c}éclairs\u{201d}"), "É");
     assert_eq!(plate_initial("10-minute soup"), "1");
@@ -482,7 +482,7 @@ fn plates_without_a_photo_show_the_first_letter_or_digit() {
 }
 
 #[tokio::test]
-async fn library_plates_list_ingredients_and_show_photos_in_the_well() {
+async fn library_tickets_are_pinned_print_ingredients_and_pack_long_lists() {
     let db = database().await;
     let now = stamp();
     sqlx::query(
@@ -503,6 +503,17 @@ async fn library_plates_list_ingredients_and_show_photos_in_the_well() {
     .execute(&db)
     .await
     .unwrap();
+    for position in 0..=TICKET_COLUMNS_AFTER {
+        sqlx::query(
+            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES(?,'big','ingredient',?,?)",
+        )
+        .bind(format!("b{position}"))
+        .bind(position as i64)
+        .bind(format!("Item {position}"))
+        .execute(&db)
+        .await
+        .unwrap();
+    }
     let page = home(
         State(state(db)),
         AuthUser { id: "u1".into() },
@@ -512,21 +523,25 @@ async fn library_plates_list_ingredients_and_show_photos_in_the_well() {
     .await
     .unwrap()
     .0;
-    assert_eq!(page.matches(r#"<article class="plate">"#).count(), 2);
-    assert!(page.contains(r#"<span class="visually-hidden">Ready in </span>40 min"#));
+    // Every ticket hangs on its own pin; there is no rail.
+    assert_eq!(page.matches(r#"<article class="ticket">"#).count(), 2);
+    assert!(!page.contains("class=\"rail\""));
+    assert!(page.contains("Ready in 40 min"));
     assert!(page.contains("Serves 6"));
-    // Ingredient names only, in recipe order; steps stay off the plate.
-    assert!(page.contains("Silken tofu, Chilli flakes <em>(optional)</em></p>"));
+    assert!(page.contains(
+        r#"<b class="ticket-qty">300 g</b> <span class="ticket-item">Silken tofu</span>"#
+    ));
+    assert!(page.contains("Chilli flakes <em>(optional)</em>"));
     assert!(!page.contains("Blend everything"));
-    // The stew's photo fills its well; every plate keeps its initial
-    // underneath for recipes without a photo and for e-ink mode.
+    assert_eq!(page.matches(r#"class="ticket-items is-packed""#).count(), 1);
+    assert_eq!(page.matches(r#"class="ticket-items""#).count(), 1);
+    // Only the stew has a photo, behind its thumbnail toggle.
+    assert_eq!(page.matches(r#"class="ticket-thumb-toggle""#).count(), 1);
     assert_eq!(
-        page.matches(r#"<img class="plate-photo" src="/recipes/big/thumbnail""#)
+        page.matches(r#"<img class="ticket-photo" src="/recipes/big/thumbnail""#)
             .count(),
         1
     );
-    assert_eq!(page.matches(r#"class="plate-photo""#).count(), 1);
-    assert!(page.contains(r#"<span class="plate-initial">B</span>"#));
 }
 
 #[tokio::test]

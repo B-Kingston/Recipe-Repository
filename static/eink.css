@@ -2,7 +2,8 @@
    mode (chosen in Settings › Display, or a Kindle browser on Automatic).
    Pure black on white: trays, plates and pills get black outlines instead
    of cobalt rims and shadows, tints become white, the speckles go, dish
-   photos are left out (plates show their initial; other images turn grey),
+   photos are left out (plates show their initial, tickets drop their
+   thumbnail; other images turn grey),
    nothing animates, and the type grows. */
 
 :root {
@@ -41,11 +42,11 @@
 html { scroll-behavior: auto; }
 body { font-size: 18px; background-image: none; }
 img { filter: grayscale(1) contrast(1.1); }
-.plate-photo { display: none; }
+.plate-photo, .ticket-thumb-toggle, .ticket-photo { display: none; }
 a:hover { color: #000000; }
 
 .utility-bar { position: relative; }
-.utility-inner { box-shadow: inset 0 0 0 2px #000000; }
+.utility-inner { --notch-rim: #000000; --notch-line: 2px; box-shadow: none; }
 .brand-mark-well { opacity: 1; }
 .account-panel { box-shadow: inset 0 0 0 2px #000000; }
 .account-avatar { box-shadow: none; }
@@ -57,19 +58,28 @@ a:hover { color: #000000; }
 .button, button, .button:active, button:active { transform: none; box-shadow: inset 0 0 0 2px #000000; }
 .button.primary, button.primary, .button.primary:active, button.primary:active { box-shadow: none; }
 .button.quiet, button.quiet, .button.quiet.danger, button.quiet.danger { box-shadow: none; text-decoration: underline; }
+input[type=file]:hover::-webkit-file-upload-button { background: #ffffff; }
+input[type=file]:hover::file-selector-button { background: #ffffff; }
 .top-nav a[aria-current="page"], .version-tab.is-current, .view-tab.is-active { box-shadow: none; }
 
-/* The sign turns white with a black edge; plates keep a black rim and show
-   their initial, since photos are left out. */
+/* The sign turns white with a black edge. Pushpins and ticket bars turn
+   black; a ticket keeps its serrated top and bottom (with finer teeth) and
+   gets a 1px black outline that follows the teeth. */
 .library-sign { background: #ffffff; background-image: none; box-shadow: inset 0 0 0 3px #000000; color: #000000; }
 .library-sign h1, .library-sign .eyebrow, .library-count { color: #000000; }
 .search-form, .search-form:focus-within { box-shadow: inset 0 0 0 2px #000000; }
-.plate-disc, .plate:hover .plate-disc { transform: none; box-shadow: none; }
-.plate-well { background: #ffffff; box-shadow: none; }
-.plate-title { font-size: 21px; }
-.plate-description, .plate-ingredients { font-size: 15.5px; }
-.badge { border: 2px solid #000000; }
+.ticket::before { background: #000000; box-shadow: none; }
+.ticket, .ticket:hover {
+  transform: rotate(calc(var(--tilt) * 2));
+  -webkit-filter: drop-shadow(1px 0 0 #000000) drop-shadow(-1px 0 0 #000000) drop-shadow(0 1px 0 #000000) drop-shadow(0 -1px 0 #000000);
+  filter: drop-shadow(1px 0 0 #000000) drop-shadow(-1px 0 0 #000000) drop-shadow(0 1px 0 #000000) drop-shadow(0 -1px 0 #000000);
+}
+.ticket-paper { --tooth: 6px; font-size: 15px; }
+.ticket-bar { font-size: 15.5px; }
+.ticket-head { font-size: 17.5px; }
+.ticket-items.is-packed { font-size: 14px; }
 .hero-plate .plate-disc { box-shadow: none; }
+.plate-well { background: #ffffff; box-shadow: none; }
 
 .ingredients-section, .recipe-chat, .note-edit form, .thumb-picker, .chart-detail, .recipe-sheet .form-panel { box-shadow: inset 0 0 0 2px #000000; }
 .edit-form, .add-form { box-shadow: inset 0 0 0 2px #000000; }
