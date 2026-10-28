@@ -46,7 +46,9 @@ img { filter: grayscale(1) contrast(1.1); }
 a:hover { color: #000000; }
 
 .utility-bar { position: relative; }
-.utility-inner { --notch-rim: #000000; --notch-line: 2px; box-shadow: none; }
+.utility-inner { --notch-rim: #000000; --notch-fill: #ffffff; --notch-line: 2px; background: #ffffff; box-shadow: none; }
+.utility-glass { display: none; }
+.utility-inner::before, .utility-inner::after { -webkit-backdrop-filter: none; backdrop-filter: none; -webkit-mask-image: none; mask-image: none; }
 .brand-mark-well { opacity: 1; }
 .account-panel { box-shadow: inset 0 0 0 2px #000000; }
 .account-avatar { box-shadow: none; }

@@ -144,6 +144,7 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
 }
 .utility-inner {
   --notch-rim: var(--cobalt);
+  --notch-fill: var(--card);
   --notch-flare: 18px;
   --notch-line: 2.5px;
   --notch-size: calc(var(--notch-flare) + var(--notch-line));
@@ -160,7 +161,7 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
   border: var(--notch-line) solid var(--notch-rim);
   border-top: 0;
   border-radius: 0 0 30px 30px;
-  background: var(--card);
+  background: var(--notch-fill);
   box-shadow: 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
   pointer-events: auto;
 }
@@ -177,11 +178,52 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
 }
 .utility-inner::before {
   right: 100%;
-  background: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - 1px), var(--notch-rim) var(--notch-flare), var(--notch-rim) calc(var(--notch-size) - 1px), var(--card) var(--notch-size));
+  background: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - 1px), var(--notch-rim) var(--notch-flare), var(--notch-rim) calc(var(--notch-size) - 1px), var(--notch-fill) var(--notch-size));
 }
 .utility-inner::after {
   left: 100%;
-  background: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - 1px), var(--notch-rim) var(--notch-flare), var(--notch-rim) calc(var(--notch-size) - 1px), var(--card) var(--notch-size));
+  background: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - 1px), var(--notch-rim) var(--notch-flare), var(--notch-rim) calc(var(--notch-size) - 1px), var(--notch-fill) var(--notch-size));
+}
+/* Frosted glass, iOS style, where the browser can blur what scrolls
+   beneath: the enamel turns translucent and a layer behind the notch
+   blurs the page. The blur sits on its own layer, not on .utility-inner,
+   because a backdrop-filter there would hide the page from the flares'
+   own blur; each flare is masked to its enamel so the clear quarter
+   circle stays sharp. Older browsers (and Kindles) keep solid enamel. */
+.utility-glass { display: none; }
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .utility-inner {
+    --notch-fill: rgba(252, 253, 252, .62);
+    background: transparent;
+  }
+  .utility-glass {
+    display: block;
+    position: absolute;
+    z-index: -1;
+    top: 0;
+    right: calc(-1 * var(--notch-line));
+    bottom: calc(-1 * var(--notch-line));
+    left: calc(-1 * var(--notch-line));
+    border-radius: 0 0 30px 30px;
+    background: linear-gradient(180deg, rgba(255, 255, 255, .5), rgba(255, 255, 255, 0) 70%), var(--notch-fill);
+    box-shadow: inset 0 -1px 0 rgba(255, 255, 255, .7);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+    pointer-events: none;
+  }
+  .utility-inner::before,
+  .utility-inner::after {
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+    backdrop-filter: saturate(180%) blur(20px);
+  }
+  .utility-inner::before {
+    -webkit-mask-image: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - 1px), #000 var(--notch-flare));
+    mask-image: radial-gradient(circle at 0 100%, transparent calc(var(--notch-flare) - 1px), #000 var(--notch-flare));
+  }
+  .utility-inner::after {
+    -webkit-mask-image: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - 1px), #000 var(--notch-flare));
+    mask-image: radial-gradient(circle at 100% 100%, transparent calc(var(--notch-flare) - 1px), #000 var(--notch-flare));
+  }
 }
 .brand {
   display: inline-flex;
