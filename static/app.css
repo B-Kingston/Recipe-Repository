@@ -82,14 +82,12 @@ body {
   min-height: 100vh;
   color: var(--ink);
   background-color: var(--ground);
-  /* Speckles: three sparse dot grids of prime pitches, offset from each
-     other, so they read as scattered flecks rather than a pattern. */
-  background-image:
-    radial-gradient(circle, var(--speck) .8px, transparent 1.2px),
-    radial-gradient(circle, var(--speck-light) .7px, transparent 1.1px),
-    radial-gradient(circle, var(--speck-light) 1.1px, transparent 1.5px);
-  background-size: 61px 67px, 43px 37px, 89px 83px;
-  background-position: 3px 7px, 29px 19px, 47px 61px;
+  /* Speckles: two tiles of randomly scattered flecks (sizes and both speck
+     colours mixed) at coprime sizes, so their overlay only repeats every
+     few hundred thousand pixels and reads as enamel, not wallpaper. The SVGs
+     hard-code --speck and --speck-light. */
+  background-image: url('/static/speckle.svg'), url('/static/speckle-sparse.svg');
+  background-position: 0 0, 173px 89px;
   font: 17px/1.55 var(--sans);
 }
 a { color: inherit; text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
