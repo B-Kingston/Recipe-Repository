@@ -1,14 +1,29 @@
 {% extends "base.html" %}{% block title %}Recipes · Recipe Repository{% endblock %}{% block nav_library %} aria-current="page"{% endblock %}{% block content %}
 <section id="all-recipes">
   <div class="library-sign">
+    <div class="library-sign-copy">
     <div id="search-title">
       {% if results %}
       <p class="eyebrow">Search</p>
       <h1>Results for “{{ query }}”</h1>
+      {% else %}{% if let Some(folder) = open_folder %}
+      <p class="eyebrow"><a href="/">{{ folder.shelf }}</a></p>
+      <h1>{{ folder.name }}</h1>
+      <p class="library-count">{{ recipes.len() }} ticket{% if recipes.len() != 1 %}s{% endif %}</p>
       {% else %}
       <h1>Recipes</h1>
-      {% if recipes.len() > 0 %}<p class="library-count">{{ recipes.len() }} ticket{% if recipes.len() != 1 %}s{% endif %}, filed A to Z</p>{% endif %}
-      {% endif %}
+      {% if total > 0 %}<p class="library-count">{{ total }} ticket{% if total != 1 %}s{% endif %}, {% if view == "folders" %}by folder{% else if view == "cuisines" %}by cuisine{% else %}filed A to Z{% endif %}</p>{% endif %}
+      {% endif %}{% endif %}
+    </div>
+    {# A–Z files every ticket on one board; Folders and Cuisines pin them
+       in stacks, one per folder. The choice is saved per account. #}
+    {% if total > 0 %}
+    <form class="view-toggle library-toggle" method="post" action="/library/view" aria-label="Library view">
+      <button class="view-tab{% if view == "az" %} is-active{% endif %}" name="view" value="az" aria-pressed="{{ view == "az" }}">A–Z</button>
+      <button class="view-tab{% if view == "folders" %} is-active{% endif %}" name="view" value="folders" aria-pressed="{{ view == "folders" }}"><svg class="toggle-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3.5h4.5l1.5 1.8h7v8.2h-13z"/></svg>Folders</button>
+      <button class="view-tab{% if view == "cuisines" %} is-active{% endif %}" name="view" value="cuisines" aria-pressed="{{ view == "cuisines" }}">Cuisines</button>
+    </form>
+    {% endif %}
     </div>
     {# Searches as you type: a pause of 350 ms (or Enter) fetches the library
        for the query and swaps in the title and results; the form itself stays,
@@ -18,7 +33,7 @@
     <form class="search-form" method="get" action="/" role="search" data-live-search hx-get="/" hx-trigger="submit" hx-target="#search-results" hx-select="#search-results" hx-select-oob="#search-title" hx-swap="outerHTML show:none" hx-replace-url="true" hx-sync="this:replace">
       <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
       <label class="visually-hidden" for="search-q">Search recipes</label>
-      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Search by dish or ingredient" hx-get="/" hx-trigger="input changed delay:350ms" hx-sync="closest form:replace">
+      <input id="search-q" type="text" name="q" value="{{ query }}" maxlength="200" placeholder="Dish, ingredient or cuisine" hx-get="/" hx-trigger="input changed delay:350ms" hx-sync="closest form:replace">
       <button class="primary" type="submit">Search</button>
     </form>
   </div>
@@ -26,6 +41,9 @@
   <div id="search-results">
   {% if notice != "" %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
   {% if results %}<div class="actions"><a class="button" href="/">Show all recipes</a></div>{% endif %}
+  {% if let Some(folder) = open_folder %}<div class="actions"><a class="button" href="/"><span aria-hidden="true">←</span> All {{ folder.shelf|lower }}</a></div>
+  {% if recipes.len() == 0 %}<div class="empty-state"><h2>Nothing in this folder.</h2><p>Recipes filed here will show up as you add them.</p></div>{% endif %}
+  {% endif %}
 
   {% if recipes.len() == 0 && results %}
   <div class="empty-state">
@@ -34,7 +52,7 @@
     <p>Nothing in your library is close to “{{ query }}”. Try different words.</p>
   </div>
   {% endif %}
-  {% if recipes.len() == 0 && !results %}
+  {% if total == 0 && !results %}
   <div class="empty-state">
     <span class="empty-icon" aria-hidden="true"><svg class="brand-mark" viewBox="0 0 30 30" focusable="false"><circle class="brand-mark-rim" cx="15" cy="15" r="12.5"/><circle class="brand-mark-well" cx="15" cy="15" r="7"/><path class="brand-mark-chip" d="M22.3 5.3c1.2-.9 2.9-.6 3.4.5-.6 1.1-2.3 1.6-3.5.9z"/></svg></span>
     <h2>No recipes yet.</h2>
@@ -43,7 +61,28 @@
   </div>
   {% endif %}
 
+  {# Folders and Cuisines: each folder is a stack of tickets on one pin; its
+     top ticket lists the first few dishes, and opens the folder. #}
+  {% if !stacks.is_empty() %}
+  <div class="ticket-board stack-board">
+  {% for stack in stacks %}
+    <a class="ticket ticket-stack" href="/?folder={{ stack.slug }}">
+      {% if stack.layers() > 1 %}<span class="ticket-paper stack-under stack-under-2" aria-hidden="true"></span>{% endif %}
+      {% if stack.layers() > 0 %}<span class="ticket-paper stack-under stack-under-1" aria-hidden="true"></span>{% endif %}
+      <span class="ticket-paper stack-top">
+        <span class="ticket-bar ticket-head stack-head"><span class="stack-name">{{ stack.name }}</span><span class="stack-count">{{ stack.count }}<span class="visually-hidden"> recipe{% if stack.count != 1 %}s{% endif %}</span></span></span>
+        <span class="stack-titles">
+          {% for title in stack.titles %}<span class="stack-title">{{ title }}</span>{% endfor %}
+          {% if stack.more > 0 %}<span class="stack-title stack-more">… {{ stack.more }} more</span>{% endif %}
+        </span>
+      </span>
+    </a>
+  {% endfor %}
+  </div>
+  {% endif %}
+
   {# Every recipe is an order ticket pinned to the wall on its own pushpin. #}
+  {% if !recipes.is_empty() %}
   <div class="ticket-board">
   {% for recipe in recipes %}
     <article class="ticket">
@@ -66,6 +105,7 @@
           {% for item in recipe.ingredients %}
           <li><b class="ticket-qty">{{ item.quantity }}{% if item.unit != "" %} {{ item.unit }}{% endif %}</b> <span class="ticket-item">{{ item.text }}{% if item.optional != 0 %} <em>(optional)</em>{% endif %}</span></li>
           {% endfor %}
+          {% if recipe.phone_hidden() > 0 %}<li class="ticket-more">… {{ recipe.phone_hidden() }} more</li>{% endif %}
         </ul>
         {% endif %}
         {% if recipe.added != "" %}<p class="ticket-added"><time datetime="{{ recipe.created_at }}">{{ recipe.added }}</time></p>{% endif %}
@@ -73,6 +113,7 @@
     </article>
   {% endfor %}
   </div>
+  {% endif %}
   </div>
 </section>
 {% endblock %}

@@ -91,6 +91,7 @@ fn card_query() -> Query<RecipeQuery> {
         edit_meta: None,
         view: None,
         step: None,
+        serves: None,
     })
 }
 
@@ -1040,6 +1041,7 @@ use sqlx::sqlite::SqliteJournalMode;
 fn details_form(title: &str, description: &str) -> Form<RecipeForm> {
     Form(RecipeForm {
         title: title.into(),
+        plate_name: String::new(),
         description: description.into(),
         servings: "4".into(),
         prep_minutes: String::new(),

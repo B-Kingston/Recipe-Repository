@@ -144,12 +144,26 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
   width: min(100%, 1096px);
   margin: 0 auto;
   padding: 8px 7px 6px 18px;
-  border: var(--notch-line) solid var(--notch-rim);
+  border: var(--notch-line) solid transparent;
   border-top: 0;
   border-radius: 0 0 30px 30px;
   background: var(--notch-fill);
   box-shadow: 0 3px 0 var(--cobalt-deep), 0 10px 24px rgba(20, 44, 120, .14);
   pointer-events: auto;
+}
+/* The rim is its own layer and starts where the flares' curves end: drawn
+   as the notch's border it ran up beside them, showing through the frosted
+   flares as a thin line. */
+.utility-rim {
+  position: absolute;
+  top: calc(var(--notch-size) - 1px);
+  right: calc(-1 * var(--notch-line));
+  bottom: calc(-1 * var(--notch-line));
+  left: calc(-1 * var(--notch-line));
+  border: var(--notch-line) solid var(--notch-rim);
+  border-top: 0;
+  border-radius: 0 0 30px 30px;
+  pointer-events: none;
 }
 /* A ring centred on the flare's outer bottom corner: clear inside, rim on
    the ring, enamel outside it. The 1px ramps smooth the edges. */
@@ -197,8 +211,12 @@ h3 { font: 700 1.05rem/1.3 var(--display); }
     backdrop-filter: saturate(180%) blur(20px);
     pointer-events: none;
   }
+  /* The flares have no highlight layer of their own, so their enamel is
+     the notch's fill and highlight combined (.62 under .5 white ≈ .81);
+     at .62 they read as a grey-blue gap beside the notch's top. */
   .utility-inner::before,
   .utility-inner::after {
+    --notch-fill: rgba(252, 253, 252, .84);
     -webkit-backdrop-filter: saturate(180%) blur(20px);
     backdrop-filter: saturate(180%) blur(20px);
   }
@@ -696,7 +714,67 @@ label > input[type=checkbox] { margin-right: 8px; }
 .ticket-items em { color: var(--muted); }
 .ticket-items.is-packed { -webkit-column-count: 2; column-count: 2; -webkit-column-gap: 14px; column-gap: 14px; font-size: 13px; }
 .ticket-items.is-packed li { display: block; -webkit-column-break-inside: avoid; page-break-inside: avoid; break-inside: avoid; }
+.ticket-more { display: none; }
 .ticket-added { margin: 14px 0 0; color: var(--muted); font-size: 12px; letter-spacing: .02em; }
+/* The sign's view toggle: A–Z, Folders, Cuisines (a white enamel pill
+   whose chosen segment is cobalt). */
+.library-sign-copy { min-width: 0; }
+.library-sign .eyebrow a { color: inherit; }
+.library-sign .library-toggle { display: inline-flex; width: auto; max-width: 100%; margin: 16px 0 0; background: var(--card); box-shadow: 0 3px 0 rgba(10, 24, 70, .35); }
+.library-toggle .view-tab { gap: 6px; min-height: 34px; padding: 0 15px; border: 0; background: transparent; box-shadow: none; font-size: 14px; }
+.library-toggle .view-tab:hover { background: var(--cobalt-wash); color: var(--cobalt-deep); }
+.library-toggle .view-tab:active { transform: none; box-shadow: none; }
+.library-toggle .view-tab.is-active, .library-toggle .view-tab.is-active:hover { background: var(--cobalt); color: var(--on-ink); box-shadow: 0 2px 0 var(--cobalt-deep); }
+.toggle-icon, .filing-icon { flex: none; width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+
+/* Folder stacks: a folder is a pile of tickets on one pin. Up to two
+   blank papers peek out askew under the top ticket, which names the
+   folder and lists its first dishes. The whole stack opens the folder. */
+.ticket-stack { display: block; color: inherit; text-decoration: none; }
+.ticket-stack:hover { color: inherit; }
+.ticket-stack:focus-visible { outline: 0; }
+.ticket-stack:focus-within .stack-under { box-shadow: none; }
+.ticket-stack .ticket-paper { display: block; }
+.stack-top { min-height: 176px; }
+.stack-under { position: absolute; top: 0; right: 0; bottom: 0; left: 0; background: var(--soft); }
+.stack-under-1 { transform: rotate(3deg) translate(5px, 4px); }
+.stack-under-2 { transform: rotate(-4deg) translate(-5px, 7px); }
+.stack-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.stack-name { min-width: 0; overflow-wrap: anywhere; }
+.stack-count { flex: none; font: 700 13px/1 var(--sans); opacity: .85; }
+.stack-titles { display: block; margin-top: 12px; }
+.stack-title { display: block; padding: 5px 0; border-bottom: 1px dashed var(--lines); font-weight: 700; overflow-wrap: anywhere; }
+.stack-more { border-bottom: 0; color: var(--muted); font-weight: 400; }
+
+/* The recipe page's folder and cuisine picker, in the sources' popover. */
+.filing-disclosure summary { gap: 7px; }
+.filing-form { width: min(330px, calc(100vw - 48px)); padding: 4px 18px 16px; }
+.filing-form .actions { margin: 14px 0 0; }
+
+/* One column on a phone: narrower tickets with smaller type, so a ticket
+   no longer fills the screen. After the ticket rules, so it overrides them. */
+@media (max-width: 599px) {
+  .ticket-board { gap: 30px; }
+  .ticket { max-width: 280px; }
+  /* The sign narrows towards the tickets below it, so it no longer
+     stretches past them across the screen. */
+  .library-sign { max-width: 330px; margin-inline: auto; }
+  .library-sign .search-form { padding-left: 14px; gap: 8px; }
+  .library-sign .search-form button { padding-inline: 16px; }
+  .ticket-paper { --tooth: 8px; padding: 26px 15px 17px; font-size: 12.5px; }
+  .ticket-bars { gap: 4px; }
+  .ticket-bar { padding: 4px 9px; font-size: 12.5px; }
+  .ticket-head { font-size: 14.5px; }
+  .ticket-thumb { width: 32px; height: 32px; }
+  .ticket-label { margin-top: 11px; font-size: 12.5px; }
+  .ticket-note { margin-top: 11px; }
+  .ticket-note p { -webkit-line-clamp: 3; }
+  .ticket-added { margin-top: 11px; font-size: 11px; }
+  /* The first six ingredients (TICKET_PHONE_ITEMS), then "… N more". */
+  .ticket-items.is-packed { -webkit-column-count: 1; column-count: 1; font-size: inherit; }
+  .ticket-items li:nth-child(n+7) { display: none; }
+  .ticket-items li.ticket-more { display: block; color: var(--muted); font-weight: 700; }
+}
 
 .empty-state {
   margin-top: 32px;
@@ -723,26 +801,84 @@ label > input[type=checkbox] { margin-right: 8px; }
   font: 700 16px/1 var(--display);
   text-decoration: none;
 }
-.version-tabs { display: flex; gap: 6px; margin: 0 0 14px; padding: 2px 4px 4px; overflow-x: auto; scrollbar-width: none; }
+/* Version tabs: folder tabs standing on the recipe sheet, the header
+   notch turned upside down. The open tab is white enamel with the sheet's
+   rim, covers the sheet's top rim where it stands, and flares into it with
+   the notch's concave corners. The others sit behind it, a shade darker,
+   on the rim. The bar keeps clear of the sheet's rounded corners. */
+.version-tabs {
+  --tab-rim: var(--cobalt);
+  --tab-fill: var(--card);
+  --tab-flare: 14px;
+  --tab-line: 2.5px;
+  --tab-size: calc(var(--tab-flare) + var(--tab-line));
+  --tab-corner: 30px;
+  --tab-clear: calc(var(--tab-corner) + var(--tab-size));
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  margin: 0 0 calc(-1 * var(--tab-line));
+  padding: 4px 0 0 var(--tab-clear);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
 .version-tab {
+  position: relative;
   flex: none;
   display: inline-block;
   max-width: 260px;
-  height: 36px;
-  padding: 0 15px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--card);
-  box-shadow: inset 0 0 0 2px var(--cobalt-pale);
+  height: 34px;
+  margin-bottom: var(--tab-line);
+  padding: 0 16px;
+  border: 2px solid var(--cobalt-pale);
+  border-bottom: 0;
+  border-radius: 16px 16px 0 0;
+  background: var(--cobalt-wash);
   color: var(--cobalt-deep);
-  font: 700 14px/36px var(--sans);
+  font: 700 14px/32px var(--sans);
   text-decoration: none;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
+.version-tab-label { display: block; overflow: hidden; text-overflow: ellipsis; }
 .version-tab:first-child { margin-left: auto; }
-.version-tab:hover { box-shadow: inset 0 0 0 2px var(--cobalt); color: var(--cobalt-deep); }
-.version-tab.is-current { background: var(--cobalt); box-shadow: 0 2px 0 var(--cobalt-deep); color: var(--on-ink); }
+.version-tab:hover { border-color: var(--cobalt); color: var(--cobalt-deep); }
+.version-tab.is-current {
+  height: calc(40px + var(--tab-line));
+  margin: 0 var(--tab-size);
+  border: var(--tab-line) solid var(--tab-rim);
+  border-bottom: 0;
+  border-radius: 18px 18px 0 0;
+  background: var(--tab-fill);
+  color: var(--cobalt-deep);
+  line-height: 38px;
+}
+.version-tab.is-current:first-child { margin-left: auto; }
+/* The sheet's corners are rounded; the last tab (and its flare) stops where
+   the top edge is still straight. A margin, not the row's end padding,
+   which some browsers drop once the row scrolls. */
+.version-tab:last-child, .version-tab.is-current:last-child { margin-right: var(--tab-clear); }
+/* The notch's flares flipped: a ring centred on the flare's outer top
+   corner, clear inside, rim on the ring (meeting the sheet's rim), enamel
+   outside it. */
+.version-tab.is-current::before,
+.version-tab.is-current::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: var(--tab-size);
+  height: var(--tab-size);
+  pointer-events: none;
+}
+.version-tab.is-current::before {
+  right: 100%;
+  background: radial-gradient(circle at 0 0, transparent calc(var(--tab-flare) - 1px), var(--tab-rim) var(--tab-flare), var(--tab-rim) calc(var(--tab-size) - 1px), var(--tab-fill) var(--tab-size));
+}
+.version-tab.is-current::after {
+  left: 100%;
+  background: radial-gradient(circle at 100% 0, transparent calc(var(--tab-flare) - 1px), var(--tab-rim) var(--tab-flare), var(--tab-rim) calc(var(--tab-size) - 1px), var(--tab-fill) var(--tab-size));
+}
 .recipe-sheet {
   padding: 40px 44px 44px;
   border-radius: 30px;
@@ -817,7 +953,8 @@ label > input[type=checkbox] { margin-right: 8px; }
   box-shadow: 0 4px 0 rgba(20, 44, 120, .16), 0 16px 22px rgba(20, 44, 120, .18);
 }
 .hero-plate .plate-disc::after { top: 76.9%; left: -2.6%; transform: rotate(-30deg); }
-.hero-plate .plate-initial { font-size: 92px; }
+.hero-plate { font-size: 92px; }
+.hero-plate .plate-initial { font-size: 1em; line-height: .95; text-align: center; overflow-wrap: normal; }
 .plate-rim-text { position: absolute; top: 0; left: 0; width: 240px; height: 240px; overflow: visible; pointer-events: none; }
 .plate-rim-text text { fill: var(--card); font-family: var(--display); font-weight: 700; letter-spacing: 1.6px; }
 .plate-rim-text .rim-facts { font-family: var(--sans); letter-spacing: 1.8px; }
@@ -899,7 +1036,8 @@ label > input[type=checkbox] { margin-right: 8px; }
 /* The ingredients sit in a shallow dish; the method runs beside them with
    each step numbered on a cobalt enamel token. */
 .card-body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 32px 44px; margin-top: 30px; }
-.ingredients-section { flex: 1 1 280px; max-width: 380px; padding: 20px 22px 12px; border-radius: 22px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.card-side { display: flex; flex: 1 1 280px; flex-direction: column; gap: 20px; max-width: 380px; min-width: 0; }
+.ingredients-section { padding: 20px 22px 12px; border-radius: 22px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
 .method-section { flex: 999 1 420px; min-width: 0; }
 .section-label { margin: 0 0 6px; color: var(--cobalt-deep); font: 800 1.35rem/1.2 var(--display); font-variation-settings: "opsz" 32; }
 .empty-section { margin: .6rem 0; }
@@ -993,6 +1131,14 @@ label > input[type=checkbox] { margin-right: 8px; }
 .chat-change-label { flex: 0 1 auto; padding: 3px 13px; border: 2px solid var(--cobalt); border-radius: 999px; color: var(--cobalt-deep); font: 700 13.5px/1.3 var(--sans); text-align: center; }
 .chat-waiting { margin: 0 0 10px; }
 .chat-ask { display: flex; align-items: flex-end; gap: 8px; }
+/* Beside the method the drawer is a narrow column: a shorter thread,
+   wider bubbles, and the Ask button under the question box. */
+.card-side .recipe-chat { margin: 0; padding: 16px 16px 16px; }
+.card-side .chat-thread { max-height: 18rem; }
+.card-side .chat-bubble { max-width: 94%; }
+.card-side .chat-answer .chat-bubble { font-size: 15px; }
+.card-side .chat-ask { flex-direction: column; align-items: stretch; }
+.card-side .chat-ask button { align-self: flex-end; }
 .chat-ask textarea { flex: 1 1 auto; min-width: 0; min-height: 44px; margin: 0; resize: vertical; }
 .chat-keep, .chat-kept { margin: 2px 0 0; }
 .chat-keep button.compact { min-height: 32px; padding: 0 8px; color: var(--muted); font-size: 13px; }
@@ -1369,7 +1515,7 @@ body.auth-popup-open { overflow: hidden; }
   .paper { padding: 22px 0 56px; }
   h1 { font-size: 2.1rem; }
   .section-heading h1 { font-size: 1.9rem; }
-  .library-sign { grid-template-columns: minmax(0, 1fr); padding: 26px 26px 26px; border-radius: 22px; }
+  .library-sign { grid-template-columns: minmax(0, 1fr); padding: 26px 22px; border-radius: 22px; }
   .library-sign h1 { font-size: 2.3rem; }
   .ticket-board { margin-top: 32px; }
   .setup-page { padding: 16px; }
@@ -1377,11 +1523,16 @@ body.auth-popup-open { overflow: hidden; }
   .block, .panel, .form-panel { padding: 18px; }
   .recipe-sheet { padding: 26px 20px 28px; border-radius: 24px; }
   .add-card h1 { font-size: 1.9rem; }
-  .version-tabs { padding: 0 12px; }
+  .version-tabs { --tab-corner: 24px; }
   .page-header h1 { font-size: 1.9rem; }
-  .hero-plate { margin: 0 auto; }
+  /* The plate at 170px: the rim and initial scale by 170/240, and the rim
+     text's viewBox scales with its box. */
+  .hero-plate { width: 170px; height: 170px; margin: 0 auto; }
+  .hero-plate .plate-disc { width: 170px; height: 170px; border-width: 20px; }
+  .hero-plate { font-size: 65px; }
+  .plate-rim-text { width: 170px; height: 170px; }
   .ingredients-section { padding: 16px 16px 8px; }
-  .ingredients-section { max-width: none; }
+  .card-side { max-width: none; }
   .step-group > .step-ingredients, .step-group > .step-moment { margin-left: 0; }
   .block-index { width: 30px; height: 30px; margin-right: 12px; font-size: 14px; line-height: 30px; }
   .two-col { grid-template-columns: 1fr; }
@@ -1401,6 +1552,34 @@ body.auth-popup-open { overflow: hidden; }
   .brand-text { display: none; }
   .utility-end { gap: 4px; }
   .top-nav a { padding: 0 10px; }
+}
+/* Too narrow for the avatar beside the nav: the account menu becomes a
+   Settings pill with a caret, and Settings opens from the top of its panel. */
+.account-compact, .account-settings { display: none; }
+@media (max-width: 480px) {
+  .utility-inner { gap: 6px; padding-left: 12px; }
+  .utility-end { gap: 2px; }
+  .top-nav { gap: 0; }
+  .top-nav a { padding: 0 9px; }
+  .has-account .nav-settings { display: none; }
+  .account-button { width: auto; height: 42px; padding: 0 10px 0 11px; border-radius: 999px; color: var(--cobalt-deep); font: 700 15px/1 var(--sans); white-space: nowrap; }
+  .account-button .account-avatar { display: none; }
+  .account-compact { display: inline; }
+  .account-compact::after { content: ""; display: inline-block; margin-left: 6px; border: 5px solid transparent; border-top-color: currentColor; border-bottom-width: 0; vertical-align: 2px; }
+  .account-button:hover { background: var(--cobalt-wash); }
+  .account-menu[open] .account-button { background: var(--cobalt-wash); }
+  .utility-end:has(.nav-settings[aria-current]) .account-button { background: var(--cobalt); color: var(--on-ink); box-shadow: 0 2px 0 var(--cobalt-deep); }
+  .account-panel .account-settings { display: flex; margin-bottom: 8px; }
+  /* Clear the notch's rim and shadow, which the pill sits further inside. */
+  .account-panel { top: calc(100% + 22px); }
+}
+@media (max-width: 370px) {
+  .utility-inner { padding-left: 8px; }
+  .brand-mark { width: 26px; height: 26px; }
+  .top-nav a { padding: 0 7px; }
+  .top-nav a, .account-button { font-size: 14px; }
+  .account-button { padding: 0 8px; }
+  .account-compact::after { margin-left: 4px; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -1445,3 +1624,10 @@ body.htmx-request::before {
   .paper { padding: 0; }
   .recipe-sheet { padding: 0; box-shadow: none; }
 }
+
+/* Servings toggle beside the facts: the view toggle's pills, a little
+   tighter, with its label inside the wash. */
+.serves-toggle { align-items: center; flex-wrap: wrap; }
+.serves-toggle .view-tab { min-height: 34px; padding: 0 12px; }
+.serves-toggle-label { padding: 0 8px 0 12px; color: var(--cobalt-deep); font: 700 12px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; }
+.serves-note { flex-basis: 100%; margin: 0; font-size: 14px; }

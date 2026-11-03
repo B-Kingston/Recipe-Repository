@@ -2,7 +2,7 @@ use crate::auth::AuthUser;
 use crate::recipes::{home, store_embedding};
 use crate::search::{
     Indexed, MAX_RESULTS, keyword_rank, keyword_terms, normalize_query, rank, recipe_document,
-    stale_documents, tokens,
+    squash, stale_documents, tokens,
 };
 use crate::{AppState, Block, HomeQuery, stamp};
 use axum::extract::{Query, State};
@@ -255,6 +255,7 @@ async fn search_page(db: SqlitePool, query: &str) -> String {
         crate::htmx::Flash::default(),
         Query(HomeQuery {
             q: Some(query.into()),
+            ..HomeQuery::default()
         }),
     )
     .await
@@ -367,4 +368,22 @@ fn keyword_rank_returns_at_most_the_result_cap() {
         .map(|index| (format!("r{index:02}"), tokens("Lentil soup")))
         .collect();
     assert_eq!(keyword_rank("lentils", &docs).len(), MAX_RESULTS);
+}
+
+#[test]
+fn web_addresses_are_left_out_of_what_is_indexed() {
+    assert_eq!(
+        squash("Times retained. ([pbs.org](https://www.pbs.org/food/stories/spanish-rice-recipe?utm_source=openai))\nNext line"),
+        "Times retained. pbs.org Next line"
+    );
+    assert_eq!(squash("see https://example.com/thai-curry now"), "see now");
+    assert_eq!(squash("  plain   words "), "plain words");
+    let document = recipe_document(
+        "Tomato rice",
+        "Leftover rice ([pbs.org](https://www.pbs.org/spanish-rice))",
+        &[],
+    );
+    assert!(!document.contains("spanish"));
+    let terms = keyword_terms("Tomato rice", "From https://example.com/spanish-rice", &[]);
+    assert!(!terms.iter().any(|term| term == "spanish"));
 }

@@ -35,12 +35,14 @@ mod chart;
 mod chat;
 mod display;
 mod embeddings;
+mod folders;
 mod htmx;
 mod media;
 mod media_worker;
 mod moments;
 mod notes;
 mod recipes;
+mod scale;
 mod search;
 mod thumbs;
 use auth::{
@@ -97,14 +99,14 @@ const CLAUDE_MODEL_OPTIONS: &[&str] = &[
     "claude-sonnet-5",
     "claude-opus-5",
 ];
-const RECIPE_PROMPT: &str = r#"You are a recipe assistant. Prefer credible guidance and synthesize practical advice without copying source text. Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Notice when the user's request excludes an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without X" — and do not silently drop it. Judge whether the ingredient is genuinely optional; when it plays a structural role (binding, leavening, emulsifying, thickening, moisture, or browning), substitute a suitable alternative from sound cooking knowledge (such as flax or chia "eggs", aquafaba, plant milks and butters, or xanthan gum) and adjust technique so the recipe still achieves its intended result. Be concise and practical for a home cook."#;
+const RECIPE_PROMPT: &str = r#"You are a recipe assistant. Prefer credible guidance and synthesize practical advice without copying source text. Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Notice when the user's request excludes an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without X" — and do not silently drop it. Judge whether the ingredient is genuinely optional; when it plays a structural role (binding, leavening, emulsifying, thickening, moisture, or browning), substitute a suitable alternative from sound cooking knowledge (such as flax or chia "eggs", aquafaba, plant milks and butters, or xanthan gum) and adjust technique so the recipe still achieves its intended result. Be concise and practical for a home cook."#;
 const GROUNDED_RECIPE_PROMPT: &str = r#"You are a meticulous recipe research assistant. Research before generating. Always use the web_search tool. When the user supplies one or more URLs, search for their published title, author, and recipe details. When the user names an existing recipe, cook, book, restaurant, or website, locate the likely original and cross-check it against at least two independent, credible sources when available.
 
 Study ingredient ratios, ingredient roles, preparation, sequencing, temperatures, timings, texture cues, and the intended final result. Recreate the referenced recipe faithfully enough to achieve that result, while resolving omissions or contradictions with sound cooking knowledge. Do not copy expressive prose, headnotes, or distinctive wording; write original, concise instructions. Preserve attribution through citations rather than imitation of the author's voice.
 
 When the user asks to exclude an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without nuts", and similar — do not silently drop it. First judge whether the ingredient is genuinely optional: if it only adds flavour or is truly dispensable, omitting it is fine, but make that a conscious, reasoned decision. If it plays a structural role — binding, leavening, emulsifying, thickening, moisture, browning, or setting — research suitable replacement ingredients and techniques with web_search (for example flax or chia "eggs", aquafaba, mashed banana, plant milks and butters, nut-free butters, xanthan or psyllium gum) and adapt quantities and method so the recipe still achieves its intended result. Keep the recipe true to its original character: the substitution must preserve the outcome, not merely delete the ingredient.
 
-Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Cite every source that materially informed the recipe."#;
+Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Cite every source that materially informed the recipe."#;
 
 /// System prompt for drafts built from imported social-video evidence (the
 /// From Video importer and its alteration chain). The web_search tool is
@@ -114,7 +116,7 @@ const EVIDENCE_RECIPE_PROMPT: &str = r#"You are a meticulous recipe assistant wo
 
 Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge, and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough. Fill every such gap so the finished recipe works end to end, and keep it faithful to the ingredients, character, and method shown in the video. Do not copy expressive prose from researched sources; write original, concise instructions.
 
-Return one complete recipe, not a patch. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."#;
+Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."#;
 
 #[derive(Clone)]
 struct AppState {
@@ -304,6 +306,8 @@ struct Recipe {
     cook_minutes: Option<i64>,
     chart_json: String,
     updated_at: String,
+    /// One or two words for the plate's well; empty shows the initial.
+    plate_name: String,
 }
 #[derive(Debug, Clone, FromRow)]
 struct Block {
@@ -338,12 +342,16 @@ struct ViewBlock {
     unit: String,
     optional: bool,
     editing: bool,
+    /// The quantity and unit as shown, scaled to the page's servings.
+    shown_quantity: String,
 }
 impl ViewBlock {
     fn from_block(b: Block, edit: Option<&str>) -> Self {
         let optional = b.optional();
         let editing = edit == Some(&b.id);
+        let shown_quantity = format!("{} {}", b.quantity, b.unit).trim().to_string();
         Self {
+            shown_quantity,
             id: b.id,
             position: b.position,
             text: b.text,
@@ -410,10 +418,12 @@ struct ChartView {
     step_count: usize,
 }
 
-/// Query string of the library page: `?q=` runs a search.
+/// Query string of the library page: `?q=` runs a search, `?folder=`
+/// opens one folder of the Folders or Cuisines view.
 #[derive(Default, Deserialize)]
 struct HomeQuery {
     q: Option<String>,
+    folder: Option<String>,
 }
 #[derive(Template)]
 #[template(path = "home.html")]
@@ -425,6 +435,15 @@ struct HomeTemplate {
     results: bool,
     /// Search status shown above the recipes (indexing progress, service problems).
     notice: String,
+    /// The sign's toggle: "az", "folders" or "cuisines".
+    view: &'static str,
+    /// Every recipe of the library, whatever the page shows.
+    total: usize,
+    /// The Folders or Cuisines view's stacks; empty otherwise (and while a
+    /// folder is open or a search runs).
+    stacks: Vec<folders::Stack>,
+    /// The folder whose tickets `recipes` are.
+    open_folder: Option<folders::OpenFolder>,
 }
 #[derive(Template)]
 #[template(path = "setup.html")]
@@ -502,15 +521,30 @@ struct RecipeTemplate {
     chat: Option<chat::ChatPanel>,
     /// The cook's notes on the recipe.
     notes: notes::NotesPanel,
+    /// The servings the amounts are shown for (`?serves=`).
+    scale: scale::Scale,
+    /// The library folder and cuisine the recipe is filed in.
+    filing: folders::Filing,
 }
 /// Titles up to this many characters run around the top of the recipe
 /// page's plate rim; longer ones would not fit and leave it plain.
 const RIM_TITLE_MAX: usize = 26;
 
 impl RecipeTemplate {
-    /// The letter in the plate's well when there is no dish photo.
+    /// What the plate's well shows when there is no dish photo: the plate
+    /// name, else the title's initial.
     fn plate_initial(&self) -> String {
-        recipes::plate_initial(&self.recipe.title)
+        if self.recipe.plate_name.is_empty() {
+            recipes::plate_initial(&self.recipe.title)
+        } else {
+            self.recipe.plate_name.clone()
+        }
+    }
+
+    /// The well's text size as a fraction of the initial's (CSS `em`), so the
+    /// longest word of a plate name fits across the well.
+    fn plate_initial_scale(&self) -> String {
+        format!("{:.2}", recipes::plate_name_scale(&self.plate_initial()))
     }
 
     /// The title as printed around the top of the plate rim, or empty when
@@ -527,7 +561,7 @@ impl RecipeTemplate {
     /// e.g. "SERVES 4  ★  35 MIN".
     fn rim_facts(&self) -> String {
         let mut facts = Vec::new();
-        if let Some(servings) = self.recipe.servings.filter(|servings| *servings > 0) {
+        if let Some(servings) = self.scale.serves {
             facts.push(format!("SERVES {servings}"));
         }
         let time = recipes::total_time(self.recipe.prep_minutes, self.recipe.cook_minutes);
@@ -782,6 +816,9 @@ struct SettingsTemplate {
     shared_web_search: &'static str,
     /// Whether video step moments are captured and shown (global setting).
     step_moments: bool,
+    /// The units new recipes are generated in: "metric", "imperial" or "source".
+    measurement: &'static str,
+    units_notice: &'static str,
     /// Whether the user has the recipe chat (the Ask drawer) on.
     recipe_chat: bool,
     /// Whether the embedding sidecar is configured (`EMBEDDING_URL`).
@@ -905,6 +942,8 @@ fn render(t: impl Template) -> Result<Html<String>> {
 #[derive(Deserialize)]
 struct RecipeForm {
     title: String,
+    #[serde(default)]
+    plate_name: String,
     description: String,
     servings: String,
     prep_minutes: String,
@@ -1049,6 +1088,10 @@ struct SearchEngineForm {
     engine: String,
 }
 #[derive(Deserialize)]
+struct MeasurementForm {
+    system: String,
+}
+#[derive(Deserialize)]
 struct StepMomentsForm {
     #[serde(default)]
     enabled: Option<String>,
@@ -1105,6 +1148,8 @@ struct RecipeQuery {
     edit_meta: Option<String>,
     view: Option<String>,
     step: Option<usize>,
+    /// Servings to scale the amounts to; absent shows the recipe as written.
+    serves: Option<i64>,
 }
 #[derive(Deserialize)]
 struct AddRecipeQuery {
@@ -1187,6 +1232,7 @@ async fn main() -> anyhowless::Result<()> {
     });
     if state.embedder.is_some() {
         tokio::spawn(search::backfill(state.clone()));
+        tokio::spawn(folders::warm(state.clone()));
     }
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
@@ -1213,6 +1259,8 @@ async fn healthcheck() -> anyhowless::Result<()> {
 fn routes(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .route("/", get(home))
+        .route("/library/view", post(folders::update_library_view))
+        .route("/recipes/{id}/filing", post(folders::update_filing))
         .route("/recipes/{id}/thumbnail", get(recipe_thumbnail))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
@@ -1296,6 +1344,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_page).post(update_settings))
         .route("/settings/media-cleaner", post(update_media_cleaner))
         .route("/settings/step-moments", post(update_step_moments))
+        .route("/settings/measurements", post(update_measurements))
         .route("/settings/recipe-chat", post(update_recipe_chat))
         .route("/settings/web-search", post(add_web_search_key))
         .route("/settings/web-search/delete", post(delete_web_search_key))
@@ -1389,6 +1438,10 @@ struct GeneratedStep {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GeneratedRecipe {
     title: String,
+    /// The dish in one or two words ("Roti", "Pad thai") for the plate on
+    /// the recipe page. Older drafts have none.
+    #[serde(rename = "plateName", default)]
+    plate_name: String,
     description: String,
     #[serde(rename = "prepMinutes")]
     prep_minutes: i64,
@@ -1765,6 +1818,41 @@ async fn set_app_setting(db: &SqlitePool, user_id: &str, key: &str, value: &str)
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// app_settings key of the units the user's recipes are generated in:
+/// "metric", "imperial", or "source" / absent (whatever suits the recipe).
+const MEASUREMENT_SETTING: &str = "measurement_system";
+const MEASUREMENT_METRIC: &str = "metric";
+const MEASUREMENT_IMPERIAL: &str = "imperial";
+const MEASUREMENT_SOURCE: &str = "source";
+
+/// The user's measurement choice: "metric", "imperial" or "source".
+pub(crate) async fn measurement_system(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
+    Ok(
+        match app_setting(db, user_id, MEASUREMENT_SETTING)
+            .await?
+            .as_deref()
+        {
+            Some(MEASUREMENT_METRIC) => MEASUREMENT_METRIC,
+            Some(MEASUREMENT_IMPERIAL) => MEASUREMENT_IMPERIAL,
+            _ => MEASUREMENT_SOURCE,
+        },
+    )
+}
+
+/// The prompt line that holds generated and AI-edited recipes to the user's
+/// units, or None to leave the units to the recipe.
+pub(crate) fn measurement_rule(system: &str) -> Option<&'static str> {
+    match system {
+        MEASUREMENT_METRIC => Some(
+            "Units: write every ingredient quantity, ingredientUses amount, temperature, and size in metric units (g, kg, ml, l, °C, cm). Weigh dry ingredients in grams where a cook would; keep tsp and tbsp for small amounts and counted items as counts. Convert any other units from the source or request, rounding to practical amounts.",
+        ),
+        MEASUREMENT_IMPERIAL => Some(
+            "Units: write every ingredient quantity, ingredientUses amount, temperature, and size in US customary units (cups, tbsp, tsp, oz, lb, fl oz, °F, inches), using fractions such as 1/2 or 1 1/4 rather than decimals. Keep counted items as counts. Convert any metric units from the source or request, rounding to practical amounts.",
+        ),
+        _ => None,
+    }
 }
 
 /// app_settings key of the user's "video step moments" switch.
@@ -2241,6 +2329,12 @@ async fn settings_page(
         } else {
             ""
         },
+        measurement: measurement_system(&s.db, &user.id).await?,
+        units_notice: if flash.is("units_saved") {
+            "Units saved."
+        } else {
+            ""
+        },
         moments_notice: if flash.is("moments_saved") {
             "Step moments saved."
         } else {
@@ -2614,6 +2708,24 @@ async fn update_ai_logins(
 /// Switches video step moments on or off for the signed-in user. Off stops
 /// their new imports from capturing a moment pool and hides moments on their
 /// pages; stored moments stay, so switching back on shows them again.
+/// Saves the units the signed-in user's recipes are generated in. Saved
+/// recipes keep their units; the recipe chat can convert one on request.
+async fn update_measurements(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Form(form): Form<MeasurementForm>,
+) -> Result<Response> {
+    if ![MEASUREMENT_METRIC, MEASUREMENT_IMPERIAL, MEASUREMENT_SOURCE]
+        .contains(&form.system.as_str())
+    {
+        return Err(AppError::BadRequest(
+            "Choose metric, imperial, or as written.".into(),
+        ));
+    }
+    set_app_setting(&s.db, &user.id, MEASUREMENT_SETTING, &form.system).await?;
+    Ok(flash_redirect("/settings#settings-units", "units_saved"))
+}
+
 async fn update_step_moments(
     State(s): State<Arc<AppState>>,
     user: AuthUser,

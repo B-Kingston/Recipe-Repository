@@ -33,6 +33,7 @@ use tower::ServiceExt;
 fn recipe() -> GeneratedRecipe {
     GeneratedRecipe {
         title: "Toast".into(),
+        plate_name: "Toast".into(),
         description: String::new(),
         prep_minutes: 1,
         cook_minutes: 3,
@@ -697,6 +698,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
             edit_meta: None,
             view: None,
             step: None,
+            serves: None,
         }),
         crate::htmx::Flash::default(),
     )

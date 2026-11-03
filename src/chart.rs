@@ -1,4 +1,5 @@
 use crate::ai::validate_generated;
+use crate::scale::Scale;
 use crate::{
     Block, ChartCell, ChartDetail, ChartLeaf, ChartRecipe, ChartView, FlowStep, GeneratedRecipe,
     GeneratedStep, Ingredient, Recipe, ViewStep,
@@ -58,6 +59,7 @@ pub(crate) fn build_chart(
     ingredients: &[Block],
     steps: &[ViewStep],
     requested: Option<usize>,
+    scale: &Scale,
 ) -> ChartView {
     let rich = (!recipe.chart_json.trim().is_empty())
         .then_some(recipe.chart_json.as_str())
@@ -66,6 +68,7 @@ pub(crate) fn build_chart(
         .filter(|chart| {
             let candidate = GeneratedRecipe {
                 title: recipe.title.clone(),
+                plate_name: String::new(),
                 description: String::new(),
                 prep_minutes: 0,
                 cook_minutes: 0,
@@ -108,7 +111,7 @@ pub(crate) fn build_chart(
                     .into_iter()
                     .filter_map(|use_| {
                         ingredients.get(use_.ingredient).map(|ingredient| {
-                            format!("{} {}", use_.amount, ingredient.text)
+                            format!("{} {}", scale.line(&use_.amount), ingredient.text)
                                 .trim()
                                 .to_string()
                         })
@@ -153,7 +156,7 @@ pub(crate) fn build_chart(
                 let name = ingredient.text.to_lowercase();
                 !used.iter().any(|line| line.contains(&name))
             })
-            .map(ingredient_line)
+            .map(|ingredient| scale.line(&ingredient_line(ingredient)))
             .collect()
     };
     let selected = selected_chart_step(requested, flow.len());
@@ -214,7 +217,12 @@ pub(crate) fn build_chart(
                 span: (end - row).max(1),
                 active: selected == Some(step),
                 dimmed: is_selected && !active_steps.contains(&step),
-                href: format!("/recipes/{}?view=chart&step={}", recipe.id, step + 1),
+                href: format!(
+                    "/recipes/{}?view=chart&step={}{}",
+                    recipe.id,
+                    step + 1,
+                    scale.query
+                ),
             }
         })
         .collect();
@@ -223,8 +231,16 @@ pub(crate) fn build_chart(
         text: steps[step].block.text.clone(),
         additions: flow[step].additions.clone(),
         timer_seconds: flow[step].timer_seconds,
-        previous_href: format!("/recipes/{}?view=chart&step={}", recipe.id, step),
-        next_href: format!("/recipes/{}?view=chart&step={}", recipe.id, step + 2),
+        previous_href: format!(
+            "/recipes/{}?view=chart&step={}{}",
+            recipe.id, step, scale.query
+        ),
+        next_href: format!(
+            "/recipes/{}?view=chart&step={}{}",
+            recipe.id,
+            step + 2,
+            scale.query
+        ),
         has_previous: step > 0,
         has_next: step + 1 < flow.len(),
         moment: steps[step].moment.clone(),

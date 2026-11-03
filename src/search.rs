@@ -98,9 +98,23 @@ pub(crate) fn indexing_note(count: usize) -> String {
     format!("{count} {noun} {verb} still being indexed, so results may be incomplete.")
 }
 
-/// Collapses runs of whitespace (including newlines) to single spaces.
-fn squash(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Collapses runs of whitespace (including newlines) to single spaces and
+/// drops web addresses: a Markdown link keeps its label, a bare URL goes.
+/// A citation's slug ("…/spanish-rice-recipe-using-leftover-rice") once
+/// outweighed the dish itself and filed an Egyptian tomato rice as Spanish.
+pub(crate) fn squash(text: &str) -> String {
+    text.split_whitespace()
+        .map(
+            |word| match word.find("http://").or_else(|| word.find("https://")) {
+                Some(start) => word[..start]
+                    .trim_end_matches(['(', '[', ']', '<'])
+                    .trim_start_matches(['(', '[']),
+                None => word,
+            },
+        )
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The text embedded for one recipe: the description, the ingredient lines
@@ -284,12 +298,12 @@ pub(crate) fn keyword_terms(title: &str, description: &str, blocks: &[Block]) ->
     for _ in 0..TITLE_WEIGHT {
         terms.extend(title.iter().cloned());
     }
-    terms.extend(tokens(description));
+    terms.extend(tokens(&squash(description)));
     for block in blocks {
-        terms.extend(tokens(&format!(
+        terms.extend(tokens(&squash(&format!(
             "{} {} {}",
             block.quantity, block.unit, block.text
-        )));
+        ))));
     }
     terms
 }
@@ -426,18 +440,29 @@ async fn keyword_search(state: &AppState, user_id: &str, query: &str) -> crate::
     })
 }
 
+/// Embeds up to `INLINE_REFRESH` of a user's stale recipes now and hands
+/// the rest to a background task; returns how many were left over.
+pub(crate) async fn refresh_user(
+    state: &AppState,
+    embedder: &Embedder,
+    user_id: &str,
+) -> Result<usize, String> {
+    let refresh = refresh_index(&state.db, embedder, Some(user_id), INLINE_REFRESH).await?;
+    if refresh.remaining > 0 {
+        spawn_background_refresh(state.db.clone(), embedder.clone(), user_id.to_owned());
+    }
+    Ok(refresh.remaining)
+}
+
 async fn ranked(
     state: &AppState,
     embedder: &Embedder,
     user_id: &str,
     query: &str,
 ) -> Result<Outcome, String> {
-    let refresh = refresh_index(&state.db, embedder, Some(user_id), INLINE_REFRESH).await?;
-    if refresh.remaining > 0 {
-        spawn_background_refresh(state.db.clone(), embedder.clone(), user_id.to_owned());
-    }
-    let notice = if refresh.remaining > 0 {
-        indexing_note(refresh.remaining)
+    let remaining = refresh_user(state, embedder, user_id).await?;
+    let notice = if remaining > 0 {
+        indexing_note(remaining)
     } else {
         String::new()
     };

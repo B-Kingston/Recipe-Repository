@@ -20,25 +20,31 @@
   <header class="utility-bar">
     <div class="utility-inner">
       <span class="utility-glass" aria-hidden="true"></span>
+      <span class="utility-rim" aria-hidden="true"></span>
       <a class="brand" href="/" aria-label="Recipe Repository home">
         <svg class="brand-mark" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true" focusable="false"><circle class="brand-mark-rim" cx="15" cy="15" r="12.5"/><circle class="brand-mark-well" cx="15" cy="15" r="7"/><path class="brand-mark-chip" d="M22.3 5.3c1.2-.9 2.9-.6 3.4.5-.6 1.1-2.3 1.6-3.5.9z"/></svg>
         <span class="brand-text">Recipe Repository</span>
       </a>
-      <div class="utility-end">
+      {# On a narrow screen the account menu takes over the Settings link: its
+         summary turns into a Settings pill and its panel opens with a Settings
+         link, so the header keeps to one line. #}
+      <div class="utility-end{% if crate::auth::account_menu().is_some() %} has-account{% endif %}">
         <nav class="top-nav" aria-label="Main navigation">
           <a href="/"{% block nav_library %}{% endblock %}>Library</a>
           <a href="/recipes/new"{% block nav_add %}{% endblock %}>Add recipe</a>
-          <a href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
+          <a class="nav-settings" href="/settings"{% block nav_settings %}{% endblock %}>Settings</a>
         </nav>
         {% if let Some(menu) = crate::auth::account_menu() %}
         {# Switching or leaving an account reloads the whole page. #}
         <details class="account-menu" data-account-menu hx-boost="false">
           <summary class="account-button" title="Account: {{ menu.username }}">
             <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
+            <span class="account-compact" aria-hidden="true">Settings</span>
             <span class="visually-hidden">Account: {{ menu.username }}</span>
           </summary>
           <div class="account-panel">
             <div class="account-card">
+              <a class="account-row account-action account-settings" href="/settings" hx-boost="true">Settings</a>
               <div class="account-head">
                 <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
                 <p><span class="account-name">{{ menu.username }}</span><span class="account-state">Signed in</span></p>

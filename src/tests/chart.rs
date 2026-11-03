@@ -41,6 +41,7 @@ fn chart_layout_merges_steps() {
     let recipe = Recipe {
         id: "r".into(),
         title: "Toast".into(),
+        plate_name: String::new(),
         description: String::new(),
         servings: None,
         prep_minutes: None,
@@ -86,6 +87,7 @@ fn chart_layout_merges_steps() {
             unit: String::new(),
             optional: false,
             editing: false,
+            shown_quantity: String::new(),
         },
         ingredients: vec![],
         ingredients_text: String::new(),
@@ -96,6 +98,7 @@ fn chart_layout_merges_steps() {
         &[ingredient],
         &[step(0, "Heat pan"), step(1, "Toast bread")],
         Some(2),
+        &crate::scale::Scale::none(),
     );
     assert_eq!(chart.cells.len(), 2);
     assert!(chart.cells[1].active);

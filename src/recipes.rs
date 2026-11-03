@@ -1,4 +1,5 @@
 use crate::chart::{build_chart, infer_step_ingredients};
+use crate::folders;
 use crate::htmx::Flash;
 use crate::moments::{self, MomentKind, MomentPool, MomentVector, StepMoment};
 use crate::search::{self, Indexed};
@@ -33,9 +34,12 @@ fn block_label(section: &str, action: &str) -> String {
     format!("{noun} {action}")
 }
 
-/// The library page. Without `?q=` it lists every recipe filed A to Z; with
-/// it, the recipes ranked by embedding similarity or BM25 (the user's choice,
-/// and the fallback when the embedding service is missing or down).
+/// The library page. Without `?q=` it lists every recipe filed A to Z, or,
+/// in the Folders or Cuisines view, one ticket stack per folder (`?folder=`
+/// opens one). With `?q=`, the recipes ranked by embedding similarity or
+/// BM25 (the user's choice, and the fallback when the embedding service is
+/// missing or down); a query that names a folder ("thai", "desserts") lists
+/// that folder's recipes first.
 pub(crate) async fn home(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -43,6 +47,7 @@ pub(crate) async fn home(
     Query(params): Query<HomeQuery>,
 ) -> Result<Html<String>> {
     let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
+    let view = folders::library_view(&state.db, &user.id).await?;
     let cards: Vec<LibraryCard> = sqlx::query_as(
         "SELECT id,title,description,servings,prep_minutes,cook_minutes,
                 thumbnail_jpeg IS NOT NULL AS has_thumbnail,created_at
@@ -51,29 +56,61 @@ pub(crate) async fn home(
     .bind(&user.id)
     .fetch_all(&state.db)
     .await?;
-    let (mut recipes, results, notice) = if query.is_empty() {
-        let notice = if flash.is("account_deleted") {
-            "Account deleted. This browser switched to your next account.".to_string()
-        } else {
-            String::new()
-        };
-        (cards, false, notice)
-    } else {
+    let total = cards.len();
+    let open = params
+        .folder
+        .as_deref()
+        .filter(|_| query.is_empty())
+        .and_then(|slug| folders::resolve(slug, view));
+    let mut stacks = Vec::new();
+    let mut open_folder = None;
+    let (mut recipes, results, notice) = if !query.is_empty() {
         let outcome = search::search(&state, &user.id, &query).await?;
         let mut by_id: HashMap<String, LibraryCard> = cards
             .into_iter()
             .map(|card| (card.id.clone(), card))
             .collect();
-        let found = outcome
-            .ids
-            .iter()
-            .filter_map(|id| by_id.remove(id))
-            .collect();
+        let mut found = Vec::new();
+        if let Some((shelf, folder)) = folders::match_query(&query) {
+            let filed = folders::shelve(&state, &user.id, shelf).await?;
+            let mut members: Vec<LibraryCard> = filed
+                .iter()
+                .filter(|(_, slug)| **slug == folder.slug)
+                .filter_map(|(id, _)| by_id.remove(id))
+                .collect();
+            file_a_to_z(&mut members);
+            found = members;
+        }
+        found.extend(outcome.ids.iter().filter_map(|id| by_id.remove(id)));
         (found, true, outcome.notice)
+    } else if let Some((shelf, folder)) = open {
+        let filed = folders::shelve(&state, &user.id, shelf).await?;
+        let mut members: Vec<LibraryCard> = cards
+            .into_iter()
+            .filter(|card| filed.get(&card.id).copied() == Some(folder.slug))
+            .collect();
+        file_a_to_z(&mut members);
+        open_folder = Some(folders::OpenFolder::new(shelf, folder));
+        (members, false, String::new())
+    } else {
+        let notice = if flash.is("account_deleted") {
+            "Account deleted. This browser switched to your next account.".to_string()
+        } else {
+            String::new()
+        };
+        match view {
+            Some(shelf) if total > 0 => {
+                let filed = folders::shelve(&state, &user.id, shelf).await?;
+                stacks = folders::stacks(shelf, &filed, &cards);
+                (Vec::new(), false, notice)
+            }
+            _ => {
+                let mut cards = cards;
+                file_a_to_z(&mut cards);
+                (cards, false, notice)
+            }
+        }
     };
-    if !results {
-        file_a_to_z(&mut recipes);
-    }
     attach_ingredients(&state.db, &user.id, &mut recipes).await?;
     stamp_added(&mut recipes);
     render(HomeTemplate {
@@ -81,6 +118,10 @@ pub(crate) async fn home(
         query,
         results,
         notice,
+        view: view.map_or("az", folders::Shelf::key),
+        total,
+        stacks,
+        open_folder,
     })
 }
 
@@ -110,10 +151,20 @@ pub(crate) struct LibraryCard {
 /// makes a wider-packed ticket rather than a very long one.
 pub(crate) const TICKET_COLUMNS_AFTER: usize = 8;
 
+/// On a phone a ticket lists this many ingredients, then "… N more"; the
+/// cut is CSS (`.ticket-more`), so wider screens keep the whole list.
+pub(crate) const TICKET_PHONE_ITEMS: usize = 6;
+
 impl LibraryCard {
     /// True when the ticket's ingredients print in two columns.
     pub(crate) fn packed(&self) -> bool {
         self.ingredients.len() > TICKET_COLUMNS_AFTER
+    }
+
+    /// How many ingredients a phone-sized ticket leaves out behind its
+    /// "…" line (it shows the first `TICKET_PHONE_ITEMS`).
+    pub(crate) fn phone_hidden(&self) -> usize {
+        self.ingredients.len().saturating_sub(TICKET_PHONE_ITEMS)
     }
 
     /// "Serves 4", or empty when the recipe has no serving count.
@@ -153,6 +204,38 @@ pub(crate) fn plate_initial(title: &str) -> String {
         .map(|c| c.to_uppercase().collect())
         .unwrap_or_default()
 }
+
+/// A plate name as stored: whitespace collapsed, at most two words and
+/// `PLATE_NAME_MAX` characters, else empty (the plate then shows the
+/// title's initial).
+pub(crate) fn clean_plate_name(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let name = words.join(" ");
+    if words.len() > 2 || name.chars().count() > PLATE_NAME_MAX {
+        return String::new();
+    }
+    name
+}
+
+/// The size of a plate name relative to a single initial: a word sized so
+/// its longest word spans about the width of the well, capped well below
+/// the initial's size so short names do not crowd the rim.
+pub(crate) fn plate_name_scale(name: &str) -> f32 {
+    let longest = name
+        .split_whitespace()
+        .map(|word| word.chars().count())
+        .max()
+        .unwrap_or(0);
+    if longest <= 1 {
+        return 1.0;
+    }
+    // The well is about 1.65 initials wide; an upper-case letter of the
+    // display face is about 0.68 of its size.
+    (1.65 / (0.68 * longest as f32)).clamp(0.24, 0.62)
+}
+
+/// The longest plate name that still reads in the plate's well.
+pub(crate) const PLATE_NAME_MAX: usize = 16;
 
 /// The letter a title is filed under: its first letter, upper-cased, or '#'
 /// when the title starts with a digit or a letter outside A to Z.
@@ -349,6 +432,67 @@ pub(crate) async fn indexed_recipes(db: &SqlitePool, user_id: &str) -> Result<Ve
         .collect())
 }
 
+/// A recipe's pinned folder and cuisine (`recipes.folder` / `.cuisine`,
+/// empty when filed automatically).
+#[derive(FromRow)]
+pub(crate) struct RecipePin {
+    pub(crate) id: String,
+    pub(crate) folder: String,
+    pub(crate) cuisine: String,
+}
+
+/// The pins of every recipe of the user.
+pub(crate) async fn recipe_pins(db: &SqlitePool, user_id: &str) -> Result<Vec<RecipePin>> {
+    Ok(
+        sqlx::query_as("SELECT id,folder,cuisine FROM recipes WHERE user_id=?")
+            .bind(user_id)
+            .fetch_all(db)
+            .await?,
+    )
+}
+
+/// One recipe's pins; NotFound when the user has no such recipe.
+pub(crate) async fn recipe_pin(db: &SqlitePool, user_id: &str, id: &str) -> Result<RecipePin> {
+    sqlx::query_as("SELECT id,folder,cuisine FROM recipes WHERE user_id=? AND id=?")
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+/// Pins a recipe to a folder and a cuisine. Leaves `updated_at` alone: the
+/// recipe's content did not change.
+pub(crate) async fn set_recipe_pin(
+    db: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    folder: &str,
+    cuisine: &str,
+) -> Result<()> {
+    let done = sqlx::query("UPDATE recipes SET folder=?,cuisine=? WHERE user_id=? AND id=?")
+        .bind(folder)
+        .bind(cuisine)
+        .bind(user_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
+
+/// A recipe's stored search vector, if it has one.
+pub(crate) async fn recipe_vector(db: &SqlitePool, recipe_id: &str) -> Result<Option<Vec<f32>>> {
+    let blob: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT vector FROM recipe_embeddings WHERE recipe_id=?")
+            .bind(recipe_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(blob.and_then(|blob| crate::embeddings::from_blob(&blob)))
+}
+
 /// Streams a recipe's chosen dish photo to its owning user only.
 pub(crate) async fn recipe_thumbnail(
     State(state): State<Arc<AppState>>,
@@ -389,10 +533,20 @@ pub(crate) async fn recipe_page(
         .into_iter()
         .partition(|block| block.section == "ingredient");
     let edit = query.edit.as_deref();
+    let scale = crate::scale::Scale::new(recipe.servings, query.serves);
     let ingredients = ingredient_blocks
         .iter()
         .cloned()
-        .map(|block| ViewBlock::from_block(block, edit))
+        .map(|block| {
+            let shown = format!(
+                "{} {}",
+                scale.quantity(&block.quantity, &block.unit),
+                block.unit
+            );
+            let mut view = ViewBlock::from_block(block, edit);
+            view.shown_quantity = shown.trim().to_string();
+            view
+        })
         .collect();
     let mut uses = step_ingredients_by_step(&state.db, &id).await?;
     let recipe_sources = sources(&state.db, &user.id, &id).await?;
@@ -425,16 +579,18 @@ pub(crate) async fn recipe_page(
             let moment = step_moments
                 .remove(&block.id)
                 .map(|moment| moments::view(&moment, &still_seconds, &still_base));
+            // The edit form keeps the amounts as written; the page shows them
+            // scaled to the chosen servings.
             ViewStep {
                 ingredients_text: used.join("\n"),
-                ingredients: used,
+                ingredients: used.iter().map(|line| scale.line(line)).collect(),
                 block: ViewBlock::from_block(block, edit),
                 moment,
             }
         })
         .collect::<Vec<_>>();
     let chart_view = query.view.as_deref() == Some("chart");
-    let chart = build_chart(&recipe, &ingredient_blocks, &steps, query.step);
+    let chart = build_chart(&recipe, &ingredient_blocks, &steps, query.step, &scale);
     let has_photo: bool = sqlx::query_scalar(
         "SELECT thumbnail_jpeg IS NOT NULL FROM recipes WHERE id=? AND user_id=?",
     )
@@ -470,6 +626,7 @@ pub(crate) async fn recipe_page(
     let chat = crate::chat::panel(&state, &user, &id, back, &flash).await?;
     let notes =
         crate::notes::panel(&state, &user, &id, None, format!("/recipes/{id}"), &flash).await?;
+    let filing = folders::filing(&state, &user.id, &id).await?;
     render(RecipeTemplate {
         servings_value: option_number(recipe.servings),
         prep_value: option_number(recipe.prep_minutes),
@@ -491,6 +648,8 @@ pub(crate) async fn recipe_page(
         active_version: 0,
         chat,
         notes,
+        scale,
+        filing,
     })
 }
 
@@ -502,11 +661,18 @@ pub(crate) async fn update_recipe(
 ) -> Result<Response> {
     let recipe = find_recipe(&state.db, &user.id, &id).await?;
     let title = required(&form.title, "Recipe title")?;
+    let plate_name = clean_plate_name(&form.plate_name);
+    if plate_name.is_empty() && !form.plate_name.trim().is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Plate name must be one or two words, at most {PLATE_NAME_MAX} characters."
+        )));
+    }
     let description = trim(&form.description);
     let servings = number(&form.servings)?;
     let prep_minutes = number(&form.prep_minutes)?;
     let cook_minutes = number(&form.cook_minutes)?;
     if recipe.title == title
+        && recipe.plate_name == plate_name
         && recipe.description == description
         && recipe.servings == servings
         && recipe.prep_minutes == prep_minutes
@@ -516,8 +682,9 @@ pub(crate) async fn update_recipe(
     }
     let mut tx = state.db.begin().await?;
     ensure_recipe_history(&mut tx, &user.id, &id).await?;
-    sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE user_id=? AND id=?")
+    sqlx::query("UPDATE recipes SET title=?,plate_name=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,updated_at=? WHERE user_id=? AND id=?")
         .bind(title)
+        .bind(&plate_name)
         .bind(description)
         .bind(servings)
         .bind(prep_minutes)

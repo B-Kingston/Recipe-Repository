@@ -130,6 +130,7 @@ async fn page(s: &Arc<AppState>, user_id: &str, recipe_id: &str) -> String {
             edit_meta: None,
             view: None,
             step: None,
+            serves: None,
         }),
         Flash::default(),
     )

@@ -720,6 +720,14 @@ pub(crate) async fn chat_reply(
     let search_key_provider = search_key
         .as_ref()
         .map_or("none", |key| key.provider.as_str());
+    let system_prompt = match crate::measurement_rule(
+        crate::measurement_system(&state.db, &user.id).await?,
+    ) {
+        Some(rule) => format!(
+            "{CHAT_SYSTEM_PROMPT}\n\n{rule} Apply this to amounts you add or change; convert existing ones only when asked."
+        ),
+        None => CHAT_SYSTEM_PROMPT.to_string(),
+    };
     for attempt in 0..2 {
         info!(
             provider,
@@ -729,7 +737,7 @@ pub(crate) async fn chat_reply(
             search_key = search_key_provider,
             attempt,
             prompt = %prompt,
-            system_prompt = %CHAT_SYSTEM_PROMPT,
+            system_prompt = %system_prompt,
             library = %tools_log,
             "LLM chat request"
         );
@@ -737,7 +745,7 @@ pub(crate) async fn chat_reply(
         let request = json!({
             "command": "chat",
             "prompt": prompt,
-            "systemPrompt": CHAT_SYSTEM_PROMPT,
+            "systemPrompt": system_prompt,
             "model": model,
             "reasoningEffort": effort,
             "searchMode": search_mode.as_str(),
@@ -970,8 +978,15 @@ pub(crate) async fn apply_draft(
             return render_draft_page(&s, &user, &id, STALE_BASE_MESSAGE, "").await;
         }
         crate::recipes::ensure_recipe_history(&mut tx, &user.id, &existing).await?;
-        sqlx::query("UPDATE recipes SET title=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
+        // A draft without a plate name (an older one) keeps the recipe's.
+        let plate_name = if recipe.plate_name.is_empty() {
+            current.plate_name.clone()
+        } else {
+            recipe.plate_name.clone()
+        };
+        sqlx::query("UPDATE recipes SET title=?,plate_name=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
             .bind(&recipe.title)
+            .bind(&plate_name)
             .bind(&recipe.description)
             .bind(recipe.servings)
             .bind(recipe.prep_minutes)
@@ -993,9 +1008,10 @@ pub(crate) async fn apply_draft(
         existing
     } else {
         let recipe_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO recipes(id,title,description,servings,prep_minutes,cook_minutes,chart_json,user_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO recipes(id,title,plate_name,description,servings,prep_minutes,cook_minutes,chart_json,user_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&recipe_id)
             .bind(&recipe.title)
+            .bind(&recipe.plate_name)
             .bind(&recipe.description)
             .bind(recipe.servings)
             .bind(recipe.prep_minutes)
@@ -1184,7 +1200,9 @@ impl SearchMode {
 /// `quantity unit name` and the description as plain text.
 const RECIPE_FIELD_RULES: &str = r#"Field formats:
 - Ingredient unit: only the measure (g, ml, tsp, tbsp, cup, clove, head, can, pinch), or empty for counted items. Put size and preparation in the name. Never repeat the name in the unit. Examples: quantity "6", unit "", name "medium tomatoes"; quantity "1", unit "head", name "garlic, cloves separated and peeled"; quantity "1", unit "", name "medium onion, diced".
-- ingredientUses amount: the quantity and unit only, never the ingredient name (e.g. "3" or "1 tbsp").
+- Ingredient quantity: a number, fraction, or range ("2", "1 1/2", "2-3"), or empty when unmeasured (then say "to taste" or similar in the name). The app scales these numbers when the cook changes the servings.
+- ingredientUses amount: the quantity and unit only, never the ingredient name (e.g. "3" or "1 tbsp"), starting with the number so it scales too.
+- Step text: do not restate amounts already given in ingredientUses; the app shows them beside the step, scaled to the servings.
 - Description: one or two sentences about the dish for the cook. Do not describe your edits, the user's request, or your reasoning.
 - Every text field is plain text: no Markdown, links, URLs, or citation markers. Put cited pages only in sources."#;
 
@@ -1323,6 +1341,8 @@ async fn pi_recipe(
     let ai_user = crate::ai_account(&state.db, &user.id).await?;
     let provider = crate::ai_provider(&state.db, &ai_user).await?;
     let (backend, model) = resolve_backend(state, &ai_user, &provider).await?;
+    // Units are the cook's own choice, not the shared AI account's.
+    let units = crate::measurement_rule(crate::measurement_system(&state.db, &user.id).await?);
     request_recipe(
         state,
         &ai_user,
@@ -1330,6 +1350,7 @@ async fn pi_recipe(
         &model,
         prompt,
         backend_search_mode(&backend, search_mode),
+        units,
     )
     .await
 }
@@ -1395,11 +1416,13 @@ async fn request_recipe(
     model: &str,
     prompt: &str,
     search_mode: SearchMode,
+    units: Option<&str>,
 ) -> Result<(GeneratedRecipe, Vec<Source>)> {
     let effort =
         crate::selected_effort(&state.db, user_id, crate::DEFAULT_REASONING_EFFORT).await?;
+    let units = units.map_or_else(String::new, |rule| format!("\n- {rule}"));
     let system_prompt = format!(
-        "{}\n\n{}\n\nRecipe JSON schema:\n{}",
+        "{}\n\n{}{units}\n\nRecipe JSON schema:\n{}",
         system_recipe_prompt(search_mode),
         RECIPE_FIELD_RULES,
         recipe_schema()
@@ -1983,10 +2006,11 @@ pub(crate) fn parse_pi_response(
 }
 
 pub(crate) fn recipe_schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["title","description","prepMinutes","cookMinutes","servings","ingredients","steps"],"properties":{"title":{"type":"string"},"description":{"type":"string"},"prepMinutes":{"type":"integer"},"cookMinutes":{"type":"integer"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["name","quantity","unit","optional"],"properties":{"name":{"type":"string"},"quantity":{"type":"string"},"unit":{"type":"string"},"optional":{"type":"boolean"}}}},"steps":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["text","chartLabel","timerSeconds","ingredientUses","inputSteps"],"properties":{"text":{"type":"string"},"chartLabel":{"type":"string"},"timerSeconds":{"type":"integer","minimum":0},"ingredientUses":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ingredient","amount"],"properties":{"ingredient":{"type":"integer","minimum":0},"amount":{"type":"string"}}}},"inputSteps":{"type":"array","items":{"type":"integer","minimum":0}}}}}}})
+    json!({"type":"object","additionalProperties":false,"required":["title","plateName","description","prepMinutes","cookMinutes","servings","ingredients","steps"],"properties":{"title":{"type":"string"},"plateName":{"type":"string"},"description":{"type":"string"},"prepMinutes":{"type":"integer"},"cookMinutes":{"type":"integer"},"servings":{"type":"integer"},"ingredients":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["name","quantity","unit","optional"],"properties":{"name":{"type":"string"},"quantity":{"type":"string"},"unit":{"type":"string"},"optional":{"type":"boolean"}}}},"steps":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["text","chartLabel","timerSeconds","ingredientUses","inputSteps"],"properties":{"text":{"type":"string"},"chartLabel":{"type":"string"},"timerSeconds":{"type":"integer","minimum":0},"ingredientUses":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["ingredient","amount"],"properties":{"ingredient":{"type":"integer","minimum":0},"amount":{"type":"string"}}}},"inputSteps":{"type":"array","items":{"type":"integer","minimum":0}}}}}}})
 }
 
 pub(crate) fn normalize_generated(recipe: &mut GeneratedRecipe) -> Result<()> {
+    recipe.plate_name = crate::recipes::clean_plate_name(&recipe.plate_name);
     recipe.description = strip_markdown_links(&recipe.description);
     for step in &mut recipe.steps {
         step.text = strip_markdown_links(&step.text);

@@ -71,6 +71,8 @@ input[type=file]:hover::file-selector-button { background: #ffffff; }
 .library-sign h1, .library-sign .eyebrow, .library-count { color: #000000; }
 .search-form, .search-form:focus-within { box-shadow: inset 0 0 0 2px #000000; }
 .ticket::before { background: #000000; box-shadow: none; }
+.library-sign .library-toggle { box-shadow: inset 0 0 0 2px #000000; }
+.stack-under { background: #ffffff; }
 .ticket, .ticket:hover {
   transform: rotate(calc(var(--tilt) * 2));
   -webkit-filter: drop-shadow(1px 0 0 #000000) drop-shadow(-1px 0 0 #000000) drop-shadow(0 1px 0 #000000) drop-shadow(0 -1px 0 #000000);

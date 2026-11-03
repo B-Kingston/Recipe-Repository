@@ -1,7 +1,7 @@
 use crate::auth::AuthUser;
 use crate::recipes::{
     LibraryCard, TICKET_COLUMNS_AFTER, delete_block, delete_version, file_a_to_z, find_version,
-    home, move_block, plate_initial, recipe_page, recipe_versions, record_version, restore_version,
+    clean_plate_name, home, move_block, plate_initial, plate_name_scale, recipe_page, recipe_versions, record_version, restore_version,
     stamp_added, update_block, update_recipe, view_version,
 };
 use crate::{AppError, AppState, BlockForm, HomeQuery, RecipeForm, RecipeQuery, stamp};
@@ -261,6 +261,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         Path("r".into()),
         Form(RecipeForm {
             title: "Edited".into(),
+            plate_name: String::new(),
             description: String::new(),
             servings: "4".into(),
             prep_minutes: String::new(),
@@ -336,6 +337,7 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
         Path("r".into()),
         Form(RecipeForm {
             title: "Edited".into(),
+            plate_name: String::new(),
             description: String::new(),
             servings: "4".into(),
             prep_minutes: String::new(),
@@ -475,6 +477,12 @@ fn library_card_shows_servings_and_total_time() {
 
 #[test]
 fn recipe_plates_without_a_photo_show_the_first_letter_or_digit() {
+    assert_eq!(clean_plate_name("  Pad   thai "), "Pad thai");
+    assert_eq!(clean_plate_name("Soft wholemeal roti"), "");
+    assert_eq!(clean_plate_name("Supercalifragilistic"), "");
+    assert_eq!(plate_name_scale("S"), 1.0);
+    assert!(plate_name_scale("Roti") > plate_name_scale("Banana bread"));
+    assert!(plate_name_scale("Roti") <= 0.62);
     assert_eq!(plate_initial("chicken adobo"), "C");
     assert_eq!(plate_initial("  \u{201c}éclairs\u{201d}"), "É");
     assert_eq!(plate_initial("10-minute soup"), "1");
@@ -576,6 +584,7 @@ async fn recipe_plate_rim_carries_a_short_title_and_the_timings() {
                     edit_meta: None,
                     view: None,
                     step: None,
+                    serves: None,
                 }),
                 crate::htmx::Flash::default(),
             )
@@ -587,11 +596,70 @@ async fn recipe_plate_rim_carries_a_short_title_and_the_timings() {
     let dal = page("r").await;
     assert!(dal.contains(r##"startOffset="50%" text-anchor="middle">DAL MAKHANI</textPath>"##));
     assert!(dal.contains("SERVES 6  \u{2605}  1 H 40 MIN</textPath>"));
-    assert!(dal.contains(r#"<span class="plate-initial" aria-hidden="true">D</span>"#));
+    assert!(dal.contains(r#"<span class="plate-initial" aria-hidden="true" style="font-size: 1.00em">D</span>"#));
     assert!(!dal.contains("plate-photo"));
     // Too long for the rim: the title stays in the heading only, and a
     // recipe without timings leaves the rim plain.
     let long = page("long").await;
     assert!(!long.contains("BROWN BUTTER"));
     assert!(!long.contains("plate-rim-text"));
+}
+
+#[tokio::test]
+async fn recipe_page_scales_amounts_to_the_chosen_servings() {
+    let db = database().await;
+    sqlx::query("UPDATE recipes SET servings=4 WHERE id='r'")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit)VALUES
+         ('flour','r','ingredient',0,'plain flour','200','g'),
+         ('salt','r','ingredient',1,'salt to taste','',''),
+         ('mix','r','step',0,'Mix the flour.','','')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recipe_step_ingredients(id,step_id,position,text)VALUES('u','mix',0,'200 g plain flour')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let s = state(db);
+    let page = |serves: Option<i64>| {
+        let s = s.clone();
+        async move {
+            recipe_page(
+                State(s),
+                AuthUser { id: "u1".into() },
+                Path("r".into()),
+                Query(RecipeQuery {
+                    edit: None,
+                    edit_meta: None,
+                    view: None,
+                    step: None,
+                    serves,
+                }),
+                crate::htmx::Flash::default(),
+            )
+            .await
+            .unwrap()
+            .0
+        }
+    };
+    let written = page(None).await;
+    assert!(written.contains(r#"<span class="ingredient-qty">200 g</span>"#));
+    assert!(!written.contains("Amounts scaled"));
+    let halved = page(Some(2)).await;
+    assert!(halved.contains(r#"<span class="ingredient-qty">100 g</span>"#));
+    assert!(halved.contains(r#"<span class="step-ingredient">100 g plain flour</span>"#));
+    assert!(halved.contains("<dt>Serves</dt><dd>2</dd>"));
+    assert!(halved.contains("Amounts scaled from 4 servings"));
+    // The edit forms keep the amounts as written.
+    assert!(halved.contains(r#"name="quantity" value="200""#));
+    assert!(halved.contains(">200 g plain flour</textarea>"));
+    // The other views keep the choice.
+    assert!(halved.contains("step=1&#38;serves=2"));
 }
