@@ -3,7 +3,7 @@
    cobalt-rimmed plate (its dish photo fills the well, or its initial does),
    headings hang on an enamel sign held up with rivets, and panels are white
    enamel trays with a cobalt rim and a darker lip. Bricolage Grotesque
-   carries the headings, plates, and ticket titles; Atkinson Hyperlegible carries everything
+   carries the headings, plates, and ticket titles; Geist carries everything
    read while cooking. The palette lives in custom properties so e-ink mode
    (static/eink.css, loaded through /display.css) can swap it for pure black
    on white. */
@@ -15,33 +15,21 @@
   font-display: swap;
   src: url('/static/fonts/bricolage-grotesque-latin.woff2') format('woff2');
 }
+/* Geist (SIL OFL 1.1, static/fonts/geist-OFL.txt), as variable fonts
+   covering every weight. */
 @font-face {
-  font-family: 'Atkinson Hyperlegible';
+  font-family: 'Geist';
   font-style: normal;
-  font-weight: 400;
+  font-weight: 100 900;
   font-display: swap;
-  src: url('/static/fonts/atkinson-hyperlegible-latin-normal.woff2') format('woff2');
+  src: url('/static/fonts/geist.woff2') format('woff2');
 }
 @font-face {
-  font-family: 'Atkinson Hyperlegible';
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: url('/static/fonts/atkinson-hyperlegible-latin-bold.woff2') format('woff2');
-}
-@font-face {
-  font-family: 'Atkinson Hyperlegible';
+  font-family: 'Geist';
   font-style: italic;
-  font-weight: 400;
+  font-weight: 100 900;
   font-display: swap;
-  src: url('/static/fonts/atkinson-hyperlegible-latin-italic.woff2') format('woff2');
-}
-@font-face {
-  font-family: 'Atkinson Hyperlegible';
-  font-style: italic;
-  font-weight: 700;
-  font-display: swap;
-  src: url('/static/fonts/atkinson-hyperlegible-latin-bold-italic.woff2') format('woff2');
+  src: url('/static/fonts/geist-italic.woff2') format('woff2');
 }
 
 :root {
@@ -82,7 +70,7 @@
   --radius: 22px;
   --radius-sm: 14px;
   --display: 'Bricolage Grotesque', 'Helvetica Neue', Arial, sans-serif;
-  --sans: 'Atkinson Hyperlegible', Verdana, 'Helvetica Neue', Arial, sans-serif;
+  --sans: 'Geist', Verdana, 'Helvetica Neue', Arial, sans-serif;
   --mono: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
 }
 
