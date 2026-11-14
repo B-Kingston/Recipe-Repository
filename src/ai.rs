@@ -1,21 +1,20 @@
 use crate::media::{
     MAX_CLEANED_RECIPE_CHARS, MAX_IMPORT_NOTES_CHARS, MediaChannels, MediaDebug, MediaEvidence,
-    VideoExtras, canonical_social_url, cleaner_prompt, extract_social_evidence_debug,
-    recipe_prompt as media_recipe_prompt,
+    VideoExtras, canonical_social_url, cleaner_prompt, create_private_dir,
+    extract_social_evidence_debug, recipe_prompt as media_recipe_prompt,
 };
 use crate::recipes::{
     apply_draft_moments, copy_draft_moment_pool, copy_draft_thumbnails, delete_draft_thumbnails,
-    delete_expired_draft_thumbnails, draft_step_moments, draft_still_seconds, find_draft,
-    find_draft_still, find_draft_thumbnail_jpeg, find_draft_thumbnails, social_source_url,
-    store_draft_moment_pool, store_draft_thumbnails,
+    delete_expired_drafts, draft_step_moments, draft_still_seconds, find_draft, find_draft_still,
+    find_draft_thumbnail_jpeg, find_draft_thumbnails, social_source_url, store_draft_moment_pool,
+    store_draft_thumbnails,
 };
 use crate::{
     AddRecipeTemplate, AppError, AppState, AuthUser, ChartRecipe, DRAFT_HOURS, DebugUrlView,
-    DraftExpiredTemplate, DraftTemplate, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT,
-    GeneratedRecipe, Ingredient, IngredientUse, MediaDebugCaptureView, MediaDebugCardView,
-    MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate, MediaDebugTemplate,
-    MediaImportRunTemplate, ModelCatalogue, PromptForm, RECIPE_PROMPT, Result, Source,
-    generate_guidance, render, required, stamp,
+    DraftExpiredTemplate, DraftTemplate, GeneratedRecipe, MediaDebugCaptureView,
+    MediaDebugCardView, MediaDebugForm, MediaDebugRunRow, MediaDebugRunTemplate,
+    MediaDebugTemplate, MediaImportRunTemplate, ModelCatalogue, PromptForm, Result,
+    SnapshotIngredient, SnapshotStep, Source, generate_guidance, render, required, stamp,
 };
 use axum::{
     Form,
@@ -28,11 +27,11 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{self, Read, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path as FsPath, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, OnceLock,
@@ -45,8 +44,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// `GET /ai/generate` and `GET /ai/import`: both open the Add recipe card.
 pub(crate) async fn generate_page() -> Redirect {
     Redirect::to("/recipes/new")
+}
+
+/// The longest request the Add recipe card and a draft's alteration box take
+/// (their textareas' `maxlength`). Counted without the carriage returns a
+/// browser puts in each line break when it sends the form.
+const MAX_PROMPT_CHARS: usize = 4_000;
+
+fn check_prompt_length(prompt: &str) -> Result<()> {
+    if prompt.chars().filter(|c| *c != '\r').count() > MAX_PROMPT_CHARS {
+        return Err(AppError::BadRequest(format!(
+            "Keep the request under {MAX_PROMPT_CHARS} characters."
+        )));
+    }
+    Ok(())
 }
 
 /// The Add recipe card: one prompt that may hold an idea, recipe links, and
@@ -58,6 +72,9 @@ pub(crate) async fn generate_recipe(
 ) -> Result<Response> {
     let prompt = required(&f.prompt, "Recipe idea or URL")?;
     let channels = f.channels();
+    if let Err(error) = check_prompt_length(&prompt) {
+        return add_page_error(&s, &user, error, prompt, channels).await;
+    }
     match route_prompt(&prompt) {
         PromptRoute::Video { url, notes } => {
             match start_import(&s, &user, &url, &notes, channels).await {
@@ -75,13 +92,10 @@ pub(crate) async fn generate_recipe(
             let draft = create_draft(
                 &s,
                 &user,
-                None,
-                "generate",
                 &prompt,
                 DraftProvenance {
                     attribution: None,
                     evidence_json: None,
-                    search_mode: None,
                 },
             )
             .await;
@@ -146,10 +160,6 @@ fn prompt_link(word: &str) -> Option<&str> {
     (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
 }
 
-pub(crate) async fn import_page() -> Redirect {
-    Redirect::to("/recipes/new")
-}
-
 /// The Add recipe card.
 pub(crate) async fn add_recipe_page(
     s: &AppState,
@@ -179,9 +189,18 @@ async fn add_page_error(
     prompt: String,
     channels: MediaChannels,
 ) -> Result<Response> {
-    add_recipe_page(s, user, error.to_string(), prompt, channels)
+    add_recipe_page(s, user, shown_error(&error), prompt, channels)
         .await
         .map(IntoResponse::into_response)
+}
+
+/// What a page that shows a failure itself (the Add recipe card, a draft)
+/// tells the reader: the error's own text, or the generic notice for a
+/// server-side failure, as the error page would. These failures never reach
+/// the `IntoResponse` boundary, so they are logged here, once.
+fn shown_error(error: &AppError) -> String {
+    error!(%error, "request failed");
+    error.user_message()
 }
 
 /// Checks a video import and starts it in the background, returning the run
@@ -209,24 +228,14 @@ async fn start_import(
     ensure_media_cleaner_configured(s, &user.id).await?;
     ensure_ai_configured(s, user).await?;
     prune_debug_runs(&s.media_debug_runs);
-    if s.media_debug_runs.lock().len() >= DEBUG_RUN_LIMIT {
-        return Err(AppError::BadRequest(
-            "There are already several media jobs running. Wait for one to finish and try again."
-                .into(),
-        ));
-    }
     let run_id = Uuid::new_v4().to_string();
     let dir = env::temp_dir().join(format!("kindle-recipes-media-import-{run_id}"));
     let frames_dir = dir.join("frames").join("0");
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&frames_dir)
-        .map_err(|error| {
-            AppError::Internal(format!(
-                "Could not create the import progress directory: {error}"
-            ))
-        })?;
+    create_private_dir(&frames_dir).map_err(|error| {
+        AppError::Internal(format!(
+            "Could not create the import progress directory: {error}"
+        ))
+    })?;
     let run = MediaDebugRun::new(
         std::slice::from_ref(&source_url),
         dir,
@@ -234,9 +243,12 @@ async fn start_import(
         MediaRunPurpose::Import,
         channels,
     );
-    s.media_debug_runs
-        .lock()
-        .insert(run_id.clone(), run.clone());
+    if !insert_run(&s.media_debug_runs, &run_id, &run) {
+        return Err(AppError::BadRequest(
+            "There are already several media jobs running. Wait for one to finish and try again."
+                .into(),
+        ));
+    }
 
     tokio::spawn(run_media_import(
         s.clone(),
@@ -311,13 +323,10 @@ async fn run_media_import(
         let id = create_draft(
             &state,
             &user,
-            None,
-            "generate",
             &prompt,
             DraftProvenance {
                 attribution: Some(&source),
                 evidence_json: Some(&evidence_json),
-                search_mode: Some(SearchMode::GapFill),
             },
         )
         .await?;
@@ -328,18 +337,24 @@ async fn run_media_import(
                 "state": "adding dish photos and video moments",
             }));
         }
+        // The draft is made: a failure to store its photos or moments only
+        // costs those, never the draft.
         let extras = pending.finish().await;
         if !extras.thumbnails.is_empty() {
-            store_draft_thumbnails(&state.db, &id, &extras.thumbnails).await?;
-            run.record_event(json!({
-                "url": 0,
-                "kind": "thumbnails",
-                "count": extras.thumbnails.len(),
-            }));
+            match store_draft_thumbnails(&state.db, &id, &extras.thumbnails).await {
+                Ok(()) => run.record_event(json!({
+                    "url": 0,
+                    "kind": "thumbnails",
+                    "count": extras.thumbnails.len(),
+                })),
+                Err(error) => warn!(draft_id = %id, %error, "Dish photos were not stored"),
+            }
         }
         if !extras.moments.vectors.is_empty() {
-            store_draft_moment_pool(&state.db, &id, &extras.moments).await?;
-            match_new_draft(&state, &user, &id).await;
+            match store_draft_moment_pool(&state.db, &id, &extras.moments).await {
+                Ok(()) => match_new_draft(&state, &user, &id).await,
+                Err(error) => warn!(draft_id = %id, %error, "Video moments were not stored"),
+            }
         }
         Ok(id)
     }
@@ -361,7 +376,7 @@ async fn run_media_import(
             run.record_event(json!({
                 "url": 0,
                 "kind": "error",
-                "message": error.to_string(),
+                "message": error.user_message(),
                 "settings": error_needs_settings(&error),
             }));
         }
@@ -390,7 +405,20 @@ async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
 /// Whether the user's recipes can generate: the AI setup they use (shared or
 /// their own) has a connected provider.
 pub(crate) async fn ai_configured(state: &AppState, user: &AuthUser) -> bool {
-    ensure_ai_configured(state, user).await.is_ok()
+    configured(ensure_ai_configured(state, user).await)
+}
+
+/// A setup check as a yes or no. A check that could not run (a database
+/// error) also reads as no, so the page still renders, but it is logged.
+fn configured(check: Result<()>) -> bool {
+    match check {
+        Ok(()) => true,
+        Err(AppError::AiNotConfigured | AppError::MediaCleanerNotConfigured) => false,
+        Err(error) => {
+            warn!(%error, "Could not read the AI setup");
+            false
+        }
+    }
 }
 
 /// Whether a provider value can run: a connected subscription, or a saved
@@ -430,13 +458,12 @@ Rules:
 Return exactly one JSON object with these keys and no others: {"title":"string","servings":"string","ingredients":["string"],"steps":["string"],"timings":["string"],"relevant_notes":["string"]}. Use "" or [] when a field is absent. `ingredients` and `steps` must contain only concise recipe facts with their amounts."#;
 
 /// Keep the single-process app from spawning unbounded Node workers. Subscription
-/// (Codex/Claude) workers are serialized separately because OAuth refresh tokens may rotate.
+/// (Codex/Claude) runs are also serialized per credential because OAuth refresh tokens may rotate.
 const AI_WORKER_CONCURRENCY: usize = 2;
 const PI_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(11 * 60);
 const MODEL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const MEDIA_CLEANER_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4 * 60);
 static AI_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static SUBSCRIPTION_WORKER_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 async fn acquire_ai_worker() -> Result<OwnedSemaphorePermit> {
     AI_WORKER_LIMIT
@@ -447,13 +474,38 @@ async fn acquire_ai_worker() -> Result<OwnedSemaphorePermit> {
         .map_err(|_| AppError::Ai)
 }
 
-async fn acquire_subscription_worker() -> Result<OwnedSemaphorePermit> {
-    SUBSCRIPTION_WORKER_LIMIT
-        .get_or_init(|| Arc::new(Semaphore::new(1)))
+/// The slot for one subscription credential (an account's Codex or Claude
+/// login). Two runs on the same credential could both refresh its token, and
+/// a provider that rotates refresh tokens revokes the login when the old one
+/// is used again, so they take turns. Other accounts and the other provider
+/// run alongside.
+pub(crate) async fn acquire_subscription_worker(
+    user_id: &str,
+    pi_provider: &str,
+) -> Result<OwnedSemaphorePermit> {
+    static SLOTS: Mutex<BTreeMap<String, Arc<Semaphore>>> = Mutex::new(BTreeMap::new());
+    keyed(&SLOTS, &format!("{user_id}/{pi_provider}"), || {
+        Semaphore::new(1)
+    })
+    .acquire_owned()
+    .await
+    .map_err(|_| AppError::Ai)
+}
+
+/// The entry for `key` in a map of per-key locks, made on first use. Entries
+/// that no caller holds any more are dropped on the way, so the map keeps
+/// only the keys in use.
+fn keyed<T>(
+    locks: &Mutex<BTreeMap<String, Arc<T>>>,
+    key: &str,
+    make: impl FnOnce() -> T,
+) -> Arc<T> {
+    let mut locks = locks.lock();
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(make()))
         .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| AppError::Ai)
 }
 
 async fn retry_backoff(attempt: usize) {
@@ -470,22 +522,27 @@ async fn media_cleaner_provider(state: &AppState, user_id: &str) -> Result<Strin
     }
 }
 
-async fn ensure_media_cleaner_configured(state: &AppState, user_id: &str) -> Result<()> {
-    let user_id = &crate::ai_account(&state.db, user_id).await?;
-    let provider = media_cleaner_provider(state, user_id).await?;
-    ensure_provider_configured(state, user_id, &provider)
+/// The account whose AI setup runs a user's video cleaner, and the provider
+/// it runs on; `MediaCleanerNotConfigured` when that provider cannot run.
+async fn media_cleaner_setup(state: &AppState, user_id: &str) -> Result<(String, String)> {
+    let ai_user = crate::ai_account(&state.db, user_id).await?;
+    let provider = media_cleaner_provider(state, &ai_user).await?;
+    ensure_provider_configured(state, &ai_user, &provider)
         .await
         .map_err(|error| match error {
             AppError::AiNotConfigured => AppError::MediaCleanerNotConfigured,
             other => other,
-        })
+        })?;
+    Ok((ai_user, provider))
+}
+
+async fn ensure_media_cleaner_configured(state: &AppState, user_id: &str) -> Result<()> {
+    media_cleaner_setup(state, user_id).await.map(|_| ())
 }
 
 /// Whether video imports can run their cleaning pass.
 pub(crate) async fn media_cleaner_configured(state: &AppState, user_id: &str) -> bool {
-    ensure_media_cleaner_configured(state, user_id)
-        .await
-        .is_ok()
+    configured(ensure_media_cleaner_configured(state, user_id).await)
 }
 
 /// Runs the recipe-only cleaning pass after local extraction on the
@@ -497,92 +554,130 @@ async fn clean_media_evidence(
     user_id: &str,
     mut evidence: MediaEvidence,
 ) -> Result<MediaEvidence> {
-    ensure_media_cleaner_configured(state, user_id).await?;
-    let user_id = &crate::ai_account(&state.db, user_id).await?;
-    let provider = media_cleaner_provider(state, user_id).await?;
-    let (backend, provider_model) = resolve_backend(state, user_id, &provider).await?;
-    let model = crate::media_cleaner_model(&state.db, user_id)
+    let (ai_user, provider) = media_cleaner_setup(state, user_id).await?;
+    let (backend, provider_model) = resolve_backend(state, &ai_user, &provider).await?;
+    let model = crate::media_cleaner_model(&state.db, &ai_user)
         .await?
         .unwrap_or(provider_model);
     let cleaner_prompt = cleaner_prompt(&evidence);
-    let request = json!({
-        "command": "cleanMedia",
-        "model": model,
-        "systemPrompt": MEDIA_CLEANER_SYSTEM_PROMPT,
-        "prompt": cleaner_prompt,
-        "reasoningEffort": "low",
-    });
-    info!(
-        provider = backend.label(),
-        model = %model,
-        prompt = %cleaner_prompt,
-        system_prompt = MEDIA_CLEANER_SYSTEM_PROMPT,
-        "LLM media-cleaner request"
-    );
-    let started = Instant::now();
-    // Retry once on transient (non-configuration) failures so a flaky
-    // response does not abort the whole video import.
-    let mut parsed: Option<Value> = None;
-    let mut config_failed = false;
-    for attempt in 0..=1 {
-        let out = backend
-            .run(state, request.clone(), MEDIA_CLEANER_WORKER_TIMEOUT)
-            .await?;
-        let value: Value = serde_json::from_slice(&out.stdout).map_err(|_| AppError::Ai)?;
-        if out.status.success() {
-            parsed = Some(value);
-            break;
-        }
-        let code = value["code"].as_str().unwrap_or("worker");
-        let message = value["error"].as_str().unwrap_or("no message");
-        let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
-        if code == "configuration" {
-            config_failed = true;
-            break;
-        }
-        if attempt == 0 && retryable {
-            warn!(
-                attempt,
-                code, message, "Media cleaner failed; retrying once"
-            );
-            retry_backoff(attempt).await;
-            continue;
-        }
-        error!(
-            code,
-            message,
-            retryable,
-            status = %out.status,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "Media cleaner failed"
+    let provider = backend.label();
+    let request = |attempt: usize| {
+        info!(
+            provider,
+            model = %model,
+            attempt,
+            prompt = %cleaner_prompt,
+            system_prompt = MEDIA_CLEANER_SYSTEM_PROMPT,
+            "LLM media-cleaner request"
         );
-        return Err(AppError::Ai);
-    }
-    let value = parsed.ok_or_else(|| {
-        if config_failed {
-            AppError::MediaCleanerNotConfigured
-        } else {
-            AppError::Ai
-        }
-    })?;
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    info!(
-        provider = backend.label(),
-        model = %model,
-        elapsed_ms,
-        response = %value,
-        "LLM media-cleaner response"
-    );
-    let cleaned = value["cleanedText"]
-        .as_str()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or(AppError::Ai)?;
-    if cleaned.len() > MAX_CLEANED_RECIPE_CHARS {
-        return Err(AppError::Ai);
-    }
-    evidence.cleaned_recipe_text = cleaned.to_string();
+        json!({
+            "command": "cleanMedia",
+            "model": model,
+            "systemPrompt": MEDIA_CLEANER_SYSTEM_PROMPT,
+            "prompt": cleaner_prompt,
+            "reasoningEffort": "low",
+        })
+    };
+    // The worker caps the text in UTF-16 units; counting characters keeps a
+    // non-Latin recipe it accepted from being refused here.
+    let accept = |value: Value| {
+        value["cleanedText"]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.chars().count() <= MAX_CLEANED_RECIPE_CHARS)
+            .map(str::to_string)
+            .ok_or(AppError::Ai)
+    };
+    evidence.cleaned_recipe_text = run_with_retry(
+        state,
+        &backend,
+        WorkerCall {
+            name: "media-cleaner",
+            timeout: MEDIA_CLEANER_WORKER_TIMEOUT,
+            not_configured: AppError::MediaCleanerNotConfigured,
+        },
+        request,
+        accept,
+    )
+    .await?;
     Ok(evidence)
+}
+
+/// One kind of worker call, as `run_with_retry` runs it.
+struct WorkerCall {
+    /// Names the call in the log.
+    name: &'static str,
+    timeout: std::time::Duration,
+    /// What a missing login (the worker's `code: "configuration"`) becomes.
+    not_configured: AppError,
+}
+
+/// Runs one worker request through a backend and reads its reply, trying
+/// once more after a retryable worker failure or a reply `accept` refuses.
+/// `request` builds (and logs) each attempt's request, so a second attempt
+/// may add guidance. A missing login is never retried, and neither is a
+/// refused one (`AiLoginRefused` from the backend). A worker that printed no
+/// readable reply (it crashed) fails without a retry, with its exit status
+/// in the log.
+async fn run_with_retry<T>(
+    state: &AppState,
+    backend: &RecipeBackend<'_>,
+    call: WorkerCall,
+    mut request: impl FnMut(usize) -> Value,
+    mut accept: impl FnMut(Value) -> Result<T>,
+) -> Result<T> {
+    let WorkerCall {
+        name,
+        timeout,
+        not_configured,
+    } = call;
+    let provider = backend.label();
+    for attempt in 0..2 {
+        let last = attempt == 1;
+        let started = Instant::now();
+        let output = backend.run(state, request(attempt), timeout).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let reply: Option<Value> = serde_json::from_slice(&output.stdout).ok();
+        let value = match reply {
+            Some(value) if output.status.success() => value,
+            reply => {
+                let reply = reply.unwrap_or_default();
+                let code = reply["code"].as_str().unwrap_or("worker");
+                let message = reply["error"].as_str().unwrap_or("no readable reply");
+                let retryable = reply["retryable"].as_bool().unwrap_or(code == "output");
+                if code == "configuration" {
+                    error!(call = name, provider, code, message, status = %output.status, elapsed_ms, "AI worker failed");
+                    return Err(not_configured);
+                }
+                if !last && retryable {
+                    warn!(call = name, provider, attempt, code, message, status = %output.status, elapsed_ms, "AI worker failed; retrying");
+                    retry_backoff(attempt).await;
+                    continue;
+                }
+                error!(call = name, provider, attempt, code, message, retryable, status = %output.status, elapsed_ms, "AI worker failed");
+                return Err(AppError::Ai);
+            }
+        };
+        info!(
+            call = name,
+            provider,
+            attempt,
+            elapsed_ms,
+            response = %value,
+            "LLM response"
+        );
+        match accept(value) {
+            Ok(result) => return Ok(result),
+            Err(error) if !last => {
+                warn!(call = name, attempt, %error, "AI reply refused; retrying");
+            }
+            Err(error) => {
+                error!(call = name, attempt, %error, "AI reply refused");
+                return Err(error);
+            }
+        }
+    }
+    Err(AppError::Ai)
 }
 
 pub(crate) async fn draft_page(
@@ -590,7 +685,18 @@ pub(crate) async fn draft_page(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    match render_draft_page(&s, &user, &id, "", "").await {
+    draft_page_or_expired(&s, &user, &id, "", "").await
+}
+
+/// The draft's page, or the expired page once the draft is gone.
+async fn draft_page_or_expired(
+    state: &AppState,
+    user: &AuthUser,
+    id: &str,
+    error: &str,
+    prompt: &str,
+) -> Result<Response> {
+    match render_draft_page(state, user, id, error, prompt).await {
         Err(AppError::NotFound) => draft_expired_response(),
         result => result,
     }
@@ -602,10 +708,9 @@ fn draft_expired_response() -> Result<Response> {
     Ok((StatusCode::NOT_FOUND, render(DraftExpiredTemplate {})?).into_response())
 }
 
-/// Alters the recipe held in a draft, opening the result as a new draft.
-/// The alteration chain keeps pointing at the original saved recipe (if any),
-/// so applying the final draft still updates that recipe, guarded by the
-/// staleness check against the version this chain was based on.
+/// Alters the recipe held in a draft, opening the result as a new draft. The
+/// draft altered stays as it is, so the cook can go back to it until it
+/// expires; saving any draft of the chain creates a new recipe.
 pub(crate) async fn alter_draft(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
@@ -618,25 +723,19 @@ pub(crate) async fn alter_draft(
         Err(error) => return Err(error),
     };
     let prompt = required(&f.prompt, "Comments")?;
+    if let Err(error) = check_prompt_length(&prompt) {
+        return draft_page_or_expired(&s, &user, &id, &shown_error(&error), &prompt).await;
+    }
     let full = alteration_prompt(&prompt, &draft.recipe_json);
-    let base = draft.recipe_id.as_deref().map(|recipe_id| {
-        (
-            recipe_id,
-            draft.base_updated_at.as_deref().unwrap_or_default(),
-        )
-    });
     let evidence = parse_evidence(&draft.evidence_json)?;
     let source = evidence.as_ref().map(MediaEvidence::source);
     match create_draft(
         &s,
         &user,
-        base,
-        "alter",
         &full,
         DraftProvenance {
             attribution: source.as_ref(),
             evidence_json: evidence.as_ref().map(|_| draft.evidence_json.as_str()),
-            search_mode: evidence.as_ref().map(|_| SearchMode::GapFill),
         },
     )
     .await
@@ -649,7 +748,8 @@ pub(crate) async fn alter_draft(
             match_new_draft(&s, &user, &new_id).await;
             Ok(Redirect::to(&format!("/ai/drafts/{new_id}")).into_response())
         }
-        Err(e) => render_draft_page(&s, &user, &id, &e.to_string(), &prompt).await,
+        // The draft may have expired during a long failed run.
+        Err(error) => draft_page_or_expired(&s, &user, &id, &shown_error(&error), &prompt).await,
     }
 }
 
@@ -700,7 +800,7 @@ pub(crate) struct ChatReply {
 /// rode along, never the photo bytes. With `PI_SEARCH_ENABLED` the model may
 /// search the web: with its provider's own search, or else with the AI
 /// account's search API key (`chat_web_search`). A retryable worker failure
-/// is tried once more; a refused login is not.
+/// or an unreadable reply is tried once more; a refused login is not.
 pub(crate) async fn chat_reply(
     state: &AppState,
     user: &AuthUser,
@@ -717,6 +817,9 @@ pub(crate) async fn chat_reply(
     let tools_log = chat_library_log(library);
     let search_key = crate::web_search_key(&state.db, &ai_user).await?;
     let (search_mode, web_search) = chat_web_search(state.search_grounding, search_key.as_ref());
+    // A custom server away from its provider's API gets the search key
+    // instead of the provider's own search, as generation does.
+    let hosted_search = backend.has_web_search();
     let search_key_provider = search_key
         .as_ref()
         .map_or("none", |key| key.provider.as_str());
@@ -728,7 +831,7 @@ pub(crate) async fn chat_reply(
         ),
         None => CHAT_SYSTEM_PROMPT.to_string(),
     };
-    for attempt in 0..2 {
+    let request = |attempt: usize| {
         info!(
             provider,
             model,
@@ -741,8 +844,7 @@ pub(crate) async fn chat_reply(
             library = %tools_log,
             "LLM chat request"
         );
-        let started = Instant::now();
-        let request = json!({
+        json!({
             "command": "chat",
             "prompt": prompt,
             "systemPrompt": system_prompt,
@@ -750,40 +852,23 @@ pub(crate) async fn chat_reply(
             "reasoningEffort": effort,
             "searchMode": search_mode.as_str(),
             "webSearch": web_search,
+            "hostedSearch": hosted_search,
             "library": library,
             "recipe": recipe,
-        });
-        let output = backend.run(state, request, PI_WORKER_TIMEOUT).await?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
-        if !output.status.success() {
-            let code = value["code"].as_str().unwrap_or("worker");
-            let message = value["error"].as_str().unwrap_or("no message");
-            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
-            if code == "configuration" || attempt == 1 || !retryable {
-                error!(code, message, retryable, status = %output.status, elapsed_ms, "LLM chat worker failed");
-                return Err(if code == "configuration" {
-                    AppError::AiNotConfigured
-                } else {
-                    AppError::Ai
-                });
-            }
-            warn!(code, message, retryable, status = %output.status, elapsed_ms, "LLM chat worker failed; retrying");
-            retry_backoff(attempt).await;
-            continue;
-        }
-        info!(
-            provider,
-            model,
-            reasoning_effort = %effort,
-            attempt,
-            elapsed_ms,
-            response = %value,
-            "LLM chat response"
-        );
-        return serde_json::from_value(value).map_err(|_| AppError::Ai);
-    }
-    Err(AppError::Ai)
+        })
+    };
+    run_with_retry(
+        state,
+        &backend,
+        WorkerCall {
+            name: "chat",
+            timeout: PI_WORKER_TIMEOUT,
+            not_configured: AppError::AiNotConfigured,
+        },
+        request,
+        |value| serde_json::from_value(value).map_err(|_| AppError::Ai),
+    )
+    .await
 }
 
 /// The chat's search posture: `GapFill` (search allowed, never required)
@@ -867,13 +952,11 @@ async fn render_draft_page(
         .collect();
     let sources: Vec<Source> =
         serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?;
-    let step_moments =
-        draft_moment_views(state, user, id, &draft, &sources, recipe.steps.len()).await?;
+    let step_moments = draft_moment_views(state, user, id, &sources, recipe.steps.len()).await?;
     render(DraftTemplate {
         id: id.to_string(),
         recipe,
         sources,
-        suggestions: draft.search_suggestions,
         evidence,
         thumbs,
         step_moments,
@@ -883,37 +966,26 @@ async fn render_draft_page(
     .map(IntoResponse::into_response)
 }
 
-/// One entry per draft step: its matched video moment, if any. The video is
-/// the draft's social source, else the social source of the recipe it alters.
+/// One entry per draft step: its matched video moment, if any. Moments show
+/// only for a draft that comes from a social video.
 async fn draft_moment_views(
     state: &AppState,
     user: &AuthUser,
     id: &str,
-    draft: &crate::Draft,
     sources: &[Source],
     step_count: usize,
 ) -> Result<Vec<Option<crate::MomentView>>> {
     let mut views = vec![None; step_count];
-    if !crate::step_moments_enabled(&state.db, &user.id).await? {
+    if social_source_url(sources).is_none()
+        || !crate::step_moments_enabled(&state.db, &user.id).await?
+    {
         return Ok(views);
     }
     let moments = draft_step_moments(&state.db, id).await?;
     if moments.is_empty() {
         return Ok(views);
     }
-    // Moments show only for drafts that come from a social video.
-    let has_video = match (social_source_url(sources), draft.recipe_id.as_deref()) {
-        (Some(_), _) => true,
-        (None, Some(recipe_id)) => {
-            social_source_url(&crate::recipes::sources(&state.db, &user.id, recipe_id).await?)
-                .is_some()
-        }
-        (None, None) => false,
-    };
-    if !has_video {
-        return Ok(views);
-    }
-    let stills = draft_still_seconds(&state.db, id, draft.recipe_id.as_deref()).await?;
+    let stills = draft_still_seconds(&state.db, id).await?;
     let still_base = format!("/ai/drafts/{id}/stills");
     for moment in moments {
         if let Some(slot) = views.get_mut(moment.step_index) {
@@ -931,14 +1003,7 @@ async fn match_new_draft(state: &AppState, user: &AuthUser, draft_id: &str) {
         let mut recipe: GeneratedRecipe =
             serde_json::from_str(&draft.recipe_json).map_err(|_| AppError::Ai)?;
         normalize_generated(&mut recipe)?;
-        crate::moments::match_draft(
-            state,
-            &user.id,
-            draft_id,
-            draft.recipe_id.as_deref(),
-            &recipe,
-        )
-        .await
+        crate::moments::match_draft(state, &user.id, draft_id, &recipe).await
     }
     .await;
     if let Err(error) = result {
@@ -946,9 +1011,9 @@ async fn match_new_draft(state: &AppState, user: &AuthUser, draft_id: &str) {
     }
 }
 
-const STALE_BASE_MESSAGE: &str =
-    "This recipe changed after the draft was made. Generate a new alteration.";
-
+/// Saves a draft as a new recipe, with the dish photo the cook picked, its
+/// sources, and its video moments, and consumes the draft, all in one
+/// transaction.
 pub(crate) async fn apply_draft(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
@@ -967,102 +1032,59 @@ pub(crate) async fn apply_draft(
         serde_json::from_str(&draft.sources_json).map_err(|_| AppError::Ai)?;
     let chart_json =
         serde_json::to_string(&ChartRecipe::from_generated(&recipe)).map_err(|_| AppError::Ai)?;
-    let altering = draft.recipe_id.is_some();
-    let mut tx = s.db.begin().await?;
-    let now = stamp();
-    let recipe_id = if let Some(existing) = draft.recipe_id {
-        // Read inside the transaction so the staleness guard and the write see the same row.
-        let current = crate::recipes::find_recipe_tx(&mut tx, &user.id, &existing).await?;
-        if draft.base_updated_at.as_deref() != Some(current.updated_at.as_str()) {
-            tx.rollback().await?;
-            return render_draft_page(&s, &user, &id, STALE_BASE_MESSAGE, "").await;
+    // The chosen candidate becomes the recipe's photo; an absent or empty
+    // choice saves the recipe without one.
+    let thumbnail = match f
+        .thumbnail
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(choice) => {
+            let idx: i64 = choice.parse().map_err(|_| {
+                AppError::BadRequest("The selected dish photo was not recognised.".into())
+            })?;
+            find_draft_thumbnail_jpeg(&s.db, &user.id, &id, idx).await?
         }
-        crate::recipes::ensure_recipe_history(&mut tx, &user.id, &existing).await?;
-        // A draft without a plate name (an older one) keeps the recipe's.
-        let plate_name = if recipe.plate_name.is_empty() {
-            current.plate_name.clone()
-        } else {
-            recipe.plate_name.clone()
-        };
-        sqlx::query("UPDATE recipes SET title=?,plate_name=?,description=?,servings=?,prep_minutes=?,cook_minutes=?,chart_json=?,updated_at=? WHERE user_id=? AND id=?")
-            .bind(&recipe.title)
-            .bind(&plate_name)
-            .bind(&recipe.description)
-            .bind(recipe.servings)
-            .bind(recipe.prep_minutes)
-            .bind(recipe.cook_minutes)
-            .bind(&chart_json)
-            .bind(&now)
-            .bind(&user.id)
-            .bind(&existing)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM recipe_blocks WHERE recipe_id=?")
-            .bind(&existing)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM recipe_sources WHERE recipe_id=?")
-            .bind(&existing)
-            .execute(&mut *tx)
-            .await?;
-        existing
-    } else {
-        let recipe_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO recipes(id,title,plate_name,description,servings,prep_minutes,cook_minutes,chart_json,user_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(&recipe_id)
-            .bind(&recipe.title)
-            .bind(&recipe.plate_name)
-            .bind(&recipe.description)
-            .bind(recipe.servings)
-            .bind(recipe.prep_minutes)
-            .bind(recipe.cook_minutes)
-            .bind(&chart_json)
-            .bind(&user.id)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        recipe_id
+        None => None,
     };
-    for (position, ingredient) in recipe.ingredients.iter().enumerate() {
-        sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit,optional)VALUES(?,?,?,?,?,?,?,?)")
-            .bind(Uuid::new_v4().to_string())
-            .bind(&recipe_id)
-            .bind("ingredient")
-            .bind(position as i64)
-            .bind(&ingredient.name)
-            .bind(&ingredient.quantity)
-            .bind(&ingredient.unit)
-            .bind(if ingredient.optional { 1 } else { 0 })
-            .execute(&mut *tx)
-            .await?;
-    }
-    let mut step_ids = Vec::with_capacity(recipe.steps.len());
-    for (position, step) in recipe.steps.iter().enumerate() {
-        let step_id = Uuid::new_v4().to_string();
-        step_ids.push(step_id.clone());
-        sqlx::query(
-            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text)VALUES(?,?,?,?,?)",
-        )
-        .bind(&step_id)
+    let ingredients: Vec<SnapshotIngredient> = recipe
+        .ingredients
+        .iter()
+        .map(|ingredient| SnapshotIngredient {
+            name: ingredient.name.clone(),
+            quantity: ingredient.quantity.clone(),
+            unit: ingredient.unit.clone(),
+            optional: ingredient.optional,
+        })
+        .collect();
+    let steps: Vec<SnapshotStep> = recipe
+        .steps
+        .iter()
+        .map(|step| SnapshotStep {
+            text: step.text.clone(),
+            ingredients: step.ingredients.clone(),
+        })
+        .collect();
+    let mut tx = crate::recipes::begin_write(&s.db).await?;
+    let now = stamp();
+    let recipe_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO recipes(id,title,plate_name,description,servings,prep_minutes,cook_minutes,chart_json,thumbnail_jpeg,user_id,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&recipe_id)
-        .bind("step")
-        .bind(position as i64)
-        .bind(&step.text)
+        .bind(&recipe.title)
+        .bind(&recipe.plate_name)
+        .bind(&recipe.description)
+        .bind(recipe.servings)
+        .bind(recipe.prep_minutes)
+        .bind(recipe.cook_minutes)
+        .bind(&chart_json)
+        .bind(thumbnail)
+        .bind(&user.id)
+        .bind(&now)
+        .bind(&now)
         .execute(&mut *tx)
         .await?;
-        for (ingredient_position, ingredient) in step.ingredients.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO recipe_step_ingredients(id,step_id,position,text)VALUES(?,?,?,?)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&step_id)
-            .bind(ingredient_position as i64)
-            .bind(ingredient)
-            .execute(&mut *tx)
-            .await?;
-        }
-    }
+    let step_ids = crate::recipes::insert_blocks(&mut tx, &recipe_id, &ingredients, &steps).await?;
     for (position, source) in sources.iter().enumerate() {
         sqlx::query("INSERT INTO recipe_sources(id,recipe_id,position,title,url)VALUES(?,?,?,?,?)")
             .bind(Uuid::new_v4().to_string())
@@ -1073,49 +1095,22 @@ pub(crate) async fn apply_draft(
             .execute(&mut *tx)
             .await?;
     }
-    // Copy the chosen candidate onto the recipe inside the same transaction;
-    // an absent or empty choice leaves any existing photo untouched.
-    if let Some(choice) = f
-        .thumbnail
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let idx: i64 = choice.parse().map_err(|_| {
-            AppError::BadRequest("The selected dish photo was not recognised.".into())
-        })?;
-        let jpeg: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT jpeg FROM draft_thumbnails WHERE draft_id=? AND idx=?")
-                .bind(&id)
-                .bind(idx)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some(jpeg) = jpeg {
-            sqlx::query("UPDATE recipes SET thumbnail_jpeg=? WHERE id=? AND user_id=?")
-                .bind(&jpeg)
-                .bind(&recipe_id)
-                .bind(&user.id)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
-    let label = if altering {
-        "AI alteration applied"
-    } else {
-        "Recipe created with AI"
-    };
-    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, label).await?;
+    crate::recipes::record_version(&mut tx, &user.id, &recipe_id, "Recipe created with AI").await?;
     // Before the draft row goes: deleting it cascades its moment pool.
     apply_draft_moments(&mut tx, &id, &recipe_id, &step_ids).await?;
-    sqlx::query("DELETE FROM draft_thumbnails WHERE draft_id=?")
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
+    delete_draft_thumbnails(&mut *tx, &id).await?;
+    let consumed = sqlx::query("DELETE FROM ai_drafts WHERE id=? AND user_id=?")
         .bind(&id)
         .bind(&user.id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+    if consumed == 0 {
+        // Another Save of this draft (a double submit) finished first, or the
+        // draft was discarded meanwhile: this one saves nothing.
+        tx.rollback().await?;
+        return draft_expired_response();
+    }
     tx.commit().await?;
     Ok(Redirect::to(&format!("/recipes/{recipe_id}")).into_response())
 }
@@ -1135,8 +1130,7 @@ pub(crate) async fn draft_thumbnail(
     Ok(crate::image_response(jpeg))
 }
 
-/// Serves one moment still for a live draft: from the draft's own pool, or
-/// from the pool of the recipe the draft alters.
+/// Serves one moment still from a live draft's moment pool.
 pub(crate) async fn draft_still(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
@@ -1167,7 +1161,7 @@ pub(crate) async fn cancel_draft(
 }
 
 /// Web-search posture for one generation call.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SearchMode {
     /// No web_search tool; the model answers from knowledge alone.
     Off,
@@ -1196,6 +1190,17 @@ impl SearchMode {
     }
 }
 
+/// The search posture a generation asks for: research for a written
+/// request, gap-filling for imported video evidence, and none at all when
+/// `PI_SEARCH_ENABLED` is off.
+pub(crate) fn generation_search_mode(search_enabled: bool, evidence: bool) -> SearchMode {
+    match (search_enabled, evidence) {
+        (false, _) => SearchMode::Off,
+        (true, false) => SearchMode::Grounded,
+        (true, true) => SearchMode::GapFill,
+    }
+}
+
 /// Field formats shared by every generation prompt. The recipe card renders
 /// `quantity unit name` and the description as plain text.
 const RECIPE_FIELD_RULES: &str = r#"Field formats:
@@ -1206,52 +1211,131 @@ const RECIPE_FIELD_RULES: &str = r#"Field formats:
 - Description: one or two sentences about the dish for the cook. Do not describe your edits, the user's request, or your reasoning.
 - Every text field is plain text: no Markdown, links, URLs, or citation markers. Put cited pages only in sources."#;
 
-/// System prompt matching each search posture.
-pub(crate) fn system_recipe_prompt(search_mode: SearchMode) -> &'static str {
-    match search_mode {
-        SearchMode::Off => RECIPE_PROMPT,
-        SearchMode::Grounded => GROUNDED_RECIPE_PROMPT,
-        SearchMode::GapFill => EVIDENCE_RECIPE_PROMPT,
+// The recipe system prompts share their rules through these macros (literals,
+// so `concat!` builds each prompt as one constant): a rule changed here
+// changes in every prompt.
+
+/// What every generation returns: one complete recipe, its plate name, the
+/// quantity audit, and the chart fields.
+macro_rules! recipe_contract {
+    () => {
+        r#"Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent."#
+    };
+}
+
+/// How to leave out an ingredient the request excludes, from cooking
+/// knowledge. The grounded prompt has its own version, which researches the
+/// substitute.
+macro_rules! exclusion_rule {
+    () => {
+        r#"Notice when the user's request excludes an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without X" — and do not silently drop it. Judge whether the ingredient is genuinely optional; when it plays a structural role (binding, leavening, emulsifying, thickening, moisture, or browning), substitute a suitable alternative from sound cooking knowledge (such as flax or chia "eggs", aquafaba, plant milks and butters, or xanthan gum) and adjust technique so the recipe still achieves its intended result."#
+    };
+}
+
+/// The prompt for a draft built from imported social-video evidence (a video
+/// import and its alteration chain). `$research` follows "reason from sound
+/// cooking knowledge", `$own_words` closes that paragraph, and `$sources`
+/// says what goes in sources.
+macro_rules! evidence_prompt {
+    ($research:literal, $own_words:literal, $sources:literal) => {
+        concat!(
+            r#"You are a meticulous recipe assistant working from imported social-video evidence. The evidence was distilled automatically from a social video's caption, spoken audio, and on-screen text, so it can be incomplete, garbled, or one-sided. Treat it as the best available record of the original creator's intent, not as verified fact.
+
+Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge"#,
+            $research,
+            ". Fill every such gap so the finished recipe works end to end, and keep it faithful to the ingredients, character, and method shown in the video.",
+            $own_words,
+            "\n\n",
+            exclusion_rule!(),
+            "\n\n",
+            recipe_contract!(),
+            " ",
+            $sources
+        )
+    };
+}
+
+/// System prompt for a written request without web search.
+pub(crate) const RECIPE_PROMPT: &str = concat!(
+    "You are a recipe assistant. Prefer credible guidance and synthesize practical advice without copying source text. ",
+    recipe_contract!(),
+    " ",
+    exclusion_rule!(),
+    " Be concise and practical for a home cook."
+);
+
+/// System prompt for a written request researched with web search.
+pub(crate) const GROUNDED_RECIPE_PROMPT: &str = concat!(
+    r#"You are a meticulous recipe research assistant. Research before generating. Always use the web_search tool. When the user supplies one or more URLs, search for their published title, author, and recipe details. When the user names an existing recipe, cook, book, restaurant, or website, locate the likely original and cross-check it against at least two independent, credible sources when available.
+
+Study ingredient ratios, ingredient roles, preparation, sequencing, temperatures, timings, texture cues, and the intended final result. Recreate the referenced recipe faithfully enough to achieve that result, while resolving omissions or contradictions with sound cooking knowledge. Do not copy expressive prose, headnotes, or distinctive wording; write original, concise instructions. Preserve attribution through citations rather than imitation of the author's voice.
+
+When the user asks to exclude an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without nuts", and similar — do not silently drop it. First judge whether the ingredient is genuinely optional: if it only adds flavour or is truly dispensable, omitting it is fine, but make that a conscious, reasoned decision. If it plays a structural role — binding, leavening, emulsifying, thickening, moisture, browning, or setting — research suitable replacement ingredients and techniques with web_search (for example flax or chia "eggs", aquafaba, mashed banana, plant milks and butters, nut-free butters, xanthan or psyllium gum) and adapt quantities and method so the recipe still achieves its intended result. Keep the recipe true to its original character: the substitution must preserve the outcome, not merely delete the ingredient.
+
+"#,
+    recipe_contract!(),
+    " Cite every source that materially informed the recipe."
+);
+
+/// System prompt for video evidence with the web_search tool attached. The
+/// tool is optional: research fills the gaps the evidence leaves, so an
+/// answer drawn purely from sufficient evidence stays valid.
+pub(crate) const EVIDENCE_RECIPE_PROMPT: &str = evidence_prompt!(
+    ", and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough",
+    " Do not copy expressive prose from researched sources; write original, concise instructions.",
+    "When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."
+);
+
+/// System prompt for video evidence without web search (`PI_SEARCH_ENABLED`
+/// off, or a backend with no search tool).
+pub(crate) const EVIDENCE_OFFLINE_RECIPE_PROMPT: &str =
+    evidence_prompt!("", "", "Return an empty sources array.");
+
+/// The system prompt for a generation: what it works from (a written request
+/// or video evidence) and whether it may search.
+pub(crate) fn system_recipe_prompt(evidence: bool, search_mode: SearchMode) -> &'static str {
+    match (evidence, search_mode) {
+        (true, SearchMode::Off) => EVIDENCE_OFFLINE_RECIPE_PROMPT,
+        (true, _) => EVIDENCE_RECIPE_PROMPT,
+        (false, SearchMode::Grounded) => GROUNDED_RECIPE_PROMPT,
+        (false, _) => RECIPE_PROMPT,
     }
 }
 
 /// Extra instruction appended when a generation attempt fails validation.
-pub(crate) fn retry_guidance(search_mode: SearchMode) -> &'static str {
-    match search_mode {
-        SearchMode::Off => {
-            "\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
+pub(crate) fn retry_guidance(evidence: bool, search_mode: SearchMode) -> &'static str {
+    match (evidence, search_mode) {
+        (true, SearchMode::Off) => {
+            "\n\nImportant: fill every gap the video evidence leaves open from sound cooking knowledge, and return the complete recipe as valid JSON matching the requested schema."
         }
-        SearchMode::Grounded => {
+        (true, _) => {
+            "\n\nImportant: fill every gap the video evidence leaves open — research similar recipes with web_search wherever the evidence is incomplete or implausible — and return the complete recipe as valid JSON matching the requested schema."
+        }
+        (false, SearchMode::Grounded) => {
             "\n\nImportant: research this thoroughly with web_search before answering. Return the complete recipe and cite only web_search result URLs."
         }
-        SearchMode::GapFill => {
-            "\n\nImportant: fill every gap the video evidence leaves open — research similar recipes with web_search wherever the evidence is incomplete or implausible — and return the complete recipe as valid JSON matching the requested schema."
+        (false, _) => {
+            "\n\nImportant: return a complete recipe as valid JSON matching the requested schema."
         }
     }
 }
 
 struct DraftProvenance<'a> {
     attribution: Option<&'a Source>,
+    /// The imported video evidence the prompt was built from; None for a
+    /// written request. It picks the evidence prompt and gap-fill search.
     evidence_json: Option<&'a str>,
-    /// Generation-time search posture; `None` follows the global
-    /// `PI_SEARCH_ENABLED` grounding setting.
-    search_mode: Option<SearchMode>,
 }
 
+/// Generates a recipe and stores it as a new draft of the user's.
 async fn create_draft(
     state: &AppState,
     user: &AuthUser,
-    base: Option<(&str, &str)>,
-    operation: &str,
     prompt: &str,
     provenance: DraftProvenance<'_>,
 ) -> Result<String> {
-    let search_mode = provenance.search_mode.unwrap_or(if state.search_grounding {
-        SearchMode::Grounded
-    } else {
-        SearchMode::Off
-    });
-    let (generated_recipe, sources) = pi_recipe(state, user, prompt, search_mode).await?;
+    let evidence = provenance.evidence_json.is_some();
+    let (generated_recipe, sources) = pi_recipe(state, user, prompt, evidence).await?;
     let sources = dedupe_sources(
         sources
             .into_iter()
@@ -1260,33 +1344,36 @@ async fn create_draft(
     );
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    delete_expired_draft_thumbnails(&state.db, &now.to_rfc3339()).await?;
-    sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
-        .bind(now.to_rfc3339())
-        .execute(&state.db)
-        .await?;
-    sqlx::query("INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,base_updated_at,user_id,created_at,expires_at,evidence_json)VALUES(?,?,?,?,?,?,?,?,?,?)")
-        .bind(&id)
-        .bind(base.map(|(recipe_id, _)| recipe_id))
-        .bind(operation)
-        .bind(serde_json::to_string(&generated_recipe).map_err(|_| AppError::Ai)?)
-        .bind(serde_json::to_string(&sources).map_err(|_| AppError::Ai)?)
-        .bind(base.map(|(_, base_updated_at)| base_updated_at))
-        .bind(&user.id)
-        .bind(now.to_rfc3339())
-        .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
-        .bind(provenance.evidence_json.unwrap_or_default())
-        .execute(&state.db)
-        .await?;
+    delete_expired_drafts(&state.db, &now.to_rfc3339()).await?;
+    // A video import runs for minutes in the background: if its account was
+    // deleted meanwhile, nothing is stored for the gone user.
+    let inserted = sqlx::query(
+        "INSERT INTO ai_drafts(id,recipe_json,sources_json,user_id,created_at,expires_at,evidence_json)
+         SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM users WHERE id=?)",
+    )
+    .bind(&id)
+    .bind(serde_json::to_string(&generated_recipe).map_err(|_| AppError::Ai)?)
+    .bind(serde_json::to_string(&sources).map_err(|_| AppError::Ai)?)
+    .bind(&user.id)
+    .bind(now.to_rfc3339())
+    .bind((now + Duration::hours(DRAFT_HOURS)).to_rfc3339())
+    .bind(provenance.evidence_json.unwrap_or_default())
+    .bind(&user.id)
+    .execute(&state.db)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Err(AppError::NotFound);
+    }
     Ok(id)
 }
 
-/// Where one recipe generation call runs: a stored subscription credential
-/// (Codex or Claude) or a registered OpenAI- or Anthropic-spec endpoint.
+/// Where one worker call runs: a stored subscription credential (Codex or
+/// Claude) or a registered API endpoint.
 enum RecipeBackend<'a> {
     Subscription {
         user_id: &'a str,
-        pi_provider: &'static str,
+        pi_provider: &'a str,
     },
     /// The API key rides in the worker request and never round-trips back.
     Endpoint(crate::Endpoint),
@@ -1297,6 +1384,17 @@ impl RecipeBackend<'_> {
         match self {
             Self::Subscription { pi_provider, .. } => pi_provider,
             Self::Endpoint(endpoint) => endpoint.spec.as_str(),
+        }
+    }
+
+    /// Whether the backend searches the web itself: a subscription, or an
+    /// endpoint at its provider's own API (`endpoint_has_web_search`).
+    fn has_web_search(&self) -> bool {
+        match self {
+            Self::Subscription { .. } => true,
+            Self::Endpoint(endpoint) => {
+                crate::endpoint_has_web_search(&endpoint.spec, &endpoint.base_url)
+            }
         }
     }
 
@@ -1330,27 +1428,70 @@ impl RecipeBackend<'_> {
     }
 }
 
+/// Generates a recipe through the user's AI setup. A second attempt,
+/// re-prompted with research guidance, follows a retryable worker failure or
+/// an output that fails validation. Only validated output is returned.
 async fn pi_recipe(
     state: &AppState,
     user: &AuthUser,
     prompt: &str,
-    search_mode: SearchMode,
+    evidence: bool,
 ) -> Result<(GeneratedRecipe, Vec<Source>)> {
     // The AI account's credentials serve the call, and a refreshed token is
     // stored back on that account, so a shared login stays valid for everyone.
     let ai_user = crate::ai_account(&state.db, &user.id).await?;
     let provider = crate::ai_provider(&state.db, &ai_user).await?;
     let (backend, model) = resolve_backend(state, &ai_user, &provider).await?;
-    // Units are the cook's own choice, not the shared AI account's.
-    let units = crate::measurement_rule(crate::measurement_system(&state.db, &user.id).await?);
-    request_recipe(
-        state,
-        &ai_user,
+    let search_mode = backend_search_mode(
         &backend,
-        &model,
-        prompt,
-        backend_search_mode(&backend, search_mode),
-        units,
+        generation_search_mode(state.search_grounding, evidence),
+    );
+    let effort =
+        crate::selected_effort(&state.db, &ai_user, crate::DEFAULT_REASONING_EFFORT).await?;
+    // Units are the cook's own choice, not the shared AI account's.
+    let units = crate::measurement_rule(crate::measurement_system(&state.db, &user.id).await?)
+        .map_or_else(String::new, |rule| format!("\n- {rule}"));
+    let system_prompt = format!(
+        "{}\n\n{}{units}\n\nRecipe JSON schema:\n{}",
+        system_recipe_prompt(evidence, search_mode),
+        RECIPE_FIELD_RULES,
+        recipe_schema()
+    );
+    let provider = backend.label();
+    let request = |attempt: usize| {
+        let input = if attempt == 0 {
+            prompt.to_string()
+        } else {
+            format!("{prompt}{}", retry_guidance(evidence, search_mode))
+        };
+        info!(
+            provider,
+            model,
+            reasoning_effort = %effort,
+            search_mode = search_mode.as_str(),
+            attempt,
+            prompt = %input,
+            system_prompt = %system_prompt,
+            "LLM request"
+        );
+        json!({
+            "prompt": input,
+            "systemPrompt": system_prompt,
+            "model": model,
+            "reasoningEffort": effort,
+            "searchMode": search_mode.as_str(),
+        })
+    };
+    run_with_retry(
+        state,
+        &backend,
+        WorkerCall {
+            name: "recipe",
+            timeout: PI_WORKER_TIMEOUT,
+            not_configured: AppError::AiNotConfigured,
+        },
+        request,
+        |value| parse_pi_response(value, search_mode.requires_sources()),
     )
     .await
 }
@@ -1387,194 +1528,133 @@ async fn resolve_backend<'a>(
     }
 }
 
-/// The search posture a backend can honour. Endpoints run through pi-ai have
-/// no web search tool, so a grounded request generates without research
-/// instead of failing for want of sources. Gap-fill keeps its evidence prompt:
-/// its sources are optional, and the worker sends no search tool.
+/// The search posture a backend can honour. An endpoint without web search
+/// (`endpoint_has_web_search`: a pi-ai provider, or a custom server away from
+/// the provider's own API) generates without searching: a grounded request
+/// instead of failing for want of sources, and video evidence with the
+/// evidence prompt that does not offer the tool.
 fn backend_search_mode(backend: &RecipeBackend<'_>, search_mode: SearchMode) -> SearchMode {
     match backend {
-        RecipeBackend::Endpoint(endpoint) => endpoint_search_mode(&endpoint.spec, search_mode),
+        RecipeBackend::Endpoint(endpoint) => {
+            endpoint_search_mode(&endpoint.spec, &endpoint.base_url, search_mode)
+        }
         RecipeBackend::Subscription { .. } => search_mode,
     }
 }
 
-pub(crate) fn endpoint_search_mode(spec: &str, search_mode: SearchMode) -> SearchMode {
-    if search_mode == SearchMode::Grounded && !crate::spec_has_web_search(spec) {
-        SearchMode::Off
-    } else {
-        search_mode
-    }
-}
-
-/// Generates a recipe through one backend. A second attempt, re-prompted with
-/// research guidance, follows a retryable worker failure or an output that
-/// fails validation. Only validated output is returned.
-async fn request_recipe(
-    state: &AppState,
-    user_id: &str,
-    backend: &RecipeBackend<'_>,
-    model: &str,
-    prompt: &str,
+pub(crate) fn endpoint_search_mode(
+    spec: &str,
+    base_url: &str,
     search_mode: SearchMode,
-    units: Option<&str>,
-) -> Result<(GeneratedRecipe, Vec<Source>)> {
-    let effort =
-        crate::selected_effort(&state.db, user_id, crate::DEFAULT_REASONING_EFFORT).await?;
-    let units = units.map_or_else(String::new, |rule| format!("\n- {rule}"));
-    let system_prompt = format!(
-        "{}\n\n{}{units}\n\nRecipe JSON schema:\n{}",
-        system_recipe_prompt(search_mode),
-        RECIPE_FIELD_RULES,
-        recipe_schema()
-    );
-    let provider = backend.label();
-    for attempt in 0..2 {
-        let input = if attempt == 0 {
-            prompt.to_string()
-        } else {
-            format!("{prompt}{}", retry_guidance(search_mode))
-        };
-        info!(
-            provider,
-            model,
-            reasoning_effort = %effort,
-            search_mode = search_mode.as_str(),
-            attempt,
-            prompt = %input,
-            system_prompt = %system_prompt,
-            "LLM request"
-        );
-        let started = Instant::now();
-        let request = json!({
-            "prompt": input,
-            "systemPrompt": system_prompt,
-            "model": model,
-            "reasoningEffort": effort,
-            "searchMode": search_mode.as_str(),
-        });
-        let output = backend.run(state, request, PI_WORKER_TIMEOUT).await?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
-        if !output.status.success() {
-            let code = value["code"].as_str().unwrap_or("worker");
-            let message = value["error"].as_str().unwrap_or("no message");
-            let retryable = value["retryable"].as_bool().unwrap_or(code == "output");
-            if code == "configuration" || attempt == 1 || !retryable {
-                error!(code, message, retryable, status = %output.status, elapsed_ms, "LLM worker failed");
-                return Err(if code == "configuration" {
-                    AppError::AiNotConfigured
-                } else {
-                    AppError::Ai
-                });
-            }
-            warn!(code, message, retryable, status = %output.status, elapsed_ms, "LLM worker failed; retrying with research guidance");
-            retry_backoff(attempt).await;
-            continue;
-        }
-        info!(
-            provider,
-            model,
-            reasoning_effort = %effort,
-            attempt,
-            elapsed_ms,
-            response = %value,
-            "LLM response"
-        );
-        match parse_pi_response(value, search_mode.requires_sources()) {
-            Ok(result) => return Ok(result),
-            Err(error) => {
-                if attempt == 1 {
-                    error!(attempt, error = %error, "LLM output failed validation");
-                } else {
-                    warn!(attempt, error = %error, "LLM output failed validation; retrying");
-                }
-            }
-        }
+) -> SearchMode {
+    if crate::endpoint_has_web_search(spec, base_url) {
+        search_mode
+    } else {
+        SearchMode::Off
     }
-    Err(AppError::Ai)
 }
 
-/// Runs the Pi worker once, blocking, with the payload on stdin. Credentials
-/// arrive only in the payload, so any gateway variables in the app's own
-/// environment are stripped from the worker's.
+/// Runs `node <script> <args>` once, blocking, with `payload` on stdin, and
+/// kills it once `timeout` has passed. When the run fails, times out, or
+/// cannot be fed its payload, its stderr goes to the app log under `label`;
+/// a successful run's stderr is the caller's to log. Credentials reach a
+/// script only in its payload, and the variables of the retired Vercel AI
+/// Gateway setup are stripped so a stale gateway key is never picked up.
+pub(crate) fn run_node(
+    label: &str,
+    script: &str,
+    args: &[&str],
+    payload: &[u8],
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    let mut child = Command::new("node")
+        .arg(script)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("AI_GATEWAY_API_KEY")
+        .env_remove("AI_GATEWAY_BASE_URL")
+        .spawn()?;
+    let stdout_reader = spawn_pipe_reader(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("stdout was not piped"))?,
+    );
+    let stderr_reader = spawn_pipe_reader(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("stderr was not piped"))?,
+    );
+    let status = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("stdin was not piped"))
+        .and_then(|mut stdin| stdin.write_all(payload))
+        .and_then(|()| wait_until(&mut child, Instant::now() + timeout))
+        .and_then(|status| {
+            status.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{label} exceeded its {} second timeout", timeout.as_secs()),
+                )
+            })
+        });
+    if status.is_err() {
+        let _ = kill_and_reap(&mut child);
+    }
+    let stdout = join_pipe_reader(stdout_reader);
+    let stderr = join_pipe_reader(stderr_reader).unwrap_or_default();
+    if !status.as_ref().is_ok_and(std::process::ExitStatus::success) {
+        log_stderr(label, &stderr);
+    }
+    Ok(std::process::Output {
+        status: status?,
+        stdout: stdout?,
+        stderr,
+    })
+}
+
+/// Waits for a child until `deadline`; None when the deadline came first.
+fn wait_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Copies a Node script's stderr into the app log, a line at a time.
+fn log_stderr(label: &str, stderr: &[u8]) {
+    for line in String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        info!(line, "{label}");
+    }
+}
+
+/// Runs the Pi worker once, blocking, with the payload on stdin. Its stderr
+/// is the worker's own log of the call (tool calls, cache usage), so it
+/// reaches the app log after every run.
 fn run_pi_worker(
     worker_path: &str,
     payload: &[u8],
     timeout: std::time::Duration,
 ) -> io::Result<std::process::Output> {
-    let mut command = Command::new("node");
-    command
-        .arg(worker_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
-        .env_remove("AI_GATEWAY_API_KEY")
-        .env_remove("AI_GATEWAY_BASE_URL");
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("Pi worker stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("Pi worker stderr was not piped"))?;
-    let stdout_reader = spawn_pipe_reader(stdout);
-    let stderr_reader = spawn_pipe_reader(stderr);
-
-    let write_result = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("Pi worker stdin was not piped"))
-        .and_then(|mut stdin| stdin.write_all(payload));
-    if let Err(error) = write_result {
-        let _ = kill_and_reap(&mut child);
-        let _ = join_pipe_reader(stdout_reader);
-        let _ = join_pipe_reader(stderr_reader);
-        return Err(error);
-    }
-
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                timed_out = true;
-                break kill_and_reap(&mut child)?;
-            }
-            Ok(None) => thread::sleep(std::time::Duration::from_millis(25)),
-            Err(error) => {
-                let _ = kill_and_reap(&mut child);
-                let _ = join_pipe_reader(stdout_reader);
-                let _ = join_pipe_reader(stderr_reader);
-                return Err(error);
-            }
-        }
-    };
-
-    let stdout = join_pipe_reader(stdout_reader)?;
-    let stderr = join_pipe_reader(stderr_reader)?;
-    if timed_out {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "Pi worker exceeded its {} second timeout",
-                timeout.as_secs()
-            ),
-        ));
-    }
-    let output = std::process::Output {
-        status,
-        stdout,
-        stderr,
-    };
-    for line in String::from_utf8_lossy(&output.stderr).lines() {
-        let line = line.trim();
-        if !line.is_empty() {
-            info!(line, "Pi worker");
-        }
+    let output = run_node("Pi worker", worker_path, &[], payload, timeout)?;
+    if output.status.success() {
+        log_stderr("Pi worker", &output.stderr);
     }
     Ok(output)
 }
@@ -1603,7 +1683,8 @@ fn kill_and_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
 }
 
 /// Runs one worker process on a blocking thread under an AI worker slot.
-/// Timeouts are logged here; every failure maps to the generic AI error.
+/// Every failure to run it (a timeout, a missing `node`) is logged here and
+/// becomes the generic AI error.
 async fn run_worker(
     state: &AppState,
     payload: Vec<u8>,
@@ -1618,9 +1699,7 @@ async fn run_worker(
     .await
     .map_err(|_| AppError::Ai)?
     .map_err(|error| {
-        if error.kind() == io::ErrorKind::TimedOut {
-            error!(%error, "Pi worker timed out");
-        }
+        error!(%error, "Pi worker failed to run");
         AppError::Ai
     })
 }
@@ -1631,10 +1710,17 @@ struct TempAuthFile {
     path: PathBuf,
 }
 
+/// Names of the temp files and directories the app makes, which
+/// `remove_leftover_temp_files` clears: subscription auth files, and the
+/// directories of media work (`kindle-recipes-media-`, import and debugger
+/// runs included) and of photo uploads.
+const TEMP_AUTH_FILE_PREFIX: &str = "kindle-recipes-auth-";
+const TEMP_DIR_PREFIXES: [&str; 2] = ["kindle-recipes-media-", "kindle-recipes-upload-"];
+
 impl TempAuthFile {
     fn create(pi_provider: &str, credential: &Value) -> io::Result<Self> {
         let auth = Self {
-            path: env::temp_dir().join(format!("kindle-recipes-auth-{}.json", Uuid::new_v4())),
+            path: env::temp_dir().join(format!("{TEMP_AUTH_FILE_PREFIX}{}.json", Uuid::new_v4())),
         };
         let mut auth_file = json!({});
         auth_file[pi_provider] = credential.clone();
@@ -1663,16 +1749,74 @@ impl Drop for TempAuthFile {
     }
 }
 
-/// Runs a subscription (Codex or Claude) worker. The subscription slot is held
-/// for the whole call, the stored credential is read under it, and a token the
-/// SDK refreshed is persisted even when the run fails or times out.
+/// Removes what an earlier run of the app left in `dir` (the temp
+/// directory): subscription auth files holding OAuth tokens, media work and
+/// run directories, and photo upload directories. Each is removed by its
+/// owner when done, so only a crash or a restart leaves any behind. Call it
+/// once at startup, before anything can be using them. Entries are judged by
+/// their own type, so a planted symlink is never followed.
+pub(crate) fn remove_leftover_temp_files(dir: &FsPath) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let (Ok(kind), Some(name)) = (
+            entry.file_type(),
+            entry.file_name().to_str().map(str::to_owned),
+        ) else {
+            continue;
+        };
+        let path = entry.path();
+        let removed = if kind.is_file() && name.starts_with(TEMP_AUTH_FILE_PREFIX) {
+            fs::remove_file(&path)
+        } else if kind.is_dir()
+            && TEMP_DIR_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            fs::remove_dir_all(&path)
+        } else {
+            continue;
+        };
+        if let Err(error) = removed {
+            warn!(path = %path.display(), %error, "Could not remove a leftover temp file");
+        }
+    }
+}
+
+/// Runs a subscription (Codex or Claude) worker. The run goes on in a task of
+/// its own, so a caller that goes away (a closed tab, a sleeping Kindle)
+/// cannot drop the credential's slot or its auth file while the worker still
+/// runs, nor lose the token the worker refreshes.
 async fn run_subscription_worker(
     state: &AppState,
     user_id: &str,
     pi_provider: &str,
+    request: Value,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    tokio::spawn(subscription_run(
+        state.clone(),
+        user_id.to_string(),
+        pi_provider.to_string(),
+        request,
+        timeout,
+    ))
+    .await
+    .map_err(|_| AppError::Ai)?
+}
+
+/// One subscription run. The credential's slot is held for the whole run,
+/// the stored credential is read under it, and a token the SDK refreshed is
+/// written back even when the run fails or times out.
+async fn subscription_run(
+    state: AppState,
+    user_id: String,
+    pi_provider: String,
     mut request: Value,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
+    let (state, user_id, pi_provider) = (&state, user_id.as_str(), pi_provider.as_str());
     // Fail fast rather than queue behind a running subscription worker.
     if crate::pi_credential(&state.db, user_id, pi_provider)
         .await?
@@ -1681,7 +1825,7 @@ async fn run_subscription_worker(
         return Err(AppError::AiNotConfigured);
     }
     // Lock order: subscription slot here, then the general AI worker slot inside run_worker.
-    let _subscription_permit = acquire_subscription_worker().await?;
+    let _subscription_permit = acquire_subscription_worker(user_id, pi_provider).await?;
     let credential = crate::pi_credential(&state.db, user_id, pi_provider)
         .await?
         .ok_or(AppError::AiNotConfigured)?;
@@ -1697,7 +1841,14 @@ async fn run_subscription_worker(
         .refreshed(pi_provider)
         .filter(|refreshed| *refreshed != credential)
     {
-        crate::store_pi_credential(&state.db, user_id, pi_provider, &refreshed).await?;
+        crate::store_refreshed_pi_credential(
+            &state.db,
+            user_id,
+            pi_provider,
+            &credential,
+            &refreshed,
+        )
+        .await?;
     }
     let login = crate::Login::Subscription {
         user_id,
@@ -1798,16 +1949,15 @@ pub(crate) async fn check_endpoint_login(
     state: &AppState,
     endpoint: &crate::Endpoint,
 ) -> Result<LoginCheck> {
-    let payload = serde_json::to_vec(&json!({
-        "command": "listModels",
-        "provider": endpoint.spec,
-        "apiBaseUrl": endpoint.base_url,
-        "apiKey": endpoint.api_key,
-    }))
-    .map_err(|_| AppError::Ai)?;
-    let output = run_worker(state, payload, MODEL_LIST_TIMEOUT).await?;
-    let login = crate::Login::Endpoint { id: &endpoint.id };
-    match track_login(state, login, &endpoint.name, true, output).await {
+    let backend = RecipeBackend::Endpoint(endpoint.clone());
+    match backend
+        .run(
+            state,
+            json!({ "command": "listModels" }),
+            MODEL_LIST_TIMEOUT,
+        )
+        .await
+    {
         Ok(output) => Ok(login_check_result(&endpoint.name, &output)),
         Err(AppError::AiLoginRefused(_)) => Ok(LoginCheck::Refused),
         Err(error) => Err(error),
@@ -1855,44 +2005,37 @@ impl ModelSource<'_> {
 /// credential; an endpoint from its own models API with its stored key. Empty
 /// when there is no credential or discovery fails.
 async fn fetch_models(state: &AppState, source: &ModelSource<'_>) -> Result<Vec<String>> {
-    let output = match source {
+    let backend = match source {
         ModelSource::Subscription {
             user_id,
             pi_provider,
-        } => match run_subscription_worker(
-            state,
+        } => RecipeBackend::Subscription {
             user_id,
             pi_provider,
+        },
+        ModelSource::Endpoint(endpoint) => RecipeBackend::Endpoint((*endpoint).clone()),
+    };
+    let output = match backend
+        .run(
+            state,
             json!({ "command": "listModels" }),
             MODEL_LIST_TIMEOUT,
         )
         .await
-        {
-            Ok(output) => output,
-            Err(AppError::AiNotConfigured) => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        },
-        ModelSource::Endpoint(endpoint) => {
-            let payload = serde_json::to_vec(&json!({
-                "command": "listModels",
-                "provider": endpoint.spec,
-                "apiBaseUrl": endpoint.base_url,
-                "apiKey": endpoint.api_key,
-            }))
-            .map_err(|_| AppError::Ai)?;
-            let output = run_worker(state, payload, MODEL_LIST_TIMEOUT).await?;
-            track_login(
-                state,
-                crate::Login::Endpoint { id: &endpoint.id },
-                &endpoint.name,
-                true,
-                output,
-            )
-            .await?
-        }
+    {
+        Ok(output) => output,
+        Err(AppError::AiNotConfigured) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     if !output.status.success() {
-        error!(status = %output.status, source = source.key(), "Model discovery failed");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        error!(
+            status = %output.status,
+            source = source.key(),
+            code = value["code"].as_str().unwrap_or("worker"),
+            message = value["error"].as_str().unwrap_or("no readable reply"),
+            "Model discovery failed"
+        );
         return Ok(Vec::new());
     }
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| AppError::Ai)?;
@@ -1940,15 +2083,9 @@ fn fresh_cached_models(state: &AppState, key: &str) -> Option<Vec<String>> {
 /// here, and the cache re-check after acquiring it returns the list the first
 /// one stored instead of starting another worker run.
 fn discovery_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: parking_lot::Mutex<Vec<(String, Arc<tokio::sync::Mutex<()>>)>> =
-        parking_lot::Mutex::new(Vec::new());
-    let mut locks = LOCKS.lock();
-    if let Some((_, lock)) = locks.iter().find(|(existing, _)| existing == key) {
-        return lock.clone();
-    }
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.push((key.to_string(), lock.clone()));
-    lock
+    static LOCKS: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>> =
+        Mutex::new(BTreeMap::new());
+    keyed(&LOCKS, key, || tokio::sync::Mutex::new(()))
 }
 
 /// Discovers the models for one source. A fresh cached list is returned
@@ -2015,69 +2152,6 @@ pub(crate) fn normalize_generated(recipe: &mut GeneratedRecipe) -> Result<()> {
     for step in &mut recipe.steps {
         step.text = strip_markdown_links(&step.text);
     }
-    if recipe
-        .steps
-        .iter()
-        .all(|step| step.chart_label.trim().is_empty())
-    {
-        // Old drafts stored only display strings; retain them as a safe linear flow.
-        for index in 0..recipe.steps.len() {
-            let step = &mut recipe.steps[index];
-            step.chart_label = step
-                .text
-                .split_whitespace()
-                .take(5)
-                .collect::<Vec<_>>()
-                .join(" ");
-            step.timer_seconds = 0;
-            for display in &step.ingredients {
-                let display_lower = display.to_lowercase();
-                let Some((ingredient_index, ingredient)) = recipe
-                    .ingredients
-                    .iter()
-                    .enumerate()
-                    .find(|(_, ingredient)| {
-                        display_lower.ends_with(&ingredient.name.to_lowercase())
-                    })
-                else {
-                    continue;
-                };
-                // Case folding can change byte lengths, so the split point is checked rather than assumed.
-                let amount = display
-                    .len()
-                    .checked_sub(ingredient.name.len())
-                    .and_then(|split| display.get(..split))
-                    .unwrap_or_default()
-                    .trim();
-                step.ingredient_uses.push(IngredientUse {
-                    ingredient: ingredient_index,
-                    amount: if amount.is_empty() {
-                        ingredient_display(ingredient)
-                    } else {
-                        amount.to_string()
-                    },
-                });
-            }
-            if index > 0 {
-                step.input_steps.push(index - 1);
-            }
-        }
-        let used: HashSet<usize> = recipe
-            .steps
-            .iter()
-            .flat_map(|step| step.ingredient_uses.iter().map(|use_| use_.ingredient))
-            .collect();
-        if let Some(last) = recipe.steps.last_mut() {
-            for (index, ingredient) in recipe.ingredients.iter().enumerate() {
-                if !used.contains(&index) {
-                    last.ingredient_uses.push(IngredientUse {
-                        ingredient: index,
-                        amount: ingredient_display(ingredient),
-                    });
-                }
-            }
-        }
-    }
     for step in &mut recipe.steps {
         step.ingredients = step
             .ingredient_uses
@@ -2092,17 +2166,6 @@ pub(crate) fn normalize_generated(recipe: &mut GeneratedRecipe) -> Result<()> {
             .collect();
     }
     validate_generated(recipe)
-}
-
-fn ingredient_display(ingredient: &Ingredient) -> String {
-    let amount = format!("{} {}", ingredient.quantity, ingredient.unit)
-        .trim()
-        .to_string();
-    if amount.is_empty() {
-        "as needed".into()
-    } else {
-        amount
-    }
 }
 
 /// Text fields render as plain text, so Markdown links from web-search
@@ -2142,10 +2205,23 @@ pub(crate) fn strip_markdown_links(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Most ingredients, and most steps, a generated recipe may have: far more
+/// than any real recipe, so only runaway output is refused.
+const MAX_GENERATED_ITEMS: usize = 100;
+/// Longest step timer a generated recipe may set: a week, enough for a cure
+/// or a ferment.
+const MAX_TIMER_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
     if recipe.title.trim().is_empty()
         || recipe.ingredients.is_empty()
+        || recipe.ingredients.len() > MAX_GENERATED_ITEMS
+        || recipe
+            .ingredients
+            .iter()
+            .any(|ingredient| ingredient.name.trim().is_empty())
         || recipe.steps.len() < 2
+        || recipe.steps.len() > MAX_GENERATED_ITEMS
         || recipe.prep_minutes < 0
         || recipe.cook_minutes < 0
         || recipe.servings < 0
@@ -2166,7 +2242,7 @@ pub(crate) fn validate_generated(recipe: &GeneratedRecipe) -> Result<()> {
     for (index, step) in recipe.steps.iter().enumerate() {
         if step.text.trim().is_empty()
             || step.chart_label.trim().is_empty()
-            || step.timer_seconds < 0
+            || !(0..=MAX_TIMER_SECONDS).contains(&step.timer_seconds)
         {
             warn!(step = index, "AI recipe step failed content checks");
             return Err(AppError::Ai);
@@ -2387,12 +2463,43 @@ pub(crate) fn find_run(runs: &DebugRunMap, run_id: &str) -> Result<MediaDebugRun
     runs.lock().get(run_id).cloned().ok_or(AppError::NotFound)
 }
 
-fn find_import_run(runs: &DebugRunMap, run_id: &str, user_id: &str) -> Result<MediaDebugRun> {
+/// A run of one purpose that `user_id` started. Another account's run, even
+/// with its id, is not found: runs hold raw transcripts, OCR text, and frames.
+fn find_owned_run(
+    runs: &DebugRunMap,
+    run_id: &str,
+    user_id: &str,
+    purpose: MediaRunPurpose,
+) -> Result<MediaDebugRun> {
     let run = find_run(runs, run_id)?;
-    if run.purpose != MediaRunPurpose::Import || run.owner_id != user_id {
+    if run.purpose != purpose || run.owner_id != user_id {
         return Err(AppError::NotFound);
     }
     Ok(run)
+}
+
+/// Adds a run unless `DEBUG_RUN_LIMIT` runs are already kept. The count and
+/// the insert share one lock, so two starts at once cannot both pass.
+fn insert_run(runs: &DebugRunMap, run_id: &str, run: &MediaDebugRun) -> bool {
+    let mut runs = runs.lock();
+    if runs.len() >= DEBUG_RUN_LIMIT {
+        return false;
+    }
+    runs.insert(run_id.to_string(), run.clone());
+    true
+}
+
+/// Drops every run of a deleted account, with its frames on disk. A run
+/// still working stores nothing afterwards: its draft would belong to an
+/// account that is gone, which `create_draft` refuses.
+pub(crate) fn forget_media_runs(runs: &DebugRunMap, user_id: &str) {
+    runs.lock().retain(|_, run| {
+        if run.owner_id != user_id {
+            return true;
+        }
+        let _ = fs::remove_dir_all(&run.dir);
+        false
+    });
 }
 
 /// Splits the debugger textarea into validated canonical URLs plus per-line
@@ -2580,19 +2687,25 @@ pub(crate) fn prune_debug_runs(runs: &DebugRunMap) {
     }
 }
 
-pub(crate) async fn media_debug_page(State(s): State<Arc<AppState>>) -> Result<Html<String>> {
+pub(crate) async fn media_debug_page(
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+) -> Result<Html<String>> {
     prune_debug_runs(&s.media_debug_runs);
-    debug_page_response(&s.media_debug_runs, String::new(), String::new())
+    debug_page_response(&s.media_debug_runs, &user.id, String::new(), String::new())
 }
 
+/// The debugger launcher, listing the signed-in user's own debugger runs.
 fn debug_page_response(
     runs: &DebugRunMap,
+    user_id: &str,
     error: String,
     urls_value: String,
 ) -> Result<Html<String>> {
     let snapshot = runs.lock();
     let mut rows: Vec<(Instant, MediaDebugRunRow)> = snapshot
         .iter()
+        .filter(|(_, run)| run.purpose == MediaRunPurpose::Debug && run.owner_id == user_id)
         .map(|(id, run)| {
             (
                 run.created,
@@ -2622,33 +2735,19 @@ pub(crate) async fn media_debug_start(
     prune_debug_runs(&s.media_debug_runs);
     let (urls, errors) = parse_debug_urls(&form.urls);
     let mut error = errors.join(" ");
-    if s.media_debug_runs.lock().len() >= DEBUG_RUN_LIMIT {
-        error = "There are already several media jobs running. Wait for one to finish.".into();
-    }
     if urls.is_empty() && error.is_empty() {
         error = "Paste at least one Facebook or Instagram URL.".into();
     }
     if !error.is_empty() || urls.is_empty() {
-        return debug_page_response(&s.media_debug_runs, error, form.urls)
+        return debug_page_response(&s.media_debug_runs, &user.id, error, form.urls)
             .map(IntoResponse::into_response);
     }
     let run_id = Uuid::new_v4().to_string();
     let dir = env::temp_dir().join(format!("kindle-recipes-media-debug-{run_id}"));
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir.join("frames"))
-        .map_err(|error| {
+    for index in 0..urls.len() {
+        create_private_dir(&dir.join("frames").join(index.to_string())).map_err(|error| {
             AppError::Internal(format!("Could not create the debug directory: {error}"))
         })?;
-    for index in 0..urls.len() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir.join("frames").join(index.to_string()))
-            .map_err(|error| {
-                AppError::Internal(format!("Could not create the debug directory: {error}"))
-            })?;
     }
     let run = MediaDebugRun::new(
         &urls,
@@ -2657,9 +2756,12 @@ pub(crate) async fn media_debug_start(
         MediaRunPurpose::Debug,
         MediaChannels::default(),
     );
-    s.media_debug_runs
-        .lock()
-        .insert(run_id.clone(), run.clone());
+    if !insert_run(&s.media_debug_runs, &run_id, &run) {
+        let _ = fs::remove_dir_all(&run.dir);
+        let error = "There are already several media jobs running. Wait for one to finish.";
+        return debug_page_response(&s.media_debug_runs, &user.id, error.into(), form.urls)
+            .map(IntoResponse::into_response);
+    }
     tokio::spawn(async move {
         for (index, url) in urls.into_iter().enumerate() {
             {
@@ -2730,7 +2832,7 @@ pub(crate) async fn media_debug_start(
                             run.record_event(json!({
                                 "url": index,
                                 "kind": "error",
-                                "message": format!("The video cleaner failed: {error}"),
+                                "message": format!("The video cleaner failed: {}", error.user_message()),
                             }));
                             run.urls[index].lock().status = "failed".into();
                         }
@@ -2741,7 +2843,7 @@ pub(crate) async fn media_debug_start(
                     run.record_event(json!({
                         "url": index,
                         "kind": "error",
-                        "message": error.to_string(),
+                        "message": error.user_message(),
                     }));
                     run.urls[index].lock().status = "failed".into();
                 }
@@ -2797,7 +2899,12 @@ pub(crate) async fn import_run_page(
     user: AuthUser,
     Path(run_id): Path<String>,
 ) -> Result<Html<String>> {
-    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    let run = find_owned_run(
+        &s.media_debug_runs,
+        &run_id,
+        &user.id,
+        MediaRunPurpose::Import,
+    )?;
     let evidence = debug_url_view(
         &run.urls[0].lock(),
         &format!("/ai/import/{run_id}/frames"),
@@ -2919,12 +3026,15 @@ pub(crate) fn import_sources(
 
 pub(crate) async fn media_debug_run_page(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path(run_id): Path<String>,
 ) -> Result<Html<String>> {
-    let run = find_run(&s.media_debug_runs, &run_id)?;
-    if run.purpose != MediaRunPurpose::Debug {
-        return Err(AppError::NotFound);
-    }
+    let run = find_owned_run(
+        &s.media_debug_runs,
+        &run_id,
+        &user.id,
+        MediaRunPurpose::Debug,
+    )?;
     let finished = run.finished();
     let frames_base = format!("/settings/media-debug/{run_id}/frames");
     let views = run
@@ -2965,7 +3075,12 @@ pub(crate) async fn import_events(
     Path(run_id): Path<String>,
     Query(query): Query<DebugEventsQuery>,
 ) -> Result<Json<Value>> {
-    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    let run = find_owned_run(
+        &s.media_debug_runs,
+        &run_id,
+        &user.id,
+        MediaRunPurpose::Import,
+    )?;
     Ok(run_events(run, query.since))
 }
 
@@ -2996,17 +3111,25 @@ pub(crate) async fn import_frame(
     user: AuthUser,
     Path((run_id, url_index, file)): Path<(String, usize, String)>,
 ) -> Result<Response> {
-    let run = find_import_run(&s.media_debug_runs, &run_id, &user.id)?;
+    let run = find_owned_run(
+        &s.media_debug_runs,
+        &run_id,
+        &user.id,
+        MediaRunPurpose::Import,
+    )?;
     run_frame(&run, url_index, &file).await
 }
 
 pub(crate) async fn media_debug_frame(
     State(s): State<Arc<AppState>>,
+    user: AuthUser,
     Path((run_id, url_index, file)): Path<(String, usize, String)>,
 ) -> Result<Response> {
-    let run = find_run(&s.media_debug_runs, &run_id)?;
-    if run.purpose != MediaRunPurpose::Debug {
-        return Err(AppError::NotFound);
-    }
+    let run = find_owned_run(
+        &s.media_debug_runs,
+        &run_id,
+        &user.id,
+        MediaRunPurpose::Debug,
+    )?;
     run_frame(&run, url_index, &file).await
 }

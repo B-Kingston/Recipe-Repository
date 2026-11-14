@@ -1,9 +1,10 @@
 //! Servings scaling for the recipe page: reads the amount at the start of an
-//! ingredient quantity or a step's ingredient line ("1 1/2", "½", "200g",
-//! "2–3"), multiplies it, and writes it back rounded the way a cook measures:
-//! metric weights and volumes to sensible whole numbers, everything else to
-//! kitchen fractions. Text with no leading amount ("to taste", "a pinch")
-//! stays as it is. Pure functions, no I/O.
+//! ingredient quantity or a step's ingredient line ("1 1/2", "1-1/2", "½",
+//! "200g", "2–3"), multiplies it, and writes it back rounded the way a cook
+//! measures: metric weights and volumes to round figures (fives from 100,
+//! whole numbers from 10, a decimal or two below that), everything else to
+//! kitchen fractions. Text without an amount it can read whole ("to taste",
+//! "a pinch", "1,5 kg") stays as it is. Pure functions, no I/O.
 
 /// The servings links the recipe page offers, besides the recipe's own.
 pub(crate) const SERVING_CHOICES: std::ops::RangeInclusive<i64> = 1..=6;
@@ -67,6 +68,14 @@ impl Scale {
         self.original != self.serves
     }
 
+    /// `?serves=N` when scaled, else empty: the query of the card view.
+    pub(crate) fn page_query(&self) -> String {
+        match self.query.strip_prefix('&') {
+            Some(query) => format!("?{query}"),
+            None => String::new(),
+        }
+    }
+
     /// The servings links: 1 to 6, plus the recipe's own count when larger.
     pub(crate) fn choices(&self) -> Vec<i64> {
         let mut choices: Vec<i64> = SERVING_CHOICES.collect();
@@ -105,7 +114,8 @@ impl Scale {
 
 /// Scales the amount at the start of `text` by `factor`, keeping the rest of
 /// the text as written. Returns `text` unchanged when it has no leading
-/// amount or the factor is 1.
+/// amount, when the number goes on past what could be read, or when the
+/// factor is 1.
 pub(crate) fn scale_text(text: &str, unit: &str, factor: f64) -> String {
     if (factor - 1.0).abs() < 1e-9 || !factor.is_finite() || factor <= 0.0 {
         return text.to_string();
@@ -116,12 +126,18 @@ pub(crate) fn scale_text(text: &str, unit: &str, factor: f64) -> String {
         return text.to_string();
     };
     let rest = &body[amount.end..];
-    let unit_word = if unit.trim().is_empty() {
-        rest.split(|c: char| c.is_whitespace() || c == '(' || c == ',')
-            .find(|word| !word.is_empty())
-            .unwrap_or_default()
+    if continues_number(rest) {
+        return text.to_string();
+    }
+    // The unit is the ingredient's own field, else the word after the amount.
+    let (unit_word, unit_end) = if unit.trim().is_empty() {
+        let start = rest.find(|c: char| !unit_break(c)).unwrap_or(rest.len());
+        let end = rest[start..]
+            .find(unit_break)
+            .map_or(rest.len(), |len| start + len);
+        (&rest[start..end], end)
     } else {
-        unit.trim()
+        (unit.trim(), 0)
     };
     let metric = is_metric(unit_word);
     let values: Vec<String> = amount
@@ -134,7 +150,41 @@ pub(crate) fn scale_text(text: &str, unit: &str, factor: f64) -> String {
         [low, high] => format!("{low}{}{high}", amount.separator),
         _ => return text.to_string(),
     };
+    // A second measure after a slash ("400g/14oz") is the same amount in
+    // other units, so it scales too.
+    let rest = match rest[unit_end..].trim_start().strip_prefix('/') {
+        Some(alternate) if parse_amount(alternate.trim_start()).is_some() => format!(
+            "{}{}",
+            &rest[..rest.len() - alternate.len()],
+            scale_text(alternate, "", factor)
+        ),
+        _ => rest.to_string(),
+    };
     format!("{}{scaled}{rest}", &text[..leading])
+}
+
+/// What ends a unit written after an amount: the "g" of "200 g, sifted",
+/// "200g (7oz)", or "400g/14oz".
+fn unit_break(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '(' | ',' | '/')
+}
+
+/// Whether the text after a read amount still belongs to its number: a
+/// decimal comma ("1,5 kg"), a slash or fraction glyph the reader did not
+/// take, or a fraction after a decimal ("1.5 1/2"). Scaling only the part
+/// that was read would print a wrong amount.
+fn continues_number(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(',' | '.') => chars.next().is_some_and(|c| c.is_ascii_digit()),
+        Some(c) if c.is_ascii_digit() || is_slash(c) || is_fraction_glyph(c) => true,
+        Some(c) if c.is_whitespace() => {
+            let after = rest.trim_start();
+            after.chars().next().is_some_and(is_fraction_glyph)
+                || integer(after).is_some_and(|(_, used)| strip_slash(&after[used..]).is_some())
+        }
+        _ => false,
+    }
 }
 
 struct Amount {
@@ -145,7 +195,8 @@ struct Amount {
     end: usize,
 }
 
-/// A leading number, fraction, mixed number, or range of two of those.
+/// A leading number, fraction, mixed number, or range of two of those. A
+/// dash or "to" before a smaller number ("3-2") reads as no amount at all.
 fn parse_amount(text: &str) -> Option<Amount> {
     let (first, mut end) = parse_number(text)?;
     let mut values = vec![first];
@@ -157,12 +208,13 @@ fn parse_amount(text: &str) -> Option<Amount> {
         if let Some(tail) = trimmed.strip_prefix(dash) {
             let tail_trimmed = tail.trim_start();
             if let Some((second, used)) = parse_number(tail_trimmed) {
-                if second >= first {
-                    let consumed = gap + dash.len() + (tail.len() - tail_trimmed.len());
-                    separator = after[..consumed].to_string();
-                    end += consumed + used;
-                    values.push(second);
+                if second < first {
+                    return None;
                 }
+                let consumed = gap + dash.len() + (tail.len() - tail_trimmed.len());
+                separator = after[..consumed].to_string();
+                end += consumed + used;
+                values.push(second);
             }
             break;
         }
@@ -174,8 +226,8 @@ fn parse_amount(text: &str) -> Option<Amount> {
     })
 }
 
-/// One number at the start of `text`: "2", "1.5", "1/2", "1 1/2", "½", "1½",
-/// "1 ½". Returns the value and the bytes it took.
+/// One number at the start of `text`: "2", "1.5", "1/2", "1 1/2", "1-1/2",
+/// "½", "1½", "1 ½". Returns the value and the bytes it took.
 fn parse_number(text: &str) -> Option<(f64, usize)> {
     if let Some((value, used)) = glyph(text) {
         return Some((value, used));
@@ -189,39 +241,71 @@ fn parse_number(text: &str) -> Option<(f64, usize)> {
     }
     let whole_text = text[..digits].trim_end_matches('.');
     let whole: f64 = whole_text.parse().ok()?;
-    let mut end = whole_text.len();
+    let end = whole_text.len();
     let rest = &text[end..];
     // A plain fraction: "1/2".
-    if let Some(denominator) = rest.strip_prefix('/') {
+    if let Some(denominator) = strip_slash(rest) {
         let (bottom, used) = integer(denominator)?;
         if bottom == 0 || whole_text.contains('.') {
             return None;
         }
-        return Some((whole / bottom as f64, end + 1 + used));
+        return Some((
+            whole / f64::from(bottom),
+            text.len() - denominator.len() + used,
+        ));
     }
-    // A glued or spaced fraction after the whole number: "1½", "1 ½", "1 1/2".
     if !whole_text.contains('.') {
-        let spaced = rest.trim_start_matches(' ');
-        let gap = rest.len() - spaced.len();
-        if gap <= 1 {
-            if let Some((part, used)) = glyph(spaced) {
-                return Some((whole + part, end + gap + used));
-            }
-        }
-        if gap == 1 {
-            if let Some((top, top_used)) = integer(spaced) {
-                if let Some(bottom_text) = spaced[top_used..].strip_prefix('/') {
-                    if let Some((bottom, bottom_used)) = integer(bottom_text) {
-                        if bottom != 0 && top < bottom {
-                            end += gap + top_used + 1 + bottom_used;
-                            return Some((whole + top as f64 / bottom as f64, end));
-                        }
-                    }
-                }
-            }
+        if let Some((part, used)) = fraction_part(rest) {
+            return Some((whole + part, end + used));
         }
     }
     Some((whole, end))
+}
+
+/// The proper fraction that follows a whole number: a glyph, glued on or
+/// after spaces or a hyphen ("½", " ½", "-½"), or "a/b" with a < b after
+/// spaces or a hyphen (" 1/2", and "-1/2" as in the American "1-1/2").
+/// Returns its value and the bytes it took, separator included.
+fn fraction_part(rest: &str) -> Option<(f64, usize)> {
+    let after = match rest.strip_prefix('-') {
+        Some(after) => after,
+        None => rest.trim_start(),
+    };
+    let gap = rest.len() - after.len();
+    if let Some((part, used)) = glyph(after) {
+        return Some((part, gap + used));
+    }
+    if gap == 0 {
+        return None;
+    }
+    let (top, top_used) = integer(after)?;
+    let bottom_text = strip_slash(&after[top_used..])?;
+    let (bottom, bottom_used) = integer(bottom_text)?;
+    (bottom != 0 && top < bottom).then(|| {
+        (
+            f64::from(top) / f64::from(bottom),
+            rest.len() - bottom_text.len() + bottom_used,
+        )
+    })
+}
+
+/// A slash, or the Unicode fraction slash of "1⁄2".
+fn is_slash(c: char) -> bool {
+    matches!(c, '/' | '\u{2044}')
+}
+
+/// The text after a leading slash, if `text` starts with one.
+fn strip_slash(text: &str) -> Option<&str> {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .filter(|c| is_slash(*c))
+        .map(|_| chars.as_str())
+}
+
+/// Any Unicode vulgar fraction, whether `GLYPHS` reads it or not ("⅟", "↉").
+fn is_fraction_glyph(c: char) -> bool {
+    matches!(c, '\u{00BC}'..='\u{00BE}' | '\u{2150}'..='\u{215F}' | '\u{2189}')
 }
 
 fn integer(text: &str) -> Option<(u32, usize)> {
@@ -235,7 +319,7 @@ fn integer(text: &str) -> Option<(u32, usize)> {
     text[..used].parse().ok().map(|value| (value, used))
 }
 
-const GLYPHS: [(char, f64); 11] = [
+const GLYPHS: [(char, f64); 18] = [
     ('½', 0.5),
     ('⅓', 1.0 / 3.0),
     ('⅔', 2.0 / 3.0),
@@ -246,7 +330,14 @@ const GLYPHS: [(char, f64); 11] = [
     ('⅝', 0.625),
     ('⅞', 0.875),
     ('⅕', 0.2),
+    ('⅖', 0.4),
+    ('⅗', 0.6),
+    ('⅘', 0.8),
     ('⅙', 1.0 / 6.0),
+    ('⅚', 5.0 / 6.0),
+    ('⅐', 1.0 / 7.0),
+    ('⅑', 1.0 / 9.0),
+    ('⅒', 0.1),
 ];
 
 fn glyph(text: &str) -> Option<(f64, usize)> {
@@ -309,8 +400,9 @@ fn format_metric(value: f64) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// The nearest kitchen fraction: halves, thirds, quarters, and eighths, as
-/// "1½"; whole numbers from 10 up. Never rounds a real amount down to 0.
+/// The nearest kitchen fraction: halves, thirds, quarters, or ⅛ for a small
+/// amount (3/8 comes out as ⅓ and 7/8 as ¾), as "1½"; whole numbers from 10
+/// up. Never rounds a real amount down to 0.
 fn format_fraction(value: f64) -> String {
     if value >= 10.0 {
         return format!("{}", value.round() as i64);

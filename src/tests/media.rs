@@ -314,6 +314,7 @@ async fn frames_are_served_only_from_the_retained_directory() {
     // A valid capture is served as JPEG.
     let response = media_debug_frame(
         State(app.clone()),
+        AuthUser { id: "u1".into() },
         Path((run_id.clone(), 0usize, "f0001.jpg".into())),
     )
     .await
@@ -324,6 +325,7 @@ async fn frames_are_served_only_from_the_retained_directory() {
     for evil in ["../../boot", "f0001.jpg%00", "sub/f0001.jpg"] {
         let outcome = media_debug_frame(
             State(app.clone()),
+            AuthUser { id: "u1".into() },
             Path((run_id.clone(), 0usize, evil.into())),
         )
         .await;

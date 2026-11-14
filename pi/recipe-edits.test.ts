@@ -98,6 +98,7 @@ test("bad numbers and empty text are errors that leave the copy alone", () => {
     call("change_step", { step: 1 }),
     call("add_ingredient", { name: "" }),
     call("change_ingredient", { ingredient: 1, name: "" }),
+    call("change_ingredient", { ingredient: 1 }),
     call("rename_recipe", {}),
   ]) {
     assert.equal(runEditTool(draft, bad).isError, true, bad.name);
@@ -115,6 +116,14 @@ test("draftChanged ignores where items came from and sees what the cook would", 
   assert.equal(draftChanged(original, draft), false);
   runEditTool(draft, call("change_ingredient", { ingredient: 1, unit: "grams" }));
   assert.equal(draftChanged(original, draft), true);
+});
+
+test("a step's ingredient lines sent back as they were are no change", () => {
+  const original = recipeDraft({ title: "Dal", steps: [{ text: "Simmer.", ingredients: [" 2 tsp salt ", "  "] }] })!;
+  assert.deepEqual(original.steps[0].ingredients, ["2 tsp salt"]);
+  const draft = copyDraft(original);
+  runEditTool(draft, call("change_step", { step: 1, ingredients: ["2 tsp salt"] }));
+  assert.equal(draftChanged(original, draft), false);
 });
 
 /** A small seeded random generator, so the sequence below is the same every run. */

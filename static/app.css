@@ -65,6 +65,9 @@
   --focus-ring: 0 0 0 3px rgba(30, 63, 166, .24);
   /* A white enamel tray: cobalt rim, darker lip, soft drop. */
   --tray: inset 0 0 0 2.5px var(--cobalt), 0 3px 0 var(--cobalt-deep), 0 14px 24px rgba(20, 44, 120, .12);
+  /* A shallow dish inside a tray (on --soft): the ingredients, the chat,
+     and the panels that open on the recipe sheet. */
+  --dish: inset 0 0 0 2px var(--lines);
   --shadow: 0 3px 0 rgba(20, 44, 120, .16), 0 12px 22px rgba(20, 44, 120, .1);
   --shadow-lift: 0 3px 0 rgba(20, 44, 120, .2), 0 18px 32px rgba(20, 44, 120, .2);
   --radius: 22px;
@@ -75,6 +78,9 @@
 }
 
 * { box-sizing: border-box; }
+/* The hidden attribute always hides, whatever display a class gives the
+   element (.actions and .button are flex). */
+[hidden] { display: none !important; }
 html { overscroll-behavior: none; scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 body {
   overscroll-behavior: none;
@@ -471,7 +477,6 @@ legend { padding: 0; }
 label.inline { display: inline-flex; align-items: center; gap: 8px; margin-right: 14px; }
 label.inline input { margin-top: 0; }
 .compact-textarea { min-height: 4.8rem; }
-.short-textarea { min-height: 4rem; }
 .toggle-row {
   display: flex;
   flex-wrap: wrap;
@@ -524,14 +529,6 @@ label > input[type=checkbox] { margin-right: 8px; }
 .developer-tools[open] summary { margin-bottom: .6rem; }
 
 /* Library: an enamel sign, then the pinned tickets. */
-.section-heading {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px 40px;
-}
-.section-heading h1 { margin: 0; font-size: 2.4rem; overflow-wrap: anywhere; }
 /* The sign: cobalt enamel with a white pinstripe inside the edge and a rivet
    in each corner. The title sits on the left and the search on the right. */
 .library-sign {
@@ -1031,13 +1028,13 @@ label > input[type=checkbox] { margin-right: 8px; }
 }
 .view-tab:hover { color: var(--cobalt); }
 .view-tab.is-active { background: var(--cobalt); color: var(--on-ink); box-shadow: 0 2px 0 var(--cobalt-deep); }
-.recipe-sheet .form-panel { max-width: none; margin: 20px 0 0; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.recipe-sheet .form-panel { max-width: none; margin: 20px 0 0; background: var(--soft); box-shadow: var(--dish); }
 
 /* The ingredients sit in a shallow dish; the method runs beside them with
    each step numbered on a cobalt enamel token. */
 .card-body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 32px 44px; margin-top: 30px; }
 .card-side { display: flex; flex: 1 1 280px; flex-direction: column; gap: 20px; max-width: 380px; min-width: 0; }
-.ingredients-section { padding: 20px 22px 12px; border-radius: 22px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.ingredients-section { padding: 20px 22px 12px; border-radius: 22px; background: var(--soft); box-shadow: var(--dish); }
 .method-section { flex: 999 1 420px; min-width: 0; }
 .section-label { margin: 0 0 6px; color: var(--cobalt-deep); font: 800 1.35rem/1.2 var(--display); font-variation-settings: "opsz" 32; }
 .empty-section { margin: .6rem 0; }
@@ -1092,7 +1089,7 @@ label > input[type=checkbox] { margin-right: 8px; }
    leaves a divider: a zigzag rule (static/zigzag.svg, one rounded period
    repeated) either side of a pill naming the change. */
 .chat-toggle.is-pressed, .chat-toggle.is-pressed:hover { background: var(--cobalt); box-shadow: 0 2px 0 var(--cobalt-deep); color: var(--on-ink); }
-.recipe-chat { margin: 18px 0 0; padding: 18px 20px 20px; border-radius: 22px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.recipe-chat { margin: 18px 0 0; padding: 18px 20px 20px; border-radius: 22px; background: var(--soft); box-shadow: var(--dish); }
 .chat-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .chat-head .section-label { margin: 0; }
 .chat-empty { margin: 0 0 12px; }
@@ -1144,10 +1141,12 @@ label > input[type=checkbox] { margin-right: 8px; }
 .chat-keep button.compact { min-height: 32px; padding: 0 8px; color: var(--muted); font-size: 13px; }
 .chat-kept { color: var(--muted); font: 700 13px/1.3 var(--sans); }
 
+/* Under the card, the notes and the dish photo panel each open with a
+   cobalt rule. */
+.recipe-notes, .thumb-manage { margin-top: 36px; padding-top: 22px; border-top: 3px solid var(--cobalt); }
+
 /* Notes: the cook's own notes under the recipe, each dated and
    tagged with what it is about (the whole recipe, or one version). */
-.recipe-notes { margin-top: 36px; padding-top: 22px; border-top: 3px solid var(--cobalt); }
-.recipe-notes h2 { margin: 0 0 8px; color: var(--cobalt-deep); font: 800 1.35rem/1.2 var(--display); }
 .note-list { margin: 0 0 8px; padding: 0; list-style: none; }
 .note { padding: 12px 0 14px; border-bottom: 1.5px dashed var(--lines); }
 .note-meta { margin: 0 0 4px; color: var(--muted); font: 700 13.5px/1.3 var(--sans); }
@@ -1157,7 +1156,7 @@ label > input[type=checkbox] { margin-right: 8px; }
 .note-photo:hover img, .note-photo:focus img { outline: 2.5px solid var(--cobalt); outline-offset: 2px; }
 .note-edit { margin-top: 6px; }
 .note-edit summary { display: inline-block; color: var(--cobalt); cursor: pointer; font: 700 13.5px/1.3 var(--sans); }
-.note-edit form { margin: 8px 0 0; padding: 16px 18px; border-radius: 18px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.note-edit form { margin: 8px 0 0; padding: 16px 18px; border-radius: 18px; background: var(--soft); box-shadow: var(--dish); }
 
 .edit-form, .add-form { margin: 10px 0 14px; padding: 16px 18px; border-radius: 18px; background: var(--card); box-shadow: inset 0 0 0 2px var(--cobalt-pale); font-family: var(--sans); }
 .edit-form > label:first-child, .add-form > input[type=hidden] + label { margin-top: 0; }
@@ -1180,12 +1179,10 @@ label > input[type=checkbox] { margin-right: 8px; }
 /* Dish photo management, plus the draft and re-pick frame pickers. Each
    candidate frame is shown on a small plate, cropped as the library will
    crop it. */
-.thumb-manage { margin-top: 36px; padding-top: 22px; border-top: 3px solid var(--cobalt); }
-.thumb-manage h2 { margin: 0 0 8px; color: var(--cobalt-deep); font: 800 1.35rem/1.2 var(--display); }
 .thumb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .thumb-upload { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .thumb-upload input[type=file] { width: auto; max-width: 260px; margin: 0; font-size: 13px; }
-.thumb-picker { margin: 24px 0 0; padding: 20px 22px; background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.thumb-picker { margin: 24px 0 0; padding: 20px 22px; background: var(--soft); box-shadow: var(--dish); }
 .thumb-picker h2 { margin: 0; }
 .thumb-picker .muted { margin: 4px 0 12px; }
 .thumb-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr)); gap: 14px; }
@@ -1221,7 +1218,6 @@ label > input[type=checkbox] { margin-right: 8px; }
   padding: 2vh 2vw;
   background: rgba(17, 26, 34, .92);
 }
-.still-viewer[hidden] { display: none; }
 .still-viewer img {
   display: block;
   width: auto;
@@ -1236,7 +1232,6 @@ label > input[type=checkbox] { margin-right: 8px; }
 .still-viewer-close { top: 2vh; right: 2vw; }
 .still-viewer-prev { left: 2vw; top: 50%; transform: translateY(-50%); }
 .still-viewer-next { right: 2vw; top: 50%; transform: translateY(-50%); }
-.still-viewer button[hidden] { display: none; }
 body.still-viewer-open { overflow: hidden; }
 
 /* The Settings sign-in popup (auth-popup.ts): a sign-in page's #auth-flow,
@@ -1252,7 +1247,6 @@ body.still-viewer-open { overflow: hidden; }
   padding: 8vh 16px 24px;
   background: rgba(17, 26, 34, .45);
 }
-.auth-popup[hidden] { display: none; }
 .auth-popup-card {
   position: relative;
   width: min(100%, 640px);
@@ -1310,7 +1304,7 @@ body.auth-popup-open { overflow: hidden; }
 .chart-cell.is-active, .chart-cell.is-active:hover { background: var(--cobalt); color: var(--on-ink); }
 .chart-leaf.is-active { background: var(--chip); box-shadow: inset 4px 0 var(--rule); }
 .chart-cell.is-dimmed, .chart-leaf.is-dimmed { color: var(--muted); }
-.chart-detail { margin-top: 18px; padding: 22px 24px; border-radius: var(--radius); background: var(--soft); box-shadow: inset 0 0 0 2px var(--lines); }
+.chart-detail { margin-top: 18px; padding: 22px 24px; border-radius: var(--radius); background: var(--soft); box-shadow: var(--dish); }
 .chart-detail h3 { margin: 0 0 12px; font: 400 1.3rem/1.5 var(--sans); }
 .chart-additions { margin: 10px 0; }
 .chart-additions span { display: inline-block; margin: 3px 3px 3px 0; padding: 4px 11px; border-radius: 999px; background: var(--chip); color: var(--cobalt-deep); font: 700 13.5px/1.2 var(--sans); }
@@ -1345,7 +1339,6 @@ body.auth-popup-open { overflow: hidden; }
 .ruled-input:focus { border: 0; box-shadow: inset 3px 0 var(--cobalt); }
 .ruled-input::placeholder { color: var(--muted); opacity: .8; }
 .link-slips { display: flex; flex-wrap: wrap; gap: 22px 18px; margin: 30px 0 6px; }
-.link-slips[hidden] { display: none; }
 .link-slip {
   position: relative;
   flex: 1 1 240px;
@@ -1381,7 +1374,6 @@ body.auth-popup-open { overflow: hidden; }
   text-underline-offset: 3px;
 }
 .link-slip-actions button:hover { border: 0; background: transparent; color: var(--cobalt); }
-.video-options[hidden] { display: none; }
 .video-options .error { margin: 18px 0 0; }
 .add-card-actions {
   display: flex;
@@ -1415,29 +1407,11 @@ body.auth-popup-open { overflow: hidden; }
 .codex-status--connected { background: var(--green-wash); color: var(--green-ink); }
 .codex-status--missing { background: var(--red-wash); color: var(--red-ink); }
 .codex-user-code { margin: 6px 0 12px; color: var(--cobalt-deep); font: 700 28px/1.2 var(--mono); letter-spacing: .12em; }
-.endpoint-list { margin: 12px 0 0; padding: 0; list-style: none; }
-.endpoint-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 8px 0;
-  padding: 12px 16px;
-  border: 2px solid var(--lines);
-  border-radius: 16px;
-  background: var(--card);
-}
-.endpoint-row--active { border-color: var(--cobalt); }
-.endpoint-detail { min-width: 0; }
-.endpoint-detail .muted { margin: 2px 0 0; }
 
 /* Draft evidence from a video import */
 .evidence-panel { margin: 24px 0 18px; }
 .evidence-panel > summary { cursor: pointer; font-size: 1.05rem; font-weight: 700; }
 .evidence-panel[open] > summary { margin-bottom: 8px; }
-.evidence-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
-.evidence-heading h2 { margin: 0; }
-.evidence-heading a { font-size: 13px; font-weight: 700; }
 .evidence-panel details { margin-top: 10px; padding-top: 10px; border-top: 1.5px dashed var(--lines); }
 .evidence-panel summary { cursor: pointer; font-weight: 600; }
 .evidence-text { max-height: 16rem; margin: 8px 0 2px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: .88rem/1.5 var(--mono); }
@@ -1490,6 +1464,20 @@ body.auth-popup-open { overflow: hidden; }
 
 /* Media extraction debugger */
 .media-debug-form textarea { font-family: var(--mono); }
+.run-list { margin: 12px 0 0; padding: 0; list-style: none; }
+.run-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 12px 16px;
+  border: 2px solid var(--lines);
+  border-radius: 16px;
+  background: var(--card);
+}
+.run-detail { min-width: 0; }
+.run-detail .muted { margin: 2px 0 0; }
 .debug-url-card { margin-top: 14px; }
 .debug-url-title { overflow-wrap: anywhere; }
 .debug-status { margin-right: 8px; text-transform: capitalize; vertical-align: middle; }
@@ -1514,7 +1502,6 @@ body.auth-popup-open { overflow: hidden; }
   .app-shell { padding: 0 16px; }
   .paper { padding: 22px 0 56px; }
   h1 { font-size: 2.1rem; }
-  .section-heading h1 { font-size: 1.9rem; }
   .library-sign { grid-template-columns: minmax(0, 1fr); padding: 26px 22px; border-radius: 22px; }
   .library-sign h1 { font-size: 2.3rem; }
   .ticket-board { margin-top: 32px; }
@@ -1617,7 +1604,7 @@ body.htmx-request::before {
 @media print {
   body { background: white; }
   .ingredients-section { box-shadow: none; }
-  .utility-bar, .back-link, .version-tabs, .card-actions, .source-disclosure, .chart-view, .add-block, .thumb-manage, .recipe-details-form, .hero-plate { display: none; }
+  .utility-bar, .back-link, .version-tabs, .card-actions, .source-disclosure, .serves-toggle, .chart-view, .recipe-chat, .add-block, .recipe-notes, .thumb-manage, .recipe-details-form, .hero-plate { display: none; }
   .recipe-sheet .card-body { display: none; }
   .print-standard { display: block; }
   .app-shell { width: 100%; padding: 0; }

@@ -22,9 +22,10 @@ interface Reply {
   body: unknown;
 }
 
-/** The request options the flow sends: always a string body. */
+/** The request options the flow sends: always a string body and a timeout. */
 interface SentOptions {
   body: string;
+  signal?: AbortSignal;
 }
 
 function mockFetch(routes: Record<string, Reply | ((options: SentOptions) => Reply)>) {
@@ -56,6 +57,25 @@ test("startDeviceFlow requests device codes and exposes the verification URI", a
     assert.equal(device.intervalSeconds, 5);
     assert.equal(device.expiresInSeconds, 15 * 60);
     assert.deepEqual(JSON.parse(fake.calls[0].options.body), { client_id: "app_EMoamEEZ73f0CkXaXp7hrann" });
+    assert.ok(fake.calls[0].options.signal instanceof AbortSignal, "a stalled auth server cannot hold the sign-in open");
+  } finally {
+    fake.restore();
+  }
+});
+
+test("startDeviceFlow keeps the device code out of an invalid-response error", async () => {
+  const fake = mockFetch({
+    "https://auth.openai.com/api/accounts/deviceauth/usercode": {
+      body: { device_auth_id: "deviceauth_secret", user_code: "6ZM9-9XMXN" },
+    },
+  });
+  try {
+    await assert.rejects(startDeviceFlow(), (error) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /Invalid device code response/);
+      assert.ok(!error.message.includes("deviceauth_secret") && !error.message.includes("6ZM9-9XMXN"));
+      return true;
+    });
   } finally {
     fake.restore();
   }
@@ -99,13 +119,15 @@ test("pollDeviceFlow maps pending, slow_down, and failed responses", async () =>
       const body = JSON.parse(options.body);
       if (body.user_code === "PEND-XXXXX") return { status: 403, body: { error: "deviceauth_authorization_pending" } };
       if (body.user_code === "SLOW-XXXXX") return { status: 400, body: { error: { code: "slow_down" } } };
-      return { status: 500, body: { error: "boom" } };
+      return { status: 500, body: { error: "boom", detail: "x".repeat(2000) } };
     },
   });
   try {
     assert.deepEqual(await pollDeviceFlow({ deviceAuthId: "d", userCode: "PEND-XXXXX" }), { status: "pending" });
     assert.deepEqual(await pollDeviceFlow({ deviceAuthId: "d", userCode: "SLOW-XXXXX" }), { status: "slow_down" });
-    assert.equal((await pollDeviceFlow({ deviceAuthId: "d", userCode: "FAIL-XXXXX" })).status, "failed");
+    const failed = await pollDeviceFlow({ deviceAuthId: "d", userCode: "FAIL-XXXXX" });
+    assert.equal(failed.status, "failed");
+    assert.ok(failed.status === "failed" && failed.message.length < 400, "the error body is cut short");
   } finally {
     fake.restore();
   }

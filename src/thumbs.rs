@@ -15,7 +15,7 @@
 
 use crate::embeddings::{self, BlockingEmbedder, Input};
 use crate::media::{
-    VideoProbe, create_private_dir, env_flag, env_path, remaining_timeout, run_tool,
+    MAX_MEDIA_SECONDS, VideoProbe, create_private_dir, remaining_timeout, run_ffmpeg,
 };
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -40,8 +40,6 @@ const NON_DISH_PROMPTS: [&str; 4] = [
 const ANALYSIS_WIDTH: usize = 128;
 /// Samples per second pulled from the video during the scoring pass.
 const SCAN_HZ: f64 = 2.0;
-/// Local analysis never looks past the same cap the OCR pipeline uses.
-const ANALYSIS_SECONDS_CAP: u64 = 300;
 /// Edge of the encoded square candidates, before the browser scales it down.
 const OUTPUT_SIZE: u32 = 600;
 /// Brand intros live at the very start; never nominate the first moments.
@@ -58,7 +56,7 @@ const SIGNATURE_SIDE: usize = 16;
 /// Mean absolute luma difference per signature cell below which two samples
 /// count as the same shot.
 const DUPLICATE_MEAN_DISTANCE: f32 = 9.0;
-/// Bound on the raw RGB scoring stream: 128-bit wide portrait samples over
+/// Bound on the raw RGB scoring stream: 128-pixel wide portrait samples over
 /// five minutes fit far below this; the cap only stops pathological input.
 const RAW_OUTPUT_MAX_BYTES: usize = 96 * 1024 * 1024;
 
@@ -85,7 +83,7 @@ pub(crate) struct ThumbCandidate {
 /// Whether thumbnail nomination should run at all. Read at extraction time so
 /// custom installs can disable the extra ffmpeg passes without a rebuild.
 pub(crate) fn enabled() -> bool {
-    env_flag("THUMBNAILS_ENABLED", true)
+    crate::env_bool("THUMBNAILS_ENABLED", true)
 }
 
 /// Extracts up to [`MAX_THUMBNAILS`] cropped dish-photo candidates from
@@ -111,16 +109,11 @@ pub(crate) fn extract_thumbnails(
     let frame_bytes = ANALYSIS_WIDTH * analysis_height * 3;
 
     // Pass one: constant-rate tiny RGB samples straight down the pipe.
-    let ffmpeg = env_path("MEDIA_FFMPEG_PATH", "ffmpeg");
     let args = vec![
-        "-y".into(),
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
         "-i".into(),
         video_path.to_string_lossy().to_string(),
         "-t".into(),
-        ANALYSIS_SECONDS_CAP.to_string(),
+        MAX_MEDIA_SECONDS.to_string(),
         "-vf".into(),
         format!("fps={SCAN_HZ},scale={ANALYSIS_WIDTH}:{analysis_height}"),
         "-pix_fmt".into(),
@@ -133,7 +126,7 @@ pub(crate) fn extract_thumbnails(
         warnings.push("The media deadline passed before thumbnail sampling.".into());
         return Vec::new();
     };
-    let raw = match run_tool(&ffmpeg, &args, timeout, RAW_OUTPUT_MAX_BYTES) {
+    let raw = match run_ffmpeg(&args, timeout, RAW_OUTPUT_MAX_BYTES) {
         Ok(output) => output.stdout,
         Err(error) => {
             warnings.push(format!("Thumbnail frame sampling failed: {error}"));
@@ -198,10 +191,6 @@ pub(crate) fn extract_thumbnails(
         let (x, y, side) = square_crop_window(width, height, cx, cy);
         let out_path = out_dir.join(format!("thumb-{choice_index}.jpg"));
         let args = vec![
-            "-y".into(),
-            "-hide_banner".into(),
-            "-loglevel".into(),
-            "error".into(),
             "-ss".into(),
             format!("{:.3}", sample.t),
             "-i".into(),
@@ -214,7 +203,7 @@ pub(crate) fn extract_thumbnails(
             "3".into(),
             out_path.to_string_lossy().to_string(),
         ];
-        if let Err(error) = run_tool(&ffmpeg, &args, timeout, 1024 * 1024) {
+        if let Err(error) = run_ffmpeg(&args, timeout, 1024 * 1024) {
             warn!(%error, second = sample.t, "Thumbnail crop failed");
             warnings.push(format!(
                 "A thumbnail candidate could not be cropped: {error}"
@@ -244,12 +233,17 @@ pub(crate) fn extract_thumbnails(
         }
     }
     candidates.truncate(MAX_THUMBNAILS);
-    let best = candidates.first().map(|candidate| candidate.score);
+    // The embedding ranking may put any crop first, so take the best
+    // heuristic score among the kept crops rather than the first one's.
+    let best_score = candidates
+        .iter()
+        .map(|candidate| candidate.score)
+        .fold(0.0, f32::max);
     info!(
         samples = frames,
         candidates = candidates.len(),
         ranked = embedder.is_some(),
-        best_score = best.unwrap_or(0.0),
+        best_score,
         "Dish thumbnail candidates selected"
     );
     candidates

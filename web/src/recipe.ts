@@ -1,8 +1,9 @@
 /* Recipe page: the cooking-step timer counts down and announces its end once,
  * the arrow keys step through the chart, an ingredient or step link opens its
- * edit form without a reload, and a refreshed dish-photo panel above the
- * viewport keeps the page from jumping. The chart links and the pending
- * photo and moment polls are plain htmx attributes in recipe.html. */
+ * edit form without a reload (and the form's Cancel closes it again), and a
+ * refreshed dish-photo panel above the viewport keeps the page from jumping.
+ * The chart links and the pending photo and moment polls are plain htmx
+ * attributes in recipe.html. */
 namespace Recipes {
   let timerId: number | null = null;
 
@@ -44,7 +45,15 @@ namespace Recipes {
     });
   });
 
+  // A modified click (a new tab or window) is left to the browser, which
+  // opens the ?edit= or plain page the link names.
   document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const cancel = closest(event.target, "[data-edit-cancel]");
+    if (cancel) {
+      closeEdit(cancel.getAttribute("data-edit-cancel") || "", event);
+      return;
+    }
     const link = closest(event.target, "[data-edit-block]");
     if (!link) return;
     const form = document.getElementById("edit-" + link.getAttribute("data-edit-block")) as HTMLFormElement | null;
@@ -55,6 +64,18 @@ namespace Recipes {
     const field = form.querySelector("input,textarea") as HTMLElement | null;
     if (field) field.focus();
   });
+
+  // Cancel puts back what the form held and hides it, so the pollers that
+  // wait while an edit is open run again; focus returns to the block.
+  function closeEdit(id: string, event: Event): void {
+    const form = document.getElementById("edit-" + id) as HTMLFormElement | null;
+    if (!form) return;
+    event.preventDefault();
+    form.reset();
+    form.hidden = true;
+    const link = document.querySelector('[data-edit-block="' + id + '"]') as HTMLElement | null;
+    if (link) link.focus();
+  }
 
   document.addEventListener("keydown", (event) => {
     if (event.altKey || event.ctrlKey || event.metaKey || isTyping(event.target)) return;
@@ -68,14 +89,15 @@ namespace Recipes {
     link.click();
   });
 
-  // The dish-photo panel can change height when its poll swaps it. When the
-  // panel sits above the viewport, scroll by the difference so the text being
-  // read stays put.
+  // The dish-photo panel changes height when its poll swaps in the frames.
+  // When the panel sits above the viewport, scroll by the difference so the
+  // text being read stays put. A poll whose swap is held back (the frames are
+  // still pending) changes nothing.
   let thumbAbove: { bottom: number; offset: number } | null = null;
   document.addEventListener("htmx:beforeSwap", ((event: HtmxEvent) => {
     const target = event.detail.target;
     thumbAbove = null;
-    if (!target || !target.className || !/(^| )thumb-manage( |$)/.test(target.className)) return;
+    if (!event.detail.shouldSwap || !target || !target.className || !/(^| )thumb-manage( |$)/.test(target.className)) return;
     const box = target.getBoundingClientRect();
     if (box.bottom <= 0) thumbAbove = { bottom: box.bottom, offset: window.pageYOffset || 0 };
   }) as EventListener);

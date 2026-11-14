@@ -18,13 +18,13 @@
 use crate::ai;
 use crate::htmx::{Flash, flash_redirect};
 use crate::recipes::{
-    AcceptOutcome, ChatMessage, ChatNoteRow, ProposalRow, VersionListRow, accept_chat_proposal,
-    chat_answer_text, chat_busy, chat_notes, chat_thread, clear_chat, decline_chat_proposal,
-    fail_chat_answer, find_recipe, find_recipe_tx, find_version, finish_chat_answer, insert_note,
-    kept_chat_answers, recipe_snapshot, recipe_versions, start_chat_turn,
+    AcceptOutcome, AnswerProposal, ChatMessage, ChatNoteRow, ProposalRow, VersionListRow,
+    accept_chat_proposal, chat_answer_text, chat_notes, chat_thread, clear_chat,
+    decline_chat_proposal, fail_chat_answer, find_recipe, find_version, finish_chat_answer,
+    insert_note, kept_chat_answers, recipe_snapshot, recipe_versions, start_chat_turn,
 };
 use crate::{
-    AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, ChatProposal, RecipeProposal,
+    AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, ChatProposal, Recipe, RecipeProposal,
     RecipeSnapshot, Result, app_setting, display_timestamp, moments, required, set_app_setting,
 };
 use axum::{
@@ -120,7 +120,7 @@ pub(crate) struct ChatView {
 pub(crate) async fn panel(
     state: &AppState,
     user: &AuthUser,
-    recipe_id: &str,
+    recipe: &Recipe,
     back: String,
     flash: &Flash,
 ) -> Result<Option<ChatPanel>> {
@@ -130,8 +130,8 @@ pub(crate) async fn panel(
     let open = drawer_open(&state.db, &user.id).await?;
     let (thread, kept) = if open {
         (
-            chat_thread(&state.db, &user.id, recipe_id).await?,
-            kept_chat_answers(&state.db, &user.id, recipe_id).await?,
+            chat_thread(&state.db, &user.id, &recipe.id).await?,
+            kept_chat_answers(&state.db, &user.id, &recipe.id).await?,
         )
     } else {
         Default::default()
@@ -139,23 +139,16 @@ pub(crate) async fn panel(
     let poll_state = thread
         .iter()
         .filter(|row| row.status == "pending")
-        .map(|row| format!("{}:{}", row.id, row.status))
+        .map(|row| row.id.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let updated_at = if thread.iter().any(|row| row.change_state == "ready") {
-        find_recipe(&state.db, &user.id, recipe_id)
-            .await?
-            .updated_at
-    } else {
-        String::new()
-    };
     let messages = thread
         .into_iter()
         .map(|row| ChatView {
             proposal: (row.change_state == "ready")
                 .then(|| serde_json::from_str::<ChatProposal>(&row.proposal_json).ok())
                 .flatten()
-                .map(|proposal| proposal_view(&proposal, row.proposal_base != updated_at)),
+                .map(|proposal| proposal_view(&proposal, row.proposal_base != recipe.updated_at)),
             kept: kept.contains(&row.id),
             time: display_timestamp(&row.created_at),
             id: row.id,
@@ -267,19 +260,21 @@ pub(crate) async fn ask(
     }
     let back = return_target(&recipe.id, &form.back);
     let to = format!("{back}#recipe-chat");
-    // One answer at a time keeps the thread in order.
-    if chat_busy(&s.db, &user.id, &recipe.id).await? {
-        return Ok(flash_redirect(&to, "chat_busy"));
-    }
     open_drawer(&s.db, &user.id).await?;
-    let answer_id = start_chat_turn(&s.db, &user.id, &recipe.id, &question).await?;
+    let Some(answer_id) = start_chat_turn(&s.db, &user.id, &recipe.id, &question).await? else {
+        return Ok(flash_redirect(&to, "chat_busy"));
+    };
     let state = s.clone();
     let recipe_id = recipe.id.clone();
     tokio::spawn(async move {
         if let Err(error) = answer(&state, &user, &recipe_id, &answer_id).await {
             warn!(%error, "recipe chat answer failed");
             let (status, message) = failure(&error);
-            if let Err(error) = fail_chat_answer(&state.db, &answer_id, status, &message).await {
+            if let Err(error) = fail_chat_answer(
+                &state.db, &user.id, &recipe_id, &answer_id, status, &message,
+            )
+            .await
+            {
                 error!(%error, "could not record the failed chat answer");
             }
         }
@@ -317,34 +312,30 @@ pub(crate) async fn keep_answer(
     let text = chat_answer_text(&s.db, &user.id, &recipe.id, &message_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !kept_chat_answers(&s.db, &user.id, &recipe.id)
-        .await?
-        .contains(&message_id)
-    {
-        let body = clip(&text, crate::notes::MAX_NOTE_CHARS);
-        insert_note(
-            &s.db,
-            &user.id,
-            &recipe.id,
-            None,
-            &body,
-            None,
-            Some(&message_id),
-        )
-        .await?;
-    }
+    let body = clip(&text, crate::notes::MAX_NOTE_CHARS);
+    insert_note(
+        &s.db,
+        &user.id,
+        &recipe.id,
+        None,
+        &body,
+        None,
+        Some(&message_id),
+    )
+    .await?;
     let back = return_target(&recipe.id, &form.back);
     Ok(flash_redirect(&format!("{back}#recipe-chat"), "note_kept"))
 }
 
 /// Runs one answer: the model call, with the recipe the edit tools work on.
 /// A proposal that passes `valid_proposal` is stored with the answer for the
-/// cook to accept or deny. A thread cleared meanwhile stops the run quietly.
+/// cook to accept or deny; one that fails it marks the answer's change as not
+/// made. A thread cleared meanwhile stops the run quietly.
 async fn answer(state: &AppState, user: &AuthUser, recipe_id: &str, answer_id: &str) -> Result<()> {
     let thread = chat_thread(&state.db, &user.id, recipe_id).await?;
     let (snapshot, base) = {
         let mut conn = state.db.acquire().await?;
-        let recipe = find_recipe_tx(&mut conn, &user.id, recipe_id).await?;
+        let recipe = find_recipe(&mut *conn, &user.id, recipe_id).await?;
         (
             recipe_snapshot(&mut conn, &user.id, recipe_id).await?,
             recipe.updated_at,
@@ -355,7 +346,7 @@ async fn answer(state: &AppState, user: &AuthUser, recipe_id: &str, answer_id: &
     let versions = recipe_versions(&state.db, &user.id, recipe_id).await?;
     let library = chat_library(state, user, recipe_id, &notes, &versions).await?;
     let summary = library_summary(&notes, &versions);
-    let Some((prompt, _question)) = chat_prompt(&recipe_json, &summary, &thread, answer_id) else {
+    let Some(prompt) = chat_prompt(&recipe_json, &summary, &thread, answer_id) else {
         return Ok(());
     };
     let reply = ai::chat_reply(state, user, &prompt, &library, &snapshot).await?;
@@ -363,34 +354,46 @@ async fn answer(state: &AppState, user: &AuthUser, recipe_id: &str, answer_id: &
     if reply_text.is_empty() {
         return Err(AppError::Ai);
     }
-    let proposal = reply.proposal.filter(|proposal| {
-        let valid = valid_proposal(&snapshot, proposal);
-        if !valid {
-            warn!("recipe chat proposal was refused as invalid");
-        }
-        valid
-    });
     let label = model_label(&reply.label);
-    let json = match &proposal {
-        Some(after) => serde_json::to_string(&ChatProposal {
-            before: snapshot,
-            after: after.clone(),
-        })
-        .map_err(|_| AppError::Ai)?,
-        None => String::new(),
+    let json = match reply.proposal {
+        None => None,
+        Some(after) if valid_proposal(&snapshot, &after) => Some(
+            serde_json::to_string(&ChatProposal {
+                before: snapshot,
+                after,
+            })
+            .map_err(|_| AppError::Ai)?,
+        ),
+        Some(_) => {
+            warn!("recipe chat proposal was refused as invalid");
+            return finish_chat_answer(
+                &state.db,
+                &user.id,
+                recipe_id,
+                answer_id,
+                &reply_text,
+                AnswerProposal::Refused,
+            )
+            .await;
+        }
+    };
+    let proposal = match &json {
+        Some(json) => AnswerProposal::Ready(ProposalRow {
+            label: &label,
+            json,
+            base: &base,
+        }),
+        None => AnswerProposal::None,
     };
     finish_chat_answer(
         &state.db,
+        &user.id,
+        recipe_id,
         answer_id,
         &reply_text,
-        proposal.as_ref().map(|_| ProposalRow {
-            label: &label,
-            json: &json,
-            base: &base,
-        }),
+        proposal,
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Whether a proposal can be stored: a title, named ingredients, worded
@@ -437,7 +440,7 @@ pub(crate) fn valid_proposal(before: &RecipeSnapshot, proposal: &RecipeProposal)
             proposal.steps.iter().map(|step| step.from).collect(),
             before.steps.len(),
         )
-        && proposal.snapshot() != *before
+        && proposal.changes(before)
 }
 
 /// Accepts the change an answer proposed. The card itself changes, so the
@@ -535,19 +538,25 @@ pub(crate) async fn chat_library(
 }
 
 /// One line telling the model what its tools can find, so it knows when
-/// looking is worthwhile.
+/// looking is worthwhile. `notes` holds at most CHAT_NOTES, the newest, so a
+/// full list may have older notes behind it.
 pub(crate) fn library_summary(notes: &[ChatNoteRow], versions: &[VersionListRow]) -> String {
     let photos = notes
         .iter()
         .filter(|note| note.photo_jpeg.is_some())
         .count();
+    let count = if notes.len() as i64 >= CHAT_NOTES {
+        format!("{} or more", notes.len())
+    } else {
+        notes.len().to_string()
+    };
     let mut line = match (notes.len(), photos) {
         (0, _) => "The cook has not kept any notes on this recipe yet.".to_string(),
         (1, 0) => "The cook has kept 1 note on this recipe.".to_string(),
-        (count, 0) => format!("The cook has kept {count} notes on this recipe."),
+        (_, 0) => format!("The cook has kept {count} notes on this recipe."),
         (1, _) => "The cook has kept 1 note on this recipe, with a photo.".to_string(),
-        (count, 1) => format!("The cook has kept {count} notes on this recipe, 1 with a photo."),
-        (count, photos) => {
+        (_, 1) => format!("The cook has kept {count} notes on this recipe, 1 with a photo."),
+        (_, photos) => {
             format!("The cook has kept {count} notes on this recipe, {photos} with photos.")
         }
     };
@@ -566,21 +575,19 @@ pub(crate) fn library_summary(notes: &[ChatNoteRow], versions: &[VersionListRow]
 /// The prompt for one answer: the recipe as it is now, what the tools can
 /// find, the conversation before the question (dividers included, so the
 /// model knows the recipe changed since earlier answers), and the question
-/// itself. Returns the prompt and the question, or None when the answer is
-/// no longer in the thread.
+/// itself. None when the answer is no longer in the thread.
 pub(crate) fn chat_prompt(
     recipe_json: &str,
     library_summary: &str,
     thread: &[ChatMessage],
     answer_id: &str,
-) -> Option<(String, String)> {
+) -> Option<String> {
     let position = thread.iter().position(|row| row.id == answer_id)?;
-    let question = thread[..position]
+    let question = &thread[..position]
         .iter()
         .rev()
         .find(|row| row.role == "user")?
-        .content
-        .clone();
+        .content;
     let earlier: Vec<String> = thread[..position.saturating_sub(1)]
         .iter()
         .filter_map(|row| match (row.role.as_str(), row.status.as_str()) {
@@ -609,8 +616,8 @@ pub(crate) fn chat_prompt(
         prompt.push_str("\n\n");
     }
     prompt.push_str("Latest question from the cook:\n");
-    prompt.push_str(&question);
-    Some((prompt, question))
+    prompt.push_str(question);
+    Some(prompt)
 }
 
 /// What a failed answer shows, and whether the fix is in Settings.
@@ -640,7 +647,12 @@ pub(crate) fn model_label(raw: &str) -> String {
     {
         return String::new();
     }
-    let mut chars = label.chars();
+    sentence_case(&label)
+}
+
+/// `text` with its first letter upper-cased.
+fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
     chars
         .next()
         .map(|first| first.to_uppercase().chain(chars).collect())
@@ -675,11 +687,7 @@ pub(crate) fn change_summary(before: &RecipeSnapshot, after: &RecipeSnapshot) ->
         [first, second] => format!("{first} and {second} changed"),
         _ => "recipe changed".into(),
     };
-    let mut chars = summary.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
+    sentence_case(&summary)
 }
 
 /// The divider's label: the model's own name for the change when it gave a
@@ -1054,6 +1062,14 @@ pub(crate) fn proposal_view(proposal: &ChatProposal, stale: bool) -> ProposalVie
     }
 }
 
+/// `text` cut to at most `max` characters. A cut text ends in "…", so neither
+/// the cook reading a kept note nor the model reading the history takes it
+/// for the whole.
 fn clip(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
 }

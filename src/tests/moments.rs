@@ -1,8 +1,15 @@
-use crate::embeddings::normalize;
+use super::search::{fake_sidecar, sidecar_state};
+use crate::embeddings::{DIMENSIONS, normalize, to_blob};
 use crate::moments::{
     MomentKind, MomentVector, StepMoment, align_monotonic, audio_windows, match_steps,
-    stills_around,
+    refresh_recipe, stills_around,
 };
+use crate::stamp;
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+use std::time::Duration;
 
 /// A unit vector along one axis of a small test space, slightly mixed with a
 /// shared axis so cosines are not all zero.
@@ -96,6 +103,42 @@ fn music_only_audio_falls_back_to_frames() {
 }
 
 #[test]
+fn a_weak_spoken_step_takes_its_frame_only_between_its_spoken_neighbours() {
+    let steps = vec![axis(0, 0.3), axis(1, 0.3), axis(2, 0.3)];
+    // The narration covers steps 0 and 2 (at 6 s and 30 s) but not step 1.
+    let audio = [3, 0, 4, 4, 5, 2]
+        .into_iter()
+        .enumerate()
+        .map(|(window, topic)| moment(MomentKind::Audio, window as f64 * 6.0, axis(topic, 0.3)));
+    let matched = |frame_seconds: f64| {
+        let pool: Vec<MomentVector> = audio
+            .clone()
+            .chain([
+                moment(MomentKind::Frame, 2.0, axis(0, 0.3)),
+                moment(MomentKind::Frame, frame_seconds, axis(1, 0.3)),
+            ])
+            .collect();
+        match_steps(&steps, &pool)
+            .iter()
+            .map(|m| (m.step_index, m.seconds, m.source))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        matched(20.0),
+        vec![
+            (0, 6, MomentKind::Audio),
+            (1, 20, MomentKind::Frame),
+            (2, 30, MomentKind::Audio),
+        ]
+    );
+    // Step 1's frame comes after step 2 is spoken: no moment beats one out of order.
+    assert_eq!(
+        matched(40.0),
+        vec![(0, 6, MomentKind::Audio), (2, 30, MomentKind::Audio)]
+    );
+}
+
+#[test]
 fn unrelated_video_matches_no_step() {
     let steps = vec![axis(0, 0.3), axis(1, 0.3)];
     let pool: Vec<MomentVector> = (0..4)
@@ -170,4 +213,93 @@ fn stills_spread_over_an_audio_window_and_around_a_frame() {
         source: MomentKind::Frame,
     };
     assert_eq!(stills_around(&available, &end), vec![38, 40]);
+}
+
+/// A unit vector of the sidecar's size along one axis.
+fn one_hot(index: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; DIMENSIONS];
+    vector[index] = 1.0;
+    vector
+}
+
+/// The fake sidecar's view of the step texts: boiling sits on axis 0,
+/// frying on axis 1.
+fn step_vector(text: &str) -> Vec<f32> {
+    one_hot(if text.contains("Boil") {
+        0
+    } else if text.contains("Fry") {
+        1
+    } else {
+        9
+    })
+}
+
+async fn recipe_with_a_pool() -> SqlitePool {
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate!().run(&db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO recipes(id,title,description,user_id,created_at,updated_at) VALUES('r','Stew','','u1',?1,?1)",
+    )
+    .bind(stamp())
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('s0','r','step',0,'Boil the water slowly')")
+        .execute(&db)
+        .await
+        .unwrap();
+    // The narration boils at 0 s and fries at 6 s.
+    for (seconds, topic) in [(0.0, 0), (6.0, 1), (12.0, 3), (18.0, 4)] {
+        sqlx::query(
+            "INSERT INTO recipe_moment_vectors(recipe_id,kind,seconds,vector) VALUES('r','audio',?,?)",
+        )
+        .bind(seconds)
+        .bind(to_blob(&one_hot(topic)))
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    db
+}
+
+#[tokio::test]
+async fn a_slow_refresh_never_overwrites_the_moments_of_a_later_edit() {
+    let db = recipe_with_a_pool().await;
+    let sidecar = fake_sidecar(step_vector).await;
+    let state = sidecar_state(db.clone(), &sidecar.url);
+    let first = {
+        let state = state.clone();
+        tokio::spawn(async move { refresh_recipe(&state, "u1", "r").await })
+    };
+    // Once the first refresh has read the old step, the step is edited and
+    // refreshed again; the old step's answer comes back last.
+    while !sidecar
+        .texts
+        .lock()
+        .iter()
+        .any(|text| text.contains("Boil"))
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sqlx::query("UPDATE recipe_blocks SET text='Fry the onions' WHERE id='s0'")
+        .execute(&db)
+        .await
+        .unwrap();
+    refresh_recipe(&state, "u1", "r").await.unwrap();
+    first.await.unwrap().unwrap();
+
+    let seconds: i64 =
+        sqlx::query_scalar("SELECT seconds FROM recipe_step_moments WHERE step_id='s0'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(seconds, 6);
 }

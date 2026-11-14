@@ -3,13 +3,14 @@
 {% include "version_tabs.html" %}
 <article class="recipe-sheet">
 <header class="page-header">
-  {# The dish on a big plate: the photo fills the well (the initial shows
-     without one, and in e-ink mode), and the rim carries the title, when it
-     is short enough to fit, and the servings and time. #}
+  {# The dish on a big plate: the photo fills the well (the plate name, or
+     the title's initial, shows without one, and in e-ink mode), and the rim
+     carries the title, when it is short enough to fit, and the servings and
+     time. #}
   <div class="hero-plate">
     <div class="plate-disc">
       <div class="plate-well">
-        <span class="plate-initial" aria-hidden="true" style="font-size: {{ plate_initial_scale() }}em">{{ plate_initial() }}</span>
+        <span class="plate-initial" aria-hidden="true" style="font-size: {{ plate_text_scale() }}em">{{ plate_text() }}</span>
         {% if has_photo %}<img class="plate-photo" src="/recipes/{{ recipe.id }}/thumbnail" alt="Dish photo">{% endif %}
       </div>
     </div>
@@ -44,26 +45,18 @@
   <nav class="view-toggle serves-toggle" aria-label="Scale to servings" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">
     <span class="serves-toggle-label">Serves</span>
     {% for link in scale.links() %}
-    <a class="view-tab{% if link.active %} is-active{% endif %}" href="/recipes/{{ recipe.id }}?{% if chart_view %}view=chart&{% endif %}serves={{ link.serves }}"{% if link.active %} aria-current="true"{% endif %}{% if link.as_written %} title="As written"{% endif %}>{{ link.serves }}</a>
+    <a class="view-tab{% if link.active %} is-active{% endif %}" href="/recipes/{{ recipe.id }}?{% if chart_view %}view=chart&{% if let Some(detail) = chart.detail %}step={{ detail.step }}&{% endif %}{% endif %}serves={{ link.serves }}"{% if link.active %} aria-current="true"{% endif %}{% if link.as_written %} title="As written"{% endif %}>{{ link.serves }}</a>
     {% endfor %}
   </nav>
   {% if scale.is_scaled() %}<p class="muted serves-note">Amounts scaled from {{ original }} servings. Pan size and cooking times may need adjusting.</p>{% endif %}
   {% endif %}
-  {% if sources.len() > 0 %}
-  <details class="source-disclosure">
-    <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
-    <ol class="source-popover">
-      {% for source in sources %}
-      <li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>
-      {% endfor %}
-    </ol>
-  </details>
-  {% endif %}
+  {% include "recipe_sources.html" %}
   {# The library folder and cuisine: sorted automatically by EmbeddingGemma
-     unless the cook picks one here. #}
+     unless the cook picks one here. Saving swaps only this pill, so the
+     chart's step, its timer, and the servings stay as they are. #}
   <details class="source-disclosure filing-disclosure">
     <summary><svg class="filing-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3.5h4.5l1.5 1.8h7v8.2h-13z"/></svg>{% if filing.summary() != "" %}{{ filing.summary() }}{% else %}Folder{% endif %}</summary>
-    <form class="source-popover filing-form" method="post" action="/recipes/{{ recipe.id }}/filing" hx-swap="innerHTML show:none">
+    <form class="source-popover filing-form" method="post" action="/recipes/{{ recipe.id }}/filing" hx-target="closest .filing-disclosure" hx-select=".filing-disclosure" hx-swap="outerHTML show:none" hx-push-url="false">
       <label>Folder
         <select name="folder">
           <option value="">Automatic{% if filing.folder.automatic != "" %} ({{ filing.folder.automatic }}){% endif %}</option>
@@ -82,7 +75,7 @@
 </div>
 <div class="card-actions">
   <div class="actions page-actions">
-    {% if !chart_view && steps.len() > 0 %}<a class="button primary" data-chart-start href="/recipes/{{ recipe.id }}?view=chart&step=1{{ scale.query }}" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">Start cooking</a>{% endif %}
+    {% if !chart_view && steps.len() > 0 %}<a class="button primary" href="/recipes/{{ recipe.id }}?view=chart&step=1{{ scale.query }}" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">Start cooking</a>{% endif %}
     {% if let Some(chat) = chat %}
     <form class="inline" method="post" action="/recipes/{{ recipe.id }}/chat/drawer" hx-swap="innerHTML show:none">
       <input type="hidden" name="open" value="{% if chat.open %}off{% else %}on{% endif %}">
@@ -90,12 +83,12 @@
       <button class="chat-toggle{% if chat.open %} is-pressed{% endif %}" aria-pressed="{{ chat.open }}">Ask</button>
     </form>
     {% endif %}
-    <a class="button quiet" href="/recipes/{{ recipe.id }}?edit_meta=1#recipe-details">Edit</a>
+    <a class="button quiet" href="/recipes/{{ recipe.id }}?edit_meta=1{{ scale.query }}#recipe-details">Edit</a>
     <a class="button quiet danger" href="/recipes/{{ recipe.id }}/delete">Delete</a>
   </div>
   {# The card and the chart swap in place without adding history entries. #}
   <nav class="view-toggle" aria-label="Recipe view" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">
-    <a class="view-tab{% if !chart_view %} is-active{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}{% if let Some(serves) = scale.serves %}{% if scale.is_scaled() %}?serves={{ serves }}{% endif %}{% endif %}"{% if !chart_view %} aria-current="page"{% endif %}>Card</a>
+    <a class="view-tab{% if !chart_view %} is-active{% endif %}" data-recipe-view="standard" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}"{% if !chart_view %} aria-current="page"{% endif %}>Card</a>
     <a class="view-tab{% if chart_view %} is-active{% endif %}" data-recipe-view="chart" href="/recipes/{{ recipe.id }}?view=chart{{ scale.query }}"{% if chart_view %} aria-current="page"{% endif %}>Flow chart</a>
   </nav>
 </div>
@@ -108,7 +101,7 @@
 <form id="recipe-details" class="panel form-panel recipe-details-form" method="post" action="/recipes/{{ recipe.id }}">
   <p class="eyebrow">Edit recipe details</p>
   <label>Title<input name="title" value="{{ recipe.title }}" required maxlength="180"></label>
-  <label>Plate name<input name="plate_name" value="{{ recipe.plate_name }}" maxlength="16" placeholder="One or two words, like “Roti”"></label>
+  <label>Plate name<input name="plate_name" value="{{ recipe.plate_name }}" maxlength="16" pattern="\s*\S+(\s+\S+)?\s*" title="One or two words" placeholder="One or two words, like “Roti”"></label>
   <label>Description<textarea name="description" maxlength="1000">{{ recipe.description }}</textarea></label>
   <div class="two-col">
     <label>Servings<input name="servings" type="number" min="0" value="{{ servings_value }}"></label>
@@ -117,7 +110,7 @@
       <label>Cook minutes<input name="cook_minutes" type="number" min="0" value="{{ cook_value }}"></label>
     </div>
   </div>
-  <p class="actions"><button class="primary">Save details</button><a class="button quiet" href="/recipes/{{ recipe.id }}">Cancel</a></p>
+  <p class="actions"><button class="primary">Save details</button><a class="button quiet" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}">Cancel</a></p>
 </form>
 {% endif %}
 
@@ -129,7 +122,7 @@
   <ul class="ingredient-list">
     {% for block in ingredients %}
     <li>
-      <a class="block-link ingredient-row" data-edit-block="{{ block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ block.id }}#edit-{{ block.id }}">
+      <a class="block-link ingredient-row" data-edit-block="{{ block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ block.id }}{{ scale.query }}#edit-{{ block.id }}">
         <span class="ingredient-qty">{{ block.shown_quantity }}</span>
         <span class="block-text">{{ block.text }}{% if block.optional %} <em>(optional)</em>{% endif %}</span>
       </a>
@@ -138,7 +131,7 @@
         <label class="inline">Quantity <input name="quantity" value="{{ block.quantity }}"></label>
         <label class="inline">Unit <input name="unit" value="{{ block.unit }}"></label>
         <label><input type="checkbox" name="optional" {% if block.optional %}checked{% endif %}> Optional</label>
-        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move ingredient up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move ingredient down">↓</button></p>
+        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move ingredient up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move ingredient down">↓</button><a class="button quiet" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}" data-edit-cancel="{{ block.id }}" hx-boost="false">Cancel</a></p>
         <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/delete" data-confirm="Delete this ingredient? This cannot be undone.">Delete ingredient</button></p>
       </form>
     </li>
@@ -166,22 +159,17 @@
   {% for step in steps %}
   <li class="step-group">
     <article class="block step-block">
-      <a class="block-link" data-edit-block="{{ step.block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}#edit-{{ step.block.id }}">
+      <a class="block-link" data-edit-block="{{ step.block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}{{ scale.query }}#edit-{{ step.block.id }}">
         <span class="block-index">{{ step.block.position + 1 }}</span><span class="block-text">{{ step.block.text }}</span>
       </a>
       <form id="edit-{{ step.block.id }}" class="edit-form" method="post" action="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}" hx-swap="innerHTML show:none" {% if !step.block.editing %}hidden{% endif %}>
         <label>Step<textarea name="text" required>{{ step.block.text }}</textarea></label>
         <label>Ingredients used <span class="field-help">(one exact amount per line)</span><textarea class="compact-textarea" name="step_ingredients" placeholder="500 ml water">{{ step.ingredients_text }}</textarea></label>
-        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move step up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move step down">↓</button></p>
+        <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move step up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move step down">↓</button><a class="button quiet" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}" data-edit-cancel="{{ step.block.id }}" hx-boost="false">Cancel</a></p>
         <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/delete" data-confirm="Delete this step? This cannot be undone.">Delete step</button></p>
       </form>
     </article>
-    {% if step.ingredients.len() > 0 %}
-    <div class="step-ingredients" aria-label="Ingredients used in step {{ step.block.position + 1 }}">
-      <span class="step-ingredients-label">Add</span>
-      {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
-    </div>
-    {% endif %}
+    {% let step_number = step.block.position + 1 %}{% include "step_ingredients.html" %}
     {% match step.moment %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
   </li>
   {% endfor %}
@@ -190,7 +178,7 @@
   {# The poller fetches the page and swaps it in whole once the moments are
      found (app.js holds the swap while the note is still in the response,
      and skips a poll while an edit is open). #}
-  <p class="muted step-moments-note" data-moments-pending="{{ recipe.id }}">Finding step moments in the video… <a href="/recipes/{{ recipe.id }}">Check again</a><span hidden hx-get="/recipes/{{ recipe.id }}" hx-trigger="every 3s" hx-target="body" hx-swap="innerHTML show:none" hx-indicator="this" data-swap-when-gone="[data-moments-pending]" data-poll-unless-editing></span></p>
+  <p class="muted step-moments-note" data-moments-pending="{{ recipe.id }}">Finding step moments in the video… <a href="/recipes/{{ recipe.id }}{{ scale.page_query() }}">Check again</a><span hidden hx-get="/recipes/{{ recipe.id }}{{ scale.page_query() }}" hx-trigger="every 3s" hx-target="body" hx-swap="innerHTML show:none" hx-indicator="this" data-swap-when-gone="[data-moments-pending]" data-poll-unless-editing></span></p>
   {% else if can_find_moments %}
   <form class="step-moments-note" method="post" action="/recipes/{{ recipe.id }}/moments/capture" data-busy-label="Starting…" hx-swap="innerHTML show:none">
     <p class="muted">This recipe has no video step moments yet.</p>
@@ -212,10 +200,12 @@
 {% include "recipe_notes.html" %}
 
 <section class="thumb-manage"{% if thumb_state == "pending" %} data-thumb-pending="{{ recipe.id }}"{% endif %}>
-  <h2>Dish photo</h2>
+  <h2 class="section-label">Dish photo</h2>
   {% if thumb_state == "pending" %}
-  {# Polls only this panel, and not while an edit is open. #}
-  <p class="muted">Picking new frames from the video… <a href="/recipes/{{ recipe.id }}">Check again</a><span hidden hx-get="/recipes/{{ recipe.id }}" hx-trigger="every 3s" hx-target="closest .thumb-manage" hx-select=".thumb-manage" hx-swap="outerHTML show:none" hx-indicator="this" data-poll-unless-editing></span></p>
+  {# Polls only this panel and swaps it in once the frames are ready (the
+     response no longer marks it pending); skips a poll while an edit is
+     open. #}
+  <p class="muted">Picking new frames from the video… <a href="/recipes/{{ recipe.id }}">Check again</a><span hidden hx-get="/recipes/{{ recipe.id }}" hx-trigger="every 3s" hx-target="closest .thumb-manage" hx-select=".thumb-manage" hx-swap="outerHTML show:none" hx-indicator="this" data-swap-when-gone="[data-thumb-pending]" data-poll-unless-editing></span></p>
   {% else if thumb_state == "choosing" %}
   <p class="muted">Fresh frames from the video are ready. Pick one, or discard them.</p>
   <form method="post" action="/recipes/{{ recipe.id }}/thumbnail/choose" hx-swap="innerHTML show:none">
@@ -251,21 +241,21 @@
 </section>
 {% else %}
 {# Every link in the chart swaps the page in place without adding history. #}
-<section class="chart-view" data-chart-view data-recipe-id="{{ recipe.id }}" data-step-count="{{ chart.step_count }}" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">
+<section class="chart-view" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">
   <div class="chart-heading">
     <div><p class="eyebrow">Cooking flow</p><h2>Ingredients into actions</h2></div>
     {% match chart.detail %}
-    {% when None %}{% if chart.step_count > 0 %}<a class="button primary" data-chart-start href="/recipes/{{ recipe.id }}?view=chart&step=1{{ scale.query }}">Start cooking</a>{% endif %}
-    {% when Some with (detail) %}<a class="button" data-chart-exit href="/recipes/{{ recipe.id }}?view=chart{{ scale.query }}">Exit</a>{% endmatch %}
+    {% when None %}{% if chart.step_count > 0 %}<a class="button primary" href="/recipes/{{ recipe.id }}?view=chart&step=1{{ scale.query }}">Start cooking</a>{% endif %}
+    {% when Some with (detail) %}<a class="button" href="/recipes/{{ recipe.id }}?view=chart{{ scale.query }}">Exit</a>{% endmatch %}
   </div>
   <p class="chart-help">Select an action to focus its ingredients, instruction, and timer.</p>
-  <div class="chart-scroll" tabindex="0" aria-label="Cooking-flow chart">
+  <div class="chart-scroll" tabindex="0" role="region" aria-label="Cooking-flow chart">
     <div class="chart-table" role="group" aria-label="Recipe ingredients and cooking stages" style="--chart-steps: {{ chart.step_count }}; --chart-rows: {{ chart.leaves.len() }}">
       {% for leaf in chart.leaves %}
       <div class="chart-leaf{% if leaf.active %} is-active{% endif %}{% if leaf.dimmed %} is-dimmed{% endif %}" style="grid-column: 1; grid-row: {{ leaf.row + 1 }}">{{ leaf.label }}</div>
       {% endfor %}
       {% for cell in chart.cells %}
-      <a class="chart-cell{% if cell.active %} is-active{% endif %}{% if cell.dimmed %} is-dimmed{% endif %}" data-chart-step="{{ cell.step }}" href="{{ cell.href }}"{% if cell.active %} aria-current="step"{% endif %} style="grid-column: {{ cell.step + 1 }}; grid-row: {{ cell.row + 1 }} / span {{ cell.span }}"><span>{{ cell.label }}</span></a>
+      <a class="chart-cell{% if cell.active %} is-active{% endif %}{% if cell.dimmed %} is-dimmed{% endif %}" href="{{ cell.href }}"{% if cell.active %} aria-current="step"{% endif %} style="grid-column: {{ cell.step + 1 }}; grid-row: {{ cell.row + 1 }} / span {{ cell.span }}"><span>{{ cell.label }}</span></a>
       {% endfor %}
     </div>
   </div>
@@ -288,7 +278,7 @@
     <p class="chart-controls">
       {% if detail.has_previous %}<a class="button" data-chart-back href="{{ detail.previous_href }}">← Back</a>{% else %}<span class="button is-disabled">← Back</span>{% endif %}
       {% if detail.has_next %}<a class="button primary" data-chart-next href="{{ detail.next_href }}">Next →</a>{% else %}<span class="button is-disabled">Next →</span>{% endif %}
-      <a class="button" data-chart-exit href="/recipes/{{ recipe.id }}?view=chart{{ scale.query }}">Exit</a>
+      <a class="button" href="/recipes/{{ recipe.id }}?view=chart{{ scale.query }}">Exit</a>
     </p>
   </article>
   {% endmatch %}

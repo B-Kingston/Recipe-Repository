@@ -17,6 +17,8 @@ interface HtmxDetail {
   serverResponse: string;
   /** configRequest only: the parameters about to be sent. */
   parameters: { [name: string]: string | string[] };
+  /** historyCacheMiss only: the path being restored. */
+  path: string;
 }
 
 type HtmxEvent = CustomEvent<HtmxDetail>;

@@ -14,12 +14,19 @@ use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use std::{
     collections::{HashMap, HashSet},
-    sync::LazyLock,
-    time::Duration,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tracing::{info, warn};
 
-/// Longest recipe body (description, ingredients, method) that is embedded.
+/// Longest recipe title that is embedded, in bytes.
+const TITLE_LIMIT: usize = 200;
+/// Longest recipe body (description, ingredients, method) that is embedded,
+/// in bytes. A token never covers less than a byte, so a document stays far
+/// inside the sidecar's 8192-token context whatever its script; a document
+/// the sidecar refused would fail every refresh and never be indexed.
 const BODY_LIMIT: usize = 6000;
 /// Longest accepted search query, in characters.
 const QUERY_LIMIT: usize = 200;
@@ -30,15 +37,16 @@ pub(crate) const RELATIVE_CUTOFF: f32 = 0.10;
 /// And at least this much: on the live library, matching recipes scored
 /// 0.64-0.80 and unrelated queries topped out near 0.62.
 pub(crate) const MIN_SCORE: f32 = 0.60;
-/// Added to the score of a recipe whose title contains the query.
+/// Added to the score of a recipe whose title has the query's words, in order.
 pub(crate) const TITLE_BONUS: f32 = 0.10;
 /// Stale recipes a search embeds before answering; the rest go to the background.
 const INLINE_REFRESH: usize = 24;
 /// Documents embedded and stored per round trip, so a failure keeps the earlier ones.
 const REFRESH_BATCH: usize = 16;
-/// Startup backfill: the sidecar may still be downloading its model.
-const BACKFILL_ATTEMPTS: u32 = 60;
-const BACKFILL_RETRY: Duration = Duration::from_secs(30);
+/// A fresh embedding of a stored document at least this close to its stored
+/// vector means the sidecar still serves the model that built the index: the
+/// same model reproduces a vector all but exactly, another lands far off.
+const SAME_MODEL_MIN_COSINE: f32 = 0.95;
 /// BM25 term-frequency saturation.
 const BM25_K1: f32 = 1.2;
 /// BM25 document-length normalisation.
@@ -53,8 +61,10 @@ const STOPWORDS: &[&str] = &[
     "with",
 ];
 
-/// Users whose remaining stale recipes are already being embedded in the background.
-static BACKGROUND: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// Users whose stale recipes are being embedded, inline or in the background.
+static INDEXING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// Set while the startup backfill embeds every user's stale recipes.
+static BACKFILLING: AtomicBool = AtomicBool::new(false);
 
 /// How many recipes `refresh_index` embedded and how many stale ones it left.
 #[derive(Debug, PartialEq, Eq)]
@@ -119,7 +129,7 @@ pub(crate) fn squash(text: &str) -> String {
 
 /// The text embedded for one recipe: the description, the ingredient lines
 /// (`quantity unit name`, optional ones marked) and the numbered method, in
-/// position order, capped at 6000 characters.
+/// position order. The title is capped at 200 bytes, the body at 6000.
 pub(crate) fn recipe_document(title: &str, description: &str, blocks: &[Block]) -> String {
     let mut ordered: Vec<&Block> = blocks.iter().collect();
     ordered.sort_by_key(|block| block.position);
@@ -159,35 +169,66 @@ pub(crate) fn recipe_document(title: &str, description: &str, blocks: &[Block]) 
         lines.push(format!("Method: {}", steps.join(" ")));
     }
     let mut body = lines.join("\n");
-    if let Some((end, _)) = body.char_indices().nth(BODY_LIMIT) {
-        body.truncate(end);
-    }
+    body.truncate(char_floor(&body, BODY_LIMIT));
     if body.is_empty() {
         body.push_str("none");
     }
-    embeddings::document(title, &body)
+    let title = title.trim();
+    embeddings::document(&title[..char_floor(title, TITLE_LIMIT)], &body)
 }
 
-/// Ids (with their fresh documents) of recipes whose stored document is
-/// missing or differs from the document built from the current recipe, newest
-/// edit first. `user` limits the check to one account.
+/// The longest prefix of `text`, in bytes, that ends on a character
+/// boundary and is at most `limit` bytes.
+fn char_floor(text: &str, limit: usize) -> usize {
+    if text.len() <= limit {
+        return text.len();
+    }
+    (0..=limit)
+        .rev()
+        .find(|&end| text.is_char_boundary(end))
+        .unwrap_or(0)
+}
+
+/// A recipe whose search vector must be built: its fresh document and the
+/// recipe's `updated_at` the document was built from.
+pub(crate) struct StaleDocument {
+    pub(crate) id: String,
+    pub(crate) document: String,
+    pub(crate) updated_at: String,
+}
+
+/// Recipes (of `user`, or of everyone) whose stored vector does not match
+/// their document, newest edit first. With `all`, every recipe's document is
+/// rebuilt and compared, which also catches a change to `recipe_document`
+/// itself (the startup backfill); otherwise only the recipes edited since
+/// their vector was built, or without a usable one, which keeps the check
+/// to one query per search. A recipe whose edit left its document alone is
+/// marked current instead of embedded again.
 pub(crate) async fn stale_documents(
     db: &SqlitePool,
     user: Option<&str>,
-) -> Result<Vec<(String, String)>, String> {
-    let sources = recipes::index_sources(db, user)
+    all: bool,
+) -> Result<Vec<StaleDocument>, String> {
+    let candidates = recipes::index_candidates(db, user, all)
         .await
         .map_err(|error| error.to_string())?;
-    let stored = recipes::stored_documents(db, user)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(sources
-        .into_iter()
-        .filter_map(|source| {
-            let document = recipe_document(&source.title, &source.description, &source.blocks);
-            (stored.get(&source.id) != Some(&document)).then_some((source.id, document))
-        })
-        .collect())
+    let mut stale = Vec::new();
+    for candidate in candidates {
+        let source = candidate.source;
+        let document = recipe_document(&source.title, &source.description, &source.blocks);
+        if candidate.stored.as_deref() != Some(document.as_str()) {
+            stale.push(StaleDocument {
+                id: source.id,
+                document,
+                updated_at: candidate.updated_at,
+            });
+        } else if candidate.built_from.as_deref() != Some(candidate.updated_at.as_str()) {
+            recipes::confirm_embedding(db, &source.id, &document, &candidate.updated_at)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(stale)
 }
 
 /// Embeds up to `limit` stale recipes (of `user`, or of everyone) and stores
@@ -199,7 +240,16 @@ pub(crate) async fn refresh_index(
     user: Option<&str>,
     limit: usize,
 ) -> Result<RefreshOutcome, String> {
-    let mut stale = stale_documents(db, user).await?;
+    let stale = stale_documents(db, user, false).await?;
+    embed_documents(db, embedder, stale, limit).await
+}
+
+async fn embed_documents(
+    db: &SqlitePool,
+    embedder: &Embedder,
+    mut stale: Vec<StaleDocument>,
+    limit: usize,
+) -> Result<RefreshOutcome, String> {
     let take = limit.min(stale.len());
     let remaining = stale.len() - take;
     stale.truncate(take);
@@ -208,7 +258,7 @@ pub(crate) async fn refresh_index(
     for batch in stale.chunks(REFRESH_BATCH) {
         let inputs: Vec<Input> = batch
             .iter()
-            .map(|(_, document)| Input::Text(document.clone()))
+            .map(|stale| Input::Text(stale.document.clone()))
             .collect();
         let vectors = embedder.embed(&inputs).await?;
         if vectors.len() != batch.len() {
@@ -218,8 +268,8 @@ pub(crate) async fn refresh_index(
                 batch.len()
             ));
         }
-        for ((id, document), vector) in batch.iter().zip(&vectors) {
-            recipes::store_embedding(db, id, document, vector)
+        for (stale, vector) in batch.iter().zip(&vectors) {
+            recipes::store_embedding(db, &stale.id, &stale.document, vector, &stale.updated_at)
                 .await
                 .map_err(|error| error.to_string())?;
             refreshed += 1;
@@ -235,11 +285,11 @@ pub(crate) async fn refresh_index(
 /// similarity plus a title bonus, at least `MIN_SCORE`, kept within
 /// `RELATIVE_CUTOFF` of the best score, at most `MAX_RESULTS`.
 pub(crate) fn rank(query: &str, query_vector: &[f32], entries: &[Indexed]) -> Vec<String> {
-    let needle = query.trim().to_lowercase();
+    let needle = tokens(query);
     let mut scored: Vec<(f32, &str)> = entries
         .iter()
         .map(|entry| {
-            let bonus = if !needle.is_empty() && entry.title.to_lowercase().contains(&needle) {
+            let bonus = if has_phrase(&tokens(&entry.title), &needle) {
                 TITLE_BONUS
             } else {
                 0.0
@@ -262,32 +312,40 @@ pub(crate) fn rank(query: &str, query_vector: &[f32], entries: &[Indexed]) -> Ve
         .collect()
 }
 
+/// Whether `words` hold all of `phrase`, consecutive and whole.
+fn has_phrase(words: &[String], phrase: &[String]) -> bool {
+    !phrase.is_empty() && words.windows(phrase.len()).any(|window| window == phrase)
+}
+
 /// Lowercased words of `text`, split on anything but letters and digits,
-/// stopwords dropped and simple plurals folded ("tomatoes" -> "tomato").
+/// stopwords dropped and each cut to a stem its singular and plural share
+/// ("tomatoes" and "tomato" -> "tomato").
 pub(crate) fn tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
         .filter(|word| !STOPWORDS.contains(&word.as_str()))
-        .map(fold_plural)
+        .map(stem)
         .collect()
 }
 
-fn fold_plural(word: String) -> String {
-    let len = word.chars().count();
-    if len > 4 && word.ends_with("ies") {
-        format!("{}y", &word[..word.len() - 3])
-    } else if len > 4
-        && ["oes", "ches", "shes", "sses", "xes"]
-            .iter()
-            .any(|suffix| word.ends_with(suffix))
-    {
-        word[..word.len() - 2].to_owned()
-    } else if len > 3 && word.ends_with('s') && !word.ends_with("ss") && !word.ends_with("us") {
-        word[..word.len() - 1].to_owned()
-    } else {
-        word
+/// Drops a plural "s", then a final "e", then turns a final "y" into "i",
+/// so both forms of a word meet: dish(es) -> "dish", cookie(s) -> "cooki",
+/// berry/berries -> "berri", quiche(s) -> "quich". Words of three letters or
+/// fewer, and "-ss" and "-us" words (glass, hummus), keep their "s".
+fn stem(mut word: String) -> String {
+    let long = |word: &String| word.chars().count() > 3;
+    if long(&word) && word.ends_with('s') && !word.ends_with("ss") && !word.ends_with("us") {
+        word.pop();
     }
+    if long(&word) && word.ends_with('e') {
+        word.pop();
+    }
+    if long(&word) && word.ends_with('y') {
+        word.pop();
+        word.push('i');
+    }
+    word
 }
 
 /// Every word of a recipe for BM25: the title (counted `TITLE_WEIGHT`
@@ -309,8 +367,8 @@ pub(crate) fn keyword_terms(title: &str, description: &str, blocks: &[Block]) ->
 }
 
 /// Ids of the recipes (id, `keyword_terms`) that match a query by BM25, best
-/// first: at least one query word, a score within `KEYWORD_CUTOFF` of the
-/// best, at most `MAX_RESULTS`.
+/// first: at least one query word, a score of at least `KEYWORD_CUTOFF`
+/// times the best, at most `MAX_RESULTS`.
 pub(crate) fn keyword_rank(query: &str, documents: &[(String, Vec<String>)]) -> Vec<String> {
     let mut terms = tokens(query);
     terms.sort();
@@ -377,23 +435,38 @@ pub(crate) fn keyword_rank(query: &str, documents: &[(String, Vec<String>)]) -> 
         .collect()
 }
 
-/// Releases a user's background-refresh slot when the task ends.
-struct BackgroundSlot(String);
+/// A user's claim on embedding their stale recipes, so an inline refresh, a
+/// background refresh, and the startup backfill never embed the same
+/// recipes side by side. Released on drop.
+pub(crate) struct IndexingSlot(String);
 
-impl Drop for BackgroundSlot {
+impl IndexingSlot {
+    /// None while another pass is indexing the user's recipes.
+    pub(crate) fn claim(user_id: &str) -> Option<Self> {
+        if BACKFILLING.load(Ordering::Acquire) {
+            return None;
+        }
+        INDEXING
+            .lock()
+            .insert(user_id.to_owned())
+            .then(|| Self(user_id.to_owned()))
+    }
+}
+
+impl Drop for IndexingSlot {
     fn drop(&mut self) {
-        BACKGROUND.lock().remove(&self.0);
+        INDEXING.lock().remove(&self.0);
     }
 }
 
 /// Embeds the rest of a user's stale recipes without blocking the request;
-/// a no-op while one is already running for that user.
+/// a no-op while another pass is indexing that user's recipes.
 fn spawn_background_refresh(db: SqlitePool, embedder: Embedder, user_id: String) {
-    if !BACKGROUND.lock().insert(user_id.clone()) {
+    let Some(slot) = IndexingSlot::claim(&user_id) else {
         return;
-    }
+    };
     tokio::spawn(async move {
-        let _slot = BackgroundSlot(user_id.clone());
+        let _slot = slot;
         match refresh_index(&db, &embedder, Some(&user_id), usize::MAX).await {
             Ok(outcome) => info!(
                 refreshed = outcome.refreshed,
@@ -416,7 +489,15 @@ pub(crate) async fn search(state: &AppState, user_id: &str, query: &str) -> crat
         return keyword_search(state, user_id, query).await;
     };
     match ranked(state, embedder, user_id, query).await {
-        Ok(outcome) => Ok(outcome),
+        Ok(Ranked::Results(outcome)) => Ok(outcome),
+        // Most of the library is not embedded yet (another pass, such as the
+        // startup backfill, is still indexing it): word matches stand in, so
+        // a search does not miss recipes the index has not reached.
+        Ok(Ranked::Unindexed(waiting)) => {
+            let mut outcome = keyword_search(state, user_id, query).await?;
+            outcome.notice = indexing_note(waiting);
+            Ok(outcome)
+        }
         Err(error) => {
             warn!(%error, "Library search failed; falling back to word matches");
             keyword_search(state, user_id, query).await
@@ -440,26 +521,52 @@ async fn keyword_search(state: &AppState, user_id: &str, query: &str) -> crate::
     })
 }
 
-/// Embeds up to `INLINE_REFRESH` of a user's stale recipes now and hands
-/// the rest to a background task; returns how many were left over.
+/// Embeds up to `INLINE_REFRESH` of a user's stale recipes now, with a
+/// page's short timeout, and hands the rest (or a failed batch) to a
+/// background task; returns how many were left over. While another pass is
+/// already indexing the user's recipes, it only counts them.
 pub(crate) async fn refresh_user(
     state: &AppState,
     embedder: &Embedder,
     user_id: &str,
 ) -> Result<usize, String> {
-    let refresh = refresh_index(&state.db, embedder, Some(user_id), INLINE_REFRESH).await?;
-    if refresh.remaining > 0 {
-        spawn_background_refresh(state.db.clone(), embedder.clone(), user_id.to_owned());
+    let Some(slot) = IndexingSlot::claim(user_id) else {
+        return Ok(stale_documents(&state.db, Some(user_id), false)
+            .await?
+            .len());
+    };
+    let refresh = refresh_index(
+        &state.db,
+        &embedder.interactive(),
+        Some(user_id),
+        INLINE_REFRESH,
+    )
+    .await;
+    drop(slot);
+    match refresh {
+        Ok(outcome) if outcome.remaining == 0 => Ok(0),
+        refresh => {
+            spawn_background_refresh(state.db.clone(), embedder.clone(), user_id.to_owned());
+            refresh.map(|outcome| outcome.remaining)
+        }
     }
-    Ok(refresh.remaining)
 }
 
+/// What an embedding search found.
+enum Ranked {
+    Results(Outcome),
+    /// More of the library (this many recipes) is waiting to be embedded
+    /// than is embedded, so a ranking would miss most of it.
+    Unindexed(usize),
+}
+
+/// Ranks the user's embedded recipes for `query`.
 async fn ranked(
     state: &AppState,
     embedder: &Embedder,
     user_id: &str,
     query: &str,
-) -> Result<Outcome, String> {
+) -> Result<Ranked, String> {
     let remaining = refresh_user(state, embedder, user_id).await?;
     let notice = if remaining > 0 {
         indexing_note(remaining)
@@ -469,46 +576,99 @@ async fn ranked(
     let entries = recipes::indexed_recipes(&state.db, user_id)
         .await
         .map_err(|error| error.to_string())?;
+    if remaining > entries.len() {
+        return Ok(Ranked::Unindexed(remaining));
+    }
     if entries.is_empty() {
-        return Ok(Outcome {
+        return Ok(Ranked::Results(Outcome {
             ids: Vec::new(),
             notice,
-        });
+        }));
     }
     let vector = embedder
+        .interactive()
         .embed(&[Input::Text(embeddings::query(query))])
         .await?
         .into_iter()
         .next()
         .ok_or_else(|| "embedding service returned no query vector".to_owned())?;
-    Ok(Outcome {
+    Ok(Ranked::Results(Outcome {
         ids: rank(query, &vector, &entries),
         notice,
-    })
+    }))
 }
 
-/// Startup task: embeds every user's stale recipes. The sidecar may still be
-/// downloading its model, so a failure is retried every 30 s, up to 60 times.
-pub(crate) async fn backfill(state: std::sync::Arc<AppState>) {
+/// Startup task: waits for the sidecar, which may still be downloading its
+/// model, then embeds the library folder prototypes and every stale recipe,
+/// one after the other so they do not queue against each other in its
+/// single slot.
+pub(crate) async fn backfill(state: Arc<AppState>) {
     let Some(embedder) = state.embedder.clone() else {
         return;
     };
-    for attempt in 1..=BACKFILL_ATTEMPTS {
-        match refresh_index(&state.db, &embedder, None, usize::MAX).await {
-            Ok(outcome) => {
-                info!(
-                    refreshed = outcome.refreshed,
-                    "Library search index is up to date"
-                );
-                return;
-            }
-            Err(error) => {
-                warn!(attempt, %error, "Library search backfill failed");
-                if attempt < BACKFILL_ATTEMPTS {
-                    tokio::time::sleep(BACKFILL_RETRY).await;
-                }
-            }
-        }
+    if !embedder.wait_until_ready().await {
+        warn!("The embedding service never answered; searches will index recipes on demand");
+        return;
     }
-    warn!("Library search backfill gave up; searches will index recipes on demand");
+    crate::folders::warm(&embedder).await;
+    let outcome = {
+        let _backfilling = Backfilling::start();
+        reindex(&state.db, &embedder).await
+    };
+    match outcome {
+        Ok(refreshed) => info!(refreshed, "Library search index is up to date"),
+        Err(error) => warn!(
+            %error,
+            "Library search backfill failed; searches will index recipes on demand"
+        ),
+    }
+}
+
+/// Marks the backfill as running until dropped.
+struct Backfilling;
+
+impl Backfilling {
+    fn start() -> Self {
+        BACKFILLING.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for Backfilling {
+    fn drop(&mut self) {
+        BACKFILLING.store(false, Ordering::Release);
+    }
+}
+
+/// Brings every user's search vectors up to date by rebuilding and comparing
+/// every recipe's document; when the sidecar serves another model than the
+/// one that built the index, every vector is built again. Returns how many
+/// recipes were embedded.
+pub(crate) async fn reindex(db: &SqlitePool, embedder: &Embedder) -> Result<usize, String> {
+    if model_changed(db, embedder).await? {
+        warn!("The embedding model changed; every recipe is indexed again");
+        recipes::clear_embeddings(db)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let stale = stale_documents(db, None, true).await?;
+    Ok(embed_documents(db, embedder, stale, usize::MAX)
+        .await?
+        .refreshed)
+}
+
+/// Whether the stored vectors came from another model than the sidecar
+/// serves now: the newest one is compared with a fresh embedding of its
+/// document.
+async fn model_changed(db: &SqlitePool, embedder: &Embedder) -> Result<bool, String> {
+    let Some((document, stored)) = recipes::newest_embedding(db)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    let fresh = embedder.embed(&[Input::Text(document)]).await?;
+    Ok(fresh
+        .first()
+        .is_none_or(|fresh| embeddings::dot(fresh, &stored) < SAME_MODEL_MIN_COSINE))
 }

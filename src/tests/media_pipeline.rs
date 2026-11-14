@@ -65,12 +65,14 @@ async fn dropping_the_extras_handle_cancels_the_followup_and_still_cleans_up() {
     let seen_dir = Arc::new(Mutex::new(None::<PathBuf>));
     let saw_cancel = Arc::new(AtomicBool::new(false));
     let (release, gate) = mpsc::channel::<()>();
+    let (started, has_started) = oneshot::channel::<()>();
     let (recorded, observed) = (seen_dir.clone(), saw_cancel.clone());
     let (_, extras) = run_staged_job(permit, move |dir| {
         *recorded.lock().unwrap() = Some(dir.to_path_buf());
         Ok((
             (),
             followup(move |_dir: &Path, cancel: &AtomicBool| {
+                let _ = started.send(());
                 gate.recv().unwrap();
                 observed.store(cancel.load(Ordering::SeqCst), Ordering::SeqCst);
                 0_u32
@@ -79,6 +81,12 @@ async fn dropping_the_extras_handle_cancels_the_followup_and_still_cleans_up() {
     })
     .await
     .unwrap();
+    // The job checks the flag once more before starting the follow-up, so
+    // wait until it runs: the caller gives up on work already under way.
+    tokio::time::timeout(Duration::from_secs(10), has_started)
+        .await
+        .expect("the follow-up should start")
+        .unwrap();
 
     // The cleaner or draft step failed: the caller drops the handle.
     drop(extras);
@@ -185,8 +193,14 @@ async fn without_a_followup_the_directory_is_gone_before_the_evidence_arrives() 
         !dir.exists(),
         "the CLI and debugger paths keep their cleanup guarantee"
     );
-    assert!(extras.is_finished());
-    assert_eq!(extras.finish().await, 0, "no follow-up means empty extras");
+    // The job thread may still be returning when the evidence lands, so the
+    // handle is awaited rather than polled: with nothing left to run it ends
+    // at once, with empty extras, and frees the slot.
+    let extras = tokio::time::timeout(Duration::from_secs(10), extras.finish())
+        .await
+        .expect("a job without a follow-up ends right after its evidence");
+    assert_eq!(extras, 0, "no follow-up means empty extras");
+    let _permit = wait_for_slot(slots).await;
 }
 
 fn instagram_title(account: &str, caption: &str) -> String {
@@ -604,10 +618,109 @@ fn a_description_only_import_uses_only_the_metadata_call() {
         "https://www.instagram.com/p/ABC/",
         &[],
         &mut warnings,
+        Instant::now() + Duration::from_secs(30),
     );
     let calls = ytdlp_calls(&dir);
     assert_eq!(calls.len(), 1);
     assert!(calls[0].contains("--skip-download"));
     assert_eq!(metadata.unwrap()["title"], "Meta only");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_metadata_fallback_respects_the_job_deadline() {
+    let dir = scratch("ytdlp-late");
+    let ytdlp = fake_ytdlp(&dir, "fail");
+    let mut warnings = Vec::new();
+    // The download already used up the job's time: no second call starts.
+    let fetched = fetch_video_and_metadata(
+        &ytdlp,
+        "https://www.instagram.com/p/ABC/",
+        &dir.join("work"),
+        &[],
+        &mut warnings,
+        Instant::now(),
+    );
+    assert!(fetched.metadata.is_none() && fetched.video.is_none());
+    assert!(ytdlp_calls(&dir).is_empty(), "{:?}", ytdlp_calls(&dir));
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("before the metadata lookup")),
+        "{warnings:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_tool_never_reads_the_app_stdin() {
+    // A tool that reads its input sees the end at once instead of waiting on
+    // (or, in its own process group, being stopped by) the app's terminal.
+    let output = run_tool(
+        "sh",
+        &["-c".into(), "cat; echo done".into()],
+        Duration::from_secs(10),
+        1024,
+    )
+    .expect("the tool should finish");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
+}
+
+#[test]
+fn helpers_left_behind_by_a_tool_are_killed_with_it() {
+    // The helper keeps stdout open after the tool exits; the group kill
+    // closes it, so the output is read without waiting for the helper.
+    let started = Instant::now();
+    let output = run_tool(
+        "sh",
+        &["-c".into(), "sleep 30 & echo started".into()],
+        Duration::from_secs(20),
+        1024,
+    )
+    .expect("the tool should finish");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "started\n");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_tool_that_overruns_its_timeout_is_stopped() {
+    let started = Instant::now();
+    let error = run_tool(
+        "sh",
+        &["-c".into(), "sleep 30".into()],
+        Duration::from_millis(300),
+        1024,
+    )
+    .expect_err("the tool should time out");
+    assert!(error.contains("timed out"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_frame_budget_counts_only_the_frames() {
+    let dir = scratch("budget");
+    let frames = dir.join("work").join("frames");
+    fs::create_dir_all(&frames).unwrap();
+    // A large download beside the frames does not count against them.
+    fs::write(dir.join("work").join("video.mp4"), vec![0_u8; 4096]).unwrap();
+    fs::write(frames.join("frame-0001.jpg"), vec![0_u8; 1024]).unwrap();
+    let mut warnings = Vec::new();
+    assert!(within_budget(
+        &frames,
+        2048,
+        "the OCR frame sample",
+        &mut warnings
+    ));
+    assert!(warnings.is_empty());
+    assert!(!within_budget(
+        &dir.join("work"),
+        2048,
+        "the downloaded video",
+        &mut warnings
+    ));
+    assert!(
+        warnings[0].contains("skipped the downloaded video"),
+        "{warnings:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }

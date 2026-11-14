@@ -6,14 +6,15 @@ import {
   anthropicThinking,
   anthropicTurn,
   anthropicUrl,
+  apiSearcher,
   claudeGeneration,
   catalogModelIds,
-  completionContext,
   formatRecipeEvidence,
   CHAT_TOOLS,
   WEB_SEARCH_TOOL,
   ANSWER_TOOL,
   chatLibrary,
+  chatRequestSearchPayload,
   chatSearchPayload,
   answerChat,
   hostedSearchAnswer,
@@ -21,12 +22,13 @@ import {
   chatWithTools,
   formatChatNotes,
   runChatTool,
-  runWebSearchTool,
+  runSearchTool,
   cleanedEvidence,
   completeViaPiAi,
   generateRecipe,
   isAuthFailure,
   isPiAiSpec,
+  modelCaller,
   normalizeEffort,
   openaiResponse,
   parseAnthropicOutput,
@@ -90,6 +92,11 @@ test("catalogModelIds dedupes ids and drops entries without a string id", () => 
   assert.deepEqual(catalogModelIds(models), ["gpt-5.6-sol", "gpt-5.4-mini"]);
 });
 
+test("catalogModelIds puts a two-digit minor version above the single digits", () => {
+  const models = [{ id: "gpt-5.9" }, { id: "gpt-5.10" }, { id: "claude-sonnet-5-9" }, { id: "claude-sonnet-5-10" }];
+  assert.deepEqual(catalogModelIds(models), ["gpt-5.10", "gpt-5.9", "claude-sonnet-5-10", "claude-sonnet-5-9"]);
+});
+
 test("subscriptionOf defaults to Codex and maps Claude's piProvider", () => {
   assert.equal(subscriptionOf({}).id, "openai-codex");
   assert.equal(subscriptionOf({ piProvider: "  " }).id, "openai-codex");
@@ -112,7 +119,7 @@ test("parseRequest accepts listModels without a prompt but requires one otherwis
     parseRequest('{"prompt":"p","systemPrompt":"s"}'),
     { prompt: "p", systemPrompt: "s" },
   );
-  for (const input of ["[]", "null", '"text"', '{"prompt":"p"}', "not json"]) {
+  for (const input of ["[]", "null", '"text"', '{"prompt":"p"}', "not json", '{"command":"generate","prompt":"p","systemPrompt":"s"}']) {
     assert.throws(() => parseRequest(input), (error) => {
       assert.ok(error instanceof WorkerError);
       assert.equal(error.code, "input");
@@ -221,20 +228,6 @@ test("recipePrompt tail matches the request's search mode", () => {
   assert.ok(gapfill.includes("imported social video"));
 });
 
-test("completionContext sends only the explicit non-coding context", () => {
-  const context = completionContext({
-    prompt: "Make a tomato pasta",
-    systemPrompt: "You are a recipe assistant.",
-  }, "off");
-
-  assert.equal(context.systemPrompt?.startsWith("You are a recipe assistant."), true);
-  assert.equal(context.systemPrompt?.includes("coding assistant"), false);
-  assert.deepEqual(context.tools, []);
-  assert.equal(context.messages.length, 1);
-  assert.equal(context.messages[0].role, "user");
-  assert.equal(context.messages[0].content, "Make a tomato pasta");
-});
-
 test("searchModeOf accepts only the three known modes", () => {
   assert.equal(searchModeOf({}), "off");
   assert.equal(searchModeOf({ searchMode: "nonsense" }), "off");
@@ -264,6 +257,13 @@ test("cleanedEvidence finds the JSON object between prose that contains braces",
 test("chatReply reads the answer and the change's label from the JSON reply", () => {
   const reply = chatReply("```json\n" + JSON.stringify({ reply: "Swapped the eggs for tofu.", label: "Egg-free" }) + "\n```");
   assert.deepEqual(reply, { reply: "Swapped the eggs for tofu.", label: "Egg-free" });
+});
+
+test("chatReply finds the JSON after prose that has braces of its own", () => {
+  assert.deepEqual(chatReply('Sure {metric}: {"reply":"Use 200 g {not 7 oz}.","label":"Metric"}'), {
+    reply: "Use 200 g {not 7 oz}.",
+    label: "Metric",
+  });
 });
 
 test("chatReply takes prose that ignored the format as the answer", () => {
@@ -361,6 +361,14 @@ test("recipe_version returns a saved version, and unknown versions and tools are
   assert.deepEqual(CHAT_TOOLS.map((tool) => tool.name), ["recipe_notes", "note_photo", "recipe_version"]);
 });
 
+test("the chat tools read numbers sent as numeric strings, as the edit tools do", () => {
+  const photo = runChatTool(library(), toolCall("note_photo", { note: "2" }), true);
+  assert.equal(photo.isError, false, resultText(photo));
+  const version = runChatTool(library(), toolCall("recipe_version", { version: " 1 " }), true);
+  assert.equal(version.isError, false, resultText(version));
+  assert.equal(JSON.parse(resultText(version)).version, 1);
+});
+
 test("chatWithTools runs the model's lookups, then returns its answer", async () => {
   const contexts: Context[] = [];
   const turns = [
@@ -418,6 +426,14 @@ test("chatSearchPayload uses the provider's own search only where it has one", (
   assert.equal(chatSearchPayload("google-generative-ai", "google"), null);
 });
 
+test("chatRequestSearchPayload leaves out the provider's search when the host says the backend has none", () => {
+  const custom = { provider: "anthropic", apiBaseUrl: "https://api.example.com/anthropic", apiKey: "k" };
+  assert.ok(chatRequestSearchPayload(custom, "anthropic-messages"), "the spec decides when the host says nothing");
+  assert.equal(chatRequestSearchPayload({ ...custom, hostedSearch: false }, "anthropic-messages"), null);
+  assert.ok(chatRequestSearchPayload({ hostedSearch: true }, "openai-codex-responses"), "a subscription searches itself");
+  assert.equal(chatRequestSearchPayload({ provider: "google", hostedSearch: true }, "google-generative-ai"), null);
+});
+
 test("chatWithTools offers web_search with a search key and answers it through the API", async () => {
   const contexts: Context[] = [];
   const turns = [
@@ -456,13 +472,30 @@ test("chatWithTools offers web_search with a search key and answers it through t
 
 test("a failed web search is an error result, not a failed chat", async () => {
   const rejected = (async () => new Response("{}", { status: 401 })) as typeof fetch;
+  const search = apiSearcher({ provider: "exa", apiKey: "k" }, rejected);
   const logged: string[] = [];
-  const output = await runWebSearchTool({ provider: "exa", apiKey: "k" }, toolCall("search_web", { query: "q" }), rejected, (line) => logged.push(line));
+  const output = await runSearchTool(search, toolCall("search_web", { query: "q" }), (line) => logged.push(line), "k");
   assert.equal(output.isError, true);
   assert.match(resultText(output), /Exa rejected the search API key\. Answer without the web\./);
   assert.match(logged[0], /key rejected/);
-  const empty = await runWebSearchTool({ provider: "exa", apiKey: "k" }, toolCall("search_web", { query: " " }), rejected, () => {});
+  const empty = await runSearchTool(search, toolCall("search_web", { query: " " }), () => {}, "k");
   assert.equal(empty.isError, true);
+});
+
+test("a search_web call without a query does not use up a search", async () => {
+  const queries: string[] = [];
+  let turn = 0;
+  const calls = [{}, { query: "q1" }, { query: "q2" }, { query: "q3" }];
+  await chatWithTools(async () => {
+    turn += 1;
+    return turn <= calls.length
+      ? reply([toolCall("search_web", calls[turn - 1], `call-${turn}`)], "toolUse")
+      : reply([{ type: "text", text: "Done." }]);
+  }, "s", "p", chatLibrary({}), {
+    log: () => {},
+    hostedSearch: async (query) => { queries.push(query); return `found ${query}`; },
+  });
+  assert.deepEqual(queries, ["q1", "q2", "q3"]);
 });
 
 test("chatWithTools offers the edit tools with a recipe and returns what they changed", async () => {
@@ -602,6 +635,42 @@ test("anthropicTurn gives up on a turn that keeps pausing", async () => {
     (error) => error instanceof WorkerError && error.retryable,
   );
   assert.equal(calls, 6);
+});
+
+test("anthropicTurn ends a continued turn once its one deadline has passed", async () => {
+  const realNow = Date.now;
+  let now = 0;
+  Date.now = () => now;
+  try {
+    let calls = 0;
+    const fetchImpl = fakeFetch(async () => {
+      calls += 1;
+      // The first call takes the whole ten minutes.
+      now += 600_001;
+      return { ok: true, json: async () => ({ stop_reason: "pause_turn", content: [] }) };
+    });
+    await assert.rejects(
+      anthropicTurn("https://api.anthropic.com", "k", "claude-opus-5-5", "s", "p", "low", "grounded", fetchImpl),
+      /did not finish its turn in time/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("endpoint request errors never quote the API key", async () => {
+  const key = "sk-proj-secret\r\nvalue";
+  const thrown = fakeFetch(async () => {
+    throw new TypeError(`Headers.append: "Bearer ${key}" is an invalid header value.`);
+  });
+  const echoed = fakeFetch(async () => ({ ok: false, status: 400, text: async () => `bad key ${key}` }));
+  for (const fetchImpl of [thrown, echoed]) {
+    await assert.rejects(
+      openaiResponse("https://api.openai.com/v1", key, "gpt-5.6-luna", "s", "p", "off", "low", fetchImpl),
+      (error) => error instanceof WorkerError && !error.message.includes(key) && error.message.includes("[key]"),
+    );
+  }
 });
 
 test("listEndpointModels follows Anthropic pagination and keeps its newest-first order", async () => {
@@ -852,6 +921,9 @@ test("piAiModel uses the catalogue entry, borrows a shape for unknown ids, and r
   assert.throws(() => piAiModel(models, "no-such-provider", "m"), (error) => error instanceof WorkerError && error.code === "configuration");
   const custom = piAiModel(models, "openai-compatible", "llama3", "http://ollama:11434/v1/");
   assert.equal(custom.baseUrl, "http://ollama:11434/v1");
+  // The Anthropic SDK adds /v1 itself, so a base saved with it loses it.
+  assert.equal(piAiModel(models, "anthropic", "claude-sonnet-5-5", "https://proxy.example/v1/").baseUrl, "https://proxy.example");
+  assert.equal(piAiModel(models, "anthropic", "claude-sonnet-5-5", "https://api.anthropic.com").baseUrl, "https://api.anthropic.com");
   assert.equal((custom as Model<"openai-completions">).compat?.supportsDeveloperRole, false);
   assert.throws(() => piAiModel(models, "openai-compatible", "llama3"), (error) => error instanceof WorkerError && error.code === "configuration");
 });
@@ -953,6 +1025,18 @@ test("generateRecipe keeps a native endpoint's gap-fill sources when the API ret
   assert.deepEqual(result.sources, [{ title: "x", url: "https://x.example/" }]);
 });
 
+test("generateRecipe keeps unverified gap-fill sources only after a search, on any backend", async () => {
+  const run = (request: { piProvider?: string; provider?: string }, searched: boolean) => generateRecipe(
+    { ...request, prompt: "p", systemPrompt: "s" },
+    "gapfill",
+    "low",
+    async () => ({ label: "x", text: RECIPE_REPLY, citations: new Map(), searched }),
+  );
+  assert.deepEqual((await run({ piProvider: "anthropic" }, true)).sources, [{ title: "x", url: "https://x.example/" }]);
+  assert.deepEqual((await run({ piProvider: "anthropic" }, false)).sources, []);
+  assert.deepEqual((await run({ provider: "openai" }, false)).sources, []);
+});
+
 test("generateRecipe requires a search on grounded subscription requests", async () => {
   const completeImpl = async () => ({ label: "Codex", text: RECIPE_REPLY, citations: new Map(), searched: false });
   await assert.rejects(
@@ -971,6 +1055,8 @@ test("isAuthFailure recognises refused logins and keys", () => {
     new Error("401 Unauthorized"),
     new Error("Incorrect API key provided: sk-...abcd"),
     new Error("invalid x-api-key"),
+    new Error("Provided authentication token is expired. Please try signing in again."),
+    new Error("Your authentication token has been invalidated. Please try signing in again."),
   ];
   for (const error of refused) assert.equal(isAuthFailure(error), true, String(error));
   const other: unknown[] = [
@@ -981,6 +1067,24 @@ test("isAuthFailure recognises refused logins and keys", () => {
     new Error("Anthropic response was truncated by max_tokens."),
   ];
   for (const error of other) assert.equal(isAuthFailure(error), false, String(error));
+});
+
+test("modelCaller sets the worker's defaults and words a refused login as one, without the key", async () => {
+  let sent: Record<string, unknown> = {};
+  const call = modelCaller(async (_context, options) => {
+    sent = options as Record<string, unknown>;
+    // pi-ai's Codex transport reports a 401 through onResponse and its error text only.
+    await options.onResponse?.({ status: 401, headers: {} }, {} as never);
+    return { ...reply([], "error"), errorMessage: "Token gone for sk-secret-key-123" } as AssistantMessage;
+  }, "high", "sk-secret-key-123");
+  const response = await call({ messages: [] });
+  assert.equal(sent.reasoning, "high");
+  assert.equal(sent.maxRetries, 1);
+  assert.ok(sent.signal instanceof AbortSignal, "a stalled stream times out");
+  assert.equal(response.errorMessage, "HTTP 401: Token gone for [key]");
+  assert.equal(workerFailure(new WorkerError("worker", response.errorMessage!)).code, "auth");
+  await call({ messages: [] }, { reasoning: "low" });
+  assert.equal(sent.reasoning, "low", "a call may set its own effort");
 });
 
 test("workerFailure reports a refused login as a non-retryable auth failure", () => {
@@ -1119,6 +1223,41 @@ test("a model still editing when the rounds run out keeps its proposal", async (
   };
   const result = await chatWithTools(oneAtATime, "s", "Double everything", chatLibrary({}), { log: () => {}, recipe });
   assert.ok(result.proposal, "the edits made so far come back for the cook to review");
+  // Nine turns of one edit each: the last turn's edit is kept too.
+  assert.equal(turn, 9);
+  assert.equal(result.proposal.ingredients.filter((ingredient) => ingredient.quantity === "2").length, 9);
+  assert.match(chatReply(result.text).reply, /may be incomplete/);
+});
+
+test("an Anthropic-compatible endpoint saved with /v1 chats at /v1/messages", async () => {
+  const models = piAiModels();
+  const model = piAiModel(models, "anthropic", "claude-sonnet-5-5", "https://proxy.example/v1");
+  const urls: string[] = [];
+  const fetchImpl = (async (url: string | URL | Request) => {
+    urls.push(String(url));
+    return anthropicStream([{ type: "text", text: "ok" }], "end_turn");
+  }) as typeof fetch;
+  const message = await models.completeSimple(model, { systemPrompt: "s", messages: [{ role: "user", content: "q", timestamp: 0 }], tools: [] }, {
+    apiKey: "sk-ant-api03-test",
+    maxRetries: 0,
+    fetch: fetchImpl,
+  });
+  assert.equal(message.stopReason, "stop", message.errorMessage);
+  assert.deepEqual(urls.map((url) => url.split("?")[0]), ["https://proxy.example/v1/messages"]);
+});
+
+test("the chat fails a timed-out or truncated turn for good, and a provider error for one retry", async () => {
+  const ending = async (stopReason: AssistantMessage["stopReason"]) => {
+    try {
+      await chatWithTools(async () => ({ ...reply([{ type: "text", text: "Half" }], stopReason) }) as AssistantMessage, "s", "p", chatLibrary({}), { log: () => {} });
+      return "answered";
+    } catch (error) {
+      return error instanceof WorkerError && error.retryable ? "retry" : "fail";
+    }
+  };
+  assert.equal(await ending("aborted"), "fail");
+  assert.equal(await ending("length"), "fail");
+  assert.equal(await ending("error"), "retry");
 });
 
 test("chatReply falls back to the text when the JSON has no usable reply", () => {
@@ -1245,6 +1384,11 @@ test("hostedSearchAnswer refuses an empty, paused, or failed search", async () =
   await assert.rejects(hostedSearchAnswer(anthropicChat(paused), "q"), (error) => error instanceof WebSearchError && /paused/.test(error.message));
   const failed: ChatModelCall = async () => ({ ...reply([], "error"), errorMessage: "400 tool not supported" }) as AssistantMessage;
   await assert.rejects(hostedSearchAnswer(failed, "q"), /web search failed \(400 tool not supported\)/);
+});
+
+test("hostedSearchAnswer keeps an answer cut off at the output limit and says so", async () => {
+  const cut: ChatModelCall = async () => reply([{ type: "text", text: "Rest it 5" }], "length");
+  assert.equal(await hostedSearchAnswer(cut, "q"), 'Web search for "q":\nRest it 5\n(The search answer was cut off here.)');
 });
 
 test("chatReply drops the cite tags Claude's web search puts around quotes", () => {

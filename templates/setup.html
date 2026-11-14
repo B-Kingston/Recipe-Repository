@@ -19,7 +19,7 @@
       <div class="compact-panel">
         <form method="post" action="/setup">
           <label for="username">Username</label>
-          <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" required>
+          <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40" required>
           <label for="password">Password</label>
           <input id="password" name="password" type="password" autocomplete="new-password" required aria-describedby="password-hint">
           <p class="muted" id="password-hint">At least 8 characters.</p>

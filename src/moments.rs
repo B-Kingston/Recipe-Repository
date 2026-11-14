@@ -9,20 +9,24 @@
 //! - When the aligned audio clearly talks about the steps (mean similarity
 //!   lift over the step's average window), every step takes its audio match.
 //! - Otherwise, or for a single step whose audio match is weak, the frame
-//!   match is used when it is clear enough.
+//!   match is used when it is clear enough (and, for that single step, when
+//!   it falls between its neighbours' audio moments).
 //! - Steps are aligned monotonically: step N never matches earlier than step
 //!   N-1. On narrated test reels this put 15 of 16 steps within 4 s of the
 //!   moment the cook described them; frames alone managed 12 of 16.
 
 use crate::embeddings::{self, BlockingEmbedder, Embedder, Input};
-use crate::media::{create_private_dir, env_path, remaining_timeout, run_tool};
+use crate::media::{MAX_MEDIA_SECONDS, create_private_dir, remaining_timeout, run_ffmpeg};
 use crate::recipes::{
     draft_moment_vectors, recipe_moment_vectors, recipe_step_texts, replace_draft_step_moments,
     replace_recipe_step_moments,
 };
 use crate::{AppError, AppState, GeneratedRecipe, MomentView};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -43,7 +47,10 @@ const MAX_STILLS_BYTES: usize = 24 * 1024 * 1024;
 /// Frame embeddings cost about 0.7 s each on the CPU, so a long video embeds
 /// an evenly spread subset of its stills.
 const MAX_FRAME_VECTORS: usize = 40;
-const MAX_SECONDS: u64 = 300;
+/// Inputs per sidecar call while capturing. Between calls the capture checks
+/// whether the import was cancelled or the media deadline passed, so neither
+/// waits for every frame and audio window to be embedded.
+const CAPTURE_EMBED_CHUNK: usize = 8;
 /// Similarity lift (aligned cosine minus the step's mean cosine) thresholds,
 /// calibrated on matched and mismatched reels: matched audio averaged
 /// 0.08-0.10, unrelated audio 0.035.
@@ -113,6 +120,9 @@ pub(crate) struct StepMoment {
 /// Builds the moment pool from a downloaded video and, when the audio
 /// channel ran, its 16 kHz mono WAV. Blocking (ffmpeg plus sidecar calls);
 /// failures add a warning and keep whatever part of the pool succeeded.
+/// Once `cancel` is set (nobody wants the pool any more) or the deadline
+/// passes, the capture stops at the next stage or sidecar call and returns
+/// what it has, so the media slot and the sidecar are freed early.
 pub(crate) fn capture(
     video: &Path,
     audio: Option<&Path>,
@@ -120,19 +130,21 @@ pub(crate) fn capture(
     embedder: &BlockingEmbedder,
     warnings: &mut Vec<String>,
     deadline: Instant,
+    cancel: &AtomicBool,
 ) -> MomentPool {
+    let stopped = || cancel.load(Ordering::SeqCst) || Instant::now() >= deadline;
     let mut pool = MomentPool::default();
     match extract_stills(video, workdir, deadline) {
         Ok(stills) => pool.stills = stills,
         Err(error) => warnings.push(format!("Step moment stills were not captured: {error}")),
     }
     let frames = spread(pool.stills.len(), MAX_FRAME_VECTORS);
-    if !frames.is_empty() {
+    if !frames.is_empty() && !stopped() {
         let inputs: Vec<Input> = frames
             .iter()
             .map(|&index| Input::Image(pool.stills[index].jpeg.clone()))
             .collect();
-        match embedder.embed(&inputs) {
+        match embed_until(embedder, &inputs, &stopped) {
             Ok(vectors) => {
                 pool.vectors
                     .extend(
@@ -149,7 +161,7 @@ pub(crate) fn capture(
             Err(error) => warnings.push(format!("Video frames were not embedded: {error}")),
         }
     }
-    if let Some(audio) = audio {
+    if let Some(audio) = audio.filter(|_| !stopped()) {
         match std::fs::read(audio)
             .map_err(|error| error.to_string())
             .and_then(|bytes| audio_windows(&bytes))
@@ -159,7 +171,7 @@ pub(crate) fn capture(
                     .iter()
                     .map(|(_, wav)| Input::Audio(wav.clone()))
                     .collect();
-                match embedder.embed(&inputs) {
+                match embed_until(embedder, &inputs, &stopped) {
                     Ok(vectors) => pool.vectors.extend(windows.iter().zip(vectors).map(
                         |((start, _), vector)| MomentVector {
                             kind: MomentKind::Audio,
@@ -176,7 +188,30 @@ pub(crate) fn capture(
             Err(error) => warnings.push(format!("Audio windows were not readable: {error}")),
         }
     }
+    if stopped() && !cancel.load(Ordering::SeqCst) {
+        warnings.push(
+            "The media deadline passed during step-moment capture; some moments may be missing."
+                .into(),
+        );
+    }
     pool
+}
+
+/// Embeds `inputs` a few at a time until `stopped` says to give up, and
+/// returns the vectors of the inputs embedded so far, in order.
+fn embed_until(
+    embedder: &BlockingEmbedder,
+    inputs: &[Input],
+    stopped: &dyn Fn() -> bool,
+) -> Outcome<Vec<Vec<f32>>> {
+    let mut vectors = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(CAPTURE_EMBED_CHUNK) {
+        if stopped() {
+            break;
+        }
+        vectors.extend(embedder.embed(chunk)?);
+    }
+    Ok(vectors)
 }
 
 /// Samples one still every [`STILL_INTERVAL_SECONDS`] over the analysed span.
@@ -186,13 +221,8 @@ fn extract_stills(video: &Path, workdir: &Path, deadline: Instant) -> Outcome<Ve
     let timeout =
         remaining_timeout(deadline, Duration::from_secs(90)).ok_or("the media deadline passed")?;
     let args = vec![
-        "-y".into(),
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-nostdin".into(),
         "-t".into(),
-        MAX_SECONDS.to_string(),
+        MAX_MEDIA_SECONDS.to_string(),
         "-i".into(),
         video.to_string_lossy().to_string(),
         "-vf".into(),
@@ -201,12 +231,7 @@ fn extract_stills(video: &Path, workdir: &Path, deadline: Instant) -> Outcome<Ve
         "5".into(),
         dir.join("still-%04d.jpg").to_string_lossy().to_string(),
     ];
-    run_tool(
-        &env_path("MEDIA_FFMPEG_PATH", "ffmpeg"),
-        &args,
-        timeout,
-        1024 * 1024,
-    )?;
+    run_ffmpeg(&args, timeout, 1024 * 1024)?;
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map_err(|error| error.to_string())?
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
@@ -245,7 +270,7 @@ pub(crate) fn audio_windows(wav: &[u8]) -> Outcome<Vec<(f64, Vec<u8>)>> {
     let (rate, channels, data) = pcm16_data(wav).ok_or("not a 16-bit PCM WAV file")?;
     let frame_bytes = 2 * channels as usize;
     let frames = data.len() / frame_bytes;
-    let max_frames = (MAX_SECONDS * rate as u64) as usize;
+    let max_frames = (MAX_MEDIA_SECONDS * rate as u64) as usize;
     let frames = frames.min(max_frames);
     let window = (AUDIO_WINDOW_SECONDS * rate as f64) as usize;
     let hop = (AUDIO_HOP_SECONDS * rate as f64) as usize;
@@ -343,17 +368,38 @@ pub(crate) fn match_steps(steps: &[Vec<f32>], pool: &[MomentVector]) -> Vec<Step
     let mean = |plan: &Option<Plan>| plan.as_ref().map_or(f32::MIN, Plan::mean_lift);
     let use_audio = mean(&audio_plan) >= AUDIO_MIN_MEAN_LIFT;
     let use_frames = mean(&frame_plan) >= FRAME_MIN_MEAN_LIFT;
+    let spoken: Vec<Option<&MomentVector>> = (0..steps.len())
+        .map(|step_index| {
+            if use_audio {
+                pick(&audio_plan, &audio, step_index, AUDIO_MIN_STEP_LIFT)
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut moments = Vec::new();
-    for step_index in 0..steps.len() {
+    // The earliest second a later step may match: the last moment chosen.
+    let mut earliest = f64::MIN;
+    for (step_index, &heard) in spoken.iter().enumerate() {
         let matched = if use_audio {
-            pick(&audio_plan, &audio, step_index, AUDIO_MIN_STEP_LIFT)
-                .or_else(|| pick(&frame_plan, &frames, step_index, FRAME_MIN_STEP_LIFT))
+            heard.or_else(|| {
+                // The frame plan is aligned on its own, so a weak step's
+                // frame match must also fall between its spoken neighbours.
+                let latest = spoken[step_index + 1..]
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or(f64::MAX, |next| next.seconds);
+                pick(&frame_plan, &frames, step_index, FRAME_MIN_STEP_LIFT)
+                    .filter(|frame| (earliest..=latest).contains(&frame.seconds))
+            })
         } else if use_frames {
             pick(&frame_plan, &frames, step_index, FRAME_MIN_STEP_LIFT)
         } else {
             None
         };
         if let Some(vector) = matched {
+            earliest = vector.seconds;
             moments.push(StepMoment {
                 step_index,
                 seconds: vector.seconds.max(0.0).round() as u64,
@@ -495,14 +541,13 @@ pub(crate) fn view(moment: &StepMoment, still_seconds: &[u64], still_base: &str)
     }
 }
 
-/// Matches a draft's steps to its moment pool (its own, or the pool of the
-/// recipe it alters) and stores the result. A draft without a pool, a
-/// switched-off setting, or a missing sidecar stores nothing.
+/// Matches a draft's steps to its moment pool and stores the result. A
+/// draft without a pool, a switched-off setting, or a missing sidecar
+/// stores nothing.
 pub(crate) async fn match_draft(
     state: &AppState,
     user_id: &str,
     draft_id: &str,
-    recipe_id: Option<&str>,
     recipe: &GeneratedRecipe,
 ) -> crate::Result<()> {
     let Some(embedder) = &state.embedder else {
@@ -511,7 +556,7 @@ pub(crate) async fn match_draft(
     if !crate::step_moments_enabled(&state.db, user_id).await? {
         return Ok(());
     }
-    let vectors = draft_moment_vectors(&state.db, draft_id, recipe_id).await?;
+    let vectors = draft_moment_vectors(&state.db, draft_id).await?;
     if vectors.is_empty() {
         return Ok(());
     }
@@ -522,7 +567,14 @@ pub(crate) async fn match_draft(
     replace_draft_step_moments(&state.db, draft_id, &moments).await
 }
 
-/// Re-matches a saved recipe's steps to its moment pool after a step edit.
+/// One lock per recipe whose steps are being re-matched. Two quick edits
+/// spawn two refreshes; taking turns, the later one reads the later steps
+/// and pool, and its result is the one kept.
+static REFRESHING: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+/// Re-matches a saved recipe's steps to its moment pool after a step edit,
+/// one refresh of a recipe at a time.
 pub(crate) async fn refresh_recipe(
     state: &AppState,
     user_id: &str,
@@ -531,6 +583,29 @@ pub(crate) async fn refresh_recipe(
     let Some(embedder) = &state.embedder else {
         return Ok(());
     };
+    let turn = REFRESHING
+        .lock()
+        .entry(recipe_id.to_owned())
+        .or_default()
+        .clone();
+    let outcome = {
+        let _turn = turn.lock().await;
+        match_recipe(state, embedder, user_id, recipe_id).await
+    };
+    let mut refreshing = REFRESHING.lock();
+    // Held by the map and by this call only: nobody else is waiting.
+    if Arc::strong_count(&turn) == 2 {
+        refreshing.remove(recipe_id);
+    }
+    outcome
+}
+
+async fn match_recipe(
+    state: &AppState,
+    embedder: &Embedder,
+    user_id: &str,
+    recipe_id: &str,
+) -> crate::Result<()> {
     if !crate::step_moments_enabled(&state.db, user_id).await? {
         return Ok(());
     }

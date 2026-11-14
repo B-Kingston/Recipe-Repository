@@ -1,8 +1,10 @@
 use crate::ai::{
-    DebugCardRow, DebugUrlState, PromptRoute, SearchMode, apply_draft, cancel_draft,
-    dedupe_sources, draft_page, draft_thumbnail, generate_recipe, import_sources,
-    normalize_generated, parse_pi_response, recipe_schema, retry_guidance, route_prompt,
-    strip_markdown_links, system_recipe_prompt, validate_generated,
+    DebugCardRow, DebugUrlState, MediaDebugRun, MediaRunPurpose, PromptRoute, SearchMode,
+    acquire_subscription_worker, apply_draft, cancel_draft, dedupe_sources, draft_page,
+    draft_thumbnail, forget_media_runs, generate_recipe, import_sources, media_debug_frame,
+    media_debug_page, media_debug_run_page, normalize_generated, parse_pi_response, recipe_schema,
+    remove_leftover_temp_files, retry_guidance, route_prompt, strip_markdown_links,
+    system_recipe_prompt, validate_generated,
 };
 use crate::auth::setup_create;
 use crate::media::MediaChannels;
@@ -27,6 +29,7 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
+use std::sync::atomic::AtomicUsize;
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tower::ServiceExt;
 
@@ -89,19 +92,28 @@ fn generated_recipe_needs_real_content() {
 }
 
 #[test]
-fn legacy_draft_supports_unmeasured_ingredients() {
-    let mut legacy = recipe();
-    legacy.ingredients[0].name = "salt".into();
-    legacy.ingredients[0].quantity.clear();
-    legacy.ingredients[0].unit.clear();
-    for step in &mut legacy.steps {
+fn generated_recipes_need_named_ingredients_and_sane_sizes() {
+    let mut unnamed = recipe();
+    unnamed.ingredients[0].name = "  ".into();
+    assert!(validate_generated(&unnamed).is_err());
+
+    let mut endless_timer = recipe();
+    endless_timer.steps[1].timer_seconds = 8 * 24 * 60 * 60;
+    assert!(validate_generated(&endless_timer).is_err());
+
+    let mut runaway = recipe();
+    let extra = runaway.steps[0].clone();
+    runaway.steps.splice(0..0, std::iter::repeat_n(extra, 100));
+    assert!(validate_generated(&runaway).is_err());
+}
+
+#[test]
+fn output_without_chart_labels_is_refused_so_the_retry_runs() {
+    let mut unlabelled = recipe();
+    for step in &mut unlabelled.steps {
         step.chart_label.clear();
-        step.ingredient_uses.clear();
-        step.input_steps.clear();
     }
-    legacy.steps[1].ingredients = vec!["salt".into()];
-    assert!(normalize_generated(&mut legacy).is_ok());
-    assert_eq!(legacy.steps[1].ingredient_uses[0].amount, "as needed");
+    assert!(normalize_generated(&mut unlabelled).is_err());
 }
 
 #[test]
@@ -127,24 +139,6 @@ fn chart_flow_accepts_branch_and_merge_and_rejects_bad_references() {
         validate_generated(&dangling).is_err(),
         "step 0 must flow somewhere"
     );
-}
-
-#[test]
-fn legacy_ingredient_matching_survives_case_folding_with_length_change() {
-    // The Kelvin sign lowercases to ASCII "k" but is three bytes long, so the
-    // display string cannot be split at the ingredient name's byte length.
-    let mut legacy = recipe();
-    legacy.ingredients[0].name = "\u{212A}".into();
-    legacy.ingredients[0].quantity.clear();
-    legacy.ingredients[0].unit.clear();
-    for step in &mut legacy.steps {
-        step.chart_label.clear();
-        step.ingredient_uses.clear();
-        step.input_steps.clear();
-    }
-    legacy.steps[1].ingredients = vec!["k".into()];
-    assert!(normalize_generated(&mut legacy).is_ok());
-    assert_eq!(legacy.steps[1].ingredient_uses[0].amount, "as needed");
 }
 
 #[test]
@@ -188,22 +182,60 @@ fn grounding_decides_whether_empty_sources_are_accepted() {
 
 #[test]
 fn gap_fill_mode_researches_without_requiring_sources() {
+    use crate::ai::{EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT, RECIPE_PROMPT};
     assert_eq!(
-        system_recipe_prompt(SearchMode::GapFill),
-        crate::EVIDENCE_RECIPE_PROMPT
+        system_recipe_prompt(true, SearchMode::GapFill),
+        EVIDENCE_RECIPE_PROMPT
     );
     assert_eq!(
-        system_recipe_prompt(SearchMode::Grounded),
-        crate::GROUNDED_RECIPE_PROMPT
+        system_recipe_prompt(false, SearchMode::Grounded),
+        GROUNDED_RECIPE_PROMPT
     );
-    assert_eq!(system_recipe_prompt(SearchMode::Off), crate::RECIPE_PROMPT);
+    assert_eq!(system_recipe_prompt(false, SearchMode::Off), RECIPE_PROMPT);
     assert!(!SearchMode::GapFill.requires_sources());
     assert!(SearchMode::Grounded.requires_sources());
     assert_eq!(SearchMode::GapFill.as_str(), "gapfill");
     assert_eq!(SearchMode::Off.as_str(), "off");
-    let guidance = retry_guidance(SearchMode::GapFill);
+    let guidance = retry_guidance(true, SearchMode::GapFill);
     assert!(guidance.contains("web_search"));
     assert!(guidance.contains("gap the video evidence leaves open"));
+}
+
+/// `PI_SEARCH_ENABLED=false` turns off search for video imports too, which
+/// keep their evidence prompt without the tool it would offer.
+#[test]
+fn video_evidence_without_search_keeps_its_prompt_but_drops_the_tool() {
+    use crate::ai::{EVIDENCE_OFFLINE_RECIPE_PROMPT, generation_search_mode};
+    assert_eq!(generation_search_mode(false, true), SearchMode::Off);
+    assert_eq!(generation_search_mode(false, false), SearchMode::Off);
+    assert_eq!(generation_search_mode(true, true), SearchMode::GapFill);
+    assert_eq!(generation_search_mode(true, false), SearchMode::Grounded);
+
+    let offline = system_recipe_prompt(true, SearchMode::Off);
+    assert_eq!(offline, EVIDENCE_OFFLINE_RECIPE_PROMPT);
+    assert!(offline.contains("imported social-video evidence"));
+    assert!(!offline.contains("web_search"));
+    assert!(!retry_guidance(true, SearchMode::Off).contains("web_search"));
+}
+
+/// The three prompt families share one recipe contract, and a request to
+/// leave out an ingredient is handled in each, video imports included.
+#[test]
+fn every_recipe_prompt_carries_the_shared_rules() {
+    use crate::ai::{
+        EVIDENCE_OFFLINE_RECIPE_PROMPT, EVIDENCE_RECIPE_PROMPT, GROUNDED_RECIPE_PROMPT,
+        RECIPE_PROMPT,
+    };
+    for prompt in [
+        RECIPE_PROMPT,
+        GROUNDED_RECIPE_PROMPT,
+        EVIDENCE_RECIPE_PROMPT,
+        EVIDENCE_OFFLINE_RECIPE_PROMPT,
+    ] {
+        assert!(prompt.contains("Return one complete recipe, not a patch."));
+        assert!(prompt.contains("Keep total timings consistent."));
+        assert!(prompt.contains("\"egg free\""), "{prompt}");
+    }
 }
 
 async fn database() -> SqlitePool {
@@ -500,21 +532,13 @@ fn import_sources_word_each_lane_for_the_reader() {
     );
 }
 
-async fn insert_draft(
-    db: &SqlitePool,
-    draft_id: &str,
-    recipe_id: Option<&str>,
-    base_updated_at: Option<&str>,
-) {
+async fn insert_draft(db: &SqlitePool, draft_id: &str) {
     let now = chrono::Utc::now();
     sqlx::query(
-        "INSERT INTO ai_drafts(id,recipe_id,base_updated_at,operation,recipe_json,sources_json,user_id,created_at,expires_at)
-         VALUES(?,?,?,?,?,'[]','u1',?,?)",
+        "INSERT INTO ai_drafts(id,recipe_json,sources_json,user_id,created_at,expires_at)
+         VALUES(?,?,'[]','u1',?,?)",
     )
     .bind(draft_id)
-    .bind(recipe_id)
-    .bind(base_updated_at)
-    .bind(if recipe_id.is_some() { "alter" } else { "generate" })
     .bind(serde_json::to_string(&recipe()).unwrap())
     .bind(now.to_rfc3339())
     .bind((now + chrono::Duration::hours(24)).to_rfc3339())
@@ -524,7 +548,7 @@ async fn insert_draft(
 }
 
 async fn insert_draft_with_candidates(db: &SqlitePool, draft_id: &str) {
-    insert_draft(db, draft_id, None, None).await;
+    insert_draft(db, draft_id).await;
     for (idx, seconds, jpeg) in [(0_i64, 4_i64, b"first".as_slice()), (1, 9, b"second")] {
         sqlx::query("INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg)VALUES(?,?,?,?)")
             .bind(draft_id)
@@ -589,7 +613,7 @@ async fn preview_offers_candidates_and_apply_persists_the_chosen_photo() {
 async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
     let db = database().await;
     let s = state(db.clone());
-    insert_draft(&db, "tm1", None, None).await;
+    insert_draft(&db, "tm1").await;
     sqlx::query("UPDATE ai_drafts SET sources_json=? WHERE id='tm1'")
         .bind(
             json!([{"title": "Reel", "url": "https://www.instagram.com/reel/AbCdEf123/"}])
@@ -829,8 +853,15 @@ async fn version_labels(db: &SqlitePool, recipe_id: &str) -> Vec<String> {
         .unwrap()
 }
 
+async fn recipe_count(db: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM recipes")
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
-async fn alteration_applies_only_to_the_version_it_was_based_on() {
+async fn a_draft_is_saved_as_one_new_recipe() {
     let db = database().await;
     let s = state(db.clone());
     let apply = |draft: &'static str| {
@@ -842,7 +873,7 @@ async fn alteration_applies_only_to_the_version_it_was_based_on() {
         )
     };
 
-    insert_draft(&db, "ta1", None, None).await;
+    insert_draft(&db, "ta1").await;
     let created = apply("ta1").await.unwrap();
     let recipe_id = created.headers()[header::LOCATION]
         .to_str()
@@ -853,54 +884,60 @@ async fn alteration_applies_only_to_the_version_it_was_based_on() {
         version_labels(&db, &recipe_id).await,
         ["Recipe created with AI"]
     );
-
-    let updated_at: String = sqlx::query_scalar("SELECT updated_at FROM recipes WHERE id=?")
-        .bind(&recipe_id)
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    insert_draft(
-        &db,
-        "ta2",
-        Some(&recipe_id),
-        Some("2000-01-01T00:00:00+00:00"),
+    let steps: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT b.text, COUNT(i.id) FROM recipe_blocks b
+         LEFT JOIN recipe_step_ingredients i ON i.step_id=b.id
+         WHERE b.recipe_id=? AND b.section='step' GROUP BY b.id ORDER BY b.position",
     )
-    .await;
-    // A stale base re-renders the preview with the draft kept, and writes nothing.
-    let stale = apply("ta2").await.unwrap();
-    assert_eq!(stale.status(), StatusCode::OK);
-    assert!(
-        response_body(stale)
-            .await
-            .contains("This recipe changed after the draft was made.")
-    );
-    assert_eq!(version_labels(&db, &recipe_id).await.len(), 1);
-    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_drafts WHERE id='ta2'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(kept, 1);
-
-    insert_draft(&db, "ta3", Some(&recipe_id), Some(&updated_at)).await;
-    apply("ta3").await.unwrap();
+    .bind(&recipe_id)
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(
-        version_labels(&db, &recipe_id)
-            .await
-            .last()
-            .map(String::as_str),
-        Some("AI alteration applied")
+        steps,
+        [
+            ("Heat pan.".to_string(), 0),
+            ("Toast until golden.".to_string(), 1)
+        ]
     );
 
-    // A recipe saved before history existed gets its pre-AI state recorded first.
-    seed_recipe_with_source(&db, "ta4", "").await;
-    let legacy_updated: String =
-        sqlx::query_scalar("SELECT updated_at FROM recipes WHERE id='ta4'")
-            .fetch_one(&db)
+    // Saving again finds the draft consumed.
+    let again = apply("ta1").await.unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    assert_eq!(recipe_count(&db).await, 1);
+}
+
+/// Two Saves of one draft at once: the second waits for the first to commit
+/// and then finds the draft gone, so it saves nothing. The trigger plays the
+/// first Save, consuming the draft while the second one is mid-transaction.
+#[tokio::test]
+async fn a_second_save_of_a_consumed_draft_saves_nothing() {
+    let db = database().await;
+    let s = state(db.clone());
+    insert_draft(&db, "tr1").await;
+    sqlx::query(
+        "CREATE TRIGGER consume_draft AFTER INSERT ON recipes
+         BEGIN DELETE FROM ai_drafts WHERE id='tr1'; END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let response = apply_draft(
+        State(s),
+        AuthUser { id: "u1".into() },
+        Path("tr1".into()),
+        Form(ApplyDraftForm { thumbnail: None }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(
+        response_body(response)
             .await
-            .unwrap();
-    insert_draft(&db, "ta5", Some("ta4"), Some(&legacy_updated)).await;
-    apply("ta5").await.unwrap();
-    assert_eq!(version_labels(&db, "ta4").await.len(), 2);
+            .contains("This draft is no longer available")
+    );
+    assert_eq!(recipe_count(&db).await, 0, "the second save rolled back");
 }
 
 #[tokio::test]
@@ -1165,4 +1202,330 @@ fn generated_text_drops_markdown_citations_and_keeps_link_labels() {
         strip_markdown_links("Unclosed [x](http"),
         "Unclosed [x](http"
     );
+}
+
+#[tokio::test]
+async fn an_overlong_request_is_refused_on_the_card() {
+    let state = state(database().await);
+    let card = |prompt: String| {
+        generate_recipe(
+            State(state.clone()),
+            AuthUser { id: "u1".into() },
+            Form(PromptForm {
+                prompt,
+                ..PromptForm::default()
+            }),
+        )
+    };
+    let body = response_body(card("a".repeat(4_001)).await.unwrap()).await;
+    assert!(
+        body.contains("Keep the request under 4000 characters."),
+        "{body}"
+    );
+
+    // The carriage return a browser sends with each line break is not counted.
+    let body = response_body(card("ab\r\n".repeat(1_200)).await.unwrap()).await;
+    assert!(!body.contains("Keep the request under"), "{body}");
+    assert!(body.contains("The AI service is not configured"), "{body}");
+}
+
+#[test]
+fn pages_that_show_a_failure_hide_server_side_detail() {
+    assert_eq!(
+        AppError::Internal("sqlite exploded at row 7".into()).user_message(),
+        "Something went wrong on our side. Please try again."
+    );
+    assert_eq!(
+        AppError::BadRequest("Tick a box.".into()).user_message(),
+        "Tick a box."
+    );
+    assert!(
+        AppError::Ai
+            .user_message()
+            .contains("could not prepare the recipe")
+    );
+}
+
+fn debug_run(owner: &str, dir: std::path::PathBuf) -> MediaDebugRun {
+    MediaDebugRun {
+        created: std::time::Instant::now(),
+        dir,
+        urls: Arc::new(vec![Arc::new(Mutex::new(DebugUrlState::default()))]),
+        history: Arc::new(Mutex::new(Vec::new())),
+        pending: Arc::new(AtomicUsize::new(0)),
+        owner_id: owner.into(),
+        purpose: MediaRunPurpose::Debug,
+        channels: MediaChannels::default(),
+        draft_id: Arc::new(Mutex::new(None)),
+    }
+}
+
+/// Debugger runs hold raw transcripts, OCR text, and frames: only the account
+/// that started one sees it listed or can open it, and deleting the account
+/// drops its runs with their frames.
+#[tokio::test]
+async fn debugger_runs_belong_to_the_account_that_started_them() {
+    let s = state(database().await);
+    let dir = std::env::temp_dir().join(format!("kr-debug-owner-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("frames").join("0")).unwrap();
+    std::fs::write(dir.join("frames").join("0").join("f0001.jpg"), b"jpeg").unwrap();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    s.media_debug_runs
+        .lock()
+        .insert(run_id.clone(), debug_run("u1", dir.clone()));
+    let owner = || AuthUser { id: "u1".into() };
+    let stranger = || AuthUser { id: "u2".into() };
+
+    let listed = media_debug_page(State(s.clone()), owner()).await.unwrap().0;
+    assert!(listed.contains(&run_id));
+    let listed = media_debug_page(State(s.clone()), stranger())
+        .await
+        .unwrap()
+        .0;
+    assert!(!listed.contains(&run_id));
+
+    assert!(
+        media_debug_run_page(State(s.clone()), owner(), Path(run_id.clone()))
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        media_debug_run_page(State(s.clone()), stranger(), Path(run_id.clone())).await,
+        Err(AppError::NotFound)
+    ));
+    let frame = |user: AuthUser| {
+        media_debug_frame(
+            State(s.clone()),
+            user,
+            Path((run_id.clone(), 0, "f0001.jpg".into())),
+        )
+    };
+    assert_eq!(frame(owner()).await.unwrap().status(), StatusCode::OK);
+    assert!(matches!(frame(stranger()).await, Err(AppError::NotFound)));
+
+    forget_media_runs(&s.media_debug_runs, "u2");
+    assert_eq!(s.media_debug_runs.lock().len(), 1);
+    forget_media_runs(&s.media_debug_runs, "u1");
+    assert!(s.media_debug_runs.lock().is_empty());
+    assert!(!dir.exists());
+}
+
+/// A refresh token rotates, so runs on one login take turns; other accounts'
+/// logins and the other provider do not wait for them.
+#[tokio::test]
+async fn subscription_runs_take_turns_only_on_the_same_login() {
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    let held = acquire_subscription_worker(&first, "openai-codex")
+        .await
+        .unwrap();
+    let wait = |user: &str, provider: &'static str| {
+        let user = user.to_string();
+        async move {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                acquire_subscription_worker(&user, provider),
+            )
+            .await
+        }
+    };
+    assert!(wait(&second, "openai-codex").await.is_ok());
+    assert!(wait(&first, "anthropic").await.is_ok());
+    assert!(
+        wait(&first, "openai-codex").await.is_err(),
+        "same login waits"
+    );
+    drop(held);
+    assert!(wait(&first, "openai-codex").await.is_ok());
+}
+
+/// A token the worker refreshed is written back over the credential the run
+/// started from, and never over a login the cook changed during the run.
+#[tokio::test]
+async fn a_refreshed_token_is_written_back_only_over_the_login_it_came_from() {
+    let db = database().await;
+    let codex = crate::CODEX_PI_PROVIDER;
+    let login = crate::Login::Subscription {
+        user_id: "u1",
+        pi_provider: codex,
+    };
+    let started = json!({"type": "oauth", "access": "a1", "refresh": "r1", "expires": 1});
+    let refreshed = json!({"type": "oauth", "access": "a2", "refresh": "r2", "expires": 2});
+    crate::store_pi_credential(&db, "u1", codex, &started)
+        .await
+        .unwrap();
+    crate::mark_login_refused(&db, login, true).await.unwrap();
+
+    crate::store_refreshed_pi_credential(&db, "u1", codex, &started, &refreshed)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::pi_credential(&db, "u1", codex).await.unwrap(),
+        Some(refreshed.clone())
+    );
+    // A refresh (a Refresh sign-in that then failed, say) proves nothing, so
+    // Settings still shows the earlier refusal.
+    assert!(
+        crate::subscription_login_refused(&db, "u1", codex)
+            .await
+            .unwrap()
+    );
+
+    // Reconnected during the run: the new login stays.
+    let reconnected = json!({"type": "oauth", "access": "b1", "refresh": "s1", "expires": 3});
+    crate::store_pi_credential(&db, "u1", codex, &reconnected)
+        .await
+        .unwrap();
+    crate::store_refreshed_pi_credential(&db, "u1", codex, &refreshed, &started)
+        .await
+        .unwrap();
+    assert_eq!(
+        crate::pi_credential(&db, "u1", codex).await.unwrap(),
+        Some(reconnected.clone())
+    );
+
+    // Disconnected (or the account deleted) during the run: nothing comes back.
+    sqlx::query("DELETE FROM pi_credentials WHERE user_id='u1'")
+        .execute(&db)
+        .await
+        .unwrap();
+    crate::store_refreshed_pi_credential(&db, "u1", codex, &reconnected, &refreshed)
+        .await
+        .unwrap();
+    assert_eq!(crate::pi_credential(&db, "u1", codex).await.unwrap(), None);
+}
+
+#[test]
+fn startup_clears_only_the_apps_leftover_temp_files() {
+    let dir = std::env::temp_dir().join(format!("kr-leftovers-{}", uuid::Uuid::new_v4()));
+    let upload = dir.join("kindle-recipes-upload-1");
+    let import = dir.join("kindle-recipes-media-import-2");
+    let auth = dir.join("kindle-recipes-auth-3.json");
+    let unrelated = dir.join("unrelated.txt");
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&upload).unwrap();
+    std::fs::write(upload.join("photo"), b"jpeg").unwrap();
+    std::fs::create_dir_all(import.join("frames")).unwrap();
+    std::fs::write(&auth, b"{}").unwrap();
+    std::fs::write(&unrelated, b"keep").unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"keep").unwrap();
+    // A link named like a media directory is removed as a link at most,
+    // never followed.
+    std::os::unix::fs::symlink(&outside, dir.join("kindle-recipes-media-link")).unwrap();
+
+    remove_leftover_temp_files(&dir);
+    assert!(!upload.exists());
+    assert!(!import.exists());
+    assert!(!auth.exists());
+    assert!(unrelated.exists());
+    assert!(outside.join("keep").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Migration 0025 rebuilds `ai_drafts`. Dropping the old table cascades into
+/// the drafts' moment pools, so the migration sets them aside and puts them
+/// back; drafts that altered a saved recipe go, with their candidates.
+#[tokio::test]
+async fn the_draft_table_rebuild_keeps_each_drafts_moment_pool() {
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .in_memory(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    let all = sqlx::migrate!();
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            all.iter()
+                .filter(|migration| migration.version < 25)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    before.run(&db).await.unwrap();
+    for statement in [
+        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u1','alice','x','t')",
+        "INSERT INTO recipes(id,title,created_at,updated_at,user_id) VALUES('r1','Soup','t','t','u1')",
+        "INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,status,change_request,change_state,created_at)
+         VALUES('m1','u1','r1','assistant','done','Make it vegan','drafting','t')",
+        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,evidence_json)
+         VALUES('keep',NULL,'generate','{}','[]','t','t','u1','{\"title\":\"Reel\"}')",
+        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,chat_message_id)
+         VALUES('alter','r1','alter','{}','[]','t','t','u1','m1')",
+        "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector) VALUES('keep','audio',1.0,x'00')",
+        "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector) VALUES('alter','frame',2.0,x'00')",
+        "INSERT INTO draft_moment_stills(draft_id,seconds,jpeg) VALUES('keep',2,x'ffd8')",
+        "INSERT INTO draft_step_moments(draft_id,step_index,seconds,source) VALUES('keep',0,1,'audio')",
+        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES('keep',0,1,x'ffd8')",
+        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES('alter',0,1,x'ffd8')",
+    ] {
+        sqlx::query(statement).execute(&db).await.unwrap();
+    }
+
+    all.run(&db).await.unwrap();
+
+    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM draft_moment_vectors WHERE draft_id='keep'),
+                (SELECT COUNT(*) FROM draft_moment_stills WHERE draft_id='keep'),
+                (SELECT COUNT(*) FROM draft_step_moments WHERE draft_id='keep'),
+                (SELECT COUNT(*) FROM draft_moment_vectors WHERE draft_id='alter'),
+                (SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='alter')",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 1, 0, 0));
+    let drafts: Vec<(String, String)> = sqlx::query_as("SELECT id,evidence_json FROM ai_drafts")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    assert_eq!(drafts, [("keep".into(), "{\"title\":\"Reel\"}".into())]);
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('ai_drafts')")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "id",
+            "user_id",
+            "recipe_json",
+            "sources_json",
+            "evidence_json",
+            "created_at",
+            "expires_at"
+        ]
+    );
+    let change_state: String =
+        sqlx::query_scalar("SELECT change_state FROM recipe_chat_messages WHERE id='m1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(change_state, "failed");
+    let violations: Vec<(String,)> =
+        sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert!(violations.is_empty(), "{violations:?}");
+
+    // The pool still hangs off the rebuilt table: discarding the draft takes it.
+    sqlx::query("DELETE FROM ai_drafts WHERE id='keep'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM draft_moment_vectors) + (SELECT COUNT(*) FROM draft_moment_stills)
+              + (SELECT COUNT(*) FROM draft_step_moments)",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
 }

@@ -53,7 +53,7 @@
         <h3 class="chat-diff-heading">Details</h3>
         <ul class="chat-diff">
           {% for detail in proposal.details %}
-          <li class="chat-diff-item is-changed"><span class="chat-diff-place">{{ detail.name }}</span> <del>{{ detail.before }}</del> <span class="chat-diff-arrow" aria-label="becomes">→</span> <ins>{{ detail.after }}</ins></li>
+          <li class="chat-diff-item is-changed"><span class="chat-diff-place">{{ detail.name }}</span> <del>{{ detail.before }}</del> <span class="chat-diff-arrow" aria-hidden="true">→</span><span class="visually-hidden">becomes</span> <ins>{{ detail.after }}</ins></li>
           {% endfor %}
         </ul>
         {% endif %}

@@ -14,10 +14,10 @@
 <div class="compact-panel">
   <div class="block">
     <h2>Recent runs</h2>
-    <ul class="endpoint-list">
+    <ul class="run-list">
       {% for run in runs %}
-      <li class="endpoint-row">
-        <div class="endpoint-detail">
+      <li class="run-row">
+        <div class="run-detail">
           <strong><a href="/settings/media-debug/{{ run.id }}">Run {{ run.id.split("-").next().unwrap_or("") }}</a></strong>
           <p class="muted">{{ run.url_count }} URL{% if run.url_count != 1 %}s{% endif %} &middot; {{ run.age_minutes }} min ago &middot;
             {% if run.finished %}finished{% else %}<span class="codex-status codex-status--connected">running</span>{% endif %}</p>

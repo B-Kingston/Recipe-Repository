@@ -77,6 +77,9 @@ namespace Recipes {
   }, true);
 
   document.addEventListener("keydown", (event) => {
-    if (isOpen() && (event.key === "Escape" || event.key === "Esc")) closePopup();
+    const element = popup();
+    if (!element || element.hidden) return;
+    if (event.key === "Escape" || event.key === "Esc") closePopup();
+    else keepTabWithin(event, element);
   });
 }

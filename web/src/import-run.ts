@@ -41,7 +41,6 @@ namespace Recipes {
 
   const READING = "Watching the video…";
   const CLEANING = "Picking out the recipe…";
-  const PREPARING = "Writing the draft…";
   const DRAFTING = "Writing the draft…";
   const READY = "Done.";
   const DETAILS_KEY = "recipe-import-details";
@@ -180,8 +179,8 @@ namespace Recipes {
       } else if (event.kind === "ocr-captures") {
         advanceProgress("extract", .97, lanesCopy());
       } else if (event.kind === "cleaned") {
-        advanceProgress("extract", 1, PREPARING);
-        advanceProgress("clean", 1, PREPARING);
+        advanceProgress("extract", 1, DRAFTING);
+        advanceProgress("clean", 1, DRAFTING);
       } else if (event.kind === "result") {
         advanceProgress("extract", 1, READY);
         advanceProgress("clean", 1, READY);

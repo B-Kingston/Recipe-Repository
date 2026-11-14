@@ -31,17 +31,36 @@ namespace Recipes {
     return false;
   }
 
+  /** The word without the punctuation around it, as `ai::prompt_link` reads it. */
+  function stripLink(word: string): string {
+    return word.replace(/^[(<"']+/, "").replace(/[,.);>"'!?]+$/, "");
+  }
+
+  /** The `?v=` id the server keeps on a Facebook /watch link, or "". */
+  function watchId(host: string, path: string, query: string): string {
+    if (!FACEBOOK.test(host) || path.toLowerCase().indexOf("/watch") < 0) return "";
+    const pairs = query.replace(/^\?/, "").split("&");
+    for (let index = 0; index < pairs.length; index += 1) {
+      const pair = pairs[index].split("=");
+      if (pair[0] === "v" && pair.length === 2 && /^[A-Za-z0-9_-]{1,100}$/.test(pair[1])) return "?v=" + pair[1];
+    }
+    return "";
+  }
+
   /** The links in `text`, in order, each once. */
   function cardLinks(text: string): CardLink[] {
     const links: CardLink[] = [];
     const seen: { [key: string]: boolean } = {};
     each(text.split(/\s+/), (word) => {
-      const link = word.replace(/^[(<"']+/, "").replace(/[,.);>"'!?]+$/, "");
-      const parts = /^(https?):\/\/([^\/?#]*)([^?#]*)/.exec(link);
+      const link = stripLink(word);
+      const parts = /^(https?):\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?/.exec(link);
       if (!parts) return;
       const host = parts[2].toLowerCase().replace(/^.*@/, "").replace(/:\d*$/, "").replace(/\.$/, "");
       const video = isVideo(parts[1], parts[2], host, parts[3]);
-      const key = video ? host.replace(/^(www|m)\./, "") + parts[3].replace(/\/+$/, "") : link;
+      // Two video links are one video when `canonical_social_url` makes them
+      // the same: the same host and path, plus the id of a Facebook /watch
+      // link. Anything else would be refused as two videos.
+      const key = video ? host + parts[3] + watchId(host, parts[3], parts[4] || "") : link;
       if (seen[key]) return;
       seen[key] = true;
       links.push({ text: link, host: host, path: parts[3], video: video });
@@ -129,12 +148,15 @@ namespace Recipes {
     form.setAttribute("data-busy-label", form.getAttribute(mode + "busy-label") || "");
   }
 
+  /** Drops every word that is the link `text`, and nothing else: a longer
+   * link that starts with the same text stays whole. */
   function removeLink(card: HTMLElement, text: string): void {
     const input = card.querySelector("textarea[name=prompt]") as HTMLTextAreaElement | null;
     if (!input || !text) return;
-    let value = input.value;
-    while (value.indexOf(text) >= 0) value = value.replace(text, "");
-    input.value = value.replace(/[ \t]{2,}/g, " ").replace(/^[ \t]+|[ \t]+$/g, "");
+    // Split keeping the whitespace, so lines and spacing elsewhere survive.
+    const words = input.value.split(/(\s+)/);
+    each(words, (word, index) => { if (stripLink(word) === text) words[index] = ""; });
+    input.value = words.join("").replace(/[ \t]{2,}/g, " ").replace(/^[ \t]+|[ \t]+$/g, "");
     update(card);
     input.focus();
   }

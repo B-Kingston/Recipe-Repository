@@ -15,14 +15,7 @@
     <div><dt>Prep</dt><dd>{{ recipe.prep_minutes }} min</dd></div>
     <div><dt>Cook</dt><dd>{{ recipe.cook_minutes }} min</dd></div>
   </dl>
-  {% if sources.len() > 0 %}
-  <details class="source-disclosure">
-    <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
-    <ol class="source-popover">
-      {% for source in sources %}<li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>{% endfor %}
-    </ol>
-  </details>
-  {% endif %}
+  {% include "recipe_sources.html" %}
 </div>
 <div class="card-actions">
   <div class="actions page-actions">
@@ -49,7 +42,7 @@
 <div class="card-body draft-panel">
   <section class="recipe-section ingredients-section">
     <h2 class="section-label">Ingredients</h2>
-    <ul class="ingredient-list">{% for item in recipe.ingredients %}<li class="ingredient-row"><span class="ingredient-qty">{{ item.quantity }}{% if item.unit != "" %} {{ item.unit }}{% endif %}</span><span class="block-text">{{ item.name }}{% if item.optional %} <em>(optional)</em>{% endif %}</span></li>{% endfor %}</ul>
+    <ul class="ingredient-list">{% for ingredient in recipe.ingredients %}{% include "ingredient_row.html" %}{% endfor %}</ul>
   </section>
   <section class="recipe-section method-section">
     <h2 class="section-label">Method</h2>
@@ -57,9 +50,7 @@
     {% for step in recipe.steps %}
     <li class="step-group">
       <div class="block step-block"><span class="block-index">{{ loop.index }}</span><span class="block-text">{{ step.text }}</span></div>
-      {% if step.ingredients.len() > 0 %}
-      <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}"><span class="step-ingredients-label">Add</span>{% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}</div>
-      {% endif %}
+      {% let step_number = loop.index %}{% include "step_ingredients.html" %}
       {% match step_moments[loop.index0] %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
     </li>
     {% endfor %}
@@ -86,5 +77,4 @@
   <p class="muted">The assistant returns a complete replacement draft for review. This draft stays untouched until you save one.</p>
   <p class="actions form-actions"><button class="primary">Create altered draft</button></p>
 </form>
-{% if suggestions != "" %}<div class="top-spacer">{{ suggestions }}</div>{% endif %}
 {% endblock %}

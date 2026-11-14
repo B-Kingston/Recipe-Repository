@@ -21,9 +21,20 @@ use sqlx::{
 };
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
-/// Not a decodable image, but JPEG-shaped: kept as-is when ffmpeg cannot
-/// convert it, which is how the test container stores it.
-const PHOTO: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
+/// A 4×4 grey PPM, which ffmpeg (installed in the test image) converts to a
+/// JPEG.
+fn photo() -> Vec<u8> {
+    let mut bytes = b"P6\n4 4\n255\n".to_vec();
+    bytes.resize(bytes.len() + 4 * 4 * 3, 0x80);
+    bytes
+}
+
+/// JPEG-shaped, but not an image ffmpeg can decode.
+const UNDECODABLE_JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
+
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+}
 
 /// Two accounts, each with one recipe: u1 owns "r", u2 owns "r2". "r" has
 /// no version history yet.
@@ -120,18 +131,22 @@ async fn add(
     .await
 }
 
+fn no_query() -> RecipeQuery {
+    RecipeQuery {
+        edit: None,
+        edit_meta: None,
+        view: None,
+        step: None,
+        serves: None,
+    }
+}
+
 async fn page(s: &Arc<AppState>, user_id: &str, recipe_id: &str) -> String {
     recipe_page(
         State(s.clone()),
         user(user_id),
         Path(recipe_id.into()),
-        Query(RecipeQuery {
-            edit: None,
-            edit_meta: None,
-            view: None,
-            step: None,
-            serves: None,
-        }),
+        Query(no_query()),
         Flash::default(),
     )
     .await
@@ -232,13 +247,47 @@ async fn a_note_needs_text_or_a_photo_and_a_real_version() {
     assert!(note_rows(&db, "u1", "r").await.is_empty());
 
     // A photo alone is a note.
-    add(&s, "u1", "r", &[("body", ""), ("about", "")], Some(PHOTO))
-        .await
-        .unwrap();
+    add(
+        &s,
+        "u1",
+        "r",
+        &[("body", ""), ("about", "")],
+        Some(&photo()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         note_rows(&db, "u1", "r").await,
         vec![(None, String::new(), true)]
     );
+}
+
+#[tokio::test]
+async fn a_photo_ffmpeg_cannot_convert_is_refused_not_stored_raw() {
+    let db = database().await;
+    let s = state(db.clone());
+    let refused = add(
+        &s,
+        "u1",
+        "r",
+        &[("body", "Crisp edges"), ("about", "")],
+        Some(UNDECODABLE_JPEG),
+    )
+    .await;
+    assert!(matches!(refused, Err(AppError::BadRequest(_))));
+    assert!(note_rows(&db, "u1", "r").await.is_empty());
+
+    // What is stored is ffmpeg's JPEG, never the upload itself.
+    let upload = photo();
+    add(&s, "u1", "r", &[("body", ""), ("about", "")], Some(&upload))
+        .await
+        .unwrap();
+    let stored = chat_notes(&db, "u1", "r", 1).await.unwrap()[0]
+        .photo_jpeg
+        .clone()
+        .unwrap();
+    assert!(is_jpeg(&stored));
+    assert_ne!(stored, upload);
 }
 
 #[tokio::test]
@@ -250,19 +299,19 @@ async fn notes_and_their_photos_are_private_to_the_account() {
         "u1",
         "r",
         &[("body", "Family loved it"), ("about", "")],
-        Some(PHOTO),
+        Some(&photo()),
     )
     .await
     .unwrap();
     let id = recipe_notes(&db, "u1", "r").await.unwrap()[0].id.clone();
 
-    let photo = note_photo(State(s.clone()), user("u1"), Path(("r".into(), id.clone())))
+    let served = note_photo(State(s.clone()), user("u1"), Path(("r".into(), id.clone())))
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(photo.into_body(), 1 << 20)
+    let bytes = axum::body::to_bytes(served.into_body(), 1 << 20)
         .await
         .unwrap();
-    assert_eq!(&bytes[..], PHOTO);
+    assert!(is_jpeg(&bytes));
 
     let stranger = note_photo(State(s.clone()), user("u2"), Path(("r".into(), id.clone()))).await;
     assert!(matches!(stranger, Err(AppError::NotFound)));
@@ -370,11 +419,64 @@ async fn editing_a_note_repoints_it_and_keeps_a_deleted_version() {
 }
 
 #[tokio::test]
+async fn editing_a_note_about_the_newest_version_keeps_that_version() {
+    let db = database().await;
+    let s = state(db.clone());
+    add(
+        &s,
+        "u1",
+        "r",
+        &[("body", "Crust soggy"), ("about", "current")],
+        None,
+    )
+    .await
+    .unwrap();
+    let id = recipe_notes(&db, "u1", "r").await.unwrap()[0].id.clone();
+    let html = page(&s, "u1", "r").await;
+    assert!(
+        html.contains("<option value=\"1\" selected>This version (v1 · Original recipe)</option>"),
+        "the note's own version is sent by number: {html}"
+    );
+    assert!(
+        html.contains("<option value=\"current\">This version (v1 · Original recipe)</option>"),
+        "a new note still follows the recipe"
+    );
+
+    // A version saved in another tab before the edit is sent leaves the note
+    // where it was.
+    sqlx::query(
+        "INSERT INTO recipe_versions(id,recipe_id,version,label,snapshot,created_at)
+         VALUES('v2','r',2,'Less salt','{}',?)",
+    )
+    .bind(stamp())
+    .execute(&db)
+    .await
+    .unwrap();
+    update_note(
+        State(s.clone()),
+        user("u1"),
+        Path(("r".into(), id)),
+        Form(NoteForm {
+            body: "Crust soggy at 200C".into(),
+            about: "1".into(),
+            back: "/recipes/r".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        note_rows(&db, "u1", "r").await,
+        vec![(Some(1), "Crust soggy at 200C".into(), false)]
+    );
+}
+
+#[tokio::test]
 async fn a_chat_answer_can_be_kept_as_a_note_once() {
     let db = database().await;
     let s = state(db.clone());
     let answer = start_chat_turn(&db, "u1", "r", "It came out too salty")
         .await
+        .unwrap()
         .unwrap();
     sqlx::query("UPDATE recipe_chat_messages SET status='done',content='Next time: halve the stock cube.' WHERE id=?")
         .bind(&answer)
@@ -387,15 +489,17 @@ async fn a_chat_answer_can_be_kept_as_a_note_once() {
             back: "/recipes/r".into(),
         })
     };
-    for _ in 0..2 {
-        let response = keep_answer(
+    let keep = || {
+        keep_answer(
             State(s.clone()),
             user("u1"),
             Path(("r".into(), answer.clone())),
             form(),
         )
-        .await
-        .unwrap();
+    };
+    // Twice at once (two tabs), then once more.
+    let (first, second) = tokio::join!(keep(), keep());
+    for response in [first.unwrap(), second.unwrap(), keep().await.unwrap()] {
         assert_eq!(response.headers()["location"], "/recipes/r#recipe-chat");
     }
     assert_eq!(
@@ -410,6 +514,35 @@ async fn a_chat_answer_can_be_kept_as_a_note_once() {
     let html = page(&s, "u1", "r").await;
     assert!(html.contains("Kept in notes"));
     assert!(html.contains("From the chat"));
+    // The notice shows once, in the drawer where Keep was clicked.
+    let html = recipe_page(
+        State(s.clone()),
+        user("u1"),
+        Path("r".into()),
+        Query(no_query()),
+        Flash("note_kept".into()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(html.matches("Kept in this recipe").count(), 1, "{html}");
+
+    // An answer longer than a note is cut, and says so.
+    let long = "word ".repeat(1500);
+    sqlx::query("UPDATE recipe_chat_messages SET content=? WHERE id=?")
+        .bind(&long)
+        .bind(&answer)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM recipe_notes")
+        .execute(&db)
+        .await
+        .unwrap();
+    keep().await.unwrap();
+    let kept = &note_rows(&db, "u1", "r").await[0].1;
+    assert_eq!(kept.chars().count(), crate::notes::MAX_NOTE_CHARS);
+    assert!(kept.ends_with('…'), "{kept}");
 
     let stranger = keep_answer(
         State(s.clone()),
@@ -430,7 +563,7 @@ async fn the_chat_library_carries_notes_photos_and_versions_but_logs_no_photos()
         "u1",
         "r",
         &[("body", "Original was bland"), ("about", "current")],
-        Some(PHOTO),
+        Some(&photo()),
     )
     .await
     .unwrap();
@@ -457,13 +590,13 @@ async fn the_chat_library_carries_notes_photos_and_versions_but_logs_no_photos()
     assert_eq!(library["notes"][0]["version"], serde_json::Value::Null);
     assert_eq!(library["notes"][1]["version"], 1);
     assert_eq!(library["notes"][1]["hasPhoto"], true);
-    let photo = library["notes"][1]["photo"].as_str().unwrap();
+    let sent = library["notes"][1]["photo"].as_str().unwrap();
     use base64::Engine;
     assert_eq!(
         base64::engine::general_purpose::STANDARD
-            .decode(photo)
+            .decode(sent)
             .unwrap(),
-        PHOTO
+        notes[1].photo_jpeg.clone().unwrap()
     );
     assert_eq!(library["versions"][0]["label"], "Original recipe");
     assert_eq!(library["versions"][0]["recipe"]["title"], "Shakshuka");
@@ -471,7 +604,7 @@ async fn the_chat_library_carries_notes_photos_and_versions_but_logs_no_photos()
     let logged = chat_library_log(&library).to_string();
     assert!(logged.contains("Original was bland"));
     assert!(logged.contains("\"photoSent\":true"));
-    assert!(!logged.contains(photo), "photo bytes never reach the log");
+    assert!(!logged.contains(sent), "photo bytes never reach the log");
 
     assert_eq!(
         library_summary(&notes, &versions),
@@ -480,6 +613,14 @@ async fn the_chat_library_carries_notes_photos_and_versions_but_logs_no_photos()
     assert_eq!(
         library_summary(&[], &[]),
         "The cook has not kept any notes on this recipe yet. The recipe has no saved versions yet."
+    );
+    // The chat reads at most 40 notes, so a full list may have more behind it.
+    let full = vec![notes[0].clone(); 40];
+    assert!(
+        library_summary(&full, &versions)
+            .starts_with("The cook has kept 40 or more notes on this recipe."),
+        "{}",
+        library_summary(&full, &versions)
     );
 }
 
@@ -492,6 +633,11 @@ fn about_values_and_return_targets_are_checked() {
         assert!(parse_about(bad).is_err(), "{bad}");
     }
     assert_eq!(return_target("r", "/recipes/r"), "/recipes/r");
+    // The recipe page keeps its servings.
+    assert_eq!(
+        return_target("r", "/recipes/r?serves=2"),
+        "/recipes/r?serves=2"
+    );
     assert_eq!(
         return_target("r", "/recipes/r/versions/12"),
         "/recipes/r/versions/12"
@@ -499,9 +645,10 @@ fn about_values_and_return_targets_are_checked() {
     for outside in [
         "/recipes/r/versions/",
         "/recipes/r/versions/1x",
+        "/recipes/r/versions/1?x=1",
         "/recipes/r2",
+        "/recipes/r#x",
         "//x",
-        "/recipes/r?x=1",
     ] {
         assert_eq!(return_target("r", outside), "/recipes/r", "{outside}");
     }

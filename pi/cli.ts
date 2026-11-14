@@ -5,10 +5,12 @@ export function outputJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
-export async function readStdin(): Promise<string> {
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
-  return input;
+/** Reads all of stdin as UTF-8. The chunks are joined before decoding, since a
+ * pipe read can end in the middle of a multibyte character. */
+export async function readStdin(input: AsyncIterable<Buffer | string> = process.stdin): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of input) chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /** The stdout line a CLI prints when its main fails. */

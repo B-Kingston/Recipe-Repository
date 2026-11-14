@@ -86,8 +86,14 @@ interface JsonResponse<T> {
   text: string;
 }
 
+/** How long one auth.openai.com request may take; the host waits on this
+ * script with no deadline of its own, and the sign-in popup waits on the host. */
+const REQUEST_TIMEOUT_MS = 30_000;
+/** Characters of an error body a failure message repeats. */
+const ERROR_BODY_CHARS = 300;
+
 async function requestJson<T>(url: string, options: RequestInit): Promise<JsonResponse<T>> {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   const text = await response.text().catch(() => "");
   let json: T | null = null;
   try {
@@ -115,7 +121,8 @@ export async function startDeviceFlow(): Promise<DeviceFlow> {
     !Number.isFinite(interval) ||
     interval < 0
   ) {
-    throw new Error(`Invalid device code response: ${JSON.stringify(json)}`);
+    // The body holds the device code, so the message names only what is wrong.
+    throw new Error("Invalid device code response: it lacks a device_auth_id, user_code, or interval.");
   }
   return {
     deviceAuthId: json.device_auth_id,
@@ -205,7 +212,7 @@ export async function pollDeviceFlow(device: DeviceAuth): Promise<PollResult> {
   }
   return {
     status: "failed",
-    message: `Device auth failed with status ${response.status}${text ? `: ${text}` : ""}`,
+    message: `Device auth failed with status ${response.status}${text ? `: ${text.slice(0, ERROR_BODY_CHARS)}` : ""}`,
   };
 }
 

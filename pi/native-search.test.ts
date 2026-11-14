@@ -8,6 +8,7 @@ import {
   normalizeSourceUrl,
   optionalSearchPayload,
   responsesSearchPayload,
+  webSearchCompleted,
 } from "./native-search.ts";
 
 test("nativeSearchPayload forces OpenAI hosted web search", () => {
@@ -55,12 +56,20 @@ test("SSE inspection requires a native call and collects citation annotations", 
     },
   ];
   const sse = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
-  const state = { invoked: false, sources: new Map(), outputText: [], streamedText: [] };
+  const state = { invoked: false, sources: new Map() };
 
   await inspectNativeSearchResponse(new Response(sse), state);
 
   assert.equal(state.invoked, true);
   assert.deepEqual([...state.sources], [["https://example.com/recipe", "Recipe"]]);
+});
+
+test("a web_search_call counts once it completed, not while it is still running", () => {
+  assert.equal(webSearchCompleted({ type: "web_search_call", status: "completed" }), true);
+  assert.equal(webSearchCompleted({ type: "web_search_call", action: "search" }), true, "a shape without a status");
+  assert.equal(webSearchCompleted({ type: "web_search_call", status: "in_progress", action: { type: "search" } }), false);
+  assert.equal(webSearchCompleted({ type: "web_search_call", status: "searching", action: { type: "search" } }), false);
+  assert.equal(webSearchCompleted({ type: "web_search_call", status: "failed", action: { type: "search" } }), false);
 });
 
 test("anthropicSearchPayload keeps existing tools and never forces tool_choice", () => {
@@ -70,6 +79,7 @@ test("anthropicSearchPayload keeps existing tools and never forces tool_choice",
   assert.deepEqual(payload.tools, [{ name: "fn" }, { type: "web_search_20250305", name: "web_search" }]);
   assert.ok(!("tool_choice" in payload));
   assert.deepEqual(original.tools, [{ name: "fn" }]);
+  assert.deepEqual(anthropicSearchPayload({}, 5).tools, [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }]);
 });
 
 test("Anthropic SSE marks search invoked only on a result block and collects sources", async () => {
@@ -94,18 +104,17 @@ test("Anthropic SSE marks search invoked only on a result block and collects sou
     },
   ];
   const sse = events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-  const state = { invoked: false, sources: new Map(), outputText: [], streamedText: [] };
+  const state = { invoked: false, sources: new Map() };
 
   await inspectNativeSearchResponse(new Response(sse), state);
 
   assert.equal(state.invoked, true);
   assert.deepEqual([...state.sources], [["https://example.com/a", "A"], ["https://example.com/b", "B"]]);
-  assert.deepEqual(state.streamedText, ["{\"recipe\""]);
 });
 
 test("Anthropic server_tool_use alone does not count as a completed search", async () => {
   const event = { type: "content_block_start", index: 0, content_block: { type: "server_tool_use", name: "web_search" } };
-  const state = { invoked: false, sources: new Map(), outputText: [], streamedText: [] };
+  const state = { invoked: false, sources: new Map() };
 
   await inspectNativeSearchResponse(new Response(`data: ${JSON.stringify(event)}\n\n`), state);
 
@@ -125,33 +134,6 @@ test("observer leaves non-search responses ungrounded", async () => {
   assert.equal(state.sources.size, 0);
 });
 
-test("observer mirrors OMP's text URL fallback after a verified native search", async () => {
-  const events = [
-    { type: "response.web_search_call.completed", item_id: "ws_1" },
-    {
-      type: "response.output_item.done",
-      item: {
-        type: "message",
-        content: [{
-          type: "output_text",
-          text: '{"sources":[{"url":"https://example.com/recipe"}]}',
-          annotations: [],
-        }],
-      },
-    },
-  ];
-  const observer = createNativeSearchObserver(async () => new Response(
-    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
-    { status: 200 },
-  ), { allowUnverifiedFallback: true });
-
-  await observer.fetch("https://example.test");
-  const state = await observer.finish();
-
-  assert.equal(state.invoked, true);
-  assert.deepEqual([...state.sources], [["https://example.com/recipe", "https://example.com/recipe"]]);
-});
-
 test("observer ignores malformed SSE events without rejecting the response", async () => {
   const observer = createNativeSearchObserver(async () => new Response(
     "data: not-json\n\ndata: {\"type\":\"response.web_search_call.completed\"}\n\n",
@@ -162,10 +144,9 @@ test("observer ignores malformed SSE events without rejecting the response", asy
   const state = await observer.finish();
 
   assert.equal(state.invoked, true);
-  assert.equal(state.parseErrors, 1);
 });
 
-test("observer does not accept text URL fallback unless explicitly enabled", async () => {
+test("observer reads URLs only from citations, never from the reply text", async () => {
   const observer = createNativeSearchObserver(async () => new Response(
     [
       { type: "response.web_search_call.completed" },
@@ -181,6 +162,25 @@ test("observer does not accept text URL fallback unless explicitly enabled", asy
   const state = await observer.finish();
 
   assert.equal(state.invoked, true);
+  assert.equal(state.sources.size, 0);
+});
+
+test("observer reports the retried response, not a search the abandoned attempt ran", async () => {
+  const searched = [
+    { type: "response.web_search_call.completed" },
+    { type: "response.output_text.annotation.added", annotation: { type: "url_citation", url: "https://example.com/a", title: "A" } },
+  ];
+  const responses = [
+    new Response(searched.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { status: 200 }),
+    new Response(`data: ${JSON.stringify({ type: "response.completed", response: { output: [] } })}\n\n`, { status: 200 }),
+  ];
+  const observer = createNativeSearchObserver(async () => responses.shift()!);
+
+  await observer.fetch("https://example.test");
+  await observer.fetch("https://example.test");
+  const state = await observer.finish();
+
+  assert.equal(state.invoked, false);
   assert.equal(state.sources.size, 0);
 });
 

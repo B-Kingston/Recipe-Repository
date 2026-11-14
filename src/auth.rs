@@ -1,3 +1,4 @@
+use crate::htmx::{cookie_values, set_cookie, sets_cookie};
 use crate::{
     AppError, AppState, DeleteAccountTemplate, LoginForm, LoginQuery, LoginTemplate,
     NewAccountTemplate, ResetPasswordForm, ResetPasswordTemplate, Result, SetupForm, SetupTemplate,
@@ -104,12 +105,17 @@ fn check_new_password(password: &str, confirm: &str, blank_message: &str) -> Res
 
 const MAX_USERNAME_CHARS: usize = 40;
 
-/// A new account's username, trimmed: required, and short enough for the
-/// account menu.
+/// A new account's username, trimmed: required, one line of printable text,
+/// and short enough for the account menu.
 fn check_new_username(username: &str) -> Result<String> {
     let username = trim(username);
     if username.is_empty() {
         return Err(AppError::BadRequest("Username is required.".into()));
+    }
+    if username.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(
+            "Username must be on one line, without tabs or control characters.".into(),
+        ));
     }
     if username.chars().count() > MAX_USERNAME_CHARS {
         return Err(AppError::BadRequest(format!(
@@ -132,10 +138,6 @@ const SESSION_DAYS: i64 = 30;
 /// The middleware extends a session at most once in this many hours, so most
 /// requests only read the `sessions` table.
 const SESSION_REFRESH_HOURS: i64 = 24;
-/// `Set-Cookie` value that removes the session cookie from the browser.
-const CLEARED_SESSION_COOKIE: &str = "recipe_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax";
-/// `Set-Cookie` value that removes the other-accounts cookie from the browser.
-const CLEARED_ACCOUNTS_COOKIE: &str = "recipe_accounts=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax";
 
 /// Two `Set-Cookie` headers: the session cookie, then the accounts cookie.
 type BrowserCookies = AppendHeaders<[(HeaderName, HeaderValue); 2]>;
@@ -155,25 +157,20 @@ fn is_token(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn session_cookie_header(name: &str, value: &str) -> Result<HeaderValue> {
-    let max_age = SESSION_DAYS * 24 * 60 * 60;
-    HeaderValue::from_str(&format!(
-        "{name}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
-    ))
-    .map_err(|_| AppError::Internal("session cookie is not a valid header".into()))
-}
+/// A session cookie lasts as long as the session it carries.
+const SESSION_COOKIE_MAX_AGE: i64 = SESSION_DAYS * 24 * 60 * 60;
 
 fn session_cookie(token: &str) -> Result<HeaderValue> {
-    session_cookie_header(SESSION_COOKIE, token)
+    set_cookie(SESSION_COOKIE, token, SESSION_COOKIE_MAX_AGE)
 }
 
 /// `Set-Cookie` value that remembers the browser's other signed-in accounts,
 /// or removes the cookie when there are none.
 fn accounts_cookie(tokens: &[&str]) -> Result<HeaderValue> {
     if tokens.is_empty() {
-        return Ok(HeaderValue::from_static(CLEARED_ACCOUNTS_COOKIE));
+        return set_cookie(ACCOUNTS_COOKIE, "", 0);
     }
-    session_cookie_header(ACCOUNTS_COOKIE, &tokens.join("."))
+    set_cookie(ACCOUNTS_COOKIE, &tokens.join("."), SESSION_COOKIE_MAX_AGE)
 }
 
 /// Makes `active` the browser's session and remembers `others` behind it.
@@ -185,17 +182,11 @@ fn browser_cookies(active: &str, others: &[&str]) -> Result<BrowserCookies> {
 }
 
 /// Signs the browser out of every account.
-fn cleared_cookies() -> BrowserCookies {
-    AppendHeaders([
-        (
-            header::SET_COOKIE,
-            HeaderValue::from_static(CLEARED_SESSION_COOKIE),
-        ),
-        (
-            header::SET_COOKIE,
-            HeaderValue::from_static(CLEARED_ACCOUNTS_COOKIE),
-        ),
-    ])
+fn cleared_cookies() -> Result<BrowserCookies> {
+    Ok(AppendHeaders([
+        (header::SET_COOKIE, set_cookie(SESSION_COOKIE, "", 0)?),
+        (header::SET_COOKIE, accounts_cookie(&[])?),
+    ]))
 }
 
 /// Starts a session for the user and returns its token.
@@ -230,16 +221,8 @@ async fn end_session(db: &SqlitePool, token: &str) -> Result<()> {
 
 /// The value of the named cookie from the request's `Cookie` headers, or
 /// `None` when the browser sent none.
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            let (key, value) = pair.trim().split_once('=')?;
-            (key == name && !value.is_empty()).then_some(value)
-        })
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &'a str) -> Option<&'a str> {
+    cookie_values(headers, name).find(|value| !value.is_empty())
 }
 
 /// The active session's token, if the browser sent one.
@@ -248,14 +231,15 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Tokens of the browser's other signed-in accounts in the order the cookie
-/// lists them, without duplicates or anything that cannot be a token.
+/// lists them, without duplicates or anything that cannot be a token, and no
+/// more than fit behind the active one.
 fn remembered_tokens(headers: &HeaderMap) -> Vec<&str> {
     let mut tokens: Vec<&str> = Vec::new();
     for token in cookie_value(headers, ACCOUNTS_COOKIE)
         .unwrap_or_default()
         .split('.')
     {
-        if is_token(token) && !tokens.contains(&token) && tokens.len() < MAX_BROWSER_ACCOUNTS {
+        if is_token(token) && !tokens.contains(&token) && tokens.len() + 1 < MAX_BROWSER_ACCOUNTS {
             tokens.push(token);
         }
     }
@@ -486,7 +470,7 @@ pub(crate) async fn create_user(
     check_new_password(password, confirm, "Password is required.")?;
     let password_hash = hash_off_runtime(password.to_string()).await?;
     let user_id = Uuid::new_v4().to_string();
-    let mut tx = db.begin().await?;
+    let mut tx = crate::recipes::begin_write(db).await?;
     // Conditional insert: the check and the write are one statement, so two
     // racing setup requests cannot both create the account.
     let created = sqlx::query(
@@ -696,8 +680,10 @@ pub(crate) async fn login(
 ) -> Result<Response> {
     let next = local_target(&form.next).to_string();
     let username = trim(&form.username);
+    // Letter case is ignored, as it is when a username is taken, so "alice"
+    // signs in to the account set up as "Alice".
     let row: Option<(String, String)> =
-        sqlx::query_as("SELECT id, password_hash FROM users WHERE username = ?")
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE username = ? COLLATE NOCASE")
             .bind(&username)
             .fetch_optional(&state.db)
             .await?;
@@ -725,27 +711,26 @@ pub(crate) async fn login(
 
 /// Ends the active account's session. When the browser is signed in to
 /// another account, that one takes over and the library opens; otherwise both
-/// cookies are cleared and the sign-in page opens.
+/// cookies are cleared and the sign-in page opens. Only the session in the
+/// session cookie ends: when it has already ended elsewhere (a new password,
+/// a deleted account), the remembered accounts all stay signed in.
 pub(crate) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response> {
     let sessions = browser_sessions(&state.db, &headers).await?;
-    let ending = sessions.first().map(|session| session.token.as_str());
-    if let Some(token) = session_token(&headers) {
-        end_session(&state.db, token).await?;
-    }
+    let ending = session_token(&headers);
     if let Some(token) = ending {
         end_session(&state.db, token).await?;
     }
     let others: Vec<&str> = sessions
         .iter()
-        .skip(1)
         .map(|session| session.token.as_str())
+        .filter(|token| Some(*token) != ending)
         .collect();
     match others.split_first() {
         Some((next, rest)) => Ok((browser_cookies(next, rest)?, Redirect::to("/")).into_response()),
-        None => Ok((cleared_cookies(), Redirect::to("/login")).into_response()),
+        None => Ok((cleared_cookies()?, Redirect::to("/login")).into_response()),
     }
 }
 
@@ -760,7 +745,7 @@ pub(crate) async fn logout_all(
     {
         end_session(&state.db, token).await?;
     }
-    Ok((cleared_cookies(), Redirect::to("/login")).into_response())
+    Ok((cleared_cookies()?, Redirect::to("/login")).into_response())
 }
 
 pub(crate) async fn reset_password_page(_user: AuthUser) -> Result<Html<String>> {
@@ -804,7 +789,7 @@ pub(crate) async fn reset_password(
         Err(error) => return Err(error),
     }
     let password_hash = hash_off_runtime(form.new_password).await?;
-    let mut tx = state.db.begin().await?;
+    let mut tx = crate::recipes::begin_write(&state.db).await?;
     sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
         .bind(password_hash)
         .bind(&user.id)
@@ -890,7 +875,7 @@ pub(crate) async fn delete_user(
     db: &SqlitePool,
     user_id: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let mut tx = db.begin().await?;
+    let mut tx = crate::recipes::begin_write(db).await?;
     let endpoints: Vec<String> =
         sqlx::query_scalar("SELECT id FROM ai_endpoints WHERE user_id = ?")
             .bind(user_id)
@@ -905,13 +890,10 @@ pub(crate) async fn delete_user(
         // No foreign keys: thumbnail candidates of the recipes and drafts.
         "DELETE FROM recipe_thumbnail_candidates
          WHERE recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1)",
-        "DELETE FROM draft_thumbnails WHERE draft_id IN
-           (SELECT id FROM ai_drafts WHERE user_id = ?1
-              OR recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1))",
+        "DELETE FROM draft_thumbnails WHERE draft_id IN (SELECT id FROM ai_drafts WHERE user_id = ?1)",
         // Cascades to draft_moment_vectors, draft_moment_stills, and
         // draft_step_moments.
-        "DELETE FROM ai_drafts
-         WHERE user_id = ?1 OR recipe_id IN (SELECT id FROM recipes WHERE user_id = ?1)",
+        "DELETE FROM ai_drafts WHERE user_id = ?1",
         "DELETE FROM recipe_notes WHERE user_id = ?1",
         "DELETE FROM recipe_chat_messages WHERE user_id = ?1",
         // Cascades to recipe_blocks (and so recipe_step_ingredients and
@@ -966,6 +948,7 @@ pub(crate) async fn delete_account(
         .claude_flows
         .lock()
         .retain(|_, flow| flow.user_id != user.id);
+    crate::ai::forget_media_runs(&state.media_debug_runs, &user.id);
     tracing::info!(user_id = %user.id, recipes = recipes.len(), "Account deleted");
     let others: Vec<&str> = sessions
         .iter()
@@ -983,7 +966,7 @@ pub(crate) async fn delete_account(
                 .into_response())
         }
         None => {
-            let [session, accounts] = cleared_cookies().0;
+            let [session, accounts] = cleared_cookies()?.0;
             Ok((
                 AppendHeaders([session, accounts, (header::SET_COOKIE, flash)]),
                 Redirect::to("/login"),
@@ -1062,18 +1045,24 @@ pub(crate) async fn auth_middleware(
     let promoted = session_token(req.headers()) != Some(active.token.as_str());
     if promoted || !extended_recently(&active.expires_at) {
         extend_session(&state.db, &active.token).await?;
-        cookies.push(session_cookie(&active.token)?);
+        cookies.push((SESSION_COOKIE, session_cookie(&active.token)?));
     }
     if others != remembered_tokens(req.headers()) {
-        cookies.push(accounts_cookie(&others)?);
+        cookies.push((ACCOUNTS_COOKIE, accounts_cookie(&others)?));
     }
     let menu = load_account_menu(&state.db, &active.user_id, &sessions).await?;
     req.extensions_mut().insert(AuthUser {
         id: active.user_id.clone(),
     });
     let mut response = ACCOUNT_MENU.scope(Arc::new(menu), next.run(req)).await;
-    for cookie in cookies {
-        response.headers_mut().append(header::SET_COOKIE, cookie);
+    // A handler that sets a session cookie itself (switching accounts, a new
+    // password, a deleted account) decides the browser's sessions. Browsers
+    // apply Set-Cookie headers in order, so appending this request's view
+    // after it would undo the handler's.
+    for (name, cookie) in cookies {
+        if !sets_cookie(response.headers(), name) {
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+        }
     }
     Ok(response)
 }

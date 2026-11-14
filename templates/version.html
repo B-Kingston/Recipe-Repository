@@ -21,7 +21,7 @@
 <div class="card-actions">
   <div class="actions page-actions">
     <a class="button" href="/recipes/{{ recipe.id }}">Back to current recipe</a>
-    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/delete" data-confirm="Delete version {{ version }}? This saved copy cannot be restored afterwards." data-busy-label="Deleting…"><button class="quiet danger">Delete version</button></form>
+    {% if !is_newest() %}<form class="inline" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/delete" data-confirm="Delete version {{ version }}? This saved copy cannot be restored afterwards." data-busy-label="Deleting…"><button class="quiet danger">Delete version</button></form>{% endif %}
   </div>
 </div>
 <form class="notice version-restore" method="post" action="/recipes/{{ recipe.id }}/versions/{{ version }}/restore" data-confirm="Replace the current recipe with version {{ version }}? The current recipe stays in the history." data-busy-label="Replacing…">
@@ -35,7 +35,7 @@
   {% if snapshot.ingredients.len() > 0 %}
   <ul class="ingredient-list">
     {% for ingredient in snapshot.ingredients %}
-    <li class="ingredient-row"><span class="ingredient-qty">{{ ingredient.quantity }}{% if ingredient.unit != "" %} {{ ingredient.unit }}{% endif %}</span><span class="block-text">{{ ingredient.name }}{% if ingredient.optional %} <em>(optional)</em>{% endif %}</span></li>
+    {% include "ingredient_row.html" %}
     {% endfor %}
   </ul>
   {% else %}<p class="muted">No ingredients in this version.</p>{% endif %}
@@ -50,12 +50,7 @@
     <div class="block step-block">
       <span class="block-index">{{ loop.index }}</span><span class="block-text">{{ step.text }}</span>
     </div>
-    {% if step.ingredients.len() > 0 %}
-    <div class="step-ingredients" aria-label="Ingredients used in step {{ loop.index }}">
-      <span class="step-ingredients-label">Add</span>
-      {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
-    </div>
-    {% endif %}
+    {% let step_number = loop.index %}{% include "step_ingredients.html" %}
   </li>
   {% endfor %}
   </ol>

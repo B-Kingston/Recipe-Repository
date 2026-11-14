@@ -9,6 +9,7 @@
 //! reads the key through the `Flash` extractor, and `htmx_layer` clears the
 //! cookie on that first HTML response.
 
+use crate::AppError;
 use axum::{
     extract::{FromRequestParts, Request},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
@@ -20,7 +21,7 @@ use std::convert::Infallible;
 pub(crate) const FLASH_COOKIE: &str = "recipe_flash";
 /// A flash outlives its redirect by a minute at most; it is meant for the
 /// very next page.
-const FLASH_MAX_AGE: u32 = 60;
+const FLASH_MAX_AGE: i64 = 60;
 
 /// True when htmx sent the request (boosted links and forms, polls, live
 /// search). Plain browser requests and the JSON fetches in `app.js` lack it.
@@ -28,17 +29,51 @@ pub(crate) fn is_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
 }
 
+/// The values of every cookie named `name` the browser sent, in the order of
+/// its `Cookie` headers.
+pub(crate) fn cookie_values<'a>(
+    headers: &'a HeaderMap,
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(move |pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+
+/// The `Set-Cookie` value for one of the app's cookies: the whole site,
+/// hidden from scripts, kept `max_age` seconds (0 removes it). Every cookie
+/// the app sets goes through here, so their attributes stay the same.
+pub(crate) fn set_cookie(name: &str, value: &str, max_age: i64) -> crate::Result<HeaderValue> {
+    HeaderValue::from_str(&format!(
+        "{name}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+    ))
+    .map_err(|_| AppError::Internal(format!("the {name} cookie is not a valid header")))
+}
+
+/// Whether the response already sets the named cookie.
+pub(crate) fn sets_cookie(headers: &HeaderMap, name: &str) -> bool {
+    headers.get_all(header::SET_COOKIE).iter().any(|value| {
+        value
+            .as_bytes()
+            .strip_prefix(name.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b'='))
+    })
+}
+
 /// The `Set-Cookie` value carrying one flash key.
 pub(crate) fn flash_cookie(key: &str) -> HeaderValue {
     debug_assert!(valid_key(key), "flash keys are short ASCII words");
-    HeaderValue::from_str(&format!(
-        "{FLASH_COOKIE}={key}; Path=/; Max-Age={FLASH_MAX_AGE}; HttpOnly; SameSite=Lax"
-    ))
-    .expect("flash keys are header-safe")
+    set_cookie(FLASH_COOKIE, key, FLASH_MAX_AGE).expect("flash keys are header-safe")
 }
 
 fn clear_flash_cookie() -> HeaderValue {
-    HeaderValue::from_static("recipe_flash=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+    set_cookie(FLASH_COOKIE, "", 0).expect("an empty cookie is header-safe")
 }
 
 /// A 303 to `to` that shows the `key` notice there once.
@@ -62,15 +97,9 @@ pub(crate) struct Flash(pub(crate) String);
 
 impl Flash {
     pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
-        headers
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(';'))
-            .find_map(|pair| {
-                let (name, value) = pair.trim().split_once('=')?;
-                (name == FLASH_COOKIE && valid_key(value)).then(|| Self(value.to_string()))
-            })
+        cookie_values(headers, FLASH_COOKIE)
+            .find(|value| valid_key(value))
+            .map(|value| Self(value.to_string()))
             .unwrap_or_default()
     }
 
@@ -107,11 +136,7 @@ pub(crate) async fn htmx_layer(req: Request, next: Next) -> Response {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/html"));
-    let sets_flash = response
-        .headers()
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .any(|value| value.as_bytes().starts_with(b"recipe_flash="));
+    let sets_flash = sets_cookie(response.headers(), FLASH_COOKIE);
     let headers = response.headers_mut();
     if had_flash && html && status.is_success() && !sets_flash {
         headers.append(header::SET_COOKIE, clear_flash_cookie());

@@ -1,0 +1,8 @@
+{# The ingredients a step adds, as chips under the step, on the recipe,
+   draft, and version pages. Reads `step.ingredients` and `step_number`. #}
+{% if step.ingredients.len() > 0 %}
+<div class="step-ingredients" role="group" aria-label="Ingredients used in step {{ step_number }}">
+  <span class="step-ingredients-label">Add</span>
+  {% for ingredient in step.ingredients %}<span class="step-ingredient">{{ ingredient }}</span>{% endfor %}
+</div>
+{% endif %}

@@ -2,11 +2,37 @@
  * panel's fields are submitted) and fills from live model discovery; the
  * video cleaner's model list follows its own provider choice; the "Add a
  * provider" form shows the server URL and model fields only for the "Other
- * server" choices. Runs again whenever a save swaps the panel in. */
+ * server" choices. Runs again whenever a save swaps the panel in, filling
+ * from the lists it already fetched while those are fresh. */
 namespace Recipes {
   interface ModelList {
     models: string[];
     selected?: string;
+  }
+
+  // The server keeps a model listing for 15 minutes (ai::discover_models), so
+  // a list fetched within that time is still the current one: a save that
+  // swaps the panel in reuses it rather than asking again.
+  const LIST_FRESH_MS = 15 * 60 * 1000;
+  const lists: { [source: string]: { at: number; data: ModelList } } = {};
+
+  function now(): number {
+    return new Date().getTime();
+  }
+
+  /** The model list for `source` ("pi", "claude", or an endpoint id), handed
+   * to `done` at once when a fresh one is kept, else fetched. Returns the
+   * request, or null when none was needed. */
+  function modelList(source: string, done: (data: ModelList | null) => void): XMLHttpRequest | null {
+    const kept = lists[source];
+    if (kept && now() - kept.at < LIST_FRESH_MS) {
+      done(kept.data);
+      return null;
+    }
+    return getJson<ModelList>("/settings/models?provider=" + encodeURIComponent(source), (data) => {
+      if (data && data.models) lists[source] = { at: now(), data: data };
+      done(data);
+    });
   }
 
   function option(id: string, selected: boolean): HTMLOptionElement {
@@ -43,9 +69,11 @@ namespace Recipes {
 
     function load(provider: string): void {
       const panel = panels[provider];
-      if (!panel || loaded[provider]) return;
+      // A subscription that is not connected shows its sign-in link instead
+      // of a model field, so there is nothing to fill.
+      if (!panel || loaded[provider] || !panel.querySelector("select, datalist")) return;
       loaded[provider] = true;
-      getJson<ModelList>("/settings/models?provider=" + encodeURIComponent(provider), (data) => {
+      modelList(provider, (data) => {
         if (!data || !data.models) { loaded[provider] = false; return; }
         fill(panel, data);
       });
@@ -77,13 +105,17 @@ namespace Recipes {
     const model = form.querySelector("#cleaner_model") as HTMLSelectElement | null;
     if (!provider || !model) return;
     let request: XMLHttpRequest | null = null;
+    // Only the newest load fills the list; an older one answering late (or
+    // aborted) is ignored.
+    let newest = 0;
 
     function load(): void {
       if (!provider || !model) return;
       const source = provider.value || model.getAttribute("data-ai-provider") || "";
+      const ticket = newest += 1;
       if (request) request.abort();
-      const current = request = getJson<ModelList>("/settings/models?provider=" + encodeURIComponent(source), (data) => {
-        if (current !== request) return;
+      request = modelList(source, (data) => {
+        if (ticket !== newest) return;
         request = null;
         if (!data || !data.models) return;
         const keep = model.value;

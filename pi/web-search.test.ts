@@ -138,3 +138,10 @@ test("results keep only web URLs, plain text, and at most the result count", asy
   assert.ok(results[0].snippet.length <= 701 && results[0].snippet.endsWith("…"));
   assert.equal(formatSearchResults("q", []), "No web results for \"q\".");
 });
+
+test("snippet entities are decoded once", async () => {
+  const { fetchImpl } = fakeFetch({ results: [{ title: "Tags &amp;lt;b&amp;gt;", url: "https://example.com/t", content: "Write &lt;b&gt; for bold &amp; &quot;more&quot;" }] });
+  const [result] = await webSearch({ provider: "tavily", apiKey: "k" }, "q", fetchImpl);
+  assert.equal(result.title, "Tags &lt;b&gt;");
+  assert.equal(result.snippet, "Write <b> for bold & \"more\"");
+});

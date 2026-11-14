@@ -5,12 +5,12 @@
 
 use crate::{
     AppError, AuthUser, DisplayTemplate, Result,
-    htmx::{Flash, flash_cookie},
+    htmx::{Flash, cookie_values, flash_cookie, set_cookie},
     render,
 };
 use axum::{
     Form,
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, header},
     response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
@@ -51,15 +51,8 @@ impl DisplayMode {
 
 /// The mode saved in this browser, or `Auto` when none was saved.
 pub(crate) fn chosen_mode(headers: &HeaderMap) -> DisplayMode {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            let (name, value) = pair.trim().split_once('=')?;
-            (name == DISPLAY_COOKIE).then(|| DisplayMode::parse(value))?
-        })
+    cookie_values(headers, DISPLAY_COOKIE)
+        .find_map(DisplayMode::parse)
         .unwrap_or(DisplayMode::Auto)
 }
 
@@ -123,20 +116,12 @@ pub(crate) async fn update_display(
     let mode = DisplayMode::parse(&form.mode)
         .ok_or_else(|| AppError::BadRequest("Choose Automatic, Colour or E-ink.".into()))?;
     let cookie = match mode {
-        DisplayMode::Auto => {
-            format!("{DISPLAY_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-        }
-        mode => format!(
-            "{DISPLAY_COOKIE}={}; Path=/; Max-Age={DISPLAY_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax",
-            mode.as_str()
-        ),
+        DisplayMode::Auto => set_cookie(DISPLAY_COOKIE, "", 0)?,
+        mode => set_cookie(DISPLAY_COOKIE, mode.as_str(), DISPLAY_COOKIE_MAX_AGE)?,
     };
     Ok((
         AppendHeaders([
-            (
-                header::SET_COOKIE,
-                HeaderValue::from_str(&cookie).expect("display cookies are ASCII"),
-            ),
+            (header::SET_COOKIE, cookie),
             (header::SET_COOKIE, flash_cookie("display_saved")),
         ]),
         Redirect::to("/settings/display"),

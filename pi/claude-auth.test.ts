@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { exchangeCode, parseAuthorizationInput, startFlow } from "./claude-auth.ts";
+import { exchangeCode, flowState, parseAuthorizationInput, startFlow } from "./claude-auth.ts";
 
-test("startFlow issues a PKCE S256 challenge for its verifier, sent as state", () => {
+test("startFlow issues a PKCE S256 challenge and a state that does not reveal the verifier", () => {
   const { url, verifier } = startFlow();
   const params = new URL(url).searchParams;
 
-  assert.equal(params.get("state"), verifier);
+  assert.equal(params.get("state"), flowState(verifier));
+  assert.ok(!url.includes(verifier), "the verifier stays with the host");
   assert.equal(params.get("code_challenge_method"), "S256");
   assert.equal(params.get("code_challenge"), createHash("sha256").update(verifier).digest("base64url"));
   assert.equal(params.get("redirect_uri"), "https://platform.claude.com/oauth/code/callback");
@@ -26,25 +27,26 @@ test("parseAuthorizationInput accepts code#state, redirect URLs, and bare codes"
 
 test("exchangeCode rejects a code from another sign-in without calling Anthropic", async () => {
   let called = false;
-  const result = await exchangeCode({ input: "abc#other", verifier: "mine" }, async () => {
-    called = true;
-    return new Response();
-  });
-
-  assert.equal(result.status, "failed");
+  for (const input of ["abc#other", "abc#mine"]) {
+    const result = await exchangeCode({ input, verifier: "mine" }, async () => {
+      called = true;
+      return new Response();
+    });
+    assert.equal(result.status, "failed", input);
+  }
   assert.equal(called, false);
 });
 
 test("exchangeCode returns an oauth credential that expires before the token does", async () => {
   let body: { code_verifier?: string; state?: string } | undefined;
   const before = Date.now();
-  const result = await exchangeCode({ input: "abc#mine", verifier: "mine" }, async (_url, init) => {
+  const result = await exchangeCode({ input: `abc#${flowState("mine")}`, verifier: "mine" }, async (_url, init) => {
     body = JSON.parse(String(init?.body));
     return new Response(JSON.stringify({ access_token: "sk-ant-oat-1", refresh_token: "r1", expires_in: 3600 }));
   });
 
   assert.equal(body?.code_verifier, "mine");
-  assert.equal(body?.state, "mine");
+  assert.equal(body?.state, flowState("mine"));
   assert.equal(result.status, "complete");
   assert.equal(result.credential.type, "oauth");
   assert.equal(result.credential.access, "sk-ant-oat-1");
@@ -54,11 +56,16 @@ test("exchangeCode returns an oauth credential that expires before the token doe
 });
 
 test("exchangeCode reports a rejected code as failed", async () => {
+  let state: string | undefined;
   const result = await exchangeCode(
     { input: "abc", verifier: "mine" },
-    async () => new Response("invalid_grant", { status: 400 }),
+    async (_url, init) => {
+      state = JSON.parse(String(init?.body)).state;
+      return new Response("invalid_grant", { status: 400 });
+    },
   );
 
+  assert.equal(state, flowState("mine"), "a bare code is sent with the flow's own state");
   assert.equal(result.status, "failed");
   assert.match(result.message, /400/);
 });

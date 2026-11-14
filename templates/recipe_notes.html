@@ -3,14 +3,14 @@
    are about it). Adding posts as a normal page load because it may carry a
    photo; editing and deleting are ordinary boosted forms. #}
 <section class="recipe-notes" id="notes" aria-labelledby="notes-title">
-  <h2 id="notes-title">{% if notes.fixed_version.is_some() %}Notes about this version{% else %}Notes{% endif %}</h2>
+  <h2 class="section-label" id="notes-title">{% if notes.fixed_version.is_some() %}Notes about this version{% else %}Notes{% endif %}</h2>
   <p class="muted block-note">{% if notes.fixed_version.is_some() %}What you noted when you made this version. Notes about the whole recipe are on the recipe card.{% else %}How it went, what to change next time, a photo of the result. A note is about the whole recipe, or about the version you cooked. Ask can read your notes.{% endif %}</p>
   {% if notes.notice != "" %}<p class="notice" role="status">{{ notes.notice }}</p>{% endif %}
   {% if !notes.notes.is_empty() %}
   <ul class="note-list">
     {% for note in notes.notes %}
     <li class="note" id="note-{{ note.id }}">
-      <p class="note-meta"><time>{{ note.time }}</time> · {% match note.version_link %}{% when Some with (version) %}<a href="/recipes/{{ notes.recipe_id }}/versions/{{ version }}">{{ note.about }}</a>{% when None %}{{ note.about }}{% endmatch %}{% if note.from_chat %} · From the chat{% endif %}</p>
+      <p class="note-meta">{{ note.time }} · {% match note.version_link %}{% when Some with (version) %}<a href="/recipes/{{ notes.recipe_id }}/versions/{{ version }}">{{ note.about }}</a>{% when None %}{{ note.about }}{% endmatch %}{% if note.from_chat %} · From the chat{% endif %}</p>
       {% if note.body != "" %}<p class="note-body">{{ note.body }}</p>{% endif %}
       {% if note.has_photo %}<a class="note-photo" href="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}/photo" data-still-viewer hx-boost="false"><img src="/recipes/{{ notes.recipe_id }}/notes/{{ note.id }}/photo" alt="Photo kept with this note, {{ note.time }}" loading="lazy"></a>{% endif %}
       <details class="note-edit">

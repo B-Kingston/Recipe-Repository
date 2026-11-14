@@ -101,18 +101,16 @@ async fn resolve_about(
     }
 }
 
-/// `back` when it is this recipe's page or one of its version pages, else
-/// the recipe page.
+/// `back` when it is this recipe's page (with its query, such as the
+/// servings shown) or one of its version pages, else the recipe page.
 pub(crate) fn return_target(recipe_id: &str, back: &str) -> String {
-    let page = format!("/recipes/{recipe_id}");
     let version_page = back
-        .strip_prefix(&page)
-        .and_then(|rest| rest.strip_prefix("/versions/"))
+        .strip_prefix(&format!("/recipes/{recipe_id}/versions/"))
         .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()));
-    if back == page || version_page {
+    if version_page {
         back.to_string()
     } else {
-        page
+        crate::chat::return_target(recipe_id, back)
     }
 }
 
@@ -121,18 +119,24 @@ pub(crate) fn return_target(recipe_id: &str, back: &str) -> String {
 /// version a note names; a version deleted since stays listed for it.
 fn choices(versions: &[VersionListRow], selected: Option<i64>) -> Vec<VersionChoice> {
     let current = versions.first();
+    let about_current = selected.is_some() && selected == current.map(|row| row.version);
     let mut list = vec![VersionChoice {
         value: String::new(),
         label: "The whole recipe".into(),
         selected: selected.is_none(),
     }];
     list.push(VersionChoice {
-        value: "current".into(),
+        // A note already about the newest version keeps its number, so saving
+        // it never moves it to a version made since the page was drawn.
+        value: match selected.filter(|_| about_current) {
+            Some(version) => version.to_string(),
+            None => "current".into(),
+        },
         label: match current {
             Some(row) => format!("This version (v{} · {})", row.version, row.label),
             None => "This version".into(),
         },
-        selected: selected.is_some() && selected == current.map(|row| row.version),
+        selected: about_current,
     });
     for row in versions.iter().skip(1) {
         list.push(VersionChoice {
@@ -164,24 +168,25 @@ fn about_text(versions: &[VersionListRow], version: Option<i64>) -> (String, Opt
 }
 
 /// The notes block: every note on a recipe page, or the notes about one
-/// version on that version's page.
+/// version on that version's page. `versions` is the recipe's saved
+/// versions, newest first, as the page already read them.
 pub(crate) async fn panel(
     state: &AppState,
     user: &AuthUser,
     recipe_id: &str,
+    versions: &[VersionListRow],
     fixed_version: Option<i64>,
     back: String,
     flash: &Flash,
 ) -> Result<NotesPanel> {
-    let versions = recipe_versions(&state.db, &user.id, recipe_id).await?;
     let notes = recipe_notes(&state.db, &user.id, recipe_id)
         .await?
         .into_iter()
         .filter(|note| fixed_version.is_none() || note.version == fixed_version)
         .map(|note: RecipeNote| {
-            let (about, version_link) = about_text(&versions, note.version);
+            let (about, version_link) = about_text(versions, note.version);
             NoteView {
-                choices: choices(&versions, note.version),
+                choices: choices(versions, note.version),
                 time: display_timestamp(&note.created_at),
                 from_chat: note.chat_message_id.is_some(),
                 id: note.id,
@@ -192,17 +197,18 @@ pub(crate) async fn panel(
             }
         })
         .collect();
+    // Keeping a chat answer as a note says so in the chat drawer, where the
+    // cook clicked; the notice is not repeated here.
     let notice = match flash.0.as_str() {
         "note_added" => "Note added.",
         "note_saved" => "Note saved.",
         "note_deleted" => "Note deleted.",
-        "note_kept" => "Kept in this recipe's notes.",
         _ => "",
     };
     Ok(NotesPanel {
         recipe_id: recipe_id.to_string(),
         notes,
-        choices: choices(&versions, None),
+        choices: choices(versions, None),
         fixed_version,
         back,
         notice,
@@ -252,8 +258,10 @@ pub(crate) async fn add_note(
         ));
     }
     let version = resolve_about(&s, &user, &recipe.id, parse_about(&about)?, None).await?;
+    // Only ffmpeg's output is kept, never the upload itself: note photos go
+    // to the AI with the chat, and the raw file can carry its location.
     let photo = match photo {
-        Some(raw) => Some(normalize_upload_jpeg(&raw, NOTE_PHOTO_FILTER).await?),
+        Some(raw) => Some(normalize_upload_jpeg(&raw, NOTE_PHOTO_FILTER, false).await?),
         None => None,
     };
     insert_note(

@@ -11,9 +11,9 @@ import type {
   Api,
   AssistantMessage,
   Context,
-  ImageContent,
   Model,
   Models,
+  ModelsSimpleStreamOptions,
   MutableModels,
   SimpleStreamOptions,
   TextContent,
@@ -35,7 +35,7 @@ import {
 } from "./native-search.ts";
 import { WebSearchError, formatSearchResults, redact, webSearch, webSearchConfig } from "./web-search.ts";
 import type { WebSearchConfig } from "./web-search.ts";
-import { EDIT_TOOLS, copyDraft, draftChanged, isEditTool, recipeDraft, runEditTool } from "./recipe-edits.ts";
+import { EDIT_TOOLS, copyDraft, draftChanged, isEditTool, recipeDraft, runEditTool, toolResult, whole } from "./recipe-edits.ts";
 import type { RecipeProposal } from "./recipe-edits.ts";
 export type { ProposedIngredient, ProposedStep, RecipeProposal } from "./recipe-edits.ts";
 import type { ResponsesItem, SourceLike } from "./native-search.ts";
@@ -76,6 +76,10 @@ export interface RequestFields {
   /** chat only: the account's search API key `{provider, apiKey}`, used when
    * the model has no web search of its own. Never logged. */
   webSearch?: unknown;
+  /** chat only: false when the host knows the backend has no web search of
+   * its own although its spec does (a custom server away from the provider's
+   * API); the chat then searches with `webSearch`. Absent leaves it to the spec. */
+  hostedSearch?: boolean;
   /** chat only: the recipe snapshot the edit tools work on; without it the
    * chat cannot propose changes. */
   recipe?: unknown;
@@ -135,7 +139,6 @@ export interface ListModelsResponse {
 /** The stdout line of cleanMedia. */
 export interface CleanMediaResponse {
   cleanedText: string;
-  model: string;
 }
 
 /** The model's chat answer: the reply to the cook's latest question, and
@@ -225,6 +228,11 @@ interface Subscription {
 
 type SubscriptionId = "openai-codex" | "anthropic";
 
+/** Searches Claude's server tool may run while researching one recipe: enough
+ * to research it, and few enough that the turn ends with the recipe rather
+ * than pause_turn, which a subscription call cannot continue. */
+const GENERATION_HOSTED_SEARCHES = 5;
+
 /** Subscription providers the worker runs through pi's ModelRuntime, keyed by
  * pi provider id. The host stores each OAuth credential under the same key in
  * the per-request auth.json. Both go through completeSimple, so `reasoning` maps
@@ -247,7 +255,7 @@ const SUBSCRIPTIONS: Record<SubscriptionId, Subscription> = {
     label: "Claude",
     notLoggedIn: "Pi is not logged in to Claude. Authorise Claude from the Settings page.",
     defaultModel: "claude-sonnet-5-5",
-    searchOptions: () => ({ onPayload: anthropicSearchPayload }),
+    searchOptions: () => ({ onPayload: (payload) => anthropicSearchPayload(payload, GENERATION_HOSTED_SEARCHES) }),
   },
 };
 
@@ -305,7 +313,9 @@ export class WorkerError extends Error {
  *  the provider rejected (pi-ai's ModelsError code "oauth"), or a 401 or an
  *  invalid-key error from the API. Reconnecting or replacing the key fixes
  *  these, so the host reports them as a login problem, never retries them,
- *  and marks the login in Settings. */
+ *  and marks the login in Settings. pi-ai's Codex transport reports only the
+ *  provider's text, so modelCaller adds the 401 it saw, and the Codex token
+ *  wording is matched as well. */
 const AUTH_FAILURE_PATTERNS: readonly RegExp[] = [
   /OAuth refresh failed/i,
   /invalid_grant/i,
@@ -316,6 +326,9 @@ const AUTH_FAILURE_PATTERNS: readonly RegExp[] = [
   /incorrect api key/i,
   /\b401\b[^\n]{0,40}unauthori[sz]ed/i,
   /unauthori[sz]ed[^\n]{0,40}\b401\b/i,
+  /\btoken_expired\b/i,
+  /authentication token (?:is expired|has been invalidated)/i,
+  /try signing in again/i,
 ];
 
 /** Whether an error means the provider refused the login (see AUTH_FAILURE_PATTERNS). */
@@ -343,6 +356,9 @@ export function workerFailure(error: unknown): WorkerFailure {
   };
 }
 
+/** The commands the worker runs; a request without one is a recipe generation. */
+const COMMANDS: ReadonlySet<unknown> = new Set([undefined, "listModels", "checkLogin", "cleanMedia", "chat"]);
+
 /** Parses one stdin request. listModels and checkLogin need no prompt; every
  *  other command does. */
 export function parseRequest(input: string): WorkerRequest {
@@ -356,6 +372,9 @@ export function parseRequest(input: string): WorkerRequest {
     throw new WorkerError("input", "Invalid worker request: invalid request");
   }
   const fields = request as RequestFields;
+  if (!COMMANDS.has(fields.command)) {
+    throw new WorkerError("input", `Invalid worker request: unknown command ${JSON.stringify(fields.command)}`);
+  }
   if (fields.command !== "listModels" && fields.command !== "checkLogin"
     && (typeof fields.prompt !== "string" || typeof fields.systemPrompt !== "string")) {
     throw new WorkerError("input", "Invalid worker request: missing prompt or systemPrompt");
@@ -394,6 +413,11 @@ export function piAiModels(): MutableModels {
   return models;
 }
 
+/** A stored base URL without its trailing slashes, ready for a path. */
+function withoutTrailingSlash(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
 /** A provider's chat models in pi-ai's catalogue; none for a missing spec. */
 function chatModels(models: Models, spec: string | null): Model<Api>[] {
   if (spec === null) return [];
@@ -413,7 +437,7 @@ export function piAiModel(models: Models, spec: string | null, modelId: string, 
       name: modelId,
       api: "openai-completions",
       provider: OPENAI_COMPATIBLE_SPEC,
-      baseUrl: apiBaseUrl.replace(/\/+$/, ""),
+      baseUrl: withoutTrailingSlash(apiBaseUrl),
       reasoning: false,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -431,7 +455,12 @@ export function piAiModel(models: Models, spec: string | null, modelId: string, 
     ?? catalogue.find((model) => model.api === "openai-completions")
     ?? catalogue[0];
   const model = known ? { ...shape } : { ...shape, id: modelId, name: modelId };
-  if (apiBaseUrl) model.baseUrl = apiBaseUrl.replace(/\/+$/, "");
+  if (apiBaseUrl) {
+    const base = withoutTrailingSlash(apiBaseUrl);
+    // The Anthropic SDK appends /v1/messages itself, while a stored base may
+    // already end in /v1, as anthropicUrl allows.
+    model.baseUrl = model.api === "anthropic-messages" ? base.replace(/\/v1$/i, "") : base;
+  }
   return model;
 }
 
@@ -444,6 +473,7 @@ interface ModelEntry {
 /**
  * Reduce a provider's model catalogue to sorted, de-duplicated model ids,
  * newest first so the current generation (e.g. the 5.6 range) sits on top.
+ * Numbers compare as numbers, so gpt-5.10 comes before gpt-5.9.
  */
 export function catalogModelIds(models: readonly (ModelEntry | null | undefined)[]): string[] {
   const seen = new Set<string>();
@@ -454,24 +484,42 @@ export function catalogModelIds(models: readonly (ModelEntry | null | undefined)
       ids.push(model.id);
     }
   }
-  return ids.sort((a, b) => b.localeCompare(a));
+  return ids.sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+}
+
+/** The index of the brace that closes the object opening at `start`, with
+ * braces inside JSON strings skipped; -1 when it never closes. */
+function closingBrace(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let at = start; at < text.length; at += 1) {
+    const char = text[at];
+    if (inString) {
+      if (char === "\\") at += 1;
+      else if (char === "\"") inString = false;
+    } else if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return at;
+    }
+  }
+  return -1;
 }
 
 /** Parses the first JSON object in a model reply, which may be fenced or have
- * prose around it. A JSON object ends at a closing brace, so only those
- * positions are tried, last first. */
+ * prose around it, braces in the prose included: each opening brace is tried
+ * in turn with the brace that closes it. */
 function extractJson(text: string): unknown {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim() ?? "";
-  for (const candidate of [trimmed, fenced]) {
-    const start = candidate.indexOf("{");
-    if (start === -1) continue;
-    for (let end = candidate.lastIndexOf("}"); end > start; end = candidate.lastIndexOf("}", end - 1)) {
-      try {
-        return JSON.parse(candidate.slice(start, end + 1));
-      } catch {
-        // Not a complete object ending here; try the previous closing brace.
-      }
+  for (let start = text.indexOf("{"); start !== -1; start = text.indexOf("{", start + 1)) {
+    const end = closingBrace(text, start);
+    if (end === -1) continue;
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      // Prose in braces, or a broken object; try the next opening brace.
     }
   }
   throw new WorkerError("output", "Pi did not return the required JSON response.");
@@ -547,10 +595,6 @@ export function recipePrompt(systemPrompt: string, searchMode: SearchMode = "off
   return `${systemPrompt}\n\n${output}\nUse an empty sources array.`;
 }
 
-export function completionContext(request: GenerationRequest, searchMode: SearchMode = "off"): Context {
-  return plainContext(recipePrompt(request.systemPrompt, searchMode), request.prompt);
-}
-
 /** One system prompt and one user message. Use the low-level completion API
  *  with an explicit context. Do not use AgentSession/createAgentSession here:
  *  those APIs assemble pi's default coding-agent system prompt. */
@@ -564,22 +608,30 @@ function plainContext(systemPrompt: string, prompt: string): Context {
 
 const OPENAI_RESPONSE_TIMEOUT_MS = 600_000; // generation can take minutes
 
-/** POST JSON and return the parsed body. Throws WorkerError on transport
- *  failure or non-2xx (error body truncated to 300 chars; never includes the
- *  key).  Shared by the Responses API path, the Messages API path and model
- *  discovery. The body type is the one the API documents; callers still check
- *  each field they read. */
+/** One fetchJson request. */
+interface JsonRequest {
+  headers: Record<string, string>;
+  /** Sent as JSON in a POST; without one the request is a GET. */
+  body?: unknown;
+  /** The key the headers carry, redacted from every error message. */
+  apiKey: string;
+  fetchImpl: typeof fetch;
+  timeoutMs?: number;
+}
+
+/** POST JSON (or GET) and return the parsed body. Throws WorkerError on
+ *  transport failure or non-2xx (error body truncated to 300 chars). The key
+ *  is redacted from both: undici quotes an invalid header value in its error,
+ *  and a server may echo the key back. Shared by the Responses API path, the
+ *  Messages API path and model discovery. The body type is the one the API
+ *  documents; callers still check each field they read. */
 async function fetchJson<T>(
   url: string,
-  headers: Record<string, string>,
-  body: unknown,
-  fetchImpl: typeof fetch,
-  timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS,
+  { headers, body, apiKey, fetchImpl, timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS }: JsonRequest,
 ): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    // No body means a GET, as used by model discovery.
     const response = await fetchImpl(url, body === undefined
       ? { method: "GET", headers, signal: controller.signal }
       : {
@@ -592,7 +644,7 @@ async function fetchJson<T>(
         signal: controller.signal,
       });
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
+      const detail = redact(await response.text().catch(() => ""), apiKey);
       const status = Number(response.status);
       const retryable = status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
       throw new WorkerError(
@@ -607,7 +659,7 @@ async function fetchJson<T>(
     const retryable = !(error instanceof Error && error.name === "AbortError");
     throw new WorkerError(
       "worker",
-      `API request failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      `API request failed: ${redact(error instanceof Error ? error.message : "unknown error", apiKey)}`,
       { retryable },
     );
   } finally {
@@ -718,10 +770,9 @@ export async function openaiResponse(
   reasoningEffort: ReasoningEffort = "low",
   fetchImpl: typeof fetch = fetch,
 ): Promise<ResponsesBody> {
-  return fetchJson<ResponsesBody>(
-    `${apiBaseUrl.replace(/\/+$/, "")}/responses`,
-    { Authorization: `Bearer ${apiKey}` },
-    {
+  return fetchJson<ResponsesBody>(`${withoutTrailingSlash(apiBaseUrl)}/responses`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: {
       model: modelId,
       input: [
         { role: "system", content: systemPrompt },
@@ -733,8 +784,9 @@ export async function openaiResponse(
       reasoning: { effort: reasoningEffort },
       text: { verbosity: "low" },
     },
+    apiKey,
     fetchImpl,
-  );
+  });
 }
 
 /** What a provider reply reduces to before the recipe is extracted. */
@@ -878,7 +930,7 @@ export function anthropicThinking(modelId: unknown, reasoningEffort: unknown): A
 /** A Messages API URL for a stored base URL: append /v1/<path>, unless the
  *  base already ends in /v1, then append /<path>. */
 export function anthropicUrl(baseUrl: string, path = "messages"): string {
-  const base = baseUrl.replace(/\/+$/, "");
+  const base = withoutTrailingSlash(baseUrl);
   return /\/v1$/i.test(base) ? `${base}/${path}` : `${base}/v1/${path}`;
 }
 
@@ -902,6 +954,7 @@ export async function anthropicMessages(
   reasoningEffort: ReasoningEffort = "low",
   searchMode: SearchMode = "off",
   fetchImpl: typeof fetch = fetch,
+  timeoutMs = OPENAI_RESPONSE_TIMEOUT_MS,
 ): Promise<AnthropicBody> {
   const body = {
     model: modelId,
@@ -910,13 +963,15 @@ export async function anthropicMessages(
     messages,
     ...(searchMode !== "off" ? { tools: [ANTHROPIC_WEB_SEARCH_TOOL] } : {}),
   };
-  return fetchJson<AnthropicBody>(anthropicUrl(apiBaseUrl), anthropicHeaders(apiKey), body, fetchImpl);
+  return fetchJson<AnthropicBody>(anthropicUrl(apiBaseUrl), { headers: anthropicHeaders(apiKey), body, apiKey, fetchImpl, timeoutMs });
 }
 
 /** Runs one Messages API turn to completion. A "pause_turn" stop is continued
  *  by sending the paused assistant content back unchanged; the content of all
- *  calls is returned in order, with the final stop_reason. Cache usage goes to
- *  stderr, which the host logs. */
+ *  calls is returned in order, with the final stop_reason. The calls share one
+ *  OPENAI_RESPONSE_TIMEOUT_MS deadline, which ends the turn with an error well
+ *  before the host kills the worker. Cache usage goes to stderr, which the
+ *  host logs. */
 export async function anthropicTurn(
   apiBaseUrl: string,
   apiKey: string,
@@ -929,8 +984,11 @@ export async function anthropicTurn(
 ): Promise<{ content: AnthropicBlock[]; stop_reason: unknown }> {
   const assistant: AnthropicMessage & { content: AnthropicBlock[] } = { role: "assistant", content: [] };
   const messages: AnthropicMessage[] = [{ role: "user", content: prompt }];
+  const deadline = Date.now() + OPENAI_RESPONSE_TIMEOUT_MS;
   for (let call = 0; ; call += 1) {
-    const data = await anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort, searchMode, fetchImpl);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new WorkerError("worker", "Anthropic web search did not finish its turn in time.");
+    const data = await anthropicMessages(apiBaseUrl, apiKey, modelId, systemPrompt, messages, reasoningEffort, searchMode, fetchImpl, remaining);
     logAnthropicUsage(modelId, call, data?.usage);
     const content = Array.isArray(data?.content) ? data.content : [];
     assistant.content.push(...content);
@@ -1016,20 +1074,24 @@ export async function listEndpointModels(request: RequestFields, fetchImpl: type
       const url = new URL(anthropicUrl(apiBaseUrl, "models"));
       url.searchParams.set("limit", "1000");
       if (afterId) url.searchParams.set("after_id", afterId);
-      const body = await fetchJson<ModelsListBody | null>(url.toString(), anthropicHeaders(apiKey), undefined, fetchImpl, MODEL_LIST_TIMEOUT_MS);
+      const body = await fetchJson<ModelsListBody | null>(url.toString(), {
+        headers: anthropicHeaders(apiKey),
+        apiKey,
+        fetchImpl,
+        timeoutMs: MODEL_LIST_TIMEOUT_MS,
+      });
       if (Array.isArray(body?.data)) models.push(...body.data);
       afterId = body?.has_more === true && typeof body.last_id === "string" ? body.last_id : undefined;
       if (!afterId) break;
     }
     return uniqueModelIds(models);
   }
-  const body = await fetchJson<ModelsListBody | null>(
-    `${apiBaseUrl.replace(/\/+$/, "")}/models`,
-    apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-    undefined,
+  const body = await fetchJson<ModelsListBody | null>(`${withoutTrailingSlash(apiBaseUrl)}/models`, {
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    apiKey: apiKey ?? "",
     fetchImpl,
-    MODEL_LIST_TIMEOUT_MS,
-  );
+    timeoutMs: MODEL_LIST_TIMEOUT_MS,
+  });
   const models = Array.isArray(body?.data) ? [...body.data] : [];
   const created = (model: ModelEntry | null) => (typeof model?.created === "number" ? model.created : 0);
   models.sort((a, b) => created(b) - created(a) || String(a?.id).localeCompare(String(b?.id)));
@@ -1086,8 +1148,7 @@ async function listModels(request: RequestFields): Promise<void> {
  */
 async function checkLogin(request: CheckLoginRequest): Promise<void> {
   const subscription = subscriptionOf(request);
-  const authPath = nonBlank(request.authPath);
-  if (!authPath) throw new WorkerError("input", "Missing authPath for the subscription credential.");
+  const authPath = authPathOf(request);
   const auth = JSON.parse(await readFile(authPath, "utf8")) as Record<string, { type?: string; expires?: number } | undefined>;
   const credential = auth[subscription.id];
   if (credential?.type !== "oauth") {
@@ -1102,11 +1163,17 @@ async function checkLogin(request: CheckLoginRequest): Promise<void> {
   outputJson({ ok: true } satisfies CheckLoginResponse);
 }
 
+/** The request's per-request auth.json, which every subscription request needs. */
+function authPathOf(request: RequestFields): string {
+  const authPath = nonBlank(request.authPath);
+  if (!authPath) throw new WorkerError("input", "Missing authPath for the subscription credential.");
+  return authPath;
+}
+
 /** The pi runtime over the request's per-request auth.json. The SDK refreshes
  * an expired token in that file, and the host reads the refresh back. */
 async function subscriptionRuntime(request: RequestFields): Promise<ModelRuntime> {
-  const authPath = nonBlank(request.authPath);
-  if (!authPath) throw new WorkerError("input", "Missing authPath for the subscription credential.");
+  const authPath = authPathOf(request);
   const agentDir = getAgentDir();
   await mkdir(agentDir, { recursive: true });
   return ModelRuntime.create({ authPath, modelsPath: join(agentDir, "models.json") });
@@ -1121,7 +1188,7 @@ async function cleanMedia(request: GenerationRequest): Promise<void> {
     searchMode: "off",
     reasoningEffort: normalizeEffort(request.reasoningEffort),
   });
-  outputJson({ cleanedText: cleanedEvidence(completion.text), model: request.model ?? "" } satisfies CleanMediaResponse);
+  outputJson({ cleanedText: cleanedEvidence(completion.text) } satisfies CleanMediaResponse);
 }
 
 /** The cleaner's reply reduced to the known evidence fields. */
@@ -1138,6 +1205,11 @@ async function chat(request: GenerationRequest & { library?: unknown }): Promise
   outputJson(await answerChat(request));
 }
 
+/** Writes one line to stderr, which the host forwards into its log. */
+function stderrLog(line: string): void {
+  process.stderr.write(`${line}\n`);
+}
+
 /** The chat turn behind `chat`. With search on, the model gets one
  * web_search tool: answered by a separate search call to the provider's own
  * web search when the backend has one (`hostedSearch`), else through the
@@ -1146,7 +1218,7 @@ async function chat(request: GenerationRequest & { library?: unknown }): Promise
 export async function answerChat(
   request: GenerationRequest & { library?: unknown },
   modelCall: typeof chatModelCall = chatModelCall,
-  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
+  log: (line: string) => void = stderrLog,
 ): Promise<ChatResponse> {
   const searching = searchModeOf(request) !== "off";
   const { call, canSeePhotos, hostedSearch } = await modelCall(request, searching);
@@ -1176,7 +1248,8 @@ const HOSTED_SEARCH_PROMPT = "You look things up on the web for a cooking assist
 /** Answers one web_search call with a single request to the provider's own
  * web search (`call` has it attached) and no other tools, so no turn is
  * ever replayed. A failed, paused, or empty search is a WebSearchError,
- * which the chat turns into an error result the model answers around. */
+ * which the chat turns into an error result the model answers around; an
+ * answer cut off at the output limit is kept and says so. */
 export async function hostedSearchAnswer(call: ChatModelCall, query: string): Promise<string> {
   const response = await call({
     systemPrompt: HOSTED_SEARCH_PROMPT,
@@ -1186,12 +1259,13 @@ export async function hostedSearchAnswer(call: ChatModelCall, query: string): Pr
   if (response.stopReason === "error" || response.stopReason === "aborted") {
     throw new WebSearchError(`The web search failed (${response.errorMessage || "provider error"}).`);
   }
-  if ((response as AssistantMessage & { rawStopReason?: string }).rawStopReason === "pause_turn") {
+  if (response.rawStopReason === "pause_turn") {
     throw new WebSearchError("The web search took too long and was paused.");
   }
   const text = withoutCiteTags(assistantText(response));
   if (!text) throw new WebSearchError("The web search came back empty.");
-  return `Web search for "${query}":\n${text}`;
+  const cut = response.stopReason === "length" ? "\n(The search answer was cut off here.)" : "";
+  return `Web search for "${query}":\n${text}${cut}`;
 }
 
 /** Text without the cite tags Claude's web search wraps around quotes. */
@@ -1202,8 +1276,10 @@ function withoutCiteTags(text: string): string {
 /** One model call with the chat's running context. */
 export type ChatModelCall = (context: Context) => Promise<AssistantMessage>;
 
-/** Searches Anthropic's server tool may run in one chat turn; well under the
- * server's own loop limit, so the turn ends with an answer, not pause_turn. */
+/** Searches Anthropic's server tool may run for one search_web call, that is
+ * in one hostedSearchAnswer request (an answer makes up to CHAT_SEARCHES of
+ * them); well under the server's own loop limit, so the request ends with an
+ * answer, not pause_turn. */
 const CHAT_HOSTED_SEARCHES = 4;
 
 /** The payload hook that attaches the provider's own web search to a chat
@@ -1216,15 +1292,117 @@ export function chatSearchPayload(
 ): ((payload: unknown) => Record<string, unknown>) | null {
   if (endpointSpec !== null && isPiAiSpec(endpointSpec)) return null;
   if (api === "openai-responses" || api === "openai-codex-responses") return responsesSearchPayload;
-  if (api === "anthropic-messages") {
-    return (payload) => {
-      const body = anthropicSearchPayload(payload);
-      const tools = (body.tools as Record<string, unknown>[]).map((tool) =>
-        tool.type === "web_search_20250305" ? { ...tool, max_uses: CHAT_HOSTED_SEARCHES } : tool);
-      return { ...body, tools };
-    };
-  }
+  if (api === "anthropic-messages") return (payload) => anthropicSearchPayload(payload, CHAT_HOSTED_SEARCHES);
   return null;
+}
+
+/** The provider's own search for a chat request, or null: none when the host
+ * says the backend has no search (`hostedSearch: false`), else as the spec
+ * and API allow (chatSearchPayload). */
+export function chatRequestSearchPayload(
+  request: RequestFields,
+  api: string,
+): ((payload: unknown) => Record<string, unknown>) | null {
+  if (request.hostedSearch === false) return null;
+  return chatSearchPayload(api, isEndpointRequest(request) ? nonBlank(request.provider) : null);
+}
+
+/** What a model call may set besides the context. */
+type CallOptions = Pick<ModelsSimpleStreamOptions, "fetch" | "onPayload" | "transport" | "reasoning">;
+
+/** One call to the request's model. */
+export type ModelCall = (context: Context, options?: CallOptions) => Promise<AssistantMessage>;
+
+/** The pi-ai model a request runs on, its name for messages, and a way to call it. */
+interface ModelAccess {
+  model: Model<Api>;
+  label: string;
+  call: ModelCall;
+}
+
+/** Wraps a pi-ai completion with the worker's defaults: one pi-ai retry, the
+ * response timeout, and the request's effort unless a call sets its own. A
+ * provider error is reworded so that a refused login reads as one, since
+ * pi-ai's Codex transport reports a 401 only through its status, and so that
+ * it never quotes the endpoint's key. */
+export function modelCaller(
+  complete: (context: Context, options: ModelsSimpleStreamOptions) => Promise<AssistantMessage>,
+  reasoning: ReasoningEffort,
+  apiKey: string,
+): ModelCall {
+  return async (context, options = {}) => {
+    let status = 0;
+    const response = await complete(context, {
+      reasoning,
+      maxRetries: 1,
+      signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
+      onResponse: (received) => {
+        status = received.status;
+      },
+      ...options,
+    });
+    if (response.stopReason === "error") {
+      const detail = redact(response.errorMessage ?? "", apiKey);
+      response.errorMessage = status === 401 && !/\b401\b/.test(detail) ? `HTTP 401: ${detail}` : detail;
+    }
+    return response;
+  };
+}
+
+/** A subscription's model through pi's ModelRuntime, signed in with the
+ * request's auth.json. */
+async function subscriptionAccess(request: RequestFields): Promise<ModelAccess> {
+  const subscription = subscriptionOf(request);
+  const runtime = await subscriptionRuntime(request);
+  if (!(await runtime.checkAuth(subscription.id))) {
+    throw new WorkerError("configuration", subscription.notLoggedIn);
+  }
+  const modelId = nonBlank(request.model) ?? subscription.defaultModel;
+  const model = runtime.getModel(subscription.id, modelId);
+  if (!model) throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
+  const reasoning = normalizeEffort(request.reasoningEffort);
+  return { model, label: subscription.label, call: modelCaller((context, options) => runtime.completeSimple(model, context, options), reasoning, "") };
+}
+
+/** An API endpoint's model through pi-ai with the endpoint's key. A blank key
+ * is only valid for a custom server. */
+function endpointAccess(request: RequestFields, models: Models = piAiModels()): ModelAccess {
+  const spec = nonBlank(request.provider);
+  const apiKey = nonBlank(request.apiKey);
+  const modelId = nonBlank(request.model);
+  if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
+  if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
+    throw new WorkerError("configuration", "Missing API key for this AI provider.");
+  }
+  const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
+  const reasoning = normalizeEffort(request.reasoningEffort);
+  const call = modelCaller(
+    (context, options) => models.completeSimple(model, context, { apiKey: apiKey ?? "none", ...options }),
+    reasoning,
+    apiKey ?? "",
+  );
+  return { model, label: model.provider, call };
+}
+
+/** The response, unless it stopped short. A provider error is worth a host
+ * retry; the response timeout and the output limit are not, as the same
+ * request would end the same way. Anthropic pausing a long server-side search
+ * turn is a plain stop to pi-ai, and only rawStopReason tells: what came so
+ * far is a preamble, not the answer. */
+function checkStop(response: AssistantMessage, label = "AI provider"): AssistantMessage {
+  if (response.stopReason === "error") {
+    throw new WorkerError("worker", response.errorMessage || `${label} request failed.`, { retryable: true });
+  }
+  if (response.stopReason === "aborted") {
+    throw new WorkerError("worker", response.errorMessage || `${label} request timed out.`);
+  }
+  if (response.stopReason === "length") {
+    throw new WorkerError("worker", `${label} response was truncated by its output limit.`);
+  }
+  if (response.rawStopReason === "pause_turn") {
+    throw new WorkerError("worker", `${label} paused the turn mid-search.`, { retryable: true });
+  }
+  return response;
 }
 
 /** The chat's model call through the request's backend. Every backend goes
@@ -1236,54 +1414,21 @@ export async function chatModelCall(
   request: PromptRequest,
   searching: boolean,
 ): Promise<{ call: ChatModelCall; canSeePhotos: boolean; hostedSearch: ((query: string) => Promise<string>) | null }> {
-  const reasoning = normalizeEffort(request.reasoningEffort);
-  let complete: (context: Context, onPayload?: (payload: unknown) => Record<string, unknown>) => Promise<AssistantMessage>;
-  let model: Model<Api>;
-  let spec: string | null = null;
-  if (!isEndpointRequest(request)) {
-    const subscription = subscriptionOf(request);
-    const modelRuntime = await subscriptionRuntime(request);
-    if (!(await modelRuntime.checkAuth(subscription.id))) {
-      throw new WorkerError("configuration", subscription.notLoggedIn);
-    }
-    const modelId = nonBlank(request.model) ?? subscription.defaultModel;
-    const found = modelRuntime.getModel(subscription.id, modelId);
-    if (!found) throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
-    model = found;
-    complete = (context, onPayload) => modelRuntime.completeSimple(found, context, {
-      reasoning,
-      maxRetries: 1,
-      ...(onPayload ? { onPayload } : {}),
-    });
-  } else {
-    spec = nonBlank(request.provider);
-    const apiKey = nonBlank(request.apiKey);
-    const modelId = nonBlank(request.model);
-    if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
-    if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
-      throw new WorkerError("configuration", "Missing API key for this AI provider.");
-    }
-    const models = piAiModels();
-    const found = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
-    model = found;
-    complete = (context, onPayload) => models.completeSimple(found, context, {
-      apiKey: apiKey ?? "none",
-      reasoning,
-      maxRetries: 1,
-      signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
-      ...(onPayload ? { onPayload } : {}),
-    });
-  }
-  const onPayload = searching ? chatSearchPayload(model.api, spec) : null;
+  const endpoint = isEndpointRequest(request);
+  const { model, call } = endpoint ? endpointAccess(request) : await subscriptionAccess(request);
+  const onPayload = searching ? chatRequestSearchPayload(request, model.api) : null;
   return {
-    call: (context) => complete(context),
+    call: (context) => call(context),
     canSeePhotos: model.input.includes("image"),
-    hostedSearch: onPayload ? (query) => hostedSearchAnswer((context) => complete(context, onPayload), query) : null,
+    // A search is a lookup, so it runs at low effort whatever the chat's is.
+    hostedSearch: onPayload
+      ? (query) => hostedSearchAnswer((context) => call(context, { onPayload, reasoning: "low" }), query)
+      : null,
   };
 }
 
 /** The reply shown when the model ran out of tool turns mid-edit. */
-const CHAT_ROUNDS_OUT_REPLY = "I made the changes below but ran out of steps before I could finish explaining them. Check them carefully, then accept or deny them.";
+const CHAT_ROUNDS_OUT_REPLY = "I ran out of steps before I could finish, so these changes may be incomplete. Check them carefully, then accept or deny them.";
 
 /** Model turns that may call tools before the chat must answer. Edits can
  * take a few turns (read, change, check), on top of lookups and searches. */
@@ -1342,41 +1487,22 @@ export const WEB_SEARCH_TOOL: Tool = {
 
 /** The answer tool's reply to a call without a reply. */
 function answerNeedsReply(call: ToolCall): ToolResultMessage {
-  return {
-    role: "toolResult",
-    toolCallId: call.id,
-    toolName: call.name,
-    content: [{ type: "text", text: "Give answer your reply to the cook as `reply`." }],
-    isError: true,
-    timestamp: Date.now(),
-  };
+  return toolResult(call, "Give answer your reply to the cook as `reply`.", true);
 }
 
 /** The search tool's answer once an answer has used its searches. */
 function searchesUsed(call: ToolCall): ToolResultMessage {
-  return {
-    role: "toolResult",
-    toolCallId: call.id,
-    toolName: call.name,
-    content: [{ type: "text", text: `That is the most searches for one answer (${CHAT_SEARCHES}). Answer now with what you found.` }],
-    isError: true,
-    timestamp: Date.now(),
-  };
+  return toolResult(call, `That is the most searches for one answer (${CHAT_SEARCHES}). Answer now with what you found.`, true);
 }
 
-/** Runs one web_search call through the account's search API. */
-export async function runWebSearchTool(
-  search: WebSearchConfig,
-  call: ToolCall,
-  fetchImpl: typeof fetch = globalThis.fetch,
-  log: (line: string) => void = (line) => process.stderr.write(`${line}\n`),
-): Promise<ToolResultMessage> {
-  return runSearchTool(
-    (query) => webSearch(search, query, fetchImpl).then((results) => formatSearchResults(query, results)),
-    call,
-    log,
-    search.apiKey,
-  );
+/** A searcher over the account's search API: numbered results with their URLs. */
+export function apiSearcher(search: WebSearchConfig, fetchImpl: typeof fetch = globalThis.fetch): (query: string) => Promise<string> {
+  return (query) => webSearch(search, query, fetchImpl).then((results) => formatSearchResults(query, results));
+}
+
+/** The query of a search_web call; "" when it has none. */
+function searchQuery(call: ToolCall): string {
+  return typeof call.arguments.query === "string" ? call.arguments.query.trim() : "";
 }
 
 /** Runs one web_search call through `searcher`. A failure is an error
@@ -1388,22 +1514,14 @@ export async function runSearchTool(
   log: (line: string) => void,
   key = "",
 ): Promise<ToolResultMessage> {
-  const result = (text: string, isError = false): ToolResultMessage => ({
-    role: "toolResult",
-    toolCallId: call.id,
-    toolName: call.name,
-    content: [{ type: "text", text }],
-    isError,
-    timestamp: Date.now(),
-  });
-  const query = typeof call.arguments.query === "string" ? call.arguments.query.trim() : "";
-  if (!query) return result("Give search_web a query.", true);
+  const query = searchQuery(call);
+  if (!query) return toolResult(call, "Give search_web a query.", true);
   try {
-    return result(await searcher(query));
+    return toolResult(call, await searcher(query));
   } catch (error) {
     const message = redact(error instanceof Error ? error.message : String(error), key);
     log(`chat web search failed${error instanceof WebSearchError && error.auth ? " (key rejected)" : ""}: ${message}`);
-    return result(`${message} Answer without the web.`, true);
+    return toolResult(call, `${message} Answer without the web.`, true);
   }
 }
 
@@ -1460,28 +1578,22 @@ export function formatChatNotes(library: ChatLibrary): string {
   }).join("\n\n");
 }
 
-/** Runs one chat tool call against the library. */
+/** Runs one chat tool call against the library. Numbers are read as the edit
+ * tools read them, so a numeric string ("2") works too. */
 export function runChatTool(library: ChatLibrary, call: ToolCall, canSeePhotos: boolean): ToolResultMessage {
-  const result = (text: string, isError = false, image?: ImageContent): ToolResultMessage => ({
-    role: "toolResult",
-    toolCallId: call.id,
-    toolName: call.name,
-    content: image ? [{ type: "text", text }, image] : [{ type: "text", text }],
-    isError,
-    timestamp: Date.now(),
-  });
+  const result = (text: string, isError = false): ToolResultMessage => toolResult(call, text, isError);
   if (call.name === "recipe_notes") return result(formatChatNotes(library));
   if (call.name === "note_photo") {
-    const number = finiteInteger(call.arguments.note);
+    const number = whole(call.arguments.note);
     const note = number === null ? undefined : library.notes[number - 1];
     if (!note) return result(`There is no note ${String(call.arguments.note)}. Call recipe_notes for the list.`, true);
     if (!note.hasPhoto) return result(`Note ${number} has no photo.`, true);
     if (!canSeePhotos) return result("This model cannot view photos; work from the note's text.", true);
     if (!note.photo) return result(`The photo on note ${number} was too many to send; work from the note's text.`, true);
-    return result(`The photo on note ${number}:`, false, { type: "image", data: note.photo, mimeType: "image/jpeg" });
+    return toolResult(call, `The photo on note ${number}:`, false, { type: "image", data: note.photo, mimeType: "image/jpeg" });
   }
   if (call.name === "recipe_version") {
-    const version = finiteInteger(call.arguments.version);
+    const version = whole(call.arguments.version);
     const saved = library.versions.find((entry) => entry.version === version);
     if (!saved) {
       const known = library.versions.map((entry) => entry.version).join(", ") || "none";
@@ -1525,7 +1637,7 @@ export async function chatWithTools(
   library: ChatLibrary,
   {
     canSeePhotos = false,
-    log = (line) => process.stderr.write(`${line}\n`),
+    log = stderrLog,
     search = null,
     fetchImpl = globalThis.fetch,
     hostedSearch = null,
@@ -1533,8 +1645,7 @@ export async function chatWithTools(
   }: ChatToolOptions = {},
 ): Promise<{ text: string; toolCalls: string[]; proposal: RecipeProposal | null }> {
   const draft = recipe ? copyDraft(recipe) : null;
-  const searcher = hostedSearch
-    ?? (search ? (query: string) => webSearch(search, query, fetchImpl).then((results) => formatSearchResults(query, results)) : null);
+  const searcher = hostedSearch ?? (search ? apiSearcher(search, fetchImpl) : null);
   const context: Context = {
     systemPrompt,
     messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
@@ -1543,6 +1654,30 @@ export async function chatWithTools(
   const toolCalls: string[] = [];
   let searches = 0;
   let emptyRetried = false;
+  const proposal = () => (recipe && draft && draftChanged(recipe, draft) ? draft : null);
+  const logCall = (toolCall: ToolCall) => {
+    toolCalls.push(toolCall.name);
+    log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
+  };
+  /** Runs the edits among calls no later turn will read: their results are
+   * dropped, but the changes reach the cook. */
+  const runLastEdits = (calls: ToolCall[]) => {
+    for (const toolCall of calls) {
+      logCall(toolCall);
+      if (draft && isEditTool(toolCall.name)) runEditTool(draft, toolCall);
+    }
+  };
+  const runTool = async (toolCall: ToolCall): Promise<ToolResultMessage> => {
+    if (toolCall.name === ANSWER_TOOL.name) return answerNeedsReply(toolCall);
+    if (searcher && toolCall.name === WEB_SEARCH_TOOL.name) {
+      // A call without a query searches nothing, so it does not count.
+      if (searchQuery(toolCall)) searches += 1;
+      if (searches > CHAT_SEARCHES) return searchesUsed(toolCall);
+      return runSearchTool(searcher, toolCall, log, search?.apiKey ?? "");
+    }
+    if (draft && isEditTool(toolCall.name)) return runEditTool(draft, toolCall);
+    return runChatTool(library, toolCall, canSeePhotos);
+  };
   for (let round = 0; ; round += 1) {
     let response = await call(context);
     if (!emptyRetried && response.stopReason !== "error" && response.stopReason !== "aborted"
@@ -1551,23 +1686,11 @@ export async function chatWithTools(
       // block pi-ai keeps. Nothing new goes into the context, so asking the
       // same request again is safe; it is done once per answer.
       emptyRetried = true;
-      const raw = (response as AssistantMessage & { rawStopReason?: string }).rawStopReason;
-      log(`chat answer had no text: stop=${response.stopReason} raw=${raw ?? "-"} blocks=${response.content.map((part) => part.type).join(",") || "none"} round=${round}; asking again`);
+      log(`chat answer had no text: stop=${response.stopReason} raw=${response.rawStopReason ?? "-"} blocks=${response.content.map((part) => part.type).join(",") || "none"} round=${round}; asking again`);
       response = await call(context);
     }
-    if (response.stopReason === "error" || response.stopReason === "aborted") {
-      throw new WorkerError("worker", response.errorMessage || "AI provider request failed.", { retryable: true });
-    }
-    if (response.stopReason === "length") {
-      throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
-    }
+    checkStop(response);
     const calls = response.content.filter((part): part is ToolCall => part.type === "toolCall");
-    const proposal = () => (recipe && draft && draftChanged(recipe, draft) ? draft : null);
-    if ((response as AssistantMessage & { rawStopReason?: string }).rawStopReason === "pause_turn") {
-      // Anthropic paused a long server-side search; pi-ai reports it as a
-      // plain stop, and what came so far is a preamble, not the answer.
-      throw new WorkerError("worker", "The provider paused the turn mid-search.", { retryable: true });
-    }
     if (calls.length === 0) {
       return { text: assistantText(response), toolCalls, proposal: proposal() };
     }
@@ -1575,17 +1698,13 @@ export async function chatWithTools(
       && typeof part.arguments.reply === "string" && part.arguments.reply.trim());
     if (finish) {
       // Edits called alongside the answer still count.
-      for (const toolCall of calls) {
-        if (toolCall === finish) continue;
-        toolCalls.push(toolCall.name);
-        log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
-        if (draft && isEditTool(toolCall.name)) runEditTool(draft, toolCall);
-      }
+      runLastEdits(calls.filter((toolCall) => toolCall !== finish));
       const label = typeof finish.arguments.label === "string" ? finish.arguments.label : "";
       return { text: JSON.stringify({ reply: finish.arguments.reply, label }), toolCalls, proposal: proposal() };
     }
     if (round === CHAT_TOOL_ROUNDS) {
-      // Edits made so far still reach the cook, who reviews them anyway.
+      // The cook still gets the edits, this turn's included, to review.
+      runLastEdits(calls);
       const edited = proposal();
       if (edited) {
         return { text: JSON.stringify({ reply: CHAT_ROUNDS_OUT_REPLY, label: "" }), toolCalls, proposal: edited };
@@ -1594,17 +1713,8 @@ export async function chatWithTools(
     }
     context.messages.push(response);
     for (const toolCall of calls) {
-      toolCalls.push(toolCall.name);
-      log(`chat tool call: ${toolCall.name} ${JSON.stringify(toolCall.arguments)}`);
-      const output = toolCall.name === ANSWER_TOOL.name
-        ? answerNeedsReply(toolCall)
-        : searcher && toolCall.name === WEB_SEARCH_TOOL.name
-        ? (searches += 1) > CHAT_SEARCHES
-          ? searchesUsed(toolCall)
-          : await runSearchTool(searcher, toolCall, log, search?.apiKey ?? "")
-        : draft && isEditTool(toolCall.name)
-          ? runEditTool(draft, toolCall)
-          : runChatTool(library, toolCall, canSeePhotos);
+      logCall(toolCall);
+      const output = await runTool(toolCall);
       if (round === CHAT_TOOL_ROUNDS - 1) {
         output.content.push({ type: "text", text: "That was the last lookup or edit. Call answer now with your reply." });
       }
@@ -1690,62 +1800,32 @@ export async function completeViaPiAi(
   models: Models = piAiModels(),
   fetchImpl: typeof fetch | undefined = undefined,
 ): Promise<Completion> {
-  const spec = nonBlank(request.provider);
-  const apiKey = nonBlank(request.apiKey);
-  const modelId = nonBlank(request.model);
-  if (!modelId) throw new WorkerError("configuration", "Choose a model for this AI provider in Settings.");
-  if (!apiKey && spec !== OPENAI_COMPATIBLE_SPEC) {
-    throw new WorkerError("configuration", "Missing API key for this AI provider.");
-  }
-  const model = piAiModel(models, spec, modelId, nonBlank(request.apiBaseUrl));
-  const response = await models.completeSimple(model, plainContext(systemPrompt, request.prompt), {
-    apiKey: apiKey ?? "none",
+  const { label, call } = endpointAccess(request, models);
+  const response = checkStop(await call(plainContext(systemPrompt, request.prompt), {
     reasoning: reasoningEffort,
-    maxRetries: 1,
-    signal: AbortSignal.timeout(OPENAI_RESPONSE_TIMEOUT_MS),
     ...(fetchImpl ? { fetch: fetchImpl } : {}),
-  });
-  if (response.stopReason === "error" || response.stopReason === "aborted") {
-    throw new WorkerError("worker", response.errorMessage || "AI provider request failed.", { retryable: true });
-  }
-  if (response.stopReason === "length") {
-    throw new WorkerError("worker", "AI provider response was truncated by its output limit.");
-  }
-  return { label: model.provider, text: assistantText(response), citations: new Map(), searched: false };
+  }), label);
+  return { label, text: assistantText(response), citations: new Map(), searched: false };
 }
 
 /** A call through a pi subscription (ChatGPT for Codex, Claude Pro/Max). */
 async function completeViaSubscription(request: PromptRequest, { systemPrompt, searchMode, reasoningEffort }: CompletionOptions): Promise<Completion> {
   const subscription = subscriptionOf(request);
-  const modelRuntime = await subscriptionRuntime(request);
-  if (!(await modelRuntime.checkAuth(subscription.id))) {
-    throw new WorkerError("configuration", subscription.notLoggedIn);
-  }
-  const modelId = nonBlank(request.model) ?? subscription.defaultModel;
-  const model = modelRuntime.getModel(subscription.id, modelId);
-  if (!model) {
-    throw new WorkerError("configuration", `Pi does not know the ${subscription.id}/${modelId} model.`);
-  }
-
-  const observer = searchMode === "off"
-    ? null
-    : createNativeSearchObserver(globalThis.fetch, { allowUnverifiedFallback: searchMode === "gapfill" });
-  const response = await modelRuntime.completeSimple(model, plainContext(systemPrompt, request.prompt), {
+  const { label, call } = await subscriptionAccess(request);
+  const observer = searchMode === "off" ? null : createNativeSearchObserver();
+  const response = checkStop(await call(plainContext(systemPrompt, request.prompt), {
     reasoning: reasoningEffort,
-    maxRetries: 1,
     ...(observer ? { fetch: observer.fetch, ...subscription.searchOptions(searchMode) } : {}),
-  });
-  if (response.stopReason === "error" || response.stopReason === "aborted") {
-    throw new WorkerError("worker", response.errorMessage || "Pi model request failed.");
-  }
+  }), label);
   const observed = observer ? await observer.finish() : { invoked: false, sources: new Map<string, string>() };
-  return { label: subscription.label, text: assistantText(response), citations: observed.sources, searched: observed.invoked };
+  return { label, text: assistantText(response), citations: observed.sources, searched: observed.invoked };
 }
 
 /** Recipe generation through the request's backend. pi-ai providers have no
  * web search, so they always generate as "off" (the host downgrades grounded
- * requests; gap-fill sources are optional). Only a native endpoint's gap-fill
- * may keep unverifiable claimed sources. */
+ * requests; gap-fill sources are optional). A gap-fill that searched but got
+ * no citations back to check against keeps the model's claimed sources
+ * unverified, on a subscription and a native endpoint alike. */
 export async function generateRecipe(
   request: GenerationRequest,
   searchMode: SearchMode,
@@ -1762,7 +1842,7 @@ export async function generateRecipe(
   return finishRecipe({
     ...completion,
     searchMode: effective,
-    acceptUnverifiable: isEndpointRequest(request) && !piAi && searchMode === "gapfill",
+    acceptUnverifiable: effective === "gapfill" && completion.searched,
   });
 }
 

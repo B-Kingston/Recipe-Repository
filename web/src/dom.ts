@@ -68,7 +68,7 @@ namespace Recipes {
    * GETs `url` and hands its JSON to `done`, or null when the request failed
    * or the body was not JSON. Returns the request so a caller can abort it.
    */
-  export function getJson<T>(url: string, done: (payload: T | null, status: number) => void): XMLHttpRequest {
+  export function getJson<T>(url: string, done: (payload: T | null) => void): XMLHttpRequest {
     const request = new XMLHttpRequest();
     request.open("GET", url, true);
     request.onreadystatechange = () => {
@@ -77,10 +77,37 @@ namespace Recipes {
       if (request.status >= 200 && request.status < 300) {
         try { payload = JSON.parse(request.responseText) as T; } catch (ignored) { payload = null; }
       }
-      done(payload, request.status);
+      done(payload);
     };
     request.send();
     return request;
+  }
+
+  /**
+   * Keeps Tab and Shift+Tab inside an open modal `dialog`: from its last
+   * control Tab wraps to the first, and from its first Shift+Tab wraps to
+   * the last. Call it from a keydown listener while the dialog is open.
+   */
+  export function keepTabWithin(event: KeyboardEvent, dialog: HTMLElement): void {
+    if (event.key !== "Tab" && event.keyCode !== 9) return;
+    const controls: HTMLElement[] = [];
+    each(dialog.querySelectorAll("a[href], button, input, select, textarea, [tabindex]"), (node) => {
+      const control = node as HTMLElement & { disabled?: boolean };
+      // Hidden and disabled controls take no focus.
+      if (!control.disabled && control.tabIndex >= 0 && control.offsetWidth + control.offsetHeight > 0) controls.push(control);
+    });
+    if (!controls.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    const active = document.activeElement;
+    // Leaving past the edge it is moving towards, or from outside the dialog.
+    if (!active || !dialog.contains(active) || active === (event.shiftKey ? first : last)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
   }
 
   /** Loads `url` as a whole page, as a link would. */

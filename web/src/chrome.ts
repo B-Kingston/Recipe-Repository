@@ -122,10 +122,13 @@ namespace Recipes {
     if (key === "Escape" || key === "Esc" || event.keyCode === 27) { event.preventDefault(); closeViewer(); }
     else if (key === "ArrowLeft" || event.keyCode === 37) { event.preventDefault(); show(index - 1); }
     else if (key === "ArrowRight" || event.keyCode === 39) { event.preventDefault(); show(index + 1); }
+    else keepTabWithin(event, viewer.root);
   });
 
-  // A whole-page swap closes the viewer; a poll refreshing one panel does not.
+  // A whole-page swap closes the viewer; a poll refreshing one panel does not,
+  // nor does a poll whose swap pages.ts held back (data-swap-when-gone, whose
+  // listener runs first because pages.ts loads before this file).
   document.addEventListener("htmx:beforeSwap", ((event: HtmxEvent) => {
-    if (event.detail.target === document.body) closeViewer();
+    if (event.detail.shouldSwap && event.detail.target === document.body) closeViewer();
   }) as EventListener);
 }

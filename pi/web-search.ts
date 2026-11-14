@@ -44,11 +44,15 @@ function text(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** Plain text from a snippet that may carry markup (Brave bolds matches). */
+const ENTITIES: Record<string, string> = { amp: "&", quot: "\"", "#39": "'", lt: "<", gt: ">" };
+
+/** Plain text from a snippet that may carry markup (Brave bolds matches).
+ * Tags go first, then entities in one pass, so "&amp;lt;" stays "&lt;" and an
+ * escaped "&lt;b&gt;" stays the text "<b>". */
 function plain(value: string): string {
   return value
     .replace(/<[^>]*>/g, "")
-    .replace(/&amp;/g, "&").replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&(amp|quot|#39|lt|gt);/g, (_entity, name: string) => ENTITIES[name])
     .replace(/\s+/g, " ")
     .trim();
 }

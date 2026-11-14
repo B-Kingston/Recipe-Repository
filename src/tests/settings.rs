@@ -494,6 +494,13 @@ async fn adding_a_provider_rejects_unknown_choices_missing_keys_and_bad_urls() {
         endpoint_form("custom-anthropic", "", "sk-test", ""),
         endpoint_form("custom-anthropic", "api.example.com/v1", "sk-test", ""),
         endpoint_form("custom-anthropic", "https://api.example.com", "", ""),
+        // No host, or a scheme other than http(s).
+        endpoint_form("custom-openai", "http://", "", ""),
+        endpoint_form("custom-openai", "ftp://files.example.com", "", ""),
+        // A key goes into a header: printable ASCII without spaces.
+        endpoint_form("openai", "", "sk two words", ""),
+        endpoint_form("anthropic", "", "sk-ant\u{7}bell", ""),
+        endpoint_form("custom-openai", "http://ollama:11434/v1", "key\u{e9}", ""),
     ];
     for form in cases {
         let result = add_from_form(&state, form).await;
@@ -504,12 +511,91 @@ async fn adding_a_provider_rejects_unknown_choices_missing_keys_and_bad_urls() {
 }
 
 #[test]
-fn only_native_specs_keep_grounded_search() {
+fn only_the_native_apis_keep_grounded_search() {
     use crate::ai::{SearchMode, endpoint_search_mode};
-    assert!(endpoint_search_mode("openai", SearchMode::Grounded) == SearchMode::Grounded);
-    assert!(endpoint_search_mode("anthropic", SearchMode::Grounded) == SearchMode::Grounded);
-    assert!(endpoint_search_mode("google", SearchMode::Grounded) == SearchMode::Off);
-    assert!(endpoint_search_mode("openai-compatible", SearchMode::GapFill) == SearchMode::GapFill);
+    let openai = "https://api.openai.com/v1";
+    let anthropic = "https://api.anthropic.com";
+    assert!(endpoint_search_mode("openai", openai, SearchMode::Grounded) == SearchMode::Grounded);
+    assert!(
+        endpoint_search_mode("anthropic", anthropic, SearchMode::Grounded) == SearchMode::Grounded
+    );
+    assert!(
+        endpoint_search_mode(
+            "anthropic",
+            "https://api.anthropic.com/",
+            SearchMode::Grounded
+        ) == SearchMode::Grounded
+    );
+    assert!(endpoint_search_mode("google", "", SearchMode::Grounded) == SearchMode::Off);
+    // Without a search tool, video evidence is read without searching.
+    assert!(
+        endpoint_search_mode(
+            "openai-compatible",
+            "http://ollama:11434/v1",
+            SearchMode::GapFill
+        ) == SearchMode::Off
+    );
+    assert!(endpoint_search_mode("openai", openai, SearchMode::GapFill) == SearchMode::GapFill);
+    // An Anthropic-compatible server elsewhere may not run Anthropic's search
+    // tool, so a grounded request writes without research instead of failing.
+    let elsewhere = "https://api.example.com/anthropic";
+    assert!(endpoint_search_mode("anthropic", elsewhere, SearchMode::Grounded) == SearchMode::Off);
+    assert!(
+        endpoint_search_mode(
+            "openai",
+            "https://proxy.example.com/v1",
+            SearchMode::Grounded
+        ) == SearchMode::Off
+    );
+}
+
+#[tokio::test]
+async fn a_custom_anthropic_server_is_listed_without_web_research() {
+    let db = database().await;
+    let state = state(db.clone());
+    add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
+    add_from_form(&state, endpoint_form("anthropic", "", "sk-ant-native", ""))
+        .await
+        .unwrap();
+    let body = settings_body(&state, "u1").await;
+    assert!(!body.contains("written without web research"), "{body}");
+    add_from_form(
+        &state,
+        endpoint_form(
+            "custom-anthropic",
+            "https://api.example.com/anthropic",
+            "sk-x",
+            "",
+        ),
+    )
+    .await
+    .unwrap();
+    let body = settings_body(&state, "u1").await;
+    assert_eq!(
+        body.matches("written without web research").count(),
+        1,
+        "{body}"
+    );
+}
+
+#[test]
+fn starting_a_codex_sign_in_drops_flows_that_expired() {
+    let flows = Mutex::new(HashMap::new());
+    let now = chrono::Utc::now().timestamp();
+    let flow = |user_id: &str, expires_at: i64| crate::CodexFlow {
+        user_id: user_id.into(),
+        device_auth_id: "device".into(),
+        user_code: "CODE-1234".into(),
+        expires_at,
+    };
+    flows.lock().insert("stale".into(), flow("u1", now - 1));
+    flows.lock().insert("live".into(), flow("u2", now + 600));
+    let id = crate::remember_codex_flow(&flows, flow("u1", now + 900));
+    let flows = flows.lock();
+    assert!(!flows.contains_key("stale"));
+    assert!(flows.contains_key("live"));
+    assert_eq!(flows[&id].user_id, "u1");
+    assert_eq!(flows.len(), 2);
 }
 
 #[tokio::test]
@@ -735,6 +821,18 @@ async fn claude_provider_requires_a_claude_credential() {
         .unwrap();
     let result = save(&state, claude_form("claude-sonnet-5-5")).await;
     assert!(matches!(result, Err(AppError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn any_stored_subscription_credential_can_be_selected_as_generation_would_use_it() {
+    let db = database().await;
+    let state = state(db.clone());
+    let credential = serde_json::json!({"type":"api_key","key":"sk-ant-api-key"});
+    store_pi_credential(&db, "u1", CLAUDE_PI_PROVIDER, &credential)
+        .await
+        .unwrap();
+    save(&state, claude_form("")).await.unwrap();
+    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "claude");
 }
 
 #[tokio::test]

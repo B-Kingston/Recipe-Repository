@@ -23,7 +23,13 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
@@ -322,9 +328,6 @@ pub(crate) const CUISINE_MARGIN: f32 = 0.010;
 const CLOSEST_EXAMPLES: usize = 2;
 /// The top ticket of a folder stack lists this many dishes.
 pub(crate) const STACK_TITLES: usize = 4;
-/// Startup warm-up: the sidecar may still be downloading its model.
-const WARM_ATTEMPTS: u32 = 60;
-const WARM_RETRY: Duration = Duration::from_secs(30);
 
 /// The library's two folder views.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,8 +366,19 @@ impl Shelf {
         if slug == UNSORTED.slug {
             return Some(&UNSORTED);
         }
-        self.folders()
-            .into_iter()
+        self.pinnable(slug)
+    }
+
+    /// The folder with this slug that a recipe can be filed and pinned in:
+    /// any of `folders`, never Not sorted yet.
+    pub(crate) fn pinnable(self, slug: &str) -> Option<&'static Folder> {
+        let (folders, other) = match self {
+            Shelf::Dishes => (DISH_FOLDERS, None),
+            Shelf::Cuisines => (CUISINES, Some(&OTHER_CUISINE)),
+        };
+        folders
+            .iter()
+            .chain(other)
             .find(|folder| folder.slug == slug)
     }
 }
@@ -426,11 +440,12 @@ const QUERY_TAILS: &[&str] = &["food", "cuisine", "recipe", "dish", "meal"];
 /// and each part of its name ("Beef, pork & lamb" answers "pork").
 pub(crate) fn match_query(query: &str) -> Option<(Shelf, &'static Folder)> {
     let mut words = crate::search::tokens(query);
-    while words.len() > 1
-        && words
-            .last()
-            .is_some_and(|word| QUERY_TAILS.contains(&word.as_str()))
-    {
+    let tail = |word: &String| {
+        QUERY_TAILS
+            .iter()
+            .any(|tail| crate::search::tokens(tail) == [word.as_str()])
+    };
+    while words.len() > 1 && words.last().is_some_and(tail) {
         words.pop();
     }
     let wanted = words.join(" ");
@@ -466,6 +481,8 @@ pub(crate) struct Prototypes {
 }
 
 static PROTOTYPES: OnceCell<Prototypes> = OnceCell::const_new();
+/// Set while a background task embeds the prototypes for a page.
+static WARMING: AtomicBool = AtomicBool::new(false);
 
 /// The texts embedded for the prototypes, as retrieval queries.
 fn prototype_texts() -> (Vec<String>, Vec<String>) {
@@ -516,23 +533,29 @@ async fn prototypes(embedder: &Embedder) -> std::result::Result<&'static Prototy
         .await
 }
 
-/// Startup task: embeds the prototypes, retrying every 30 s while the
-/// sidecar loads, so the first Folders view does not wait for them.
-pub(crate) async fn warm(state: Arc<AppState>) {
-    let Some(embedder) = state.embedder.clone() else {
-        return;
-    };
-    for attempt in 1..=WARM_ATTEMPTS {
-        match prototypes(&embedder).await {
-            Ok(_) => return,
-            Err(error) => {
-                warn!(attempt, %error, "Library folder prototypes failed");
-                if attempt < WARM_ATTEMPTS {
-                    tokio::time::sleep(WARM_RETRY).await;
-                }
-            }
-        }
+/// Embeds the prototypes unless they are ready (the startup task runs it
+/// once the sidecar answers); a failure is left for a page to retry.
+pub(crate) async fn warm(embedder: &Embedder) {
+    if let Err(error) = prototypes(embedder).await {
+        warn!(%error, "Library folder prototypes failed");
     }
+}
+
+/// The prototypes once embedded. A page never waits for them: until they
+/// are ready it starts one background task to embed them, which a closed
+/// page cannot cancel halfway, and files recipes by their pins alone.
+fn ready_prototypes(embedder: &Embedder) -> Option<&'static Prototypes> {
+    if let Some(prototypes) = PROTOTYPES.get() {
+        return Some(prototypes);
+    }
+    if !WARMING.swap(true, Ordering::AcqRel) {
+        let embedder = embedder.clone();
+        tokio::spawn(async move {
+            warm(&embedder).await;
+            WARMING.store(false, Ordering::Release);
+        });
+    }
+    None
 }
 
 /// Index of the dish folder a recipe vector belongs in: the folder whose
@@ -586,11 +609,7 @@ pub(crate) fn file_recipe(
     vector: Option<&[f32]>,
     prototypes: Option<&Prototypes>,
 ) -> &'static str {
-    if let Some(folder) = shelf
-        .folders()
-        .into_iter()
-        .find(|folder| folder.slug == pinned)
-    {
+    if let Some(folder) = shelf.pinnable(pinned) {
         return folder.slug;
     }
     automatic(shelf, vector, prototypes).map_or(UNSORTED.slug, |folder| folder.slug)
@@ -614,8 +633,8 @@ fn automatic(
 
 /// Vectors and prototypes for filing a user's library: brings the search
 /// index up to date first (like a search), and quietly gives up on any
-/// embedding failure, which leaves recipes unsorted rather than failing
-/// the page.
+/// embedding failure or prototypes not ready yet, which leaves recipes
+/// unsorted rather than failing or holding up the page.
 async fn embedding_inputs(
     state: &AppState,
     user_id: &str,
@@ -626,13 +645,7 @@ async fn embedding_inputs(
     if let Err(error) = crate::search::refresh_user(state, embedder, user_id).await {
         warn!(%error, "Library folders could not refresh the search index");
     }
-    let prototypes = match prototypes(embedder).await {
-        Ok(prototypes) => Some(prototypes),
-        Err(error) => {
-            warn!(%error, "Library folder prototypes failed");
-            None
-        }
-    };
+    let prototypes = ready_prototypes(embedder);
     let vectors = recipes::indexed_recipes(&state.db, user_id)
         .await?
         .into_iter()
@@ -693,8 +706,7 @@ pub(crate) fn stacks(
     cards: &[LibraryCard],
 ) -> Vec<Stack> {
     let mut sorted: Vec<&LibraryCard> = cards.iter().collect();
-    sorted
-        .sort_by_cached_key(|card| (recipes::file_letter(&card.title), card.title.to_lowercase()));
+    sorted.sort_by_cached_key(|card| recipes::a_to_z_key(&card.title));
     shelf
         .folders()
         .into_iter()
@@ -721,6 +733,7 @@ pub(crate) struct OpenFolder {
     /// "Folders" or "Cuisines".
     pub(crate) shelf: &'static str,
     pub(crate) name: &'static str,
+    pub(crate) slug: &'static str,
 }
 
 impl OpenFolder {
@@ -728,6 +741,7 @@ impl OpenFolder {
         Self {
             shelf: shelf.label(),
             name: folder.name,
+            slug: folder.slug,
         }
     }
 }
@@ -749,14 +763,11 @@ pub(crate) struct FilingChoice {
 
 impl FilingChoice {
     fn new(shelf: Shelf, pinned: &str, automatic: Option<&'static Folder>) -> Self {
-        let folders = shelf.folders();
         Self {
-            pinned: folders
-                .iter()
-                .find(|folder| folder.slug == pinned)
-                .map_or("", |folder| folder.slug),
+            pinned: shelf.pinnable(pinned).map_or("", |folder| folder.slug),
             automatic: automatic.map_or("", |folder| folder.name),
-            options: folders
+            options: shelf
+                .folders()
                 .into_iter()
                 .map(|folder| FilingOption {
                     slug: folder.slug,
@@ -835,18 +846,10 @@ pub(crate) async fn update_filing(
 ) -> Result<Response> {
     let folder = form.folder.trim();
     let cuisine = form.cuisine.trim();
-    if !folder.is_empty()
-        && Shelf::Dishes
-            .folder(folder)
-            .is_none_or(|f| f.slug == UNSORTED.slug)
-    {
+    if !folder.is_empty() && Shelf::Dishes.pinnable(folder).is_none() {
         return Err(AppError::BadRequest("Unknown folder.".into()));
     }
-    if !cuisine.is_empty()
-        && Shelf::Cuisines
-            .folder(cuisine)
-            .is_none_or(|f| f.slug == UNSORTED.slug)
-    {
+    if !cuisine.is_empty() && Shelf::Cuisines.pinnable(cuisine).is_none() {
         return Err(AppError::BadRequest("Unknown cuisine.".into()));
     }
     recipes::set_recipe_pin(&state.db, &user.id, &id, folder, cuisine).await?;

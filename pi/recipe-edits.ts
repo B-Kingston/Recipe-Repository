@@ -7,7 +7,7 @@
  * keep the stored ingredient and step rows the proposal leaves in place.
  */
 import { Type } from "@earendil-works/pi-ai";
-import type { Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { ImageContent, Tool, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 
 export interface ProposedIngredient {
   from: number | null;
@@ -144,7 +144,7 @@ function text(value: unknown): string {
 
 /** A whole number the model sent, as a number or as a numeric string
  * ("2"), which some tool-calling servers send. */
-function whole(value: unknown): number | null {
+export function whole(value: unknown): number | null {
   const number = typeof value === "string" && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
   return typeof number === "number" && Number.isInteger(number) ? number : null;
 }
@@ -179,7 +179,9 @@ export function recipeDraft(value: unknown): RecipeProposal | null {
     steps: list(raw.steps).map((step, index) => ({
       from: index,
       text: text(step.text),
-      ingredients: (Array.isArray(step.ingredients) ? step.ingredients : []).map(text).filter((line) => line.trim()),
+      // Trimmed as the edit tools trim them, so sending a step's lines back
+      // unchanged is not a change.
+      ingredients: lines(step.ingredients) ?? [],
     })),
   };
 }
@@ -260,17 +262,22 @@ function moveItem<T>(items: T[], from: number, to: number): void {
   items.splice(to, 0, item);
 }
 
-/** Runs one edit tool against the working copy. A bad number or empty text
- * is an error result naming what to fix; the copy is left as it was. */
-export function runEditTool(draft: RecipeProposal, call: ToolCall): ToolResultMessage {
-  const result = (output: string, isError = false): ToolResultMessage => ({
+/** A tool call's result: its text, and an image after it when there is one. */
+export function toolResult(call: ToolCall, output: string, isError = false, image?: ImageContent): ToolResultMessage {
+  return {
     role: "toolResult",
     toolCallId: call.id,
     toolName: call.name,
-    content: [{ type: "text", text: output }],
+    content: image ? [{ type: "text", text: output }, image] : [{ type: "text", text: output }],
     isError,
     timestamp: Date.now(),
-  });
+  };
+}
+
+/** Runs one edit tool against the working copy. A bad number or empty text
+ * is an error result naming what to fix; the copy is left as it was. */
+export function runEditTool(draft: RecipeProposal, call: ToolCall): ToolResultMessage {
+  const result = (output: string, isError = false): ToolResultMessage => toolResult(call, output, isError);
   const args = call.arguments as Record<string, unknown>;
   const noIngredient = () => result(`There is no ingredient ${String(args.ingredient)}. ${ingredientList(draft)}`, true);
   const noStep = () => result(`There is no step ${String(args.step)}. ${stepList(draft)}`, true);
@@ -312,12 +319,16 @@ export function runEditTool(draft: RecipeProposal, call: ToolCall): ToolResultMe
       const ingredient = draft.ingredients[at];
       const name = optionalText(args.name);
       if (name === "") return result("The ingredient name cannot be empty.", true);
-      if (name !== undefined) ingredient.name = name;
       const quantity = optionalText(args.quantity);
-      if (quantity !== undefined) ingredient.quantity = quantity;
       const unit = optionalText(args.unit);
+      const optional = typeof args.optional === "boolean" ? args.optional : undefined;
+      if (name === undefined && quantity === undefined && unit === undefined && optional === undefined) {
+        return result("Nothing to change: give the name, quantity, unit, or whether it is optional.", true);
+      }
+      if (name !== undefined) ingredient.name = name;
+      if (quantity !== undefined) ingredient.quantity = quantity;
       if (unit !== undefined) ingredient.unit = unit;
-      if (typeof args.optional === "boolean") ingredient.optional = args.optional;
+      if (optional !== undefined) ingredient.optional = optional;
       return result(`Ingredient ${at + 1} is now: ${ingredientLine(ingredient)}.`);
     }
     case "remove_ingredient": {

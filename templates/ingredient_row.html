@@ -1,0 +1,3 @@
+{# One ingredient as read, not edited, on the draft and version pages.
+   Reads `ingredient` (quantity, unit, name, optional). #}
+<li class="ingredient-row"><span class="ingredient-qty">{{ ingredient.quantity }}{% if ingredient.unit != "" %} {{ ingredient.unit }}{% endif %}</span><span class="block-text">{{ ingredient.name }}{% if ingredient.optional %} <em>(optional)</em>{% endif %}</span></li>

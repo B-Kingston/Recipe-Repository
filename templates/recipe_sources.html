@@ -1,0 +1,12 @@
+{# The sources pill and its popover, on the recipe and draft pages. Reads
+   `sources` (each with a url and a title). #}
+{% if sources.len() > 0 %}
+<details class="source-disclosure">
+  <summary>{{ sources.len() }} source{% if sources.len() != 1 %}s{% endif %}</summary>
+  <ol class="source-popover">
+    {% for source in sources %}
+    <li><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{% if source.title != "" %}{{ source.title }}{% else %}{{ source.url }}{% endif %}</a></li>
+    {% endfor %}
+  </ol>
+</details>
+{% endif %}

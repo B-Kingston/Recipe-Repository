@@ -5,8 +5,8 @@ use crate::chat::{
 };
 use crate::htmx::Flash;
 use crate::recipes::{
-    ChatMessage, ProposalRow, chat_thread, fail_interrupted_chats, finish_chat_answer, recipe_page,
-    recipe_snapshot, start_chat_turn,
+    AnswerProposal, ChatMessage, ProposalRow, chat_thread, fail_interrupted_chats,
+    finish_chat_answer, recipe_page, recipe_snapshot, start_chat_turn,
 };
 use crate::{
     AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, ChatProposal, ProposedIngredient,
@@ -126,6 +126,7 @@ fn snapshot() -> RecipeSnapshot {
     RecipeSnapshot {
         schema_version: 1,
         title: "Shakshuka".into(),
+        plate_name: Some(String::new()),
         description: "Eggs in sauce".into(),
         servings: Some(4),
         prep_minutes: Some(10),
@@ -232,26 +233,28 @@ async fn seed_proposal(
         .unwrap();
     let answer = start_chat_turn(db, "u1", "r", "Make it vegan")
         .await
+        .unwrap()
         .unwrap();
     let json = serde_json::to_string(&ChatProposal {
         after: after(&before),
         before,
     })
     .unwrap();
-    assert!(
-        finish_chat_answer(
-            db,
-            &answer,
-            "Swapped the eggs for tofu.",
-            Some(ProposalRow {
-                label,
-                json: &json,
-                base: &base
-            })
-        )
-        .await
-        .unwrap()
-    );
+    finish_chat_answer(
+        db,
+        "u1",
+        "r",
+        &answer,
+        "Swapped the eggs for tofu.",
+        AnswerProposal::Ready(ProposalRow {
+            label,
+            json: &json,
+            base: &base,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(change_state(db, &answer).await, "ready");
     answer
 }
 
@@ -325,7 +328,10 @@ async fn asking_without_an_ai_login_stores_the_question_and_points_to_settings()
 async fn a_second_question_waits_for_the_running_answer() {
     let db = database().await;
     let s = state(db.clone());
-    start_chat_turn(&db, "u1", "r", "First?").await.unwrap();
+    start_chat_turn(&db, "u1", "r", "First?")
+        .await
+        .unwrap()
+        .unwrap();
     let response = ask(
         State(s.clone()),
         user("u1"),
@@ -340,11 +346,24 @@ async fn a_second_question_waits_for_the_running_answer() {
 }
 
 #[tokio::test]
+async fn two_questions_sent_at_once_start_one_answer() {
+    let db = database().await;
+    let (first, second) = tokio::join!(
+        start_chat_turn(&db, "u1", "r", "First?"),
+        start_chat_turn(&db, "u1", "r", "Second?"),
+    );
+    let started = [first.unwrap(), second.unwrap()];
+    assert_eq!(started.iter().flatten().count(), 1, "{started:?}");
+    assert_eq!(thread_rows(&db, "u1", "r").await.len(), 2);
+}
+
+#[tokio::test]
 async fn chats_are_private_to_the_account() {
     let db = database().await;
     let s = state(db.clone());
     start_chat_turn(&db, "u1", "r", "A private question")
         .await
+        .unwrap()
         .unwrap();
 
     // Another account can neither ask about, open, nor clear u1's recipe chat.
@@ -474,6 +493,7 @@ async fn accepting_a_proposal_applies_it_in_place_and_marks_the_thread() {
     let answer = seed_proposal(&db, "Made vegan", vegan).await;
     start_chat_turn(&db, "u1", "r", "Later question")
         .await
+        .unwrap()
         .unwrap();
 
     let response = accept_change(
@@ -783,29 +803,25 @@ async fn a_ready_proposal_lists_its_changes_under_accept_and_deny() {
 async fn a_running_answer_polls_and_disables_the_question_box() {
     let db = database().await;
     let s = state(db.clone());
-    let answer = start_chat_turn(&db, "u1", "r", "How thick?").await.unwrap();
+    let answer = start_chat_turn(&db, "u1", "r", "How thick?")
+        .await
+        .unwrap()
+        .unwrap();
     toggle_drawer(State(s.clone()), user("u1"), Path("r".into()), drawer("on"))
         .await
         .unwrap();
     let html = page(&s, "u1", "r").await;
-    assert!(html.contains(&format!("data-chat-state=\"{answer}:pending\"")));
+    assert!(html.contains(&format!("data-chat-state=\"{answer}\"")));
     assert!(html.contains("Thinking…"));
     assert!(html.contains("data-chat-question disabled"));
 }
 
 #[tokio::test]
-async fn interrupted_answers_and_drafts_fail_at_startup() {
+async fn interrupted_answers_fail_at_startup() {
     let db = database().await;
     let pending = start_chat_turn(&db, "u1", "r", "Still there?")
         .await
-        .unwrap();
-    let drafting = start_chat_turn(&db, "u1", "r", "Make it vegan")
-        .await
-        .unwrap();
-    sqlx::query("UPDATE recipe_chat_messages SET status='done',change_state='drafting' WHERE id=?")
-        .bind(&drafting)
-        .execute(&db)
-        .await
+        .unwrap()
         .unwrap();
     fail_interrupted_chats(&db).await.unwrap();
     let rows: Vec<(String, String, String)> =
@@ -813,8 +829,7 @@ async fn interrupted_answers_and_drafts_fail_at_startup() {
             .fetch_all(&db)
             .await
             .unwrap();
-    assert_eq!(rows[0], (pending, "failed".into(), String::new()));
-    assert_eq!(rows[1], (drafting, "done".into(), "failed".into()));
+    assert_eq!(rows, [(pending, "failed".into(), String::new())]);
 }
 
 #[test]
@@ -833,14 +848,13 @@ fn the_prompt_carries_the_recipe_history_dividers_and_latest_question() {
         row("6", "user", "How long now?", "done"),
         row("7", "assistant", "", "pending"),
     ];
-    let (prompt, question) = chat_prompt(
+    let prompt = chat_prompt(
         "{\"title\":\"Shakshuka\"}",
         "The cook has kept 2 notes on this recipe.",
         &thread,
         "7",
     )
     .unwrap();
-    assert_eq!(question, "How long now?");
     assert!(prompt.starts_with(
         "Current recipe JSON:\n{\"title\":\"Shakshuka\"}\n\nThe cook has kept 2 notes on this recipe.\n\n"
     ));
@@ -1356,7 +1370,10 @@ async fn an_answer_landing_after_an_accept_shows_its_proposal_as_stale() {
         .fetch_one(&db)
         .await
         .unwrap();
-    let second = start_chat_turn(&db, "u1", "r", "Serve 8").await.unwrap();
+    let second = start_chat_turn(&db, "u1", "r", "Serve 8")
+        .await
+        .unwrap()
+        .unwrap();
     let response = accept_change(
         State(s.clone()),
         user("u1"),
@@ -1376,20 +1393,20 @@ async fn an_answer_landing_after_an_accept_shows_its_proposal_as_stale() {
         after: serves_8,
     })
     .unwrap();
-    assert!(
-        finish_chat_answer(
-            &db,
-            &second,
-            "Serves 8 now.",
-            Some(ProposalRow {
-                label: "Serves 8",
-                json: &json,
-                base: &base_before,
-            }),
-        )
-        .await
-        .unwrap()
-    );
+    finish_chat_answer(
+        &db,
+        "u1",
+        "r",
+        &second,
+        "Serves 8 now.",
+        AnswerProposal::Ready(ProposalRow {
+            label: "Serves 8",
+            json: &json,
+            base: &base_before,
+        }),
+    )
+    .await
+    .unwrap();
     toggle_drawer(State(s.clone()), user("u1"), Path("r".into()), drawer("on"))
         .await
         .unwrap();
@@ -1417,6 +1434,7 @@ async fn a_thread_cleared_while_the_model_runs_drops_the_late_answer() {
     let db = database().await;
     let answer = start_chat_turn(&db, "u1", "r", "Make it vegan")
         .await
+        .unwrap()
         .unwrap();
     clear_chat(&db, "u1", "r").await.unwrap();
     let json = serde_json::to_string(&ChatProposal {
@@ -1424,11 +1442,13 @@ async fn a_thread_cleared_while_the_model_runs_drops_the_late_answer() {
         after: proposal_over(&snapshot()),
     })
     .unwrap();
-    let stored = finish_chat_answer(
+    finish_chat_answer(
         &db,
+        "u1",
+        "r",
         &answer,
         "Done.",
-        Some(ProposalRow {
+        AnswerProposal::Ready(ProposalRow {
             label: "Made vegan",
             json: &json,
             base: "x",
@@ -1436,8 +1456,35 @@ async fn a_thread_cleared_while_the_model_runs_drops_the_late_answer() {
     )
     .await
     .unwrap();
-    assert!(!stored);
     assert!(thread_rows(&db, "u1", "r").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_proposal_says_the_change_was_not_made() {
+    let db = database().await;
+    let s = state(db.clone());
+    let answer = start_chat_turn(&db, "u1", "r", "Make it vegan")
+        .await
+        .unwrap()
+        .unwrap();
+    finish_chat_answer(
+        &db,
+        "u1",
+        "r",
+        &answer,
+        "Swapped the eggs for tofu.",
+        AnswerProposal::Refused,
+    )
+    .await
+    .unwrap();
+    assert_eq!(change_state(&db, &answer).await, "failed");
+    toggle_drawer(State(s.clone()), user("u1"), Path("r".into()), drawer("on"))
+        .await
+        .unwrap();
+    let html = page(&s, "u1", "r").await;
+    assert!(html.contains("Swapped the eggs for tofu."));
+    assert!(html.contains("This change was not made."), "{html}");
+    assert!(!html.contains(&format!("/chat/{answer}/accept")));
 }
 
 #[tokio::test]
@@ -1665,6 +1712,7 @@ async fn a_ready_row_from_before_proposals_renders_and_cannot_be_accepted() {
     // added proposal_json empty for those rows.
     let answer = start_chat_turn(&db, "u1", "r", "Make it vegan")
         .await
+        .unwrap()
         .unwrap();
     sqlx::query("UPDATE recipe_chat_messages SET status='done',content='I will make it vegan.',change_state='ready' WHERE id=?")
         .bind(&answer)
@@ -1694,6 +1742,7 @@ async fn a_ready_row_from_before_proposals_can_be_dismissed() {
     let s = state(db.clone());
     let answer = start_chat_turn(&db, "u1", "r", "Make it vegan")
         .await
+        .unwrap()
         .unwrap();
     sqlx::query("UPDATE recipe_chat_messages SET status='done',content='OK',change_state='ready' WHERE id=?")
         .bind(&answer)
@@ -1743,7 +1792,7 @@ fn the_prompt_says_which_earlier_proposals_were_not_saved() {
         row("5", "user", "Now scale it to 6", "done"),
         row("6", "assistant", "", "pending"),
     ];
-    let (prompt, _) = chat_prompt("{}", "", &thread, "6").unwrap();
+    let prompt = chat_prompt("{}", "", &thread, "6").unwrap();
     assert!(
         prompt.contains("not saved") || prompt.contains("denied"),
         "{prompt}"

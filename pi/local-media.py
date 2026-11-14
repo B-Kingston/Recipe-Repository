@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import select
 import sys
@@ -205,6 +206,8 @@ def _paddle_frame_reading(
         try:
             score = float(scores[index])
         except (IndexError, TypeError, ValueError):
+            score = 0.0
+        if not math.isfinite(score):  # NaN passes every comparison below
             score = 0.0
         if score < score_threshold or not _text_matches_language(text, lang):
             continue
@@ -612,8 +615,23 @@ def serve(channel: IO[str]) -> None:
         except Exception as error:  # a bad request must not take the worker down
             _log(f"request failed: {error}")
             response = {"id": request_id, "ok": False, "error": str(error) or type(error).__name__}
-        channel.write(json.dumps(response, ensure_ascii=False) + "\n")
+        channel.write(_response_line(response))
         channel.flush()
+
+
+def _response_line(response: dict[str, object]) -> str:
+    """One response line the Rust client can read. A result that is not
+    strict UTF-8 JSON (a NaN, a lone surrogate) becomes an error response
+    rather than an unreadable line, which would cost the worker."""
+    try:
+        line = json.dumps(response, ensure_ascii=False, allow_nan=False)
+        line.encode("utf-8")
+    except ValueError as error:  # UnicodeEncodeError is a ValueError too
+        _log(f"response could not be encoded: {error}")
+        line = json.dumps(
+            {"id": response.get("id"), "ok": False, "error": f"the response could not be encoded: {error}"}
+        )
+    return line + "\n"
 
 
 def main() -> None:

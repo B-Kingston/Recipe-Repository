@@ -12,6 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 use std::env;
 use std::time::Duration;
+use tracing::warn;
 
 /// Native EmbeddingGemma 2 output size.
 pub(crate) const DIMENSIONS: usize = 768;
@@ -21,7 +22,16 @@ pub(crate) const QUERY_PREFIX: &str = "task: search result | query: ";
 /// Inputs per HTTP request. The server embeds them one after another, so this
 /// only bounds each request's duration and body size.
 const REQUEST_BATCH: usize = 16;
+/// Per request of the media pipeline and background work: an import's
+/// frames and audio windows take minutes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per request of a page (search, library folders). The sidecar serves one
+/// request at a time, so a page stuck behind an import gives up and falls
+/// back (word search, "Not sorted yet") instead of hanging.
+const INTERACTIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// At startup the sidecar may still be downloading its model.
+const STARTUP_ATTEMPTS: u32 = 60;
+const STARTUP_RETRY: Duration = Duration::from_secs(30);
 
 /// Formats a retrieval document the way EmbeddingGemma 2 was trained.
 pub(crate) fn document(title: &str, body: &str) -> String {
@@ -65,6 +75,7 @@ impl Input {
 pub(crate) struct Embedder {
     client: reqwest::Client,
     endpoint: String,
+    timeout: Duration,
 }
 
 impl Embedder {
@@ -78,14 +89,41 @@ impl Embedder {
     }
 
     pub(crate) fn new(base_url: &str) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .unwrap_or_default();
         Self {
-            client,
+            client: reqwest::Client::new(),
             endpoint: format!("{}/v1/embeddings", base_url.trim_end_matches('/')),
+            timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// The same sidecar with another per-request timeout.
+    pub(crate) fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..self.clone()
+        }
+    }
+
+    /// A handle for page requests, which give up after `INTERACTIVE_TIMEOUT`.
+    pub(crate) fn interactive(&self) -> Self {
+        self.with_timeout(INTERACTIVE_TIMEOUT)
+    }
+
+    /// Waits until the sidecar embeds a probe text, retrying every 30 s for
+    /// up to half an hour; false when it never does.
+    pub(crate) async fn wait_until_ready(&self) -> bool {
+        for attempt in 1..=STARTUP_ATTEMPTS {
+            match self.embed(&[Input::Text(query("ready"))]).await {
+                Ok(_) => return true,
+                Err(error) => {
+                    warn!(attempt, %error, "Embedding service is not ready");
+                    if attempt < STARTUP_ATTEMPTS {
+                        tokio::time::sleep(STARTUP_RETRY).await;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Embeds every input, in order, as unit-length vectors.
@@ -105,6 +143,7 @@ impl Embedder {
         let response = self
             .client
             .post(&self.endpoint)
+            .timeout(self.timeout)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string())
             .send()
@@ -175,10 +214,16 @@ fn parse_response(bytes: &[u8], expected: usize) -> Result<Vec<Vec<f32>>, String
         })
         .collect();
     rows.sort_by_key(|(index, _)| *index);
-    if rows.len() != expected || rows.iter().any(|(_, v)| v.len() != DIMENSIONS) {
+    if rows.len() != expected {
         return Err(format!(
             "embedding service returned {} vectors for {expected} inputs",
             rows.len()
+        ));
+    }
+    if let Some((_, vector)) = rows.iter().find(|(_, v)| v.len() != DIMENSIONS) {
+        return Err(format!(
+            "embedding service returned {}-dimensional vectors, expected {DIMENSIONS}",
+            vector.len()
         ));
     }
     Ok(rows

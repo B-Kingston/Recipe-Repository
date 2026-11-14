@@ -1,9 +1,9 @@
 use askama::Template;
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Form, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
-    middleware,
+    extract::{DefaultBodyLimit, Form, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -11,6 +11,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
     FromRow, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -18,9 +19,8 @@ use sqlx::{
 use std::{
     collections::{HashMap, HashSet},
     env,
-    io::{Read, Write},
+    io::Read,
     net::SocketAddr,
-    process::Stdio,
     str::FromStr,
     sync::Arc,
 };
@@ -44,6 +44,7 @@ mod notes;
 mod recipes;
 mod scale;
 mod search;
+mod settings;
 mod thumbs;
 use auth::{
     AuthUser, auth_middleware, create_account, delete_account, delete_account_page, login,
@@ -54,7 +55,7 @@ use auth::{
 use ai::{
     DebugRunMap, ModelSource, alter_draft, apply_draft, cached_model_catalogue, cancel_draft,
     discover_models, draft_page, draft_still, draft_thumbnail, forget_model_catalogue,
-    generate_page, generate_recipe, import_events, import_frame, import_page, import_run_page,
+    generate_page, generate_recipe, import_events, import_frame, import_run_page,
     media_debug_frame, media_debug_page, media_debug_run_page, media_debug_start,
 };
 use htmx::{Flash, flash_redirect};
@@ -65,6 +66,9 @@ use recipes::{
     recipe_thumbnail, remove_thumbnail, restore_version, start_moment_capture,
     start_thumbnail_recompute, update_block, update_recipe, upload_thumbnail, view_version,
 };
+// The settings, credential, endpoint, and search-key accessors keep their
+// crate-root names.
+pub(crate) use settings::*;
 
 const DRAFT_HOURS: i64 = 24;
 const DEFAULT_MODEL: &str = "gpt-6-luna";
@@ -99,24 +103,6 @@ const CLAUDE_MODEL_OPTIONS: &[&str] = &[
     "claude-sonnet-5",
     "claude-opus-5",
 ];
-const RECIPE_PROMPT: &str = r#"You are a recipe assistant. Prefer credible guidance and synthesize practical advice without copying source text. Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Notice when the user's request excludes an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without X" — and do not silently drop it. Judge whether the ingredient is genuinely optional; when it plays a structural role (binding, leavening, emulsifying, thickening, moisture, or browning), substitute a suitable alternative from sound cooking knowledge (such as flax or chia "eggs", aquafaba, plant milks and butters, or xanthan gum) and adjust technique so the recipe still achieves its intended result. Be concise and practical for a home cook."#;
-const GROUNDED_RECIPE_PROMPT: &str = r#"You are a meticulous recipe research assistant. Research before generating. Always use the web_search tool. When the user supplies one or more URLs, search for their published title, author, and recipe details. When the user names an existing recipe, cook, book, restaurant, or website, locate the likely original and cross-check it against at least two independent, credible sources when available.
-
-Study ingredient ratios, ingredient roles, preparation, sequencing, temperatures, timings, texture cues, and the intended final result. Recreate the referenced recipe faithfully enough to achieve that result, while resolving omissions or contradictions with sound cooking knowledge. Do not copy expressive prose, headnotes, or distinctive wording; write original, concise instructions. Preserve attribution through citations rather than imitation of the author's voice.
-
-When the user asks to exclude an ingredient — "egg free", "no dairy", "vegan", "gluten free", "without nuts", and similar — do not silently drop it. First judge whether the ingredient is genuinely optional: if it only adds flavour or is truly dispensable, omitting it is fine, but make that a conscious, reasoned decision. If it plays a structural role — binding, leavening, emulsifying, thickening, moisture, browning, or setting — research suitable replacement ingredients and techniques with web_search (for example flax or chia "eggs", aquafaba, mashed banana, plant milks and butters, nut-free butters, xanthan or psyllium gum) and adapt quantities and method so the recipe still achieves its intended result. Keep the recipe true to its original character: the substitution must preserve the outcome, not merely delete the ingredient.
-
-Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. Cite every source that materially informed the recipe."#;
-
-/// System prompt for drafts built from imported social-video evidence (the
-/// From Video importer and its alteration chain). The web_search tool is
-/// attached but optional: research exists to fill gaps the evidence leaves,
-/// so an answer drawn purely from sufficient evidence stays valid.
-const EVIDENCE_RECIPE_PROMPT: &str = r#"You are a meticulous recipe assistant working from imported social-video evidence. The evidence was distilled automatically from a social video's caption, spoken audio, and on-screen text, so it can be incomplete, garbled, or one-sided. Treat it as the best available record of the original creator's intent, not as verified fact.
-
-Build the recipe from the supplied evidence first. Where it leaves the recipe incomplete or implausible — missing quantities, servings, timings, temperatures, or steps that do not hang together — judge what the dish needs: reason from sound cooking knowledge, and use the web_search tool to study similar published recipes for the same dish when knowledge alone is not enough. Fill every such gap so the finished recipe works end to end, and keep it faithful to the ingredients, character, and method shown in the video. Do not copy expressive prose from researched sources; write original, concise instructions.
-
-Return one complete recipe, not a patch. Set plateName to the dish's everyday name in one or two words, as a cook would say it ("Roti", "Pad thai", "Banana bread"), with no adjectives, method, or brand; it is printed large on a plate, so keep it to 14 characters or fewer. Before responding, silently audit the recipe's quantities: choose amounts that are realistic for the stated servings, technique, and intended result; give ingredients useful, unambiguous kitchen measurements; and verify that each step's ingredientUses allocate the listed total of that ingredient exactly once. When an ingredient is divided between steps, use explicit portions that add up to its ingredient-list amount, using consistent units where practical. Do not invent unused ingredients or use vague quantities when a measured amount is needed for a reliable result. Every ingredient must be used exactly through one or more ingredientUses. Each step has a concise chartLabel (2–6 words), a timerSeconds value (0 when untimed; use the midpoint of a range), ingredientUses containing canonical zero-based ingredient indices plus exact amounts used at that step, and inputSteps containing only earlier step indices whose outputs are combined. Give every non-final step at most one consumer; make every step flow into the final step. Ingredient-free preparation steps are allowed. Give heating, simmering, baking, frying, resting, chilling, and reducing steps realistic duration and a clear doneness cue. Keep total timings consistent. When web_search filled a gap, list those pages in sources; when the evidence alone was sufficient, return an empty sources array."#;
 
 #[derive(Clone)]
 struct AppState {
@@ -128,8 +114,8 @@ struct AppState {
     search_grounding: bool,
     codex_flows: Arc<Mutex<HashMap<String, CodexFlow>>>,
     claude_flows: Arc<Mutex<HashMap<String, ClaudeFlow>>>,
-    /// Last discovered model catalogue per Pi provider id, so Codex and
-    /// Claude lists never overwrite each other.
+    /// Last discovered model catalogue per source: a Pi provider id for a
+    /// subscription or an endpoint id, so no two lists overwrite each other.
     model_catalogue: Arc<Mutex<HashMap<String, ModelCatalogue>>>,
     media_debug_runs: DebugRunMap,
     /// Recipe ids with a dish-photo frame run in flight; in-memory only, so
@@ -143,8 +129,8 @@ struct AppState {
     embedder: Option<embeddings::Embedder>,
 }
 
-/// Last successfully discovered model catalogue for one Pi provider; reused
-/// until stale (see MODEL_CATALOGUE_TTL in ai.rs).
+/// Last successfully discovered model catalogue for one source (a Pi provider
+/// or an endpoint); reused until stale (see MODEL_CATALOGUE_TTL in ai.rs).
 #[derive(Clone)]
 struct ModelCatalogue {
     models: Vec<String>,
@@ -212,7 +198,7 @@ enum AppError {
         "The video cleaner's AI provider is not connected. Choose one in Settings before importing a video."
     )]
     MediaCleanerNotConfigured,
-    #[error("The AI service could not prepare a grounded recipe. Please try again.")]
+    #[error("The AI service could not prepare the recipe. Please try again.")]
     Ai,
     /// The provider refused the login: an expired or revoked subscription
     /// sign-in, or a rejected API key. The text says what to fix in Settings.
@@ -233,6 +219,21 @@ enum AppError {
 const GENERIC_FAILURE: &str = "Something went wrong on our side. Please try again.";
 /// Used only if the error page itself cannot be rendered.
 const ERROR_PAGE_FALLBACK: &str = "<!doctype html><title>Recipe Repository</title><p>Something went wrong. <a href=\"/\">Back to library</a></p>";
+
+impl AppError {
+    /// What the reader is told: the error's own text, or `GENERIC_FAILURE`
+    /// for a server-side failure, whose detail belongs in the log only.
+    fn user_message(&self) -> String {
+        match self {
+            Self::Internal(_)
+            | Self::CodexAuth(_)
+            | Self::ClaudeAuth(_)
+            | Self::Database(_)
+            | Self::Template(_) => GENERIC_FAILURE.into(),
+            _ => self.to_string(),
+        }
+    }
+}
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -275,10 +276,16 @@ impl IntoResponse for AppError {
                 message.clone(),
                 true,
             ),
+            Self::CodexAuth(_) | Self::ClaudeAuth(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sign-in did not work",
+                self.to_string(),
+                true,
+            ),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong",
-                GENERIC_FAILURE.into(),
+                self.user_message(),
                 false,
             ),
         };
@@ -308,6 +315,8 @@ struct Recipe {
     updated_at: String,
     /// One or two words for the plate's well; empty shows the initial.
     plate_name: String,
+    /// The recipe has a dish photo (`thumbnail_jpeg`, never loaded here).
+    has_photo: bool,
 }
 #[derive(Debug, Clone, FromRow)]
 struct Block {
@@ -346,10 +355,12 @@ struct ViewBlock {
     shown_quantity: String,
 }
 impl ViewBlock {
-    fn from_block(b: Block, edit: Option<&str>) -> Self {
+    fn from_block(b: Block, edit: Option<&str>, scale: &scale::Scale) -> Self {
         let optional = b.optional();
         let editing = edit == Some(&b.id);
-        let shown_quantity = format!("{} {}", b.quantity, b.unit).trim().to_string();
+        let shown_quantity = format!("{} {}", scale.quantity(&b.quantity, &b.unit), b.unit)
+            .trim()
+            .to_string();
         Self {
             shown_quantity,
             id: b.id,
@@ -533,7 +544,7 @@ const RIM_TITLE_MAX: usize = 26;
 impl RecipeTemplate {
     /// What the plate's well shows when there is no dish photo: the plate
     /// name, else the title's initial.
-    fn plate_initial(&self) -> String {
+    fn plate_text(&self) -> String {
         if self.recipe.plate_name.is_empty() {
             recipes::plate_initial(&self.recipe.title)
         } else {
@@ -543,8 +554,8 @@ impl RecipeTemplate {
 
     /// The well's text size as a fraction of the initial's (CSS `em`), so the
     /// longest word of a plate name fits across the well.
-    fn plate_initial_scale(&self) -> String {
-        format!("{:.2}", recipes::plate_name_scale(&self.plate_initial()))
+    fn plate_text_scale(&self) -> String {
+        format!("{:.2}", recipes::plate_name_scale(&self.plate_text()))
     }
 
     /// The title as printed around the top of the plate rim, or empty when
@@ -599,6 +610,15 @@ struct VersionTemplate {
     /// The notes about this version.
     notes: notes::NotesPanel,
 }
+impl VersionTemplate {
+    /// The version shown is the newest, the recipe as it is now, which
+    /// cannot be deleted.
+    fn is_newest(&self) -> bool {
+        self.versions
+            .first()
+            .is_some_and(|row| row.version == self.version)
+    }
+}
 
 /// The editable recipe content captured in version history. Derived chart
 /// data and thumbnail bytes are intentionally excluded; they are not shown on
@@ -609,6 +629,11 @@ struct VersionTemplate {
 pub(crate) struct RecipeSnapshot {
     pub(crate) schema_version: u8,
     pub(crate) title: String,
+    /// The name on the plate ("" for none). None in versions stored without
+    /// the field: restoring one keeps the recipe's plate name while the title
+    /// stays the same, and clears it with another title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plate_name: Option<String>,
     pub(crate) description: String,
     pub(crate) servings: Option<i64>,
     pub(crate) prep_minutes: Option<i64>,
@@ -668,11 +693,24 @@ pub(crate) struct ProposedStep {
 }
 
 impl RecipeProposal {
+    /// Whether the proposal changes anything of `before` the cook would see.
+    /// The chat never names the plate, so the plate name does not count.
+    pub(crate) fn changes(&self, before: &RecipeSnapshot) -> bool {
+        let before = RecipeSnapshot {
+            plate_name: Some(String::new()),
+            ..before.clone()
+        };
+        self.snapshot() != before
+    }
+
     /// The proposed recipe as a snapshot, the way a saved version records it.
+    /// The chat never names the plate, so the plate name is empty (Accept
+    /// keeps the recipe's while the title stays).
     pub(crate) fn snapshot(&self) -> RecipeSnapshot {
         RecipeSnapshot {
             schema_version: 1,
             title: self.title.clone(),
+            plate_name: Some(String::new()),
             description: self.description.clone(),
             servings: self.servings,
             prep_minutes: self.prep_minutes,
@@ -754,7 +792,6 @@ struct DraftTemplate {
     id: String,
     recipe: GeneratedRecipe,
     sources: Vec<Source>,
-    suggestions: String,
     evidence: Option<MediaEvidence>,
     thumbs: Vec<DraftThumbView>,
     /// The matched video moment of each step, in step order.
@@ -814,7 +851,7 @@ struct SettingsTemplate {
     web_search_key_masked: String,
     /// The shared account's search provider label, empty when it has no key.
     shared_web_search: &'static str,
-    /// Whether video step moments are captured and shown (global setting).
+    /// Whether video step moments are captured and shown for this user.
     step_moments: bool,
     /// The units new recipes are generated in: "metric", "imperial" or "source".
     measurement: &'static str,
@@ -1037,17 +1074,62 @@ pub(crate) struct DraftThumbView {
     pub(crate) seconds: u64,
 }
 
-/// Shared image response for locally produced JPEG bytes. Cache headers stay
-/// private: every thumbnail is behind the single-user sign-in.
+/// Shared image response for locally produced JPEG bytes. Every image is the
+/// owning user's, so caching stays private. A dish photo, a candidate frame, or
+/// a still can change behind the same URL, so the browser revalidates each
+/// time: the ETag is a hash of the bytes, and `not_modified` answers 304 while
+/// they are unchanged.
 pub(crate) fn image_response(jpeg: Vec<u8>) -> Response {
+    let digest = Sha256::digest(&jpeg);
+    let etag: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     (
         [
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::CACHE_CONTROL, "private, max-age=300"),
+            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+            (header::CACHE_CONTROL, "private, no-cache".to_string()),
+            (header::ETAG, format!("\"{etag}\"")),
         ],
         jpeg,
     )
         .into_response()
+}
+
+/// Turns a successful response into 304 Not Modified when the request's
+/// If-None-Match names the response's ETag, so a revalidated image that has
+/// not changed is not sent again. The session cookies the auth middleware set
+/// on the response go along: a revalidation can be the request that extends
+/// or replaces the session.
+async fn not_modified(request: Request, next: Next) -> Response {
+    let wanted = request.headers().get(header::IF_NONE_MATCH).cloned();
+    let response = next.run(request).await;
+    let (Some(wanted), Some(etag)) = (wanted, response.headers().get(header::ETAG)) else {
+        return response;
+    };
+    if response.status() != StatusCode::OK || !etag_matches(&wanted, etag) {
+        return response;
+    }
+    let mut unchanged = StatusCode::NOT_MODIFIED.into_response();
+    for name in [header::ETAG, header::CACHE_CONTROL, header::SET_COOKIE] {
+        for value in response.headers().get_all(&name) {
+            unchanged.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    unchanged
+}
+
+/// Whether an If-None-Match list names this ETag; weak and strong forms
+/// compare equal, as RFC 9110 asks for If-None-Match.
+fn etag_matches(wanted: &HeaderValue, etag: &HeaderValue) -> bool {
+    let (Ok(wanted), Ok(etag)) = (wanted.to_str(), etag.to_str()) else {
+        return false;
+    };
+    let opaque = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    let etag = opaque(etag);
+    wanted
+        .split(',')
+        .any(|tag| tag.trim() == "*" || opaque(tag) == etag)
 }
 
 #[derive(Deserialize)]
@@ -1075,8 +1157,6 @@ struct EndpointForm {
     #[serde(default)]
     model: String, // custom servers only; blank uses the preset default
 }
-/// Settings form for the video step-moments switch: the checkbox is absent
-/// when unticked.
 /// Settings form for the AI-login choice: "own" or "shared".
 #[derive(Deserialize)]
 struct AiLoginsForm {
@@ -1091,13 +1171,9 @@ struct SearchEngineForm {
 struct MeasurementForm {
     system: String,
 }
+/// Settings form for an on/off switch: the checkbox is absent when unticked.
 #[derive(Deserialize)]
-struct StepMomentsForm {
-    #[serde(default)]
-    enabled: Option<String>,
-}
-#[derive(Deserialize)]
-struct RecipeChatForm {
+struct SwitchForm {
     #[serde(default)]
     enabled: Option<String>,
 }
@@ -1147,9 +1223,22 @@ struct RecipeQuery {
     edit: Option<String>,
     edit_meta: Option<String>,
     view: Option<String>,
+    #[serde(default, deserialize_with = "lenient_number")]
     step: Option<usize>,
     /// Servings to scale the amounts to; absent shows the recipe as written.
+    #[serde(default, deserialize_with = "lenient_number")]
     serves: Option<i64>,
+}
+/// A number from the query string, or None when it is empty or not a
+/// number, so a hand-edited `?serves=abc` shows the page as if it were
+/// absent rather than failing it.
+fn lenient_number<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+{
+    let text: Option<String> = Option::deserialize(deserializer)?;
+    Ok(text.and_then(|text| text.trim().parse().ok()))
 }
 #[derive(Deserialize)]
 struct AddRecipeQuery {
@@ -1199,20 +1288,13 @@ async fn main() -> anyhowless::Result<()> {
         .connect_with(options)
         .await?;
     sqlx::migrate!().run(&db).await?;
+    ai::remove_leftover_temp_files(&env::temp_dir());
     import_legacy_codex_auth(&db).await?;
-    crate::recipes::delete_expired_draft_thumbnails(&db, &stamp()).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     retire_codex_models(&db, &configured_model).await?;
     reconcile_ai_provider(&db).await?;
     crate::recipes::fail_interrupted_chats(&db).await?;
-    let removed_expired_drafts = sqlx::query("DELETE FROM ai_drafts WHERE expires_at < ?")
-        .bind(stamp())
-        .execute(&db)
-        .await?
-        .rows_affected();
-    if removed_expired_drafts > 0 {
-        info!(removed_expired_drafts, "Removed expired AI drafts");
-    }
+    tokio::spawn(prune_expired_drafts(db.clone()));
     let state = Arc::new(AppState {
         db,
         model: configured_model,
@@ -1232,7 +1314,6 @@ async fn main() -> anyhowless::Result<()> {
     });
     if state.embedder.is_some() {
         tokio::spawn(search::backfill(state.clone()));
-        tokio::spawn(folders::warm(state.clone()));
     }
     let app = routes(state).layer(TraceLayer::new_for_http());
     let addr: SocketAddr = env::var("APP_BIND")
@@ -1243,6 +1324,21 @@ async fn main() -> anyhowless::Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+/// Deletes expired drafts now and every hour after, so their dish-photo
+/// candidates and moment stills go soon after the draft expires rather than at
+/// the next generation or restart.
+async fn prune_expired_drafts(db: SqlitePool) {
+    let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+    loop {
+        hourly.tick().await;
+        match recipes::delete_expired_drafts(&db, &stamp()).await {
+            Ok(0) => {}
+            Ok(removed) => info!(removed, "Removed expired AI drafts"),
+            Err(error) => warn!(%error, "Expired AI drafts could not be removed"),
+        }
+    }
+}
+
 async fn healthcheck() -> anyhowless::Result<()> {
     let bind = env::var("APP_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     let port = bind
@@ -1264,10 +1360,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/recipes/{id}/thumbnail", get(recipe_thumbnail))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
-        .route(
-            "/recipes/{id}/versions/{version}",
-            get(view_version).delete(delete_version),
-        )
+        .route("/recipes/{id}/versions/{version}", get(view_version))
         .route(
             "/recipes/{id}/versions/{version}/delete",
             post(delete_version),
@@ -1285,7 +1378,7 @@ fn routes(state: Arc<AppState>) -> Router {
         )
         .route("/recipes/{id}/blocks/{block_id}/delete", post(delete_block))
         .route("/ai/generate", get(generate_page).post(generate_recipe))
-        .route("/ai/import", get(import_page))
+        .route("/ai/import", get(generate_page))
         .route("/ai/import/{run_id}", get(import_run_page))
         .route("/ai/import/{run_id}/events", get(import_events))
         .route(
@@ -1389,6 +1482,7 @@ fn routes(state: Arc<AppState>) -> Router {
             "/settings/media-debug/{run_id}/frames/{url_index}/{file}",
             get(media_debug_frame),
         )
+        .layer(middleware::from_fn(recipes::keep_recipe_view))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1402,6 +1496,7 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
+        .layer(middleware::from_fn(not_modified))
         .layer(middleware::from_fn(auth::same_origin_only))
         .layer(middleware::from_fn(htmx::htmx_layer))
         .with_state(state)
@@ -1482,11 +1577,8 @@ impl ChartRecipe {
 }
 #[derive(FromRow)]
 struct Draft {
-    recipe_id: Option<String>,
     recipe_json: String,
     sources_json: String,
-    search_suggestions: String,
-    base_updated_at: Option<String>,
     evidence_json: String,
 }
 
@@ -1539,11 +1631,16 @@ fn display_timestamp(stored: &str) -> String {
         })
         .unwrap_or_else(|_| stored.to_string())
 }
+/// A boolean switch from the environment: 1/true/yes/on or 0/false/no/off in
+/// any case. Unset, empty, or anything else keeps the default, so a typo never
+/// flips a switch.
 fn env_bool(name: &str, default: bool) -> bool {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(default)
+    let value = env::var(name).unwrap_or_default();
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
 }
 fn generate_guidance(search_grounding: bool) -> &'static str {
     if search_grounding {
@@ -1656,10 +1753,15 @@ fn preset_for_spec(spec: &str) -> Option<&'static ProviderPreset> {
     PROVIDER_PRESETS.iter().find(|preset| preset.spec == spec)
 }
 
-/// Whether endpoints of this spec can run web search: only the worker's
-/// native OpenAI and Anthropic paths attach the provider's search tool.
-pub(crate) fn spec_has_web_search(spec: &str) -> bool {
-    spec == OPENAI_SPEC || spec == ANTHROPIC_SPEC
+/// Whether an endpoint can run web search: only the worker's native OpenAI
+/// and Anthropic paths attach the provider's search tool, and only the
+/// provider's own API is sure to serve it. A custom Anthropic-compatible
+/// server at another URL (a third-party API or a proxy) writes without
+/// research rather than failing every grounded request for want of sources.
+pub(crate) fn endpoint_has_web_search(spec: &str, base_url: &str) -> bool {
+    (spec == OPENAI_SPEC || spec == ANTHROPIC_SPEC)
+        && preset_for_spec(spec)
+            .is_some_and(|preset| preset.base_url == base_url.trim_end_matches('/'))
 }
 
 /// Maps an `ai_provider` value to its Pi SDK provider id; None for API endpoints.
@@ -1669,305 +1771,6 @@ pub(crate) fn pi_provider_for(provider: &str) -> Option<&'static str> {
         PROVIDER_CLAUDE => Some(CLAUDE_PI_PROVIDER),
         _ => None,
     }
-}
-
-/// The stored subscription OAuth credential for a Pi provider id, if any. The
-/// database is the source of truth; the Pi worker only ever sees a per-request
-/// materialised auth.json.
-pub(crate) async fn pi_credential(
-    db: &SqlitePool,
-    user_id: &str,
-    pi_provider: &str,
-) -> Result<Option<Value>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT credential_json FROM pi_credentials WHERE user_id=? AND provider=?")
-            .bind(user_id)
-            .bind(pi_provider)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.and_then(|(json,)| serde_json::from_str(&json).ok()))
-}
-/// Persists (or replaces) the credential for one user and provider id. The
-/// Vercel AI Gateway key shares this table under its own provider id.
-pub(crate) async fn store_pi_credential<T: Serialize>(
-    db: &SqlitePool,
-    user_id: &str,
-    pi_provider: &str,
-    credential: &T,
-) -> Result<()> {
-    let json = serde_json::to_string(credential)
-        .map_err(|_| AppError::Internal("Credential could not be serialised.".into()))?;
-    sqlx::query(
-        "INSERT INTO pi_credentials (user_id,provider,credential_json,updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id,provider) DO UPDATE SET
-           credential_json = excluded.credential_json,
-           updated_at = excluded.updated_at,
-           auth_failed_at = NULL",
-    )
-    .bind(user_id)
-    .bind(pi_provider)
-    .bind(json)
-    .bind(stamp())
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// A login the worker signs in with: one user's subscription credential or
-/// an endpoint's API key (endpoint ids are unique across users).
-#[derive(Clone, Copy)]
-pub(crate) enum Login<'a> {
-    Subscription {
-        user_id: &'a str,
-        pi_provider: &'a str,
-    },
-    Endpoint {
-        id: &'a str,
-    },
-}
-
-/// Records whether a provider refused a login: `true` stamps the failure,
-/// `false` clears an earlier one (a no-op when none is recorded).
-pub(crate) async fn mark_login_refused(
-    db: &SqlitePool,
-    login: Login<'_>,
-    refused: bool,
-) -> Result<()> {
-    let failed_at = refused.then(stamp);
-    let query = match login {
-        Login::Subscription {
-            user_id,
-            pi_provider,
-        } => sqlx::query(
-            "UPDATE pi_credentials SET auth_failed_at=?
-             WHERE user_id=? AND provider=? AND (? OR auth_failed_at IS NOT NULL)",
-        )
-        .bind(failed_at)
-        .bind(user_id)
-        .bind(pi_provider),
-        Login::Endpoint { id } => sqlx::query(
-            "UPDATE ai_endpoints SET auth_failed_at=?
-             WHERE id=? AND (? OR auth_failed_at IS NOT NULL)",
-        )
-        .bind(failed_at)
-        .bind(id),
-    };
-    query.bind(refused).execute(db).await?;
-    Ok(())
-}
-
-/// Whether the provider refused this subscription's login on its last use.
-pub(crate) async fn subscription_login_refused(
-    db: &SqlitePool,
-    user_id: &str,
-    pi_provider: &str,
-) -> Result<bool> {
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT auth_failed_at IS NOT NULL FROM pi_credentials WHERE user_id=? AND provider=?",
-    )
-    .bind(user_id)
-    .bind(pi_provider)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.is_some_and(|(refused,)| refused))
-}
-
-const MEDIA_CLEANER_PROVIDER_SETTING: &str = "media_cleaner_provider";
-const MEDIA_CLEANER_MODEL_SETTING: &str = "media_cleaner_model";
-
-/// The video cleaner's own provider ("pi", "claude", or an endpoint id);
-/// None follows the active AI provider.
-pub(crate) async fn media_cleaner_setting(
-    db: &SqlitePool,
-    user_id: &str,
-) -> Result<Option<String>> {
-    Ok(app_setting(db, user_id, MEDIA_CLEANER_PROVIDER_SETTING)
-        .await?
-        .filter(|value| !value.trim().is_empty()))
-}
-
-/// The video cleaner's model; None uses its provider's model.
-pub(crate) async fn media_cleaner_model(db: &SqlitePool, user_id: &str) -> Result<Option<String>> {
-    Ok(app_setting(db, user_id, MEDIA_CLEANER_MODEL_SETTING)
-        .await?
-        .filter(|value| !value.trim().is_empty()))
-}
-
-/// One of the user's app_settings values, if it has been saved.
-async fn app_setting(db: &SqlitePool, user_id: &str, key: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT value FROM app_settings WHERE user_id = ? AND key = ?")
-            .bind(user_id)
-            .bind(key)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.map(|(value,)| value))
-}
-
-/// Saves one of the user's app_settings values, replacing any previous one.
-async fn set_app_setting(db: &SqlitePool, user_id: &str, key: &str, value: &str) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO app_settings (user_id, key, value, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    )
-    .bind(user_id)
-    .bind(key)
-    .bind(value)
-    .bind(stamp())
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// app_settings key of the units the user's recipes are generated in:
-/// "metric", "imperial", or "source" / absent (whatever suits the recipe).
-const MEASUREMENT_SETTING: &str = "measurement_system";
-const MEASUREMENT_METRIC: &str = "metric";
-const MEASUREMENT_IMPERIAL: &str = "imperial";
-const MEASUREMENT_SOURCE: &str = "source";
-
-/// The user's measurement choice: "metric", "imperial" or "source".
-pub(crate) async fn measurement_system(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
-    Ok(
-        match app_setting(db, user_id, MEASUREMENT_SETTING)
-            .await?
-            .as_deref()
-        {
-            Some(MEASUREMENT_METRIC) => MEASUREMENT_METRIC,
-            Some(MEASUREMENT_IMPERIAL) => MEASUREMENT_IMPERIAL,
-            _ => MEASUREMENT_SOURCE,
-        },
-    )
-}
-
-/// The prompt line that holds generated and AI-edited recipes to the user's
-/// units, or None to leave the units to the recipe.
-pub(crate) fn measurement_rule(system: &str) -> Option<&'static str> {
-    match system {
-        MEASUREMENT_METRIC => Some(
-            "Units: write every ingredient quantity, ingredientUses amount, temperature, and size in metric units (g, kg, ml, l, °C, cm). Weigh dry ingredients in grams where a cook would; keep tsp and tbsp for small amounts and counted items as counts. Convert any other units from the source or request, rounding to practical amounts.",
-        ),
-        MEASUREMENT_IMPERIAL => Some(
-            "Units: write every ingredient quantity, ingredientUses amount, temperature, and size in US customary units (cups, tbsp, tsp, oz, lb, fl oz, °F, inches), using fractions such as 1/2 or 1 1/4 rather than decimals. Keep counted items as counts. Convert any metric units from the source or request, rounding to practical amounts.",
-        ),
-        _ => None,
-    }
-}
-
-/// app_settings key of the user's "video step moments" switch.
-const STEP_MOMENTS_SETTING: &str = "step_moments";
-
-/// Whether the user's video imports capture, and their recipe pages show,
-/// step moments. On unless switched off in Settings.
-pub(crate) async fn step_moments_enabled(db: &SqlitePool, user_id: &str) -> Result<bool> {
-    Ok(app_setting(db, user_id, STEP_MOMENTS_SETTING)
-        .await?
-        .as_deref()
-        != Some("off"))
-}
-
-/// app_settings key of the user's library search engine: "embeddings" (search
-/// by meaning), "bm25" (word search) or "shared" (absent too), which follows
-/// the shared account's choice the way AI logins do.
-const SEARCH_ENGINE_SETTING: &str = "search_engine";
-const SEARCH_EMBEDDINGS: &str = "embeddings";
-const SEARCH_BM25: &str = "bm25";
-const SEARCH_SHARED: &str = "shared";
-
-/// The user's own saved search choice: "embeddings", "bm25" or "shared".
-async fn own_search_engine(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
-    Ok(
-        match app_setting(db, user_id, SEARCH_ENGINE_SETTING)
-            .await?
-            .as_deref()
-        {
-            Some(SEARCH_EMBEDDINGS) => SEARCH_EMBEDDINGS,
-            Some(SEARCH_BM25) => SEARCH_BM25,
-            _ => SEARCH_SHARED,
-        },
-    )
-}
-
-/// The engine that runs the user's searches: their own choice, else the
-/// shared account's, else search by meaning.
-async fn search_engine(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
-    let own = own_search_engine(db, user_id).await?;
-    if own != SEARCH_SHARED {
-        return Ok(own);
-    }
-    let shared = match shared_ai_account(db).await? {
-        Some((id, _)) if id != user_id => own_search_engine(db, &id).await?,
-        _ => SEARCH_SHARED,
-    };
-    Ok(if shared == SEARCH_BM25 {
-        SEARCH_BM25
-    } else {
-        SEARCH_EMBEDDINGS
-    })
-}
-
-/// Whether the user's library searches use BM25 word search for every query
-/// instead of search by meaning (which falls back to BM25 on its own).
-pub(crate) async fn keyword_search_selected(db: &SqlitePool, user_id: &str) -> Result<bool> {
-    Ok(search_engine(db, user_id).await? == SEARCH_BM25)
-}
-
-/// The user's active AI provider: "pi" (Codex), "claude" (Claude
-/// subscription) or one of their ai_endpoints row ids. Stored per user like
-/// the model; reconcile_ai_provider keeps the value valid at startup and the
-/// endpoint handlers keep it valid at runtime. Anything absent resolves to
-/// "pi".
-pub(crate) async fn ai_provider(db: &SqlitePool, user_id: &str) -> Result<String> {
-    Ok(app_setting(db, user_id, "ai_provider")
-        .await?
-        .unwrap_or_else(|| PROVIDER_CODEX.into()))
-}
-
-/// app_settings key of an account's AI-login choice: "own" uses the account's
-/// own providers, subscriptions, keys, and models; anything else uses the
-/// shared account's.
-const AI_LOGINS_SETTING: &str = "ai_logins";
-
-/// The account whose AI setup every other account shares by default: the
-/// first one created, as (id, username).
-pub(crate) async fn shared_ai_account(db: &SqlitePool) -> Result<Option<(String, String)>> {
-    Ok(
-        sqlx::query_as("SELECT id, username FROM users ORDER BY created_at, id LIMIT 1")
-            .fetch_optional(db)
-            .await?,
-    )
-}
-
-/// Whether the user chose their own AI setup over the shared one.
-pub(crate) async fn uses_own_ai(db: &SqlitePool, user_id: &str) -> Result<bool> {
-    Ok(app_setting(db, user_id, AI_LOGINS_SETTING)
-        .await?
-        .as_deref()
-        == Some("own"))
-}
-
-/// The account whose AI provider, subscriptions, API keys, models, and video
-/// cleaner serve `user_id`'s generations: the shared account's, unless the
-/// user chose their own. The shared account always uses its own. Resolving an
-/// AI account again returns it unchanged.
-pub(crate) async fn ai_account(db: &SqlitePool, user_id: &str) -> Result<String> {
-    if uses_own_ai(db, user_id).await? {
-        return Ok(user_id.to_string());
-    }
-    Ok(shared_ai_account(db)
-        .await?
-        .map_or_else(|| user_id.to_string(), |(id, _)| id))
-}
-
-/// All registered AI endpoints for one user, oldest first.
-pub(crate) async fn list_endpoints(db: &SqlitePool, user_id: &str) -> Result<Vec<Endpoint>> {
-    Ok(sqlx::query_as(
-        "SELECT id,name,spec,base_url,api_key,model,auth_failed_at IS NOT NULL AS auth_failed FROM ai_endpoints WHERE user_id=? ORDER BY created_at",
-    )
-    .bind(user_id)
-    .fetch_all(db)
-    .await?)
 }
 
 /// The model an endpoint spec runs when the endpoint stores none; empty for a
@@ -1987,48 +1790,6 @@ pub(crate) fn endpoint_model(endpoint: &Endpoint) -> String {
     }
 }
 
-/// One registered AI endpoint for one user, if it exists.
-pub(crate) async fn find_endpoint(
-    db: &SqlitePool,
-    user_id: &str,
-    id: &str,
-) -> Result<Option<Endpoint>> {
-    Ok(sqlx::query_as(
-        "SELECT id,name,spec,base_url,api_key,model,auth_failed_at IS NOT NULL AS auth_failed FROM ai_endpoints WHERE user_id=? AND id=?",
-    )
-    .bind(user_id)
-    .bind(id)
-    .fetch_optional(db)
-    .await?)
-}
-
-/// Registers a new AI endpoint for one user; returns its id.
-pub(crate) async fn insert_endpoint(
-    db: &SqlitePool,
-    user_id: &str,
-    name: &str,
-    spec: &str,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-) -> Result<String> {
-    let id = Uuid::new_v4().to_string();
-    let now = stamp();
-    sqlx::query("INSERT INTO ai_endpoints(id,user_id,name,spec,base_url,api_key,model,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?)")
-        .bind(&id)
-        .bind(user_id)
-        .bind(name)
-        .bind(spec)
-        .bind(base_url)
-        .bind(api_key)
-        .bind(model)
-        .bind(&now)
-        .bind(&now)
-        .execute(db)
-        .await?;
-    Ok(id)
-}
-
 /// The search APIs a web search key can be for, as (key, label). Keep in step
 /// with SEARCH_PROVIDERS in pi/web-search.ts, which holds each one's adapter.
 const WEB_SEARCH_PROVIDERS: &[(&str, &str)] = &[
@@ -2043,61 +1804,6 @@ fn web_search_label(provider: &str) -> &'static str {
         .iter()
         .find(|(key, _)| *key == provider)
         .map_or("Web search", |(_, label)| label)
-}
-
-/// One account's own search API key, if it saved one.
-pub(crate) async fn web_search_key(db: &SqlitePool, user_id: &str) -> Result<Option<WebSearchKey>> {
-    Ok(
-        sqlx::query_as("SELECT provider,api_key FROM web_search_keys WHERE user_id=?")
-            .bind(user_id)
-            .fetch_optional(db)
-            .await?,
-    )
-}
-
-/// Saves (or replaces) one account's search API key.
-async fn store_web_search_key(
-    db: &SqlitePool,
-    user_id: &str,
-    provider: &str,
-    api_key: &str,
-) -> Result<()> {
-    let now = stamp();
-    sqlx::query("INSERT INTO web_search_keys(user_id,provider,api_key,created_at,updated_at)VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET provider=excluded.provider, api_key=excluded.api_key, updated_at=excluded.updated_at")
-        .bind(user_id)
-        .bind(provider)
-        .bind(api_key)
-        .bind(&now)
-        .bind(&now)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-pub(crate) async fn remove_endpoint(db: &SqlitePool, user_id: &str, id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM ai_endpoints WHERE user_id=? AND id=?")
-        .bind(user_id)
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-/// Replaces the model of one user's endpoint.
-pub(crate) async fn update_endpoint_model(
-    db: &SqlitePool,
-    user_id: &str,
-    id: &str,
-    model: &str,
-) -> Result<()> {
-    sqlx::query("UPDATE ai_endpoints SET model=?, updated_at=? WHERE user_id=? AND id=?")
-        .bind(model)
-        .bind(stamp())
-        .bind(user_id)
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
 }
 
 /// The tail of a stored API key, for display only; the full key is never
@@ -2117,45 +1823,6 @@ fn mask_key(key: &str) -> String {
         .rev()
         .collect();
     format!("{MASK}{tail}")
-}
-
-/// Heals stale ai_provider settings at startup: the pre-endpoint "openai"
-/// value or an id that is not one of the user's endpoints resolves to their
-/// first registered endpoint, falling back to Codex ("pi"). Missing settings
-/// are left alone (the read path defaults to "pi").
-async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
-    let settings: Vec<(String, String)> =
-        sqlx::query_as("SELECT user_id, value FROM app_settings WHERE key = 'ai_provider'")
-            .fetch_all(db)
-            .await?;
-    for (user_id, current) in settings {
-        if current == PROVIDER_CODEX || current == PROVIDER_CLAUDE {
-            continue;
-        }
-        let live: Option<(i64,)> =
-            sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? AND user_id=? LIMIT 1")
-                .bind(&current)
-                .bind(&user_id)
-                .fetch_optional(db)
-                .await?;
-        if live.is_some() {
-            continue;
-        }
-        let first: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM ai_endpoints WHERE user_id=? ORDER BY created_at LIMIT 1",
-        )
-        .bind(&user_id)
-        .fetch_optional(db)
-        .await?;
-        let value = first
-            .map(|(id,)| id)
-            .unwrap_or_else(|| PROVIDER_CODEX.into());
-        set_app_setting(db, &user_id, "ai_provider", &value).await?;
-        if value != current {
-            info!(%user_id, from = %current, to = %value, "Reconciled stale AI provider setting");
-        }
-    }
-    Ok(())
 }
 
 /// One-time migration of a credential previously written by the Pi CLI to
@@ -2184,11 +1851,12 @@ async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// Whether the user has a stored OAuth credential for a Pi provider.
+/// Whether the user has a stored credential for a Pi provider. Any stored
+/// credential counts, as it does for generation (`ensure_provider_configured`
+/// in ai.rs); one the provider refuses is flagged on its row instead.
 async fn pi_authorised(db: &SqlitePool, user_id: &str, pi_provider: &str) -> bool {
     match pi_credential(db, user_id, pi_provider).await {
-        Ok(Some(credential)) => credential["type"].as_str() == Some("oauth"),
-        Ok(None) => false,
+        Ok(credential) => credential.is_some(),
         Err(error) => {
             warn!(%error, pi_provider, "Subscription credential read failed");
             false
@@ -2221,7 +1889,7 @@ async fn settings_page(
             selected: endpoint.id == provider,
             key_masked: mask_key(&endpoint.api_key),
             default_model: spec_default_model(&endpoint.spec).to_string(),
-            web_search: spec_has_web_search(&endpoint.spec),
+            web_search: endpoint_has_web_search(&endpoint.spec, &endpoint.base_url),
             model_options: cached_model_catalogue(&s, &endpoint.id),
             auth_failed: endpoint.auth_failed,
             id: endpoint.id,
@@ -2257,7 +1925,7 @@ async fn settings_page(
     } else {
         cleaner_provider.as_str()
     };
-    let cleaner_model_options = cleaner_model_options(
+    let cleaner_model_options = select_options(
         cached_model_catalogue(
             &s,
             pi_provider_for(cleaner_source).unwrap_or(cleaner_source),
@@ -2454,27 +2122,18 @@ fn login_check_redirect(check: ai::LoginCheck, works: &str) -> Response {
 /// available, otherwise the provider's fallback list. The current selection is
 /// always included (marked selected) so saving never silently changes the model.
 fn model_options(fresh: Vec<String>, current: &str, fallback: &[&str]) -> Vec<SelectOption> {
-    let mut values = if fresh.is_empty() {
+    let values = if fresh.is_empty() {
         fallback.iter().map(|model| (*model).into()).collect()
     } else {
         fresh
     };
-    if !values.iter().any(|value| value == current) {
-        values.insert(0, current.to_string());
-    }
-    values
-        .into_iter()
-        .map(|value| SelectOption {
-            selected: value == current,
-            value,
-        })
-        .collect()
+    select_options(values, current)
 }
 
-/// Model options for the video cleaner select: the cached catalogue with the
-/// saved model kept first when it is missing. Empty means the provider's own
-/// model, which the template offers as its first option.
-fn cleaner_model_options(mut values: Vec<String>, current: &str) -> Vec<SelectOption> {
+/// Model options for a select: `values` with the saved model kept first when
+/// it is missing. An empty saved model (the video cleaner's "provider's own
+/// model", which the template offers as its first option) adds nothing.
+fn select_options(mut values: Vec<String>, current: &str) -> Vec<SelectOption> {
     if !current.is_empty() && !values.iter().any(|value| value == current) {
         values.insert(0, current.to_string());
     }
@@ -2705,9 +2364,6 @@ async fn update_ai_logins(
     Ok(flash_redirect("/settings#settings-ai", "logins_saved"))
 }
 
-/// Switches video step moments on or off for the signed-in user. Off stops
-/// their new imports from capturing a moment pool and hides moments on their
-/// pages; stored moments stay, so switching back on shows them again.
 /// Saves the units the signed-in user's recipes are generated in. Saved
 /// recipes keep their units; the recipe chat can convert one on request.
 async fn update_measurements(
@@ -2715,9 +2371,7 @@ async fn update_measurements(
     user: AuthUser,
     Form(form): Form<MeasurementForm>,
 ) -> Result<Response> {
-    if ![MEASUREMENT_METRIC, MEASUREMENT_IMPERIAL, MEASUREMENT_SOURCE]
-        .contains(&form.system.as_str())
-    {
+    if !MEASUREMENT_SYSTEMS.contains(&form.system.as_str()) {
         return Err(AppError::BadRequest(
             "Choose metric, imperial, or as written.".into(),
         ));
@@ -2726,13 +2380,15 @@ async fn update_measurements(
     Ok(flash_redirect("/settings#settings-units", "units_saved"))
 }
 
+/// Switches video step moments on or off for the signed-in user. Off stops
+/// their new imports from capturing a moment pool and hides moments on their
+/// pages; stored moments stay, so switching back on shows them again.
 async fn update_step_moments(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
-    Form(form): Form<StepMomentsForm>,
+    Form(form): Form<SwitchForm>,
 ) -> Result<Response> {
-    let value = if form.enabled.is_some() { "on" } else { "off" };
-    set_app_setting(&s.db, &user.id, STEP_MOMENTS_SETTING, value).await?;
+    save_switch(&s, &user, STEP_MOMENTS_SETTING, &form).await?;
     Ok(flash_redirect(
         "/settings#settings-moments",
         "moments_saved",
@@ -2745,11 +2401,16 @@ async fn update_step_moments(
 async fn update_recipe_chat(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
-    Form(form): Form<RecipeChatForm>,
+    Form(form): Form<SwitchForm>,
 ) -> Result<Response> {
-    let value = if form.enabled.is_some() { "on" } else { "off" };
-    set_app_setting(&s.db, &user.id, chat::CHAT_SETTING, value).await?;
+    save_switch(&s, &user, chat::CHAT_SETTING, &form).await?;
     Ok(flash_redirect("/settings#settings-chat", "chat_saved"))
+}
+
+/// Saves one of the signed-in user's on/off switches as "on" or "off".
+async fn save_switch(s: &AppState, user: &AuthUser, key: &str, form: &SwitchForm) -> Result<()> {
+    let value = if form.enabled.is_some() { "on" } else { "off" };
+    set_app_setting(&s.db, &user.id, key, value).await
 }
 
 /// Saves the signed-in user's own search API key, replacing any earlier one.
@@ -2767,10 +2428,7 @@ async fn add_web_search_key(
     if api_key.is_empty() {
         return Err(AppError::BadRequest("Enter the search API key.".into()));
     }
-    // A key goes into an HTTP header, so only printable ASCII without spaces
-    // is a key at all; anything else would fail every search (and could be
-    // echoed back in the header error).
-    if api_key.len() > 512 || !api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
+    if !header_safe_key(&api_key) {
         return Err(AppError::BadRequest(
             "That does not look like a search API key: paste the key alone, without spaces.".into(),
         ));
@@ -2784,10 +2442,7 @@ async fn add_web_search_key(
 
 /// Removes the signed-in user's own search API key.
 async fn delete_web_search_key(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
-    sqlx::query("DELETE FROM web_search_keys WHERE user_id=?")
-        .bind(&user.id)
-        .execute(&s.db)
-        .await?;
+    remove_web_search_key(&s.db, &user.id).await?;
     Ok(flash_redirect(
         "/settings#settings-web-search",
         "web_search_removed",
@@ -2801,23 +2456,37 @@ async fn update_search_engine(
     user: AuthUser,
     Form(form): Form<SearchEngineForm>,
 ) -> Result<Response> {
-    let value = match form.engine.as_str() {
-        SEARCH_EMBEDDINGS | SEARCH_BM25 | SEARCH_SHARED => form.engine.as_str(),
-        _ => return Err(AppError::BadRequest("Unknown search engine.".into())),
-    };
-    set_app_setting(&s.db, &user.id, SEARCH_ENGINE_SETTING, value).await?;
+    if !SEARCH_ENGINES.contains(&form.engine.as_str()) {
+        return Err(AppError::BadRequest("Unknown search engine.".into()));
+    }
+    set_app_setting(&s.db, &user.id, SEARCH_ENGINE_SETTING, &form.engine).await?;
     Ok(flash_redirect("/settings#settings-search", "search_saved"))
 }
 
-/// A required http(s) base URL with any trailing slash removed.
+/// A required http(s) base URL with a host, as the URL parser writes it, with
+/// any trailing slash removed.
 fn normalise_url(raw: &str, name: &str) -> Result<String> {
     let url = required(raw, name)?;
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
+    let parsed = reqwest::Url::parse(&url).ok().filter(|parsed| {
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some_and(|host| !host.is_empty())
+    });
+    let Some(parsed) = parsed else {
         return Err(AppError::BadRequest(format!(
-            "{name} must start with http:// or https://."
+            "{name} must be a web address starting with http:// or https://, such as https://api.example.com/v1."
         )));
-    }
-    Ok(url.trim_end_matches('/').to_string())
+    };
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// Longest API key accepted, in bytes.
+const MAX_API_KEY_BYTES: usize = 4096;
+
+/// Whether a pasted API key can be one: it goes into an HTTP header, so only
+/// printable ASCII without spaces is a key at all. Anything else would fail
+/// every call, and could be echoed back in the header error.
+fn header_safe_key(key: &str) -> bool {
+    key.len() <= MAX_API_KEY_BYTES && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// Adds an AI provider from the Settings picker and makes it the active one,
@@ -2845,6 +2514,11 @@ async fn add_endpoint(
     let api_key = trim(&form.api_key);
     if api_key.is_empty() && preset.spec != OPENAI_COMPATIBLE_SPEC {
         return Err(AppError::BadRequest("Enter the API key.".into()));
+    }
+    if !header_safe_key(&api_key) {
+        return Err(AppError::BadRequest(
+            "That does not look like an API key: paste the key alone, without spaces.".into(),
+        ));
     }
     let name = endpoint_name(&s.db, &user.id, preset, &base_url).await?;
     let id = crate::insert_endpoint(
@@ -2908,68 +2582,39 @@ async fn delete_endpoint(
     Ok(flash_redirect("/settings#settings-ai", "provider_removed"))
 }
 
-/// Codex models the pi SDK no longer serves. A stored choice of one of these
-/// would fail every generation, so startup moves it to the default model.
-const RETIRED_CODEX_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4"];
-
-/// Replaces every user's stored Codex model that the pi SDK no longer serves
-/// with the PI_MODEL default. A user without a stored choice already gets the
-/// default from `selected_model`.
-async fn retire_codex_models(db: &SqlitePool, model: &str) -> Result<()> {
-    for retired in RETIRED_CODEX_MODELS {
-        sqlx::query("UPDATE app_settings SET value=?, updated_at=? WHERE key='model' AND value=?")
-            .bind(model)
-            .bind(stamp())
-            .bind(retired)
-            .execute(db)
-            .await?;
+/// Runs an authorisation helper's `start` command and returns its JSON reply.
+/// `fail` wraps what went wrong in the provider's own error.
+async fn start_auth_helper(script_path: &str, fail: fn(String) -> AppError) -> Result<Value> {
+    let output = run_node_script(script_path.to_string(), "start", Vec::new())
+        .await
+        .map_err(|_| fail("could not start the authorisation flow".into()))?;
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| fail("unexpected response from the authorisation helper".into()))?;
+    if !output.status.success() || value["status"].as_str() != Some("ok") {
+        let message = value["message"]
+            .as_str()
+            .unwrap_or("authorisation could not be started");
+        return Err(fail(message.to_string()));
     }
-    Ok(())
+    Ok(value)
 }
 
-pub(crate) async fn selected_model(
-    db: &SqlitePool,
-    user_id: &str,
-    fallback: &str,
-) -> Result<String> {
-    Ok(app_setting(db, user_id, "model")
-        .await?
-        .unwrap_or_else(|| fallback.into()))
-}
-
-/// The Claude subscription model; separate from the Codex `model` setting so
-/// switching providers keeps each choice.
-pub(crate) async fn selected_claude_model(db: &SqlitePool, user_id: &str) -> Result<String> {
-    Ok(app_setting(db, user_id, "claude_model")
-        .await?
-        .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.into()))
-}
-
-pub(crate) async fn selected_effort(
-    db: &SqlitePool,
-    user_id: &str,
-    fallback: &str,
-) -> Result<String> {
-    Ok(app_setting(db, user_id, "reasoning_effort")
-        .await?
-        .unwrap_or_else(|| fallback.into()))
+/// Keeps a new Codex device-code flow and returns its id. Expired flows go
+/// first: a flow is otherwise dropped only when a poll sees it end, and a
+/// closed popup never polls again.
+fn remember_codex_flow(flows: &Mutex<HashMap<String, CodexFlow>>, flow: CodexFlow) -> String {
+    let flow_id = Uuid::new_v4().to_string();
+    let now = Utc::now().timestamp();
+    let mut flows = flows.lock();
+    flows.retain(|_, flow| now <= flow.expires_at);
+    flows.insert(flow_id.clone(), flow);
+    flow_id
 }
 
 /// Starts an OpenAI Codex device-code flow and shows the code to enter at
 /// chatgpt.com/codex/device. The rendered page polls the status route below.
 async fn authorise_codex_start(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
-    let output = run_node_script(s.auth_script_path.clone(), "start", Vec::new())
-        .await
-        .map_err(|_| AppError::CodexAuth("could not start the authorisation flow".into()))?;
-    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        AppError::CodexAuth("unexpected response from the authorisation helper".into())
-    })?;
-    if !output.status.success() || value["status"].as_str() != Some("ok") {
-        let message = value["message"]
-            .as_str()
-            .unwrap_or("authorisation could not be started");
-        return Err(AppError::CodexAuth(message.to_string()));
-    }
+    let value = start_auth_helper(&s.auth_script_path, AppError::CodexAuth).await?;
     let device_auth_id = value["deviceAuthId"]
         .as_str()
         .ok_or_else(|| AppError::CodexAuth("authorisation helper returned no device id".into()))?;
@@ -2982,9 +2627,8 @@ async fn authorise_codex_start(State(s): State<Arc<AppState>>, user: AuthUser) -
         .unwrap_or(15 * 60)
         .max(60);
     let expires_at = Utc::now().timestamp() + expires_seconds;
-    let flow_id = Uuid::new_v4().to_string();
-    s.codex_flows.lock().insert(
-        flow_id.clone(),
+    let flow_id = remember_codex_flow(
+        &s.codex_flows,
         CodexFlow {
             user_id: user.id.clone(),
             device_auth_id: device_auth_id.to_string(),
@@ -3057,18 +2701,7 @@ async fn authorise_claude_start(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
 ) -> Result<Response> {
-    let output = run_node_script(s.claude_auth_script_path.clone(), "start", Vec::new())
-        .await
-        .map_err(|_| AppError::ClaudeAuth("could not start the authorisation flow".into()))?;
-    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        AppError::ClaudeAuth("unexpected response from the authorisation helper".into())
-    })?;
-    if !output.status.success() || value["status"].as_str() != Some("ok") {
-        let message = value["message"]
-            .as_str()
-            .unwrap_or("authorisation could not be started");
-        return Err(AppError::ClaudeAuth(message.to_string()));
-    }
+    let value = start_auth_helper(&s.claude_auth_script_path, AppError::ClaudeAuth).await?;
     let url = value["url"].as_str().ok_or_else(|| {
         AppError::ClaudeAuth("authorisation helper returned no sign-in URL".into())
     })?;
@@ -3106,8 +2739,8 @@ fn claude_failure_redirect(headers: &HeaderMap, key: &str) -> Response {
 
 /// Completes a Claude flow: the pasted code (or redirect URL) is exchanged by
 /// the helper using the stored verifier, and the credential is saved. The flow
-/// is single-use once an exchange is attempted, because authorisation codes
-/// are; an empty paste leaves the flow intact for a retry.
+/// is removed only once an exchange succeeds, so an empty paste or a failed
+/// exchange leaves it for another paste until it expires.
 async fn authorise_claude_exchange(
     State(s): State<Arc<AppState>>,
     user: AuthUser,
@@ -3179,11 +2812,7 @@ async fn disconnect_subscription(
     pi_provider: &str,
     provider: &str,
 ) -> Result<Response> {
-    sqlx::query("DELETE FROM pi_credentials WHERE user_id=? AND provider=?")
-        .bind(&user.id)
-        .bind(pi_provider)
-        .execute(&s.db)
-        .await?;
+    remove_pi_credential(&s.db, &user.id, pi_provider).await?;
     if ai_provider(&s.db, &user.id).await? == provider
         && pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await
     {
@@ -3303,32 +2932,144 @@ mod error_tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("href=\"/settings\""), "{body}");
     }
+
+    #[tokio::test]
+    async fn a_failed_sign_in_shows_the_helpers_reason_and_links_to_settings() {
+        let (status, body) =
+            respond(AppError::CodexAuth("device auth is unavailable".into())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("device auth is unavailable"), "{body}");
+        assert!(body.contains("href=\"/settings\""), "{body}");
+        let (_, body) = respond(AppError::ClaudeAuth("no verifier".into())).await;
+        assert!(
+            body.contains("Claude authorisation failed: no verifier"),
+            "{body}"
+        );
+    }
 }
 
-/// Runs a Node helper script on the blocking pool, writing `payload` to its
-/// stdin and collecting stdout and stderr.
+#[cfg(test)]
+mod image_tests {
+    use super::{image_response, not_modified};
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header},
+        middleware,
+        response::Response,
+        routing::get,
+    };
+    use tower::ServiceExt;
+
+    /// Serves `jpeg` at /photo the way the image handlers do, behind the
+    /// same revalidation layer as the app.
+    async fn fetch(jpeg: &'static [u8], if_none_match: Option<&str>) -> Response {
+        let app = Router::new()
+            .route(
+                "/photo",
+                get(move || async move { image_response(jpeg.to_vec()) }),
+            )
+            .layer(middleware::from_fn(not_modified));
+        let mut request = Request::builder().uri("/photo");
+        if let Some(tag) = if_none_match {
+            request = request.header(header::IF_NONE_MATCH, tag);
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_photo_revalidates_and_a_replaced_one_is_sent_again() {
+        let first = fetch(b"old photo", None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+
+        let unchanged = fetch(b"old photo", Some(&etag)).await;
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[header::ETAG], etag.as_str());
+        assert_eq!(
+            unchanged.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+        assert!(
+            to_bytes(unchanged.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let listed = fetch(b"old photo", Some(&format!("\"other\", W/{etag}"))).await;
+        assert_eq!(listed.status(), StatusCode::NOT_MODIFIED);
+
+        // A new photo at the same URL no longer matches, so it is sent.
+        let replaced = fetch(b"new photo", Some(&etag)).await;
+        assert_eq!(replaced.status(), StatusCode::OK);
+        assert_ne!(replaced.headers()[header::ETAG], etag.as_str());
+        assert_eq!(
+            &to_bytes(replaced.into_body(), 1024).await.unwrap()[..],
+            b"new photo"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revalidated_photo_keeps_the_session_cookies_set_on_the_way() {
+        let app = Router::new()
+            .route(
+                "/photo",
+                get(|| async {
+                    let mut response = image_response(b"photo".to_vec());
+                    for cookie in ["recipe_session=new", "recipe_accounts=a.b"] {
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, cookie.parse().unwrap());
+                    }
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(not_modified));
+        let etag = fetch(b"photo", None).await.headers()[header::ETAG].clone();
+        let request = Request::builder()
+            .uri("/photo")
+            .header(header::IF_NONE_MATCH, etag)
+            .body(Body::empty())
+            .unwrap();
+        let unchanged = app.oneshot(request).await.unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        let cookies: Vec<_> = unchanged
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["recipe_session=new", "recipe_accounts=a.b"]);
+    }
+}
+
+/// How long a sign-in helper may run. Each call is one request to the
+/// provider (start a flow, poll it once, exchange a code), so a helper still
+/// running after this is stuck on the network and is killed.
+const AUTH_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs a Node sign-in helper on the blocking pool, writing `payload` to its
+/// stdin and collecting its output. A failed run's stderr is logged.
 async fn run_node_script(
     script_path: String,
     subcommand: &'static str,
     payload: Vec<u8>,
 ) -> std::io::Result<std::process::Output> {
     tokio::task::spawn_blocking(move || {
-        let mut child = std::process::Command::new("node")
-            .arg(&script_path)
-            .arg(subcommand)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .expect("script stdin is piped")
-            .write_all(&payload)?;
-        child.wait_with_output()
+        ai::run_node(
+            "Sign-in helper",
+            &script_path,
+            &[subcommand],
+            &payload,
+            AUTH_SCRIPT_TIMEOUT,
+        )
     })
     .await
     .map_err(std::io::Error::other)?
+    .inspect_err(|error| warn!(%error, subcommand, "Sign-in helper could not run"))
 }
 // Keeps main's error type small without adding an application dependency solely for startup errors.
 mod anyhowless {

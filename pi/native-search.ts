@@ -38,20 +38,12 @@ export interface NativeSearchState {
   invoked: boolean;
   /** Normalized URL to title. */
   sources: Map<string, string>;
-  outputText: string[];
-  streamedText: string[];
-  parseErrors?: number;
-}
-
-/** The observer's state, which always counts its parse errors. */
-export interface ObservedSearchState extends NativeSearchState {
-  parseErrors: number;
 }
 
 export interface NativeSearchObserver {
-  state: ObservedSearchState;
   fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
-  finish(): Promise<ObservedSearchState>;
+  /** What the last successful response showed, once it has been read. */
+  finish(): Promise<NativeSearchState>;
 }
 
 /** An Anthropic content block as it opens in the stream. */
@@ -64,7 +56,6 @@ interface AnthropicStreamBlock {
 /** An Anthropic content_block_delta payload. */
 interface AnthropicStreamDelta {
   type?: unknown;
-  text?: unknown;
   citation?: SourceLike | null;
   [key: string]: unknown;
 }
@@ -107,10 +98,9 @@ function addSource(state: NativeSearchState, source: SourceLike | null | undefin
   }
 }
 
-function collectContent(state: NativeSearchState, content: ResponsesItem["content"]): void {
+function collectCitations(state: NativeSearchState, content: ResponsesItem["content"]): void {
   if (!Array.isArray(content)) return;
   for (const part of content) {
-    if (part?.type === "output_text" && typeof part.text === "string") state.outputText.push(part.text);
     if (!Array.isArray(part?.annotations)) continue;
     for (const annotation of part.annotations) {
       if (annotation?.type === "url_citation") addSource(state, annotation);
@@ -118,10 +108,12 @@ function collectContent(state: NativeSearchState, content: ResponsesItem["conten
   }
 }
 
-/** Whether a Responses API web_search_call item ran to completion. */
+/** Whether a Responses API web_search_call item ran to completion. An item
+ * with no status (some shapes send only the search action) counts once its
+ * action is a search; one still "in_progress" or "searching" does not yet. */
 export function webSearchCompleted(item: ResponsesItem): boolean {
   const actionType = typeof item.action === "string" ? item.action : item.action?.type;
-  return item.status === "completed" || (actionType === "search" && item.status !== "failed");
+  return item.status === "completed" || (item.status === undefined && actionType === "search");
 }
 
 /** The sources a web_search_call lists on its action; a string action has none. */
@@ -135,7 +127,7 @@ function collectItem(state: NativeSearchState, item: ResponsesItem | null | unde
     if (webSearchCompleted(item)) state.invoked = true;
     for (const source of actionSources(item)) addSource(state, source);
   }
-  collectContent(state, item.content);
+  collectCitations(state, item.content);
 }
 
 function requestPayload(payload: unknown, provider: string): Record<string, unknown> {
@@ -176,11 +168,14 @@ export function responsesSearchPayload(payload: unknown): Record<string, unknown
 /** Attaches Anthropic's server-side web_search tool to a Messages API payload.
  * The tool is never forced with tool_choice: Anthropic rejects a forced tool
  * while extended thinking is on. Grounded mode relies on the prompt and on the
- * worker's check that a search result arrived. */
-export function anthropicSearchPayload(payload: unknown): Record<string, unknown> {
+ * worker's check that a search result arrived. `maxUses` caps the searches in
+ * this request, so a long research turn ends with an answer rather than a
+ * pause_turn, which pi-ai cannot continue. */
+export function anthropicSearchPayload(payload: unknown, maxUses?: number): Record<string, unknown> {
   const body = requestPayload(payload, "Anthropic");
   const tools: unknown[] = Array.isArray(body.tools) ? body.tools : [];
-  return { ...body, tools: [...tools, { type: "web_search_20250305", name: "web_search" }] };
+  const search = { type: "web_search_20250305", name: "web_search", ...(maxUses ? { max_uses: maxUses } : {}) };
+  return { ...body, tools: [...tools, search] };
 }
 
 /** Anthropic SSE: web_search_tool_result blocks carry the search results;
@@ -195,7 +190,6 @@ function collectAnthropicEvent(state: NativeSearchState, event: SearchStreamEven
   }
   if (event.type === "content_block_delta") {
     const delta = typeof event.delta === "object" ? event.delta : undefined;
-    if (delta?.type === "text_delta" && typeof delta.text === "string") state.streamedText.push(delta.text);
     if (delta?.type === "citations_delta" && delta.citation?.type === "web_search_result_location") {
       addSource(state, delta.citation);
     }
@@ -212,9 +206,6 @@ function collectNativeSearchEvent(state: NativeSearchState, parsed: unknown): vo
   if (event.type === "response.web_search_call.completed") state.invoked = true;
   if (event.type === "response.output_text.annotation.added" && event.annotation?.type === "url_citation") {
     addSource(state, event.annotation);
-  }
-  if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-    state.streamedText.push(event.delta);
   }
   collectItem(state, event.item);
   for (const item of event.response?.output ?? []) collectItem(state, item);
@@ -233,7 +224,6 @@ function inspectSseBlock(block: string, state: NativeSearchState): void {
     // The provider may add comments or a non-JSON diagnostic event. The model
     // response remains usable; a missing completed search will still fail the
     // grounded-mode check in the worker.
-    state.parseErrors = (state.parseErrors ?? 0) + 1;
   }
 }
 
@@ -257,10 +247,7 @@ export async function inspectNativeSearchResponse(response: Response, state: Nat
       }
       // Bound only an incomplete event. Complete events are processed first so
       // a large text delta cannot evict the earlier search-completed event.
-      if (buffer.length > MAX_SSE_BUFFER_CHARS) {
-        state.parseErrors = (state.parseErrors ?? 0) + 1;
-        buffer = buffer.slice(-MAX_SSE_BUFFER_CHARS);
-      }
+      if (buffer.length > MAX_SSE_BUFFER_CHARS) buffer = buffer.slice(-MAX_SSE_BUFFER_CHARS);
       if (done) break;
     }
     if (buffer.trim()) inspectSseBlock(buffer, state);
@@ -269,38 +256,28 @@ export async function inspectNativeSearchResponse(response: Response, state: Nat
   }
 }
 
-export function createNativeSearchObserver(
-  fetchImpl: typeof fetch = globalThis.fetch,
-  options: { allowUnverifiedFallback?: boolean } = {},
-): NativeSearchObserver {
-  const state: ObservedSearchState = { invoked: false, sources: new Map(), outputText: [], streamedText: [], parseErrors: 0 };
+/** A fetch wrapper that reads the search events of each successful response
+ * it passes on. Each response gets its own state, and finish reports the last
+ * one: when pi-ai retries a request, the reply comes from the retry, so a
+ * search the abandoned attempt ran does not count. */
+export function createNativeSearchObserver(fetchImpl: typeof fetch = globalThis.fetch): NativeSearchObserver {
+  let latest: NativeSearchState = { invoked: false, sources: new Map() };
   const inspections: Promise<void>[] = [];
   return {
-    state,
     async fetch(input, init) {
       const response = await fetchImpl(input, init);
       if (response.ok) {
-        inspections.push(
-          inspectNativeSearchResponse(response.clone(), state).catch(() => {
-            state.parseErrors += 1;
-          }),
-        );
+        const state: NativeSearchState = { invoked: false, sources: new Map() };
+        latest = state;
+        // A stream that cannot be read leaves the search unproven, which the
+        // grounded-mode check in the worker refuses.
+        inspections.push(inspectNativeSearchResponse(response.clone(), state).catch(() => {}));
       }
       return response;
     },
     async finish() {
       await Promise.all(inspections);
-      // Regex extraction is retained only for optional gap-fill attribution.
-      // Grounded mode must have provider-owned citation/search metadata.
-      if (options.allowUnverifiedFallback && state.sources.size === 0 && state.invoked) {
-        const text = state.outputText.join("\n") || state.streamedText.join("");
-        for (const match of text.matchAll(/https?:\/\/[^\s"'<>\\]+/g)) {
-          let url = match[0];
-          while (/[.,!?;:\])}]+$/.test(url)) url = url.slice(0, -1);
-          addSource(state, { url, title: url });
-        }
-      }
-      return state;
+      return latest;
     },
   };
 }

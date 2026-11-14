@@ -65,11 +65,19 @@ interface TokenBody {
 
 const base64url = (buffer: Buffer): string => buffer.toString("base64url");
 
+/** The OAuth state of a flow. pi-ai's copy-code login sends the PKCE verifier
+ * itself as the state, which puts the verifier in the sign-in URL. A one-way
+ * hash of it keeps the verifier secret while the host still stores only the
+ * verifier, from which exchangeCode works the state out again. */
+export function flowState(verifier: string): string {
+  return base64url(createHash("sha256").update(`oauth-state:${verifier}`).digest());
+}
+
 export function startFlow(): ClaudeFlow {
   const verifier = base64url(randomBytes(32));
   const challenge = base64url(createHash("sha256").update(verifier).digest());
-  // state is the PKCE verifier, as in pi-ai's copy-code login. Anthropic echoes
-  // it back in the pasted code#state, which exchangeCode checks before exchanging.
+  // Anthropic echoes the state back in the pasted code#state, which
+  // exchangeCode checks before exchanging.
   const params = new URLSearchParams({
     code: "true",
     client_id: CLIENT_ID,
@@ -78,7 +86,7 @@ export function startFlow(): ClaudeFlow {
     scope: SCOPES,
     code_challenge: challenge,
     code_challenge_method: "S256",
-    state: verifier,
+    state: flowState(verifier),
   });
   return { url: `${AUTHORIZE_URL}?${params}`, verifier };
 }
@@ -112,7 +120,11 @@ export async function exchangeCode({ input, verifier }: ExchangeRequest, fetchIm
   if (typeof verifier !== "string" || !verifier) throw new Error("Missing verifier");
   const { code, state } = parseAuthorizationInput(input);
   if (!code) return { status: "failed", message: "Paste the code Anthropic shows after you sign in." };
-  if (state && state !== verifier) {
+  const expected = flowState(verifier);
+  // A bare code has no state to check. It is still safe to send: PKCE binds
+  // the code to this flow's verifier, so a code from another sign-in is
+  // refused by the token endpoint.
+  if (state && state !== expected) {
     return { status: "failed", message: "The code belongs to another sign-in. Start again." };
   }
   const response = await fetchImpl(TOKEN_URL, {
@@ -122,7 +134,7 @@ export async function exchangeCode({ input, verifier }: ExchangeRequest, fetchIm
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
       code,
-      state: state || verifier,
+      state: expected,
       redirect_uri: REDIRECT_URI,
       code_verifier: verifier,
     }),

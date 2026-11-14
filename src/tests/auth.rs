@@ -273,8 +273,8 @@ async fn first_setup_creates_user_and_claims_orphans() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO ai_drafts(id,operation,recipe_json,sources_json,created_at,expires_at)
-         VALUES('draft','generate','{}','[]',?,?)",
+        "INSERT INTO ai_drafts(id,recipe_json,sources_json,created_at,expires_at)
+         VALUES('draft','{}','[]',?,?)",
     )
     .bind(&now)
     .bind(&now)
@@ -511,6 +511,16 @@ async fn login_checks_credentials_and_returns_to_the_requested_page() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    // Letter case is ignored, as it is when a new username is checked, so a
+    // phone that capitalised the name at setup still signs in.
+    let response = app
+        .clone()
+        .oneshot(post("/login", None, "username=ALICE&password=secret-pass"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(cookie_set(&response, "recipe_session").is_some());
 }
 
 #[tokio::test]
@@ -872,6 +882,10 @@ async fn the_account_menu_creates_accounts_and_switches_between_them() {
             "username=+&password=bob-secret&confirm_password=bob-secret",
             "Username is required.",
         ),
+        (
+            "username=bob%0Aevil&password=bob-secret&confirm_password=bob-secret",
+            "Username must be on one line, without tabs or control characters.",
+        ),
     ] {
         let response = app
             .clone()
@@ -1150,6 +1164,159 @@ async fn an_ended_session_hands_over_to_a_remembered_account() {
     assert_eq!(left, 0);
 }
 
+#[tokio::test]
+async fn signing_out_of_an_account_that_already_ended_keeps_the_others() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    add_account(&db, "carol", "carol-secret").await;
+    let carol = token(&sign_in(&app, "carol", "carol-secret").await).to_string();
+
+    // Alice's session ends elsewhere (a new password on another device)
+    // while this browser still shows her as the active account.
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(&alice_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(post("/logout", Some(&browser(&alice, &[&carol])), ""))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            format!("recipe_session={carol}"),
+            "recipe_accounts=".to_string()
+        ]
+    );
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&carol, &[]))))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "carol is still signed in"
+    );
+}
+
+/// Makes every session due for the middleware's daily extension.
+async fn make_extensions_due(db: &SqlitePool) {
+    sqlx::query("UPDATE sessions SET expires_at = ?")
+        .bind((Utc::now() + Duration::days(2)).to_rfc3339())
+        .execute(db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_handler_that_sets_the_session_cookie_is_not_undone_by_the_daily_extension() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let alice_id = user_id(&db, "alice").await;
+    add_account(&db, "bob", "bob-secret").await;
+    let bob = token(&sign_in(&app, "bob", "bob-secret").await).to_string();
+    make_extensions_due(&db).await;
+
+    // The page was open for over a day, so switching is the request that
+    // extends bob's session; the browser must still end up on alice.
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/accounts/switch",
+            Some(&browser(&bob, &[&alice])),
+            &format!("user_id={alice_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            format!("recipe_session={alice}"),
+            format!("recipe_accounts={bob}")
+        ]
+    );
+
+    // A new password gives this browser a new session, which the extension
+    // of the old one must not replace.
+    make_extensions_due(&db).await;
+    let response = app
+        .clone()
+        .oneshot(post(
+            "/settings/password",
+            Some(&browser(&alice, &[&bob])),
+            "current_password=secret-pass&new_password=newer-pass&confirm_password=newer-pass",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(location(&response), "/settings#settings-account");
+    let sessions: Vec<String> = set_cookies(&response)
+        .into_iter()
+        .filter(|cookie| cookie.starts_with("recipe_session="))
+        .collect();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert_ne!(sessions[0], format!("recipe_session={alice}"));
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(token(&sessions[0]), &[&bob]))))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_browser_remembers_no_more_accounts_than_fit_behind_the_active_one() {
+    use sha2::{Digest, Sha256};
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    // Eight more accounts with live sessions, all in the accounts cookie.
+    let expires = (Utc::now() + Duration::days(30)).to_rfc3339();
+    let mut remembered = Vec::new();
+    for n in 1..=8 {
+        let id = format!("user{n}");
+        sqlx::query("INSERT INTO users(id,username,password_hash,created_at) VALUES(?1,?1,'x',?2)")
+            .bind(&id)
+            .bind(stamp())
+            .execute(&db)
+            .await
+            .unwrap();
+        let token = format!("{n}{}", "t".repeat(42));
+        sqlx::query(
+            "INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+        )
+        .bind(format!("{:x}", Sha256::digest(token.as_bytes())))
+        .bind(&id)
+        .bind(stamp())
+        .bind(&expires)
+        .execute(&db)
+        .await
+        .unwrap();
+        remembered.push(token);
+    }
+    let remembered: Vec<&str> = remembered.iter().map(String::as_str).collect();
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&alice, &remembered))))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    // Seven fit behind alice; the eighth needs its password again.
+    assert!(body.contains("name=\"user_id\" value=\"user7\""), "{body}");
+    assert!(!body.contains("name=\"user_id\" value=\"user8\""));
+    assert!(body.contains("href=\"/login?username=user8\""));
+}
+
 /// Every table that holds an account's data, with the column whose value
 /// starts with the owner's user id once `seed_account` has filled it.
 const OWNED_TABLES: &[(&str, &str)] = &[
@@ -1174,14 +1341,16 @@ const OWNED_TABLES: &[(&str, &str)] = &[
     ("app_settings", "user_id"),
     ("ai_endpoints", "id"),
     ("pi_credentials", "user_id"),
+    ("web_search_keys", "user_id"),
     ("sessions", "user_id"),
     ("users", "id"),
 ];
 
 /// Seeds a row in every per-account table for `user_id`, each keyed by an id
 /// that starts with the user id: a recipe with its blocks, sources, history,
-/// search vector, photos, moments, chat, and note; an alteration draft and a
-/// new-recipe draft with thumbnails and moments; and settings and AI logins.
+/// search vector, photos, moments, chat, and note; two drafts with
+/// thumbnails, one with moments; and settings, AI logins, and the web search
+/// key.
 async fn seed_account(db: &SqlitePool, user_id: &str) {
     for statement in [
         "INSERT INTO recipes(id,title,created_at,updated_at,user_id,thumbnail_jpeg)
@@ -1209,10 +1378,10 @@ async fn seed_account(db: &SqlitePool, user_id: &str) {
          VALUES(?1||'-chat',?1,?1||'-recipe','user','More salt?',?2)",
         "INSERT INTO recipe_notes(id,user_id,recipe_id,body,photo_jpeg,chat_message_id,created_at,updated_at)
          VALUES(?1||'-note',?1,?1||'-recipe','Good',x'ffd8',?1||'-chat',?2,?2)",
-        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,chat_message_id)
-         VALUES(?1||'-alter',?1||'-recipe','alter','{}','[]',?2,?2,?1,?1||'-chat')",
-        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id)
-         VALUES(?1||'-draft',NULL,'generate','{}','[]',?2,?2,?1)",
+        "INSERT INTO ai_drafts(id,recipe_json,sources_json,created_at,expires_at,user_id)
+         VALUES(?1||'-alter','{}','[]',?2,?2,?1)",
+        "INSERT INTO ai_drafts(id,recipe_json,sources_json,created_at,expires_at,user_id)
+         VALUES(?1||'-draft','{}','[]',?2,?2,?1)",
         "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES(?1||'-draft',0,1,x'ffd8')",
         "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES(?1||'-alter',0,1,x'ffd8')",
         "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector)
@@ -1225,6 +1394,8 @@ async fn seed_account(db: &SqlitePool, user_id: &str) {
          VALUES(?1||'-endpoint',?1,'OpenAI API','openai','https://api.openai.com/v1','sk-test',?2,?2)",
         "INSERT INTO pi_credentials(user_id,provider,credential_json,updated_at)
          VALUES(?1,'openai-codex','{}',?2)",
+        "INSERT INTO web_search_keys(user_id,provider,api_key,created_at,updated_at)
+         VALUES(?1,'brave','search-key',?2,?2)",
     ] {
         let mut query = sqlx::query(statement).bind(user_id);
         if statement.contains("?2") {

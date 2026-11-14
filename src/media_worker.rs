@@ -158,6 +158,14 @@ impl Client {
 
         let mut replaced = false;
         loop {
+            // A request sent with no time left would time out at once and
+            // kill a healthy worker; the worker stays in its slot instead.
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the {} request ran out of time before it was sent",
+                    self.label
+                ));
+            }
             let mut worker = match slot
                 .take()
                 .and_then(|mut worker| worker.alive().then_some(worker))
@@ -208,10 +216,8 @@ impl Client {
 
     fn start(&self) -> Result<Worker, String> {
         let mut command = (self.spawn)();
-        // A worker must be killable with everything it spawned, and it does
-        // not need the AI Gateway secret the app environment carries.
+        // A worker must be killable with everything it spawned.
         command.process_group(0);
-        command.env_remove("AI_GATEWAY_API_KEY");
         command.env("PYTHONUNBUFFERED", "1");
         let mut child = command
             .stdin(Stdio::piped())
@@ -509,6 +515,18 @@ done
     fn keeps_one_worker_across_requests() {
         let client = client(ECHO_PID, 1024);
         let first = client.request(json!({"command": "ping"}), LONG).unwrap();
+        let second = client.request(json!({"command": "ping"}), LONG).unwrap();
+        assert_eq!(pid_of(&first), pid_of(&second));
+    }
+
+    #[test]
+    fn a_request_out_of_time_before_it_is_sent_keeps_the_warm_worker() {
+        let client = client(ECHO_PID, 1024);
+        let first = client.request(json!({"command": "ping"}), LONG).unwrap();
+        let error = client
+            .request(json!({"command": "ping"}), Duration::ZERO)
+            .unwrap_err();
+        assert!(error.contains("ran out of time"), "{error}");
         let second = client.request(json!({"command": "ping"}), LONG).unwrap();
         assert_eq!(pid_of(&first), pid_of(&second));
     }

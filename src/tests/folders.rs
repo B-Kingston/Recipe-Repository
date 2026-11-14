@@ -188,6 +188,20 @@ fn a_search_that_names_a_folder_opens_it() {
 }
 
 #[test]
+fn a_recipe_can_be_pinned_to_any_folder_of_its_shelf_but_not_sorted_yet() {
+    let pinnable = |shelf: Shelf, slug: &str| shelf.pinnable(slug).map(|folder| folder.slug);
+    assert_eq!(pinnable(Shelf::Dishes, "desserts"), Some("desserts"));
+    assert_eq!(pinnable(Shelf::Cuisines, "other"), Some("other"));
+    assert_eq!(pinnable(Shelf::Dishes, "thai"), None);
+    assert_eq!(pinnable(Shelf::Dishes, "other"), None);
+    assert_eq!(pinnable(Shelf::Cuisines, "unsorted"), None);
+    assert_eq!(
+        Shelf::Cuisines.folder("unsorted").map(|f| f.slug),
+        Some("unsorted")
+    );
+}
+
+#[test]
 fn folder_links_resolve_on_either_shelf() {
     let resolved =
         |slug: &str, view| resolve(slug, view).map(|(shelf, folder)| (shelf, folder.slug));

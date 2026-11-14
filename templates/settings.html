@@ -6,7 +6,7 @@
 {# Every form here saves in place: htmx swaps in the fresh #settings panel
    and keeps the scroll position, and the block that saved shows its notice.
    Without JavaScript the redirect's #fragment brings the block into view. #}
-<div class="compact-panel" id="settings" data-settings>
+<div class="compact-panel" id="settings">
   {% if uses_shared_ai %}
   <div class="block" id="settings-ai">
     <h2>AI provider <span class="codex-status{% if ai_ready %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if ai_ready %}&#10003; Shared{% else %}Not connected{% endif %}</span></h2>
@@ -40,8 +40,8 @@
     {% if ai_error != "" %}<p class="error" role="alert">{{ ai_error }}</p>{% endif %}
     {# A check's own error already says so; show the standing banner only without one. #}
     {% if active_login_refused && ai_error == "" %}<p class="error" role="alert">The provider you generate with refused its sign-in: it has expired or was revoked. Reconnect it (or replace its key) below.</p>{% endif %}
-    {# hx-disinherit: the Reconnect / Connect links inside load into the sign-in popup, not this form's #settings swap. #}
-    <form method="post" action="/settings" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" hx-disinherit="hx-target hx-select hx-swap" data-provider-form>
+    {# The Reconnect / Connect links inside name their own target, select, and swap, so they load into the sign-in popup rather than taking this form's #settings swap. #}
+    <form method="post" action="/settings" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" data-provider-form>
       <fieldset>
         <legend class="muted">Generate recipes with</legend>
         <div class="toggle-row provider-row">
@@ -230,7 +230,7 @@
   </div>
   <div class="block" id="settings-chat">
     <h2>Recipe chat <span class="codex-status{% if recipe_chat %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if recipe_chat %}&#10003; On{% else %}Off{% endif %}</span></h2>
-    <p class="muted block-note">An Ask button on every recipe opens a chat about that recipe. It answers with your AI setup above, and it is how you change a saved recipe with AI: ask for a change and save the draft it makes. Conversations are private to your account. Off hides the chat, and with it AI changes to saved recipes; saved conversations stay.</p>
+    <p class="muted block-note">An Ask button on every recipe opens a chat about that recipe. It answers with your AI setup above, and it is how you change a saved recipe with AI: ask for a change, then accept or deny the edits it proposes. Conversations are private to your account. Off hides the chat, and with it AI changes to saved recipes; saved conversations stay.</p>
     {% if chat_notice != "" %}<p class="notice" role="status">{{ chat_notice }}</p>{% endif %}
     <form method="post" action="/settings/recipe-chat" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
       <label><input type="checkbox" name="enabled" value="on"{% if recipe_chat %} checked{% endif %}> Show the recipe chat</label>

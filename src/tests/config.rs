@@ -5,13 +5,23 @@ use parking_lot::Mutex;
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn env_bool_accepts_true_and_false_and_uses_default_for_invalid_values() {
+fn env_bool_reads_the_usual_spellings_and_keeps_the_default_otherwise() {
     let _lock = ENV_LOCK.lock();
-    unsafe { std::env::set_var("KINDLE_RECIPES_TEST_BOOL", "false") };
-    assert!(!env_bool("KINDLE_RECIPES_TEST_BOOL", true));
-    unsafe { std::env::set_var("KINDLE_RECIPES_TEST_BOOL", "true") };
-    assert!(env_bool("KINDLE_RECIPES_TEST_BOOL", false));
-    unsafe { std::env::set_var("KINDLE_RECIPES_TEST_BOOL", "yes") };
-    assert!(env_bool("KINDLE_RECIPES_TEST_BOOL", true));
-    unsafe { std::env::remove_var("KINDLE_RECIPES_TEST_BOOL") };
+    const NAME: &str = "KINDLE_RECIPES_TEST_BOOL";
+    for off in ["false", "0", "no", "off", " OFF ", "False"] {
+        unsafe { std::env::set_var(NAME, off) };
+        assert!(!env_bool(NAME, true), "{off:?}");
+    }
+    for on in ["true", "1", "yes", "on", " Yes ", "TRUE"] {
+        unsafe { std::env::set_var(NAME, on) };
+        assert!(env_bool(NAME, false), "{on:?}");
+    }
+    for unknown in ["", "maybe", "2", "enabled"] {
+        unsafe { std::env::set_var(NAME, unknown) };
+        assert!(env_bool(NAME, true), "{unknown:?}");
+        assert!(!env_bool(NAME, false), "{unknown:?}");
+    }
+    unsafe { std::env::remove_var(NAME) };
+    assert!(env_bool(NAME, true));
+    assert!(!env_bool(NAME, false));
 }
