@@ -3,7 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "pi": "pi",
     "test": "node --test pi/*.test.ts",
     "typecheck": "tsc -p pi && tsc -p web --noEmit",
     "build:web": "tsc -p web && tsc -p web/tsconfig.htmx.json"

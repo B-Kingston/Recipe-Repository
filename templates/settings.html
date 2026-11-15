@@ -30,7 +30,7 @@
           {% if codex_authorised %}
           <span class="provider-actions">
             <button class="compact" type="submit" form="check-codex">Refresh sign-in</button>
-            <a class="button compact{% if codex_refused %} primary{% endif %}" href="{{ codex_auth_url }}" hx-get="{{ codex_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
+            <a class="button compact{% if codex_refused %} primary{% endif %}" href="/settings/authorise-codex" hx-get="/settings/authorise-codex" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
             <button class="compact" type="submit" form="disconnect-codex">Disconnect</button>
           </span>
           {% endif %}
@@ -40,7 +40,7 @@
           {% if claude_authorised %}
           <span class="provider-actions">
             <button class="compact" type="submit" form="check-claude">Refresh sign-in</button>
-            <a class="button compact{% if claude_refused %} primary{% endif %}" href="{{ claude_auth_url }}" hx-get="{{ claude_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
+            <a class="button compact{% if claude_refused %} primary{% endif %}" href="/settings/authorise-claude" hx-get="/settings/authorise-claude" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Reconnect</a>
             <button class="compact" type="submit" form="disconnect-claude">Disconnect</button>
           </span>
           {% endif %}
@@ -65,7 +65,7 @@
         </select>
         {% else %}
         <p class="muted">Sign in with your ChatGPT Plus or Pro account to use Codex.</p>
-        <p class="actions"><a class="button primary" href="{{ codex_auth_url }}" hx-get="{{ codex_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect ChatGPT</a></p>
+        <p class="actions"><a class="button primary" href="/settings/authorise-codex" hx-get="/settings/authorise-codex" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect ChatGPT</a></p>
         {% endif %}
       </div>
       <div data-model-panel="claude"{% if !claude_selected %} hidden{% endif %}>
@@ -78,7 +78,7 @@
         </select>
         {% else %}
         <p class="muted">Sign in with your Claude Pro or Max account to use Claude.</p>
-        <p class="actions"><a class="button primary" href="{{ claude_auth_url }}" hx-get="{{ claude_auth_url }}" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect Claude</a></p>
+        <p class="actions"><a class="button primary" href="/settings/authorise-claude" hx-get="/settings/authorise-claude" hx-target="#auth-popup-body" hx-select="#auth-flow" hx-swap="innerHTML" hx-push-url="false">Connect Claude</a></p>
         {% endif %}
       </div>
       {% for endpoint in endpoints %}
