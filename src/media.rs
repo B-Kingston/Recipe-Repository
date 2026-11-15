@@ -2928,21 +2928,20 @@ pub(crate) fn run_process(
     // child whose pipe buffer fills (yt-dlp metadata with many formats).
     let stdout_thread = thread::spawn(move || drain_output(stdout, max_output_bytes));
     let stderr_thread = thread::spawn(move || drain_output(stderr, max_output_bytes));
-    let fed = match (stdin, child.stdin.take()) {
-        (Some(payload), Some(mut pipe)) => std::io::Write::write_all(&mut pipe, payload),
-        _ => Ok(()),
-    };
+    // A child that stops reading early shows it in its exit status (and its
+    // stderr), so a failed write is not an error of its own.
+    if let (Some(payload), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = std::io::Write::write_all(&mut pipe, payload);
+    }
     let started = Instant::now();
-    let monitor = fed.and_then(|()| {
-        loop {
-            match has_exited(&child) {
-                Ok(true) => break Ok(true),
-                Ok(false) if started.elapsed() >= timeout => break Ok(false),
-                Ok(false) => thread::sleep(Duration::from_millis(25)),
-                Err(error) => break Err(error),
-            }
+    let monitor = loop {
+        match has_exited(&child) {
+            Ok(true) => break Ok(true),
+            Ok(false) if started.elapsed() >= timeout => break Ok(false),
+            Ok(false) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => break Err(error),
         }
-    });
+    };
     // A helper that outlives the leader can keep the output pipes open, so the
     // group is killed on every path before the readers are joined. The leader
     // is still unreaped here, so its group ID cannot have been reused.
