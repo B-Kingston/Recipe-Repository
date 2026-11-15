@@ -393,10 +393,18 @@ const SESSION_REFRESH_HOURS: i64 = 24;
 /// Two `Set-Cookie` headers: the session cookie, then the accounts cookie.
 pub(crate) type BrowserCookies = AppendHeaders<[(HeaderName, HeaderValue); 2]>;
 
-/// SHA-256 of a session token, as stored in `sessions.token_hash`. The table
-/// never holds the token itself.
-fn token_hash(token: &str) -> String {
+/// SHA-256 in hex, as stored for session and invite tokens
+/// (`sessions.token_hash`, `group_invites.token_hash`); the tables never
+/// hold a token itself.
+pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+/// A new secret token: 32 random bytes in unpadded base64url.
+pub(crate) fn new_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Whether `token` has the shape of a session token: 32 bytes in unpadded
@@ -442,9 +450,7 @@ fn cleared_cookies() -> Result<BrowserCookies> {
 
 /// Starts a session for the user and returns its token.
 async fn start_session(db: impl sqlx::SqliteExecutor<'_>, user_id: &str) -> Result<String> {
-    let mut bytes = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut bytes);
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let token = new_token();
     let now = Utc::now();
     sqlx::query("INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)")
         .bind(token_hash(&token))

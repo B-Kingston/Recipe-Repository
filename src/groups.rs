@@ -23,11 +23,8 @@ use axum::{
     http::{HeaderMap, header},
     response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
 };
-use base64::Engine;
 use chrono::{Duration, Utc};
-use rand_core::RngCore;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -214,22 +211,6 @@ pub(crate) fn valid_email(address: &str) -> bool {
     local_ok && domain_ok
 }
 
-fn sha256_hex(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
-}
-
-/// SHA-256 of an invite token, as stored in `group_invites.token_hash`.
-pub(crate) fn invite_token_hash(token: &str) -> String {
-    sha256_hex(token)
-}
-
-/// A new invite token: 32 random bytes in unpadded base64url.
-fn new_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
 /// Escapes text for an HTML mail body.
 fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -361,7 +342,7 @@ async fn find_invite<'c>(
          JOIN users u ON u.id = i.inviter_id
          WHERE i.token_hash = ? AND i.expires_at > ?",
     )
-    .bind(invite_token_hash(token))
+    .bind(crate::auth::token_hash(token))
     .bind(stamp())
     .fetch_optional(conn)
     .await?;
@@ -662,8 +643,8 @@ pub(crate) async fn send_invite(
         .await?
         .ok_or(AppError::NotFound)?;
     let masked = mask_email(&address);
-    let email_hash = sha256_hex(&address.to_lowercase());
-    let token = new_token();
+    let email_hash = crate::auth::token_hash(&address.to_lowercase());
+    let token = crate::auth::new_token();
     let now = Utc::now();
     let mut tx = crate::recipes::begin_write(&state.db).await?;
     // Inviting the same address again replaces the earlier link.
@@ -677,7 +658,7 @@ pub(crate) async fn send_invite(
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(Uuid::new_v4().to_string())
-    .bind(invite_token_hash(&token))
+    .bind(crate::auth::token_hash(&token))
     .bind(&user.id)
     .bind(&email_hash)
     .bind(&masked)
@@ -926,7 +907,7 @@ pub(crate) async fn decline_invite(
     Path(token): Path<String>,
 ) -> Result<Html<String>> {
     let declined = sqlx::query("DELETE FROM group_invites WHERE token_hash = ? AND expires_at > ?")
-        .bind(invite_token_hash(&token))
+        .bind(crate::auth::token_hash(&token))
         .bind(stamp())
         .execute(&state.db)
         .await?
