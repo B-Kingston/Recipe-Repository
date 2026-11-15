@@ -27,6 +27,7 @@
           {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
           <p class="actions">{% if adding %}<a class="button" href="/">Cancel</a> {% endif %}<button class="button primary" type="submit">Sign in</button></p>
         </form>
+        {% if forgot %}<p class="muted"><a href="/forgot">Forgot password?</a></p>{% endif %}
       </div>
     </div>
   </main>

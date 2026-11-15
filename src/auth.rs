@@ -66,7 +66,7 @@ static UNKNOWN_USER_HASH: LazyLock<String> =
     LazyLock::new(|| hash_password("kindle-recipes-unknown-user").unwrap_or_default());
 
 /// Argon2 hashing on the blocking pool, so the async runtime is never stalled.
-async fn hash_off_runtime(password: String) -> Result<String> {
+pub(crate) async fn hash_off_runtime(password: String) -> Result<String> {
     tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(|error| AppError::Internal(format!("password hashing task failed: {error}")))?
@@ -74,7 +74,7 @@ async fn hash_off_runtime(password: String) -> Result<String> {
 
 /// Argon2 verification on the blocking pool. An unknown account (`None`) is
 /// checked against the dummy hash, so it costs the same as a wrong password.
-async fn check_password(password: String, stored: Option<String>) -> bool {
+pub(crate) async fn check_password(password: String, stored: Option<String>) -> bool {
     tokio::task::spawn_blocking(move || match stored {
         Some(stored) => verify_password(&password, &stored),
         None => {
@@ -98,6 +98,10 @@ pub(crate) enum Limit {
     Password,
     /// Accounts created, or refused as a taken username, from one address.
     NewAccount,
+    /// Password reset requests from one address.
+    ForgotAddress,
+    /// Recovery mail (verification and reset links) sent for one user id.
+    AccountMail,
 }
 
 impl Limit {
@@ -105,7 +109,9 @@ impl Limit {
     pub(crate) fn allowance(self) -> usize {
         match self {
             Self::LoginAddress => 30,
+            Self::ForgotAddress => 20,
             Self::LoginUsername | Self::Password | Self::NewAccount => 10,
+            Self::AccountMail => 5,
         }
     }
 
@@ -113,7 +119,7 @@ impl Limit {
     pub(crate) fn window(self) -> StdDuration {
         StdDuration::from_secs(match self {
             Self::LoginAddress | Self::LoginUsername | Self::Password => 15 * 60,
-            Self::NewAccount => 60 * 60,
+            Self::NewAccount | Self::ForgotAddress | Self::AccountMail => 60 * 60,
         })
     }
 }
@@ -135,10 +141,11 @@ pub(crate) fn username_key(username: &str) -> LimitKey {
     (Limit::LoginUsername, name.to_ascii_lowercase())
 }
 
-/// In-memory brute-force limits for sign-in, the password page, and account
-/// creation, shared by every request of this process. Each key keeps the
-/// times of its recent hits, never more than its allowance, so a key frees
-/// up as its oldest hit leaves the window. A restart forgets them all.
+/// In-memory brute-force limits for sign-in, the password and email pages,
+/// account creation, and recovery mail, shared by every request of this
+/// process. Each key keeps the times of its recent hits, never more than its
+/// allowance, so a key frees up as its oldest hit leaves the window. A
+/// restart forgets them all.
 pub(crate) struct RateLimits {
     /// Take the client address from the left-most `X-Forwarded-For` entry
     /// (`TRUST_PROXY_HEADERS`) instead of the connection's peer address.
@@ -339,7 +346,7 @@ const MIN_PASSWORD_CHARS: usize = 8;
 /// Rules for a password being set: not blank, typed identically twice, and at
 /// least MIN_PASSWORD_CHARS characters. The password is measured as typed and
 /// stored exactly, never trimmed.
-fn check_new_password(password: &str, confirm: &str, blank_message: &str) -> Result<()> {
+pub(crate) fn check_new_password(password: &str, confirm: &str, blank_message: &str) -> Result<()> {
     if password.trim().is_empty() {
         return Err(AppError::BadRequest(blank_message.into()));
     }
@@ -393,9 +400,9 @@ const SESSION_REFRESH_HOURS: i64 = 24;
 /// Two `Set-Cookie` headers: the session cookie, then the accounts cookie.
 pub(crate) type BrowserCookies = AppendHeaders<[(HeaderName, HeaderValue); 2]>;
 
-/// SHA-256 in hex, as stored for session and invite tokens
-/// (`sessions.token_hash`, `group_invites.token_hash`); the tables never
-/// hold a token itself.
+/// SHA-256 in hex, as stored for session, invite, and email-link tokens
+/// (`sessions.token_hash`, `group_invites.token_hash`,
+/// `email_tokens.token_hash`); the tables never hold a token itself.
 pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -940,6 +947,7 @@ pub(crate) async fn login_page(
         username: trim(query.username.as_deref().unwrap_or_default()),
         next: local_target(query.next.as_deref().unwrap_or("/")).to_string(),
         adding: !browser_sessions(&state.db, &headers).await?.is_empty(),
+        forgot: state.mail.recovery_base().is_some(),
         notice: if flash.is("account_deleted") {
             "Account deleted."
         } else {
@@ -963,6 +971,7 @@ async fn login_again(
         username,
         next,
         adding: !browser_sessions(&state.db, headers).await?.is_empty(),
+        forgot: state.mail.recovery_base().is_some(),
         notice: "",
     })?;
     Ok((status, page).into_response())

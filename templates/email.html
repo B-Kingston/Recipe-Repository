@@ -1,0 +1,23 @@
+{% extends "base.html" %}{% block title %}Recovery email · Recipe Repository{% endblock %}{% block nav_settings %} aria-current="page"{% endblock %}{% block content %}
+<div class="form-intro">
+  <p class="eyebrow">Account</p>
+  <h1>Recovery email</h1>
+  <p class="deck">If you forget your password, a reset link goes to this address. A new address takes over once you follow the link sent to it.</p>
+</div>
+<div class="compact-panel">
+  <p>{% if status.verified.is_empty() %}No recovery email yet.{% else %}Now: {{ status.verified }} (verified){% endif %}</p>
+  {% if !status.pending.is_empty() %}<p class="muted">Waiting for verification: {{ status.pending }}. The link sent to it works for 24 hours.</p>{% endif %}
+  <form method="post" action="/settings/email">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" value="{{ email }}" autocomplete="email" autocapitalize="none" spellcheck="false" maxlength="254" aria-describedby="email-hint">
+    <p class="muted" id="email-hint">Leave it blank to remove your recovery email.</p>
+    <label for="current_password">Current password</label>
+    <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+    {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <p class="actions">
+      <a class="button" href="/settings">Cancel</a>
+      <button class="button primary" type="submit">Save</button>
+    </p>
+  </form>
+</div>
+{% endblock %}

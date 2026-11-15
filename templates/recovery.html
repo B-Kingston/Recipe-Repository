@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="referrer" content="no-referrer">
+  <title>{% if state == "forgot" || state == "sent" %}Forgot password{% else if state == "verify" || state == "verified" || state == "verify_expired" %}Verify email{% else %}Set a new password{% endif %} · Recipe Repository</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/display.css">
+</head>
+<body class="setup-page">
+  {# Opened from an email or the sign-in page, signed in or not, so it
+     stands alone like the sign-in page: no htmx, plain forms. #}
+  <main class="app-shell">
+    <div class="paper setup-card">
+      <div class="form-intro">
+        <p class="eyebrow">Recipe Repository</p>
+        {% if state == "forgot" %}
+        <h1>Forgot password</h1>
+        <p class="deck">Enter your username or recovery email. If the account has a verified recovery email, we send it a link to set a new password.</p>
+        {% else if state == "sent" %}
+        <h1>Check your email</h1>
+        <p class="deck">If an account matches and has a verified email, we've sent a link. It works once, for one hour.</p>
+        {% else if state == "reset" %}
+        <h1>Set a new password</h1>
+        <p class="deck">Every device signed in to the account signs out; this browser signs in with the new password.</p>
+        {% else if state == "verify" %}
+        <h1>Verify your email</h1>
+        <p class="deck">Use this address to recover your account if you forget your password.</p>
+        {% else if state == "verified" %}
+        <h1>Email verified</h1>
+        <p class="deck">Password reset links now go to this address.</p>
+        {% else %}
+        <h1>This link has expired</h1>
+        <p class="deck">It was already used, a newer one replaced it, or it is too old.</p>
+        {% endif %}
+      </div>
+      <div class="compact-panel">
+        {% if state == "forgot" %}
+        <form method="post" action="/forgot">
+          <label for="account">Username or email</label>
+          <input id="account" name="account" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="254" required autofocus>
+          {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          <p class="actions"><a class="button" href="/login">Cancel</a> <button class="button primary" type="submit">Send link</button></p>
+        </form>
+        {% else if state == "sent" %}
+        <p class="actions"><a class="button" href="/login">Back to sign in</a></p>
+        {% else if state == "reset" %}
+        <form method="post" action="/reset/{{ token }}">
+          <label for="new_password">New password</label>
+          <input id="new_password" name="new_password" type="password" autocomplete="new-password" required autofocus aria-describedby="new-password-hint">
+          <p class="muted" id="new-password-hint">At least 8 characters.</p>
+          <label for="confirm_password">Confirm new password</label>
+          <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required>
+          {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          <p class="actions"><button class="button primary" type="submit">Set password</button></p>
+        </form>
+        {% else if state == "verify" %}
+        <form method="post" action="/email/verify/{{ token }}">
+          {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          <p class="actions"><button class="button primary" type="submit">Verify email</button></p>
+        </form>
+        {% else if state == "verified" %}
+        <p class="actions"><a class="button primary" href="/">Open Recipe Repository</a></p>
+        {% else if state == "verify_expired" %}
+        <p>Send a new link from Settings, under Account.</p>
+        <p class="actions"><a class="button" href="/settings#settings-account">Open Settings</a></p>
+        {% else %}
+        <p class="actions"><a class="button primary" href="/forgot">Ask for a new link</a></p>
+        {% endif %}
+      </div>
+    </div>
+  </main>
+</body>
+</html>

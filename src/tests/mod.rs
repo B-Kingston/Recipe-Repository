@@ -7,10 +7,12 @@ mod display;
 mod folders;
 mod groups;
 mod htmx;
+mod mail;
 mod media;
 mod moments;
 mod notes;
 mod recipes;
+mod recovery;
 mod scale;
 mod search;
 mod settings;
@@ -41,6 +43,11 @@ pub(crate) async fn memory_db() -> SqlitePool {
 /// The state handlers run against in tests: no AI helpers, no embedding
 /// sidecar, mail off, and empty in-memory maps.
 pub(crate) fn test_state(db: SqlitePool) -> Arc<AppState> {
+    test_state_with_mail(db, crate::mail::Mail::default())
+}
+
+/// `test_state` with the given mail setup.
+pub(crate) fn test_state_with_mail(db: SqlitePool, mail: crate::mail::Mail) -> Arc<AppState> {
     Arc::new(AppState {
         db,
         model: String::new(),
@@ -56,7 +63,7 @@ pub(crate) fn test_state(db: SqlitePool) -> Arc<AppState> {
         moment_jobs: Default::default(),
         embedder: None,
         rate_limits: Default::default(),
-        invites: Default::default(),
+        mail,
     })
 }
 

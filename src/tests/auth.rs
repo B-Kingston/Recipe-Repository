@@ -1204,6 +1204,7 @@ const OWNED_TABLES: &[(&str, &str)] = &[
     ("ai_grants", "granter_id"),
     ("group_invites", "id"),
     ("group_invite_sends", "user_id"),
+    ("email_tokens", "token_hash"),
     ("users", "id"),
 ];
 
@@ -1211,8 +1212,8 @@ const OWNED_TABLES: &[(&str, &str)] = &[
 /// that starts with the user id: a recipe with its blocks, sources, history,
 /// search vector, photos, moments, chat, and note; two drafts with
 /// thumbnails, one with moments; settings, AI logins, and the web search
-/// key; and a group of its own (with a grant to itself), an invite it sent,
-/// and the send log.
+/// key; a group of its own (with a grant to itself), an invite it sent,
+/// and the send log; and a verification and a reset link.
 async fn seed_account(db: &SqlitePool, user_id: &str) {
     for statement in [
         "INSERT INTO recipes(id,title,created_at,updated_at,user_id,thumbnail_jpeg)
@@ -1265,6 +1266,10 @@ async fn seed_account(db: &SqlitePool, user_id: &str) {
         "INSERT INTO group_invites(id,token_hash,inviter_id,email_hash,email_masked,created_at,expires_at)
          VALUES(?1||'-invite',?1||'-token',?1,'hash','j***@example.com',?2,?2)",
         "INSERT INTO group_invite_sends(id,user_id,sent_at) VALUES(?1||'-send',?1,?2)",
+        "INSERT INTO email_tokens(token_hash,user_id,purpose,email,created_at,expires_at)
+         VALUES(?1||'-verify',?1,'verify','jane@example.com',?2,?2)",
+        "INSERT INTO email_tokens(token_hash,user_id,purpose,created_at,expires_at)
+         VALUES(?1||'-reset',?1,'reset',?2,?2)",
     ] {
         let mut query = sqlx::query(statement).bind(user_id);
         if statement.contains("?2") {

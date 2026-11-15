@@ -2,8 +2,8 @@
 //! read-only member view, copies, and AI-login grants.
 
 use super::config::ENV_LOCK;
-use crate::groups::{Invites, Mailer, OutgoingMail, mask_email, valid_email};
-use crate::{AppState, CODEX_PI_PROVIDER, routes, stamp, store_pi_credential};
+use crate::mail::{Mail, Mailer, OutgoingMail};
+use crate::{CODEX_PI_PROVIDER, routes, stamp, store_pi_credential};
 use axum::{
     Router,
     body::Body,
@@ -13,38 +13,12 @@ use axum::{
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::{
-    collections::{HashMap, HashSet},
-    io::Write,
-    sync::Arc,
-};
+use std::{io::Write, sync::Arc};
 use tower::ServiceExt;
 
 use super::memory_db as database;
 
-fn state_with(db: SqlitePool, invites: Invites) -> Arc<AppState> {
-    Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites,
-    })
-}
-
-fn state(db: SqlitePool) -> Arc<AppState> {
-    state_with(db, Invites::default())
-}
+use super::{test_state as state, test_state_with_mail as state_with};
 
 /// Puts the accounts in one new group and returns its id.
 pub(super) async fn form_group(db: &SqlitePool, members: &[&str]) -> String {
@@ -206,61 +180,6 @@ async fn every_stored_text(db: &SqlitePool) -> String {
     all
 }
 
-#[test]
-fn addresses_are_checked_and_masked() {
-    for good in [
-        "jane@example.com",
-        "jane.doe+recipes@mail.example.co.uk",
-        "j@x.io",
-        "émile@exemple.fr",
-    ] {
-        assert!(valid_email(good), "{good}");
-    }
-    for bad in [
-        "",
-        "jane",
-        "jane@",
-        "@example.com",
-        "jane@example",
-        "jane@@example.com",
-        "jane doe@example.com",
-        "jane@exa mple.com",
-        ".jane@example.com",
-        "jane..doe@example.com",
-        "jane@-example.com",
-        "jane@example..com",
-        "jane@example.com\n",
-        "jane<script>@example.com",
-    ] {
-        assert!(!valid_email(bad), "{bad:?}");
-    }
-    assert!(!valid_email(&format!("{}@example.com", "a".repeat(65))));
-    assert_eq!(mask_email("jane.doe@example.com"), "j***@example.com");
-    assert_eq!(mask_email("émile@exemple.fr"), "é***@exemple.fr");
-    assert_eq!(mask_email("nobody"), "***");
-}
-
-#[test]
-fn public_base_url_is_trimmed_and_checked() {
-    let invites = Invites::new(None, None, Some(" https://reciperepository.app/ ".into()));
-    assert_eq!(
-        invites.base_url.as_deref(),
-        Some("https://reciperepository.app")
-    );
-    assert!(!invites.mailer.enabled());
-    assert!(
-        Invites::new(None, None, Some("ftp://x".into()))
-            .base_url
-            .is_none()
-    );
-    assert!(
-        Invites::new(None, None, Some("  ".into()))
-            .base_url
-            .is_none()
-    );
-    assert!(!Invites::new(Some("  ".into()), None, None).mailer.enabled());
-}
-
 #[tokio::test]
 async fn without_mail_an_invite_shows_its_link_and_stores_only_hashes() {
     let db = database().await;
@@ -318,7 +237,7 @@ async fn without_mail_an_invite_shows_its_link_and_stores_only_hashes() {
 async fn with_mail_the_invite_is_emailed_and_the_page_shows_no_link() {
     let db = database().await;
     let sent = Arc::new(Mutex::new(Vec::<OutgoingMail>::new()));
-    let invites = Invites {
+    let invites = Mail {
         mailer: Mailer::Fake(sent.clone()),
         base_url: Some("https://reciperepository.app".into()),
     };
@@ -349,7 +268,7 @@ async fn with_mail_the_invite_is_emailed_and_the_page_shows_no_link() {
 #[tokio::test]
 async fn a_failed_email_falls_back_to_showing_the_link() {
     let db = database().await;
-    let invites = Invites {
+    let invites = Mail {
         mailer: Mailer::Failing,
         base_url: None,
     };
@@ -1230,7 +1149,7 @@ async fn members_choose_who_may_use_their_ai_logins() {
 
 /// A `tracing` writer that keeps everything logged in memory.
 #[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+pub(super) struct LogBuffer(pub(super) Arc<Mutex<Vec<u8>>>);
 
 impl Write for LogBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1254,7 +1173,7 @@ async fn the_api_key_and_full_addresses_never_reach_logs_or_pages() {
     let invites = {
         let _lock = ENV_LOCK.lock();
         unsafe { std::env::set_var("RESEND_BASE_URL", format!("http://127.0.0.1:{port}")) };
-        let invites = Invites::new(Some("re_test_SECRET_key_123".into()), None, None);
+        let invites = Mail::new(Some("re_test_SECRET_key_123".into()), None, None);
         unsafe { std::env::remove_var("RESEND_BASE_URL") };
         invites
     };

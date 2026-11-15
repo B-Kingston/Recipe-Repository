@@ -301,8 +301,13 @@
     <h2>Account</h2>
     {% if account_notice != "" %}<p class="notice" role="status">{{ account_notice }}</p>{% endif %}
     <p class="muted">A new password signs out every other device. Your current password is required.</p>
+    {% if let Some(email) = recovery_email %}
+    <p>Recovery email: {% if email.verified.is_empty() %}none{% else %}{{ email.verified }} <span class="muted">(verified)</span>{% endif %}</p>
+    {% if !email.pending.is_empty() %}<p class="muted">{{ email.pending }} is waiting for verification: follow the link sent to it.</p>{% endif %}
+    {% endif %}
     <div class="actions">
       <a class="button" href="/settings/password">Reset password</a>
+      {% if recovery_email.is_some() %}<a class="button" href="/settings/email">Recovery email</a>{% endif %}
       <form class="inline" method="post" action="/logout" hx-boost="false">
         <button type="submit">Sign out</button>
       </form>

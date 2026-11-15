@@ -38,11 +38,13 @@ mod embeddings;
 mod folders;
 mod groups;
 mod htmx;
+mod mail;
 mod media;
 mod media_worker;
 mod moments;
 mod notes;
 mod recipes;
+mod recovery;
 mod scale;
 mod search;
 mod settings;
@@ -131,9 +133,9 @@ struct AppState {
     /// Brute-force limits on sign-in, the password page, and account
     /// creation; in-memory only, so a restart forgets them.
     rate_limits: Arc<auth::RateLimits>,
-    /// How group invites reach people: Resend mail, or the link shown to the
-    /// inviter when `RESEND_API_KEY` is unset.
-    invites: groups::Invites,
+    /// Resend mail for group invites and account recovery; off when
+    /// `RESEND_API_KEY` is unset.
+    mail: mail::Mail,
 }
 
 /// Last successfully discovered model catalogue for one source (a Pi provider
@@ -489,6 +491,8 @@ struct LoginTemplate {
     next: String,
     /// The browser already has a session, so this sign-in adds an account.
     adding: bool,
+    /// Offer "Forgot password?" (`Mail::recovery_base`).
+    forgot: bool,
     /// A one-time notice above the form (an account was just deleted).
     notice: &'static str,
 }
@@ -526,6 +530,30 @@ struct InviteTemplate {
     error: String,
     /// The username typed into the sign-up form.
     username: String,
+    /// Offer the recovery email field (`Mail::recovery_base`).
+    recovery: bool,
+    /// The recovery address typed into the sign-up form.
+    email: String,
+}
+/// The signed-out recovery pages (outside the sign-in wall): Forgot
+/// password, a reset link, and an email verification link.
+#[derive(Template)]
+#[template(path = "recovery.html")]
+struct RecoveryTemplate {
+    /// One of the `recovery::PAGE_*` states.
+    state: &'static str,
+    /// The link's token, for its form's action.
+    token: String,
+    error: String,
+}
+/// The recovery email page in Settings.
+#[derive(Template)]
+#[template(path = "email.html")]
+struct EmailTemplate {
+    status: recovery::EmailStatus,
+    /// The address typed into the form.
+    email: String,
+    error: String,
 }
 #[derive(Template)]
 #[template(path = "display.html")]
@@ -888,6 +916,9 @@ struct SettingsTemplate {
     web_search_notice: &'static str,
     search_notice: &'static str,
     account_notice: &'static str,
+    /// The account's recovery email; None when this server cannot send
+    /// recovery mail.
+    recovery_email: Option<recovery::EmailStatus>,
     /// The search APIs a key can be added for, as (key, label).
     web_search_providers: &'static [(&'static str, &'static str)],
     /// The user's own search key: its provider's label and masked tail
@@ -1340,7 +1371,7 @@ async fn main() -> anyhowless::Result<()> {
             "TRUST_PROXY_HEADERS",
             false,
         ))),
-        invites: groups::Invites::new(
+        mail: mail::Mail::new(
             env::var("RESEND_API_KEY").ok(),
             env::var("RESEND_FROM").ok(),
             env::var("PUBLIC_BASE_URL").ok(),
@@ -1365,7 +1396,8 @@ async fn main() -> anyhowless::Result<()> {
 }
 /// Deletes expired drafts now and every hour after, so their dish-photo
 /// candidates and moment stills go soon after the draft expires rather than at
-/// the next generation or restart. Expired group invites go on the same tick.
+/// the next generation or restart. Expired group invites and email links go
+/// on the same tick.
 async fn prune_expired_drafts(db: SqlitePool) {
     let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
     loop {
@@ -1379,6 +1411,11 @@ async fn prune_expired_drafts(db: SqlitePool) {
             Ok(0) => {}
             Ok(removed) => info!(removed, "Removed expired group invites"),
             Err(error) => warn!(%error, "Expired group invites could not be removed"),
+        }
+        match recovery::prune_tokens(&db).await {
+            Ok(0) => {}
+            Ok(removed) => info!(removed, "Removed expired email links"),
+            Err(error) => warn!(%error, "Expired email links could not be removed"),
         }
     }
 }
@@ -1508,6 +1545,10 @@ fn routes(state: Arc<AppState>) -> Router {
             get(reset_password_page).post(reset_password),
         )
         .route(
+            "/settings/email",
+            get(recovery::email_page).post(recovery::update_email),
+        )
+        .route(
             "/settings/delete-account",
             get(delete_account_page).post(delete_account),
         )
@@ -1552,6 +1593,15 @@ fn routes(state: Arc<AppState>) -> Router {
         .route(
             "/invites/{token}/signup",
             post(groups::signup_through_invite),
+        )
+        .route("/forgot", get(recovery::forgot_page).post(recovery::forgot))
+        .route(
+            "/reset/{token}",
+            get(recovery::reset_page).post(recovery::reset),
+        )
+        .route(
+            "/email/verify/{token}",
+            get(recovery::verify_page).post(recovery::verify_email),
         )
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
@@ -2083,10 +2133,17 @@ pub(crate) async fn settings_view(
         } else {
             ""
         },
-        account_notice: if flash.is("password_changed") {
-            "Password changed."
-        } else {
-            ""
+        account_notice: match flash.0.as_str() {
+            "password_changed" => "Password changed.",
+            "email_sent" => {
+                "We sent a link to the new address. Follow it within 24 hours to make it your recovery email."
+            }
+            "email_removed" => "Recovery email removed.",
+            _ => "",
+        },
+        recovery_email: match s.mail.recovery_base() {
+            Some(_) => Some(recovery::email_status(&s.db, &user.id).await?),
+            None => None,
         },
         step_moments: step_moments_enabled(&s.db, &user.id).await?,
         embeddings_configured: s.embedder.is_some(),

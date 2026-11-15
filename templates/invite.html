@@ -32,6 +32,10 @@
         <p class="actions"><a class="button" href="/">Open Recipe Repository</a></p>
         {% else if state == "accept" %}
         <form method="post" action="/invites/{{ token }}/accept">
+          {% if recovery %}
+          <label for="email">Email for password recovery <span class="muted">(optional)</span></label>
+          <input id="email" name="email" type="email" autocomplete="email" autocapitalize="none" spellcheck="false" maxlength="254">
+          {% endif %}
           <p class="actions"><button class="button primary" type="submit">Join as {{ viewer }}</button></p>
         </form>
         <p class="muted">Not {{ viewer }}? <a href="/login?next=/invites/{{ token }}">Sign in to another account</a> to join with it.</p>
@@ -56,6 +60,11 @@
           <p class="muted" id="password-hint">At least 8 characters.</p>
           <label for="confirm_password">Confirm password</label>
           <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required>
+          {% if recovery %}
+          <label for="email">Email for password recovery <span class="muted">(optional)</span></label>
+          <input id="email" name="email" type="email" value="{{ email }}" autocomplete="email" autocapitalize="none" spellcheck="false" maxlength="254" aria-describedby="email-hint">
+          <p class="muted" id="email-hint">The address this invite went to counts as verified; another gets a link to verify it.</p>
+          {% endif %}
           {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
           <p class="actions"><button class="button primary" type="submit">Create account and join</button></p>
         </form>
