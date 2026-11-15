@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Local CPU speech-to-text and OCR helper for the recipe video importer.
 
-Two subcommands read media the Rust app extracted with ffmpeg:
+`serve` answers two commands over a JSON-lines protocol, for media the Rust
+app extracted with ffmpeg:
 
 * `transcribe` runs faster-whisper over a mono 16 kHz WAV.
 * `ocr` runs PaddleOCR PP-OCRv6 small over screenshots.
 
 Both run entirely on this machine; no audio or frame is sent to an AI API.
-Each prints one JSON document on stdout. `serve` keeps the same two commands
-alive behind a JSON-lines protocol (see `serve`) so the interpreter, the
-imports, and the loaded models are paid for once per worker instead of once
-per import. The one-shot subcommands and the worker share every code path
-below, so the benchmarks measure what production runs.
+The worker stays alive between imports, so the interpreter, the imports, and
+the loaded models are paid for once per worker instead of once per import.
+The one-shot `ocr` subcommand (used by bench/ocr) shares every code path, so
+the benchmark measures what production runs.
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ from pathlib import Path
 from typing import IO
 
 # Models stay loaded for the lifetime of the process, keyed by every parameter
-# that changes what gets built. A one-shot run uses each entry once; the
-# worker reuses them across requests.
+# that changes what gets built.
 _MODELS: dict[tuple[object, ...], object] = {}
 # Seconds spent importing libraries and building models so far; a request's
 # log line reports the share it paid (0 once the models are warm).
@@ -51,6 +50,13 @@ _LONE_WORD_MIN_SCORE = 0.95
 # Boxes share a visual row when their vertical extents overlap by at least
 # this fraction of the smaller box's height.
 _ROW_OVERLAP = 0.5
+
+
+# Speech chunks Whisper decodes at once, and frames per PaddleOCR batch.
+_WHISPER_BATCH_SIZE = 8
+_OCR_BATCH_SIZE = 8
+# A worker exits after this many seconds without a request.
+_IDLE_SECONDS = 600.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -239,7 +245,7 @@ def _skipped_frame() -> dict[str, object]:
 
 
 def _ocr_model(batch_size: int) -> object:
-    key = ("ocr", batch_size, os.environ.get("MEDIA_OCR_DEVICE", "cpu"))
+    key = ("ocr", batch_size)
     model = _MODELS.get(key)
     if model is None:
         started_build = time.perf_counter()
@@ -261,7 +267,7 @@ def _ocr_model(batch_size: int) -> object:
         model = PaddleOCR(
             text_detection_model_name="PP-OCRv6_small_det",
             text_recognition_model_name="PP-OCRv6_small_rec",
-            device=key[2],
+            device="cpu",
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
@@ -278,7 +284,7 @@ def _detector(side: int) -> object:
     It shares the recognizer's detector weights but resizes the longer side to
     `side` px, which costs a fraction of the full pipeline's detection.
     """
-    key = ("det", side, os.environ.get("MEDIA_OCR_DEVICE", "cpu"))
+    key = ("det", side)
     model = _MODELS.get(key)
     if model is None:
         started_build = time.perf_counter()
@@ -290,7 +296,7 @@ def _detector(side: int) -> object:
             ) from error
         model = TextDetection(
             model_name="PP-OCRv6_small_det",
-            device=key[2],
+            device="cpu",
             limit_type="max",
             limit_side_len=side,
         )
@@ -317,8 +323,6 @@ def ocr_frames(
     lang: str,
     batch_size: int,
     score_threshold: float,
-    gate: bool | None = None,
-    gate_side: int | None = None,
 ) -> dict[str, object]:
     if not frame_paths:
         raise RuntimeError("no OCR frames were supplied")
@@ -328,10 +332,9 @@ def ocr_frames(
     if not 0.0 <= score_threshold <= 1.0:
         raise RuntimeError("score threshold must be between 0 and 1")
     batch_size = max(1, batch_size)
-    if gate is None:
-        gate = _env_bool("MEDIA_OCR_TEXT_GATE", True)
-    if gate_side is None:
-        gate_side = _env_int("MEDIA_OCR_GATE_SIDE", 640)
+    # The text gate and its detection size are benchmark knobs (bench/ocr).
+    gate = _env_bool("MEDIA_OCR_TEXT_GATE", True)
+    gate_side = _env_int("MEDIA_OCR_GATE_SIDE", 640)
 
     _configure_paddle_cache()
     has_text = (
@@ -370,8 +373,7 @@ def ocr_frames(
 
 
 def _whisper_model(model_name: str) -> object:
-    compute_type = os.environ.get("MEDIA_WHISPER_COMPUTE_TYPE", "int8")
-    key = ("whisper", model_name, compute_type)
+    key = ("whisper", model_name)
     pipeline = _MODELS.get(key)
     if pipeline is None:
         started_build = time.perf_counter()
@@ -379,12 +381,12 @@ def _whisper_model(model_name: str) -> object:
             from faster_whisper import BatchedInferencePipeline, WhisperModel
         except ImportError as error:  # pragma: no cover - exercised in deployments
             raise RuntimeError(
-                "faster-whisper is not installed; install the media runtime or set MEDIA_PYTHON"
+                "faster-whisper is not installed; install the media runtime"
             ) from error
         cache_dir = os.environ.get("MEDIA_MODEL_CACHE", "") or None
         kwargs: dict[str, object] = {
             "device": "cpu",
-            "compute_type": compute_type,
+            "compute_type": "int8",
             "download_root": cache_dir,
         }
         try:
@@ -400,18 +402,11 @@ def _whisper_model(model_name: str) -> object:
     return pipeline
 
 
-def transcribe(
-    audio_path: Path,
-    model_name: str,
-    task: str = "transcribe",
-    batch_size: int | None = None,
-) -> dict[str, object]:
+def transcribe(audio_path: Path, model_name: str, task: str) -> dict[str, object]:
     if not audio_path.is_file():
         raise RuntimeError(f"audio file does not exist: {audio_path}")
     if task not in {"transcribe", "translate"}:
         raise RuntimeError(f"unknown transcription task: {task}")
-    if batch_size is None:
-        batch_size = _env_int("MEDIA_WHISPER_BATCH_SIZE", 8)
     # Batched decoding runs the VAD-cut speech chunks through the model
     # together and is faster and, measured, slightly more accurate than the
     # sequential beam-5 path. The caption must never be fed back as an
@@ -420,7 +415,7 @@ def transcribe(
     # timings split each chunk into sentence segments instead.
     segments, info = _whisper_model(model_name).transcribe(  # type: ignore[attr-defined]
         str(audio_path),
-        batch_size=max(1, batch_size),
+        batch_size=_WHISPER_BATCH_SIZE,
         beam_size=1,
         vad_filter=True,
         temperature=0.0,
@@ -530,9 +525,8 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
         built = _BUILD_SECONDS[0]
         result = transcribe(
             Path(audio),
-            str(request.get("model") or os.environ.get("MEDIA_WHISPER_MODEL", "base")),
-            str(request.get("task") or os.environ.get("MEDIA_WHISPER_TASK", "transcribe")),
-            _optional_int(request.get("batchSize")),
+            str(request.get("model") or "base"),
+            str(request.get("task") or "transcribe"),
         )
         segments = result["segments"]
         _log(
@@ -550,16 +544,8 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
         ):
             raise RuntimeError("ocr needs a non-empty list of frame paths")
         built = _BUILD_SECONDS[0]
-        threshold = request.get("scoreThreshold")
         result = ocr_frames(
-            [Path(frame) for frame in frames],
-            str(request.get("lang") or os.environ.get("MEDIA_OCR_LANG", "en")),
-            _optional_int(request.get("batchSize")) or _env_int("MEDIA_OCR_BATCH_SIZE", 8),
-            float(threshold)  # type: ignore[arg-type]
-            if threshold is not None
-            else float(os.environ.get("MEDIA_OCR_SCORE_THRESHOLD", "0.70")),
-            gate=request["gate"] if isinstance(request.get("gate"), bool) else None,
-            gate_side=_optional_int(request.get("gateSide")),
+            [Path(frame) for frame in frames], "en", _OCR_BATCH_SIZE, _score_threshold()
         )
         gate = result["gate"]
         _log(
@@ -571,10 +557,8 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
     raise RuntimeError(f"unknown command: {command!r}")
 
 
-def _optional_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if value > 0 else None
+def _score_threshold() -> float:
+    return float(os.environ.get("MEDIA_OCR_SCORE_THRESHOLD", "0.70"))
 
 
 def serve(channel: IO[str]) -> None:
@@ -584,9 +568,9 @@ def serve(channel: IO[str]) -> None:
     Response: `{"id": <echoed>, "ok": true, "result": {...}}` or
     `{"id": <echoed>, "ok": false, "error": "<message>"}`. A failing request
     produces an error response and the worker keeps running. The worker exits
-    when stdin closes or after `MEDIA_WORKER_IDLE_SECONDS` without a request.
+    when stdin closes or after `_IDLE_SECONDS` without a request.
     """
-    idle_seconds = float(_env_int("MEDIA_WORKER_IDLE_SECONDS", 600))
+    idle_seconds = _IDLE_SECONDS
     pending = b""
     while True:
         while b"\n" not in pending:
@@ -637,34 +621,10 @@ def _response_line(response: dict[str, object]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    transcribe_parser = subparsers.add_parser("transcribe")
-    transcribe_parser.add_argument("--model", default=os.environ.get("MEDIA_WHISPER_MODEL", "base"))
-    transcribe_parser.add_argument(
-        "--task",
-        default=os.environ.get("MEDIA_WHISPER_TASK", "transcribe"),
-        choices=["transcribe", "translate"],
-    )
-    transcribe_parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=_env_int("MEDIA_WHISPER_BATCH_SIZE", 8),
-    )
-    transcribe_parser.add_argument("audio", type=Path)
-
     ocr_parser = subparsers.add_parser("ocr")
-    ocr_parser.add_argument(
-        "--lang", default=os.environ.get("MEDIA_OCR_LANG", "en")
-    )
-    ocr_parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=_env_int("MEDIA_OCR_BATCH_SIZE", 8),
-    )
-    ocr_parser.add_argument(
-        "--score-threshold",
-        type=float,
-        default=float(os.environ.get("MEDIA_OCR_SCORE_THRESHOLD", "0.70")),
-    )
+    ocr_parser.add_argument("--lang", default="en")
+    ocr_parser.add_argument("--batch-size", type=int, default=_OCR_BATCH_SIZE)
+    ocr_parser.add_argument("--score-threshold", type=float, default=_score_threshold())
     ocr_parser.add_argument("frames", nargs="+", type=Path)
 
     subparsers.add_parser("serve")
@@ -674,12 +634,7 @@ def main() -> None:
     if args.command == "serve":
         serve(channel)
         return
-    if args.command == "transcribe":
-        result = transcribe(args.audio, args.model, args.task, args.batch_size)
-    elif args.command == "ocr":
-        result = ocr_frames(args.frames, args.lang, args.batch_size, args.score_threshold)
-    else:
-        raise RuntimeError("unknown command")
+    result = ocr_frames(args.frames, args.lang, args.batch_size, args.score_threshold)
     channel.write(json.dumps(result, ensure_ascii=False) + "\n")
     channel.flush()
 

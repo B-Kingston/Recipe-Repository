@@ -70,7 +70,7 @@ def run_checked(
 def run_paddle(
     frames: list[Path], batch_size: int
 ) -> tuple[float, dict[str, object]]:
-    python = os.environ.get("MEDIA_PYTHON", sys.executable)
+    python = sys.executable
     script = Path(__file__).resolve().parents[2] / "pi" / "local-media.py"
     command = [
         python,

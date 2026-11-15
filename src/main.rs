@@ -1330,11 +1330,9 @@ async fn main() -> anyhowless::Result<()> {
     let state = Arc::new(AppState {
         db,
         model: configured_model,
-        pi_worker_path: env::var("PI_WORKER_PATH").unwrap_or_else(|_| "pi/recipe-worker.ts".into()),
-        auth_script_path: env::var("PI_AUTH_SCRIPT_PATH")
-            .unwrap_or_else(|_| "pi/codex-auth.ts".into()),
-        claude_auth_script_path: env::var("PI_CLAUDE_AUTH_SCRIPT_PATH")
-            .unwrap_or_else(|_| "pi/claude-auth.ts".into()),
+        pi_worker_path: "pi/recipe-worker.ts".into(),
+        auth_script_path: "pi/codex-auth.ts".into(),
+        claude_auth_script_path: "pi/claude-auth.ts".into(),
         search_grounding: env_bool("PI_SEARCH_ENABLED", true),
         codex_flows: Arc::new(Mutex::new(HashMap::new())),
         claude_flows: Arc::new(Mutex::new(HashMap::new())),

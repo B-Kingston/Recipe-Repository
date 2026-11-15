@@ -1566,8 +1566,6 @@ pub(crate) fn run_node(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_remove("AI_GATEWAY_API_KEY")
-        .env_remove("AI_GATEWAY_BASE_URL")
         .spawn()?;
     let stdout_reader = spawn_pipe_reader(
         child

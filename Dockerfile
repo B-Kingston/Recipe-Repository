@@ -69,7 +69,6 @@ ENV PATH=/opt/media-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
     DATABASE_URL=sqlite:/data/recipes.sqlite3 \
     APP_BIND=0.0.0.0:3000 \
     PI_CODING_AGENT_DIR=/data/pi-agent \
-    MEDIA_PYTHON=/opt/media-venv/bin/python \
     MEDIA_MODEL_CACHE=/data/media-models \
     PADDLE_PDX_CACHE_HOME=/data/media-models \
     HF_HOME=/data/media-models \

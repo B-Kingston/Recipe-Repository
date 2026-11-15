@@ -45,17 +45,17 @@ const OCR_MAX_FRAME_JOBS: usize = 160;
 /// Cadence at which frames are extracted as cheap OCR candidates. Keep this
 /// higher than the inference cadence: a short card must exist in the candidate
 /// timeline before the planner can pick it.
-const OCR_SCAN_HZ_DEFAULT: f64 = 4.0;
+const OCR_SCAN_HZ: f64 = 4.0;
 /// OCR cadence of the steady grid. Caption cards held for a second or more are
 /// found at 1 Hz; shorter ones depend on the shot-change onsets below.
-const OCR_BASE_HZ_DEFAULT: f64 = 1.0;
+const OCR_BASE_HZ: f64 = 1.0;
 /// A sample is a shot-change onset when its luma-change score (ffmpeg
 /// signalstats YDIF) is a local peak and at least this multiple of the median
 /// score around it. Handheld footage never goes quiet, so an absolute YDIF
 /// threshold marks nearly every sample (125/128 and 159/160 at 1.0) and a
 /// fixed cut threshold of 20 found 47 cuts on one reel and 93 on another;
 /// the ratio follows each video's own level of motion.
-const OCR_CUT_RATIO_DEFAULT: f64 = 2.0;
+const OCR_CUT_RATIO: f64 = 2.0;
 /// Half-width of the median window, in seconds of video.
 const OCR_CUT_WINDOW_SECONDS: f64 = 1.0;
 /// A peak below this YDIF is sensor noise on static footage, whatever the
@@ -586,17 +586,16 @@ async fn with_fresh_download<T: Send + 'static>(
     let permit = acquire_media_slot().await?;
     let job = move |workdir: &Path| {
         let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-        let ytdlp = env_path("MEDIA_YTDLP_PATH", "yt-dlp");
         let mut warnings = Vec::new();
-        let outcome = match download_video(&ytdlp, &source_url, workdir, &mut warnings, deadline) {
-            Some(video_path) => work(&video_path, workdir, &mut warnings, deadline),
-            None => Err(AppError::BadRequest(
-                warnings
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| format!("The video could not be downloaded for {purpose}.")),
-            )),
-        };
+        let outcome =
+            match download_video("yt-dlp", &source_url, workdir, &mut warnings, deadline) {
+                Some(video_path) => work(&video_path, workdir, &mut warnings, deadline),
+                None => Err(AppError::BadRequest(
+                    warnings.last().cloned().unwrap_or_else(|| {
+                        format!("The video could not be downloaded for {purpose}.")
+                    }),
+                )),
+            };
         for warning in &warnings {
             warn!(%warning, purpose, "Video re-download warning");
         }
@@ -991,30 +990,13 @@ fn run_ocr_lane(
             json!({ "phase": "ocr", "state": "sampling frames" }),
         );
     }
-    let options = ocr_plan_options();
-    let sample = extract_frames(
-        video_path,
-        workdir,
-        frame_rate,
-        &options,
-        &mut warnings,
-        deadline,
-    );
+    let sample = extract_frames(video_path, workdir, frame_rate, &mut warnings, deadline);
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
     if let Some(debug) = debug {
         debug.event("phase", json!({ "phase": "ocr", "state": "running" }));
     }
     let snippets = sample
-        .map(|sample| {
-            read_video_text(
-                &sample,
-                frame_rate,
-                &options,
-                &mut warnings,
-                deadline,
-                debug,
-            )
-        })
+        .map(|sample| read_video_text(&sample, frame_rate, &mut warnings, deadline, debug))
         .unwrap_or_default();
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
     if let Some(debug) = debug {
@@ -1045,7 +1027,6 @@ fn extract_in_directory(
     embedder: Option<BlockingEmbedder>,
 ) -> Result<(MediaEvidence, Option<Followup<VideoExtrasOutput>>)> {
     let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-    let ytdlp = env_path("MEDIA_YTDLP_PATH", "yt-dlp");
     let observer = debug.as_deref();
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
@@ -1063,7 +1044,7 @@ fn extract_in_directory(
     }
     let VideoFetch { metadata, video } = if needs_video {
         fetch_video_and_metadata(
-            &ytdlp,
+            "yt-dlp",
             source_url,
             workdir,
             &cookies,
@@ -1072,7 +1053,7 @@ fn extract_in_directory(
         )
     } else {
         VideoFetch {
-            metadata: fetch_metadata(&ytdlp, source_url, &cookies, &mut warnings, deadline),
+            metadata: fetch_metadata("yt-dlp", source_url, &cookies, &mut warnings, deadline),
             video: None,
         }
     };
@@ -1587,7 +1568,6 @@ fn extract_frames(
     video_path: &Path,
     workdir: &Path,
     frame_rate: f64,
-    options: &OcrPlanOptions,
     warnings: &mut Vec<String>,
     deadline: Instant,
 ) -> Option<FrameSample> {
@@ -1603,7 +1583,7 @@ fn extract_frames(
     // the frames; a missing or unreadable file only degrades sampling back
     // to the uniform grid.
     let signals_path = workdir.join("ocr-signals.txt");
-    let interval = ocr_frame_interval(frame_rate, options);
+    let interval = ((frame_rate.max(1.0) / OCR_SCAN_HZ).round() as usize).max(1);
     let frame_args = vec![
         "-i".into(),
         video_path.to_string_lossy().to_string(),
@@ -1728,7 +1708,7 @@ fn transcribe_audio(
         return Transcript::default();
     };
     // The persistent transcription worker keeps Whisper loaded between
-    // imports and reads its batch size from its environment.
+    // imports.
     let request = json!({
         "command": "transcribe",
         "audio": audio_path.to_string_lossy(),
@@ -1787,12 +1767,11 @@ pub(crate) fn clean_ocr_batch(value: &Value, default_step_seconds: f64) -> Vec<O
 fn read_video_text(
     sample: &FrameSample,
     frame_rate: f64,
-    options: &OcrPlanOptions,
     warnings: &mut Vec<String>,
     deadline: Instant,
     debug: Option<&MediaDebug>,
 ) -> Vec<OcrSnippet> {
-    let jobs = plan_ocr_jobs(sample, frame_rate, options, warnings);
+    let jobs = plan_ocr_jobs(sample, frame_rate, warnings);
     if jobs.is_empty() {
         return Vec::new();
     }
@@ -1870,38 +1849,6 @@ struct FrameSample {
     /// Decoded frames between extracted samples (the extraction grid).
     interval: usize,
     signals: Vec<FrameSignal>,
-}
-
-/// Tunables for the planner; built from env in production and constructed
-/// literally in tests so no test mutates process env.
-#[derive(Debug, Clone)]
-struct OcrPlanOptions {
-    adaptive: bool,
-    scan_hz: f64,
-    base_hz: f64,
-    cut_ratio: f64,
-}
-
-fn ocr_plan_options() -> OcrPlanOptions {
-    OcrPlanOptions {
-        adaptive: crate::env_bool("MEDIA_OCR_ADAPTIVE", true),
-        scan_hz: env_bounded_f64("MEDIA_OCR_SCAN_HZ", OCR_SCAN_HZ_DEFAULT, 0.5, 8.0),
-        base_hz: env_bounded_f64("MEDIA_OCR_BASE_HZ", OCR_BASE_HZ_DEFAULT, 0.05, 8.0),
-        cut_ratio: env_bounded_f64("MEDIA_OCR_CUT_RATIO", OCR_CUT_RATIO_DEFAULT, 1.0, 50.0),
-    }
-}
-
-/// Decoded frames between OCR candidates for the configured scan cadence.
-fn ocr_frame_interval(frame_rate: f64, options: &OcrPlanOptions) -> usize {
-    ((frame_rate.max(1.0) / options.scan_hz).round() as usize).max(1)
-}
-
-fn env_bounded_f64(name: &str, default: f64, min: f64, max: f64) -> f64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= min && *value <= max)
-        .unwrap_or(default)
 }
 
 /// Parses ffmpeg metadata=mode=print output: alternating
@@ -1992,7 +1939,6 @@ fn cut_onsets(ydif: &[f64], ratio: f64, half_window: usize) -> Vec<bool> {
 fn plan_ocr_jobs(
     sample: &FrameSample,
     frame_rate: f64,
-    options: &OcrPlanOptions,
     warnings: &mut Vec<String>,
 ) -> Vec<OcrFrame> {
     let frames = list_ocr_frames(&sample.dir, warnings);
@@ -2000,8 +1946,8 @@ fn plan_ocr_jobs(
         return Vec::new();
     }
     let sample_hz = frame_rate.max(1.0) / sample.interval.max(1) as f64;
-    let stride = ((sample_hz / options.base_hz.min(sample_hz)).round() as usize).max(1);
-    if !options.adaptive || sample.signals.is_empty() {
+    let stride = ((sample_hz / OCR_BASE_HZ.min(sample_hz)).round() as usize).max(1);
+    if sample.signals.is_empty() {
         return uniform_jobs(frames, sample.interval, frame_rate, stride);
     }
     if sample.signals.len() < frames.len() {
@@ -2024,7 +1970,7 @@ fn plan_ocr_jobs(
         })
         .collect();
     let half_window = ((sample_hz * OCR_CUT_WINDOW_SECONDS).round() as usize).max(1);
-    let onsets = cut_onsets(&ydif, options.cut_ratio, half_window);
+    let onsets = cut_onsets(&ydif, OCR_CUT_RATIO, half_window);
     let mut jobs: Vec<OcrFrame> = Vec::with_capacity(count / stride + onsets.len());
     for (index, signal) in sample.signals.iter().enumerate().take(count) {
         let priority = if index == 0 || onsets[index] {
@@ -2275,18 +2221,10 @@ fn read_frames(
     warnings: &mut Vec<String>,
     deadline: Instant,
 ) -> Option<Vec<Option<SlotCapture>>> {
-    let lang = env_path("MEDIA_OCR_LANG", "en");
-    let batch_size = env::var("MEDIA_OCR_BATCH_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(8);
     // The persistent OCR worker keeps PaddleOCR loaded between imports. It
     // reads the score threshold and text-gate settings from its environment.
     let request = json!({
         "command": "ocr",
-        "lang": lang,
-        "batchSize": batch_size,
         "frames": sampled
             .iter()
             .map(|job| job.path.to_string_lossy())
@@ -2953,12 +2891,7 @@ pub(crate) fn run_ffmpeg(
         .map(String::from)
         .into();
     full.extend_from_slice(args);
-    run_tool(
-        &env_path("MEDIA_FFMPEG_PATH", "ffmpeg"),
-        &full,
-        timeout,
-        max_output_bytes,
-    )
+    run_tool("ffmpeg", &full, timeout, max_output_bytes)
 }
 
 pub(crate) fn run_tool(
@@ -3109,7 +3042,6 @@ pub(crate) struct VideoProbe {
 /// missing or unreadable frame rate falls back to 30 fps and a missing
 /// duration to `None`; a missing size is an error.
 pub(crate) fn probe_video(video_path: &Path) -> std::result::Result<VideoProbe, String> {
-    let ffprobe = env_path("MEDIA_FFPROBE_PATH", "ffprobe");
     let args = vec![
         "-v".into(),
         "error".into(),
@@ -3121,7 +3053,7 @@ pub(crate) fn probe_video(video_path: &Path) -> std::result::Result<VideoProbe, 
         "json".into(),
         video_path.to_string_lossy().to_string(),
     ];
-    let output = run_tool(&ffprobe, &args, Duration::from_secs(20), 64 * 1024)?;
+    let output = run_tool("ffprobe", &args, Duration::from_secs(20), 64 * 1024)?;
     let value = parse_json_output(&output.stdout)?;
     let stream = value
         .pointer("/streams/0")
@@ -3192,13 +3124,6 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
     }
     let rate = numerator / denominator;
     (rate > 0.0 && rate.is_finite()).then_some(rate)
-}
-
-pub(crate) fn env_path(name: &str, default: &str) -> String {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default.into())
 }
 
 fn append_cookie_args(args: &mut Vec<String>, warnings: &mut Vec<String>) {
@@ -4151,8 +4076,8 @@ fn decode_reference(name: &str) -> Option<char> {
 mod tests {
     use super::{
         FrameSample, FrameSignal, MAX_IMPORT_URL_CHARS, MediaEvidence, OCR_MAX_FRAME_JOBS,
-        OcrPlanOptions, OcrSnippet, PageHtml, canonical_social_url, clean_ocr_batch,
-        clean_ocr_rows, cleaner_prompt, decode_entities, frame_capture, frame_rows, has_real_words,
+        OcrSnippet, PageHtml, canonical_social_url, clean_ocr_batch, clean_ocr_rows,
+        cleaner_prompt, decode_entities, frame_capture, frame_rows, has_real_words,
         is_numeric_ocr_token, looks_like_ocr_token, oriented_dimensions, parse_frame_signals,
         plan_ocr_jobs, reading_is_useful, recipe_prompt, standalone_reading_is_strong,
         string_field,
@@ -4314,19 +4239,8 @@ mod tests {
     }
 
     /// Video frame rate of the planner fixtures: one candidate every 15
-    /// frames (`sample_with`) is the 4 Hz cadence of `plan_options` and
-    /// `timeline`.
+    /// frames (`sample_with`) is the 4 Hz scan cadence of `timeline`.
     const FPS: f64 = 60.0;
-
-    /// 4 Hz candidates, 1 Hz steady grid: a grid sample every 4th candidate.
-    fn plan_options(adaptive: bool) -> OcrPlanOptions {
-        OcrPlanOptions {
-            adaptive,
-            scan_hz: 4.0,
-            base_hz: 1.0,
-            cut_ratio: 2.0,
-        }
-    }
 
     /// Writes `frames` empty placeholder JPEGs into a temp directory and
     /// pairs them with the given change timeline.
@@ -4365,14 +4279,10 @@ mod tests {
 
     /// Plans `frames` candidates over a change timeline and returns each kept
     /// frame as `(candidate index, priority)` plus the planner warnings.
-    fn plan_picks(
-        options: &OcrPlanOptions,
-        frames: usize,
-        signals: Vec<FrameSignal>,
-    ) -> (Vec<(usize, u8)>, Vec<String>) {
+    fn plan_picks(frames: usize, signals: Vec<FrameSignal>) -> (Vec<(usize, u8)>, Vec<String>) {
         let (dir, sample) = sample_with(frames, signals);
         let mut warnings = Vec::new();
-        let jobs = plan_ocr_jobs(&sample, FPS, options, &mut warnings);
+        let jobs = plan_ocr_jobs(&sample, FPS, &mut warnings);
         fs::remove_dir_all(dir).unwrap();
         let picks = jobs
             .iter()
@@ -4415,7 +4325,7 @@ mod tests {
     #[test]
     fn planner_keeps_a_shot_change_that_falls_between_grid_samples() {
         let ydif = footage(40, 8.0, &[(5, 60.0), (14, 60.0)]);
-        let (picks, warnings) = plan_picks(&plan_options(true), 40, timeline(&ydif));
+        let (picks, warnings) = plan_picks(40, timeline(&ydif));
 
         // Cuts at 5 and 14 are extra samples on top of the 1 Hz grid; the
         // sample after each cut is not.
@@ -4443,7 +4353,7 @@ mod tests {
                 _ => 10.0,
             })
             .collect();
-        let (picks, _) = plan_picks(&plan_options(true), 40, timeline(&ydif));
+        let (picks, _) = plan_picks(40, timeline(&ydif));
 
         assert_eq!(indices(&picks), grid(40));
     }
@@ -4452,8 +4362,8 @@ mod tests {
     fn planner_judges_a_spike_against_the_footage_around_it() {
         let calm = footage(40, 2.0, &[(6, 30.0)]);
         let shaky = footage(40, 20.0, &[(6, 30.0)]);
-        let (calm_picks, _) = plan_picks(&plan_options(true), 40, timeline(&calm));
-        let (shaky_picks, _) = plan_picks(&plan_options(true), 40, timeline(&shaky));
+        let (calm_picks, _) = plan_picks(40, timeline(&calm));
+        let (shaky_picks, _) = plan_picks(40, timeline(&shaky));
 
         // The same score is a cut on a tripod and ordinary motion handheld.
         assert!(calm_picks.contains(&(6, 0)));
@@ -4469,7 +4379,7 @@ mod tests {
             .collect();
         ydif[0] = 0.0;
         ydif[6] = 2.5;
-        let (picks, _) = plan_picks(&plan_options(true), 40, timeline(&ydif));
+        let (picks, _) = plan_picks(40, timeline(&ydif));
 
         let mut expected = grid(40);
         expected.push(6);
@@ -4480,7 +4390,7 @@ mod tests {
     #[test]
     fn planner_counts_a_two_sample_spike_as_one_shot_change() {
         let ydif = footage(40, 8.0, &[(10, 60.0), (11, 60.0)]);
-        let (picks, _) = plan_picks(&plan_options(true), 40, timeline(&ydif));
+        let (picks, _) = plan_picks(40, timeline(&ydif));
 
         let onsets = picks
             .iter()
@@ -4494,7 +4404,7 @@ mod tests {
         let signals = timeline(&footage(4, 0.0, &[]));
         let (dir, sample) = sample_with(12, signals);
         let mut warnings = Vec::new();
-        let jobs = plan_ocr_jobs(&sample, FPS, &plan_options(true), &mut warnings);
+        let jobs = plan_ocr_jobs(&sample, FPS, &mut warnings);
         fs::remove_dir_all(dir).unwrap();
 
         // Frames 5 and 9 are grid samples beyond the timeline; their seconds
@@ -4529,7 +4439,7 @@ mod tests {
         // first sample, with the grid pushing the plan past the budget.
         let spikes: Vec<(usize, f64)> = (3..400).step_by(3).map(|index| (index, 20.0)).collect();
         let ydif = footage(400, 0.1, &spikes);
-        let (picks, warnings) = plan_picks(&plan_options(true), 400, timeline(&ydif));
+        let (picks, warnings) = plan_picks(400, timeline(&ydif));
 
         assert_eq!(picks.len(), OCR_MAX_FRAME_JOBS);
         assert!(warnings.is_empty());
@@ -4544,7 +4454,7 @@ mod tests {
         // first sample against a budget of 160.
         let spikes: Vec<(usize, f64)> = (3..600).step_by(3).map(|index| (index, 20.0)).collect();
         let ydif = footage(600, 0.1, &spikes);
-        let (picks, _) = plan_picks(&plan_options(true), 600, timeline(&ydif));
+        let (picks, _) = plan_picks(600, timeline(&ydif));
 
         // The whole budget is used, not half of it, and only onsets remain.
         assert_eq!(picks.len(), OCR_MAX_FRAME_JOBS);
@@ -4566,7 +4476,7 @@ mod tests {
         let (dir, mut sample) = sample_with(20, signals);
         sample.interval = 1;
         let mut warnings = Vec::new();
-        let jobs = plan_ocr_jobs(&sample, 2.0, &plan_options(true), &mut warnings);
+        let jobs = plan_ocr_jobs(&sample, 2.0, &mut warnings);
         fs::remove_dir_all(dir).unwrap();
 
         let seconds: Vec<f64> = jobs.iter().map(|job| job.seconds).collect();
@@ -4575,16 +4485,12 @@ mod tests {
     }
 
     #[test]
-    fn planner_falls_back_to_the_baseline_grid_without_signals_or_adaptivity() {
-        let ydif = footage(40, 8.0, &[(5, 60.0), (14, 60.0)]);
-        let (without_signals, _) = plan_picks(&plan_options(true), 40, Vec::new());
-        let (not_adaptive, _) = plan_picks(&plan_options(false), 40, timeline(&ydif));
-
+    fn planner_falls_back_to_the_baseline_grid_without_signals() {
+        let (without_signals, _) = plan_picks(40, Vec::new());
         assert_eq!(indices(&without_signals), grid(40));
-        assert_eq!(indices(&not_adaptive), grid(40));
 
         // The budget still applies: 800 candidates thin to a stride of 5.
-        let (long, _) = plan_picks(&plan_options(false), 800, Vec::new());
+        let (long, _) = plan_picks(800, Vec::new());
         assert_eq!(long.len(), OCR_MAX_FRAME_JOBS);
         assert!(long.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
@@ -4594,7 +4500,7 @@ mod tests {
     /// 125/128 and 159/160 samples active, and a caption-free one.
     fn reel_picks(raw: &str) -> Vec<usize> {
         let signals = parse_frame_signals(raw.as_bytes());
-        let (picks, warnings) = plan_picks(&plan_options(true), signals.len(), signals);
+        let (picks, warnings) = plan_picks(signals.len(), signals);
         assert!(warnings.is_empty());
         indices(&picks)
     }

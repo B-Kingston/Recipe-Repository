@@ -17,7 +17,7 @@
 //! fresh worker; a worker that had already served a request and then died
 //! (idle exit, crash) is replaced once inside the same request.
 
-use crate::media::{COMMAND_OUTPUT_MAX_BYTES, env_path, kill_process_group};
+use crate::media::{COMMAND_OUTPUT_MAX_BYTES, kill_process_group};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::{
@@ -48,17 +48,12 @@ const REAP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 static TRANSCRIBE: LazyLock<Client> = LazyLock::new(|| {
     Client::new(
         "transcription",
-        Box::new(|| worker_command("MEDIA_TRANSCRIBE_SCRIPT")),
+        Box::new(worker_command),
         COMMAND_OUTPUT_MAX_BYTES,
     )
 });
-static OCR: LazyLock<Client> = LazyLock::new(|| {
-    Client::new(
-        "OCR",
-        Box::new(|| worker_command("MEDIA_OCR_SCRIPT")),
-        COMMAND_OUTPUT_MAX_BYTES,
-    )
-});
+static OCR: LazyLock<Client> =
+    LazyLock::new(|| Client::new("OCR", Box::new(worker_command), COMMAND_OUTPUT_MAX_BYTES));
 
 /// Sends one `transcribe` request (the object must carry `"command"`) to the
 /// transcription worker and returns its `result`.
@@ -71,11 +66,10 @@ pub(crate) fn ocr(request: Value, timeout: Duration) -> Result<Value, String> {
     OCR.request(request, timeout)
 }
 
-fn worker_command(script_env: &str) -> Command {
-    let mut command = Command::new(env_path("MEDIA_PYTHON", "python3"));
-    command
-        .arg(env_path(script_env, "pi/local-media.py"))
-        .arg("serve");
+/// `python3` is the media venv's in the image (first on its PATH).
+fn worker_command() -> Command {
+    let mut command = Command::new("python3");
+    command.args(["pi/local-media.py", "serve"]);
     command
 }
 
