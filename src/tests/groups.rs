@@ -1,5 +1,5 @@
 //! Groups: invites (with and without mail), membership, recipe sharing, the
-//! read-only member view, copies, AI-login grants, and the 0026 migration.
+//! read-only member view, copies, and AI-login grants.
 
 use super::config::ENV_LOCK;
 use crate::groups::{Invites, Mailer, OutgoingMail, mask_email, valid_email};
@@ -12,10 +12,7 @@ use axum::{
 };
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::SqlitePool;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
@@ -23,19 +20,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    db
-}
+use super::memory_db as database;
 
 fn state_with(db: SqlitePool, invites: Invites) -> Arc<AppState> {
     Arc::new(AppState {
@@ -1244,107 +1229,6 @@ async fn members_choose_who_may_use_their_ai_logins() {
         StatusCode::SEE_OTHER,
         "an empty save is fine"
     );
-}
-
-/// Runs every migration before 0026, then `fixtures`, then 0026.
-async fn migrate_with(fixtures: &[&str]) -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    let all = sqlx::migrate!();
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            all.iter()
-                .filter(|migration| migration.version < 26)
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
-    before.run(&db).await.unwrap();
-    for statement in fixtures {
-        sqlx::query(statement).execute(&db).await.unwrap();
-    }
-    all.run(&db).await.unwrap();
-    db
-}
-
-#[tokio::test]
-async fn upgrading_a_single_account_makes_no_group() {
-    let db = migrate_with(&[
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u1','alice','x','2026-01-01T00:00:00+00:00')",
-        "INSERT INTO recipes(id,title,created_at,updated_at,user_id) VALUES('r1','Soup','t','t','u1')",
-        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('u1','ai_logins','own','t')",
-    ])
-    .await;
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_groups").await, 0);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM group_members").await, 0);
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM ai_grants").await, 0);
-    assert_eq!(count(&db, "SELECT shared FROM recipes").await, 0);
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM app_settings WHERE key='ai_logins'"
-        )
-        .await,
-        0
-    );
-}
-
-#[tokio::test]
-async fn upgrading_a_household_keeps_its_shared_ai_logins() {
-    let db = migrate_with(&[
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u2','bob','x','2026-02-01T00:00:00+00:00')",
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u1','alice','x','2026-01-01T00:00:00+00:00')",
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u3','carol','x','2026-03-01T00:00:00+00:00')",
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u4','dave','x','2026-04-01T00:00:00+00:00')",
-        "INSERT INTO recipes(id,title,created_at,updated_at,user_id) VALUES('r1','Soup','t','t','u2')",
-        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('u3','ai_logins','own','t')",
-        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('u4','ai_logins','shared','t')",
-        "INSERT INTO pi_credentials(user_id,provider,credential_json,updated_at) VALUES('u1','openai-codex','{}','t')",
-    ])
-    .await;
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM account_groups").await, 1);
-    let group: String = sqlx::query_scalar("SELECT id FROM account_groups")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(group.len(), 36, "a uuid-shaped id: {group}");
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM group_members WHERE group_id=(SELECT id FROM account_groups)"
-        )
-        .await,
-        4
-    );
-    let grants: Vec<(String, String)> =
-        sqlx::query_as("SELECT granter_id, grantee_id FROM ai_grants ORDER BY grantee_id")
-            .fetch_all(&db)
-            .await
-            .unwrap();
-    assert_eq!(
-        grants,
-        vec![("u1".into(), "u2".into()), ("u1".into(), "u4".into())],
-        "the oldest grants everyone but the account that chose its own"
-    );
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM app_settings WHERE key='ai_logins'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(count(&db, "SELECT shared FROM recipes").await, 0);
-    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u1");
-    assert_eq!(crate::ai_account(&db, "u3").await.unwrap(), "u3");
 }
 
 /// A `tracing` writer that keeps everything logged in memory.

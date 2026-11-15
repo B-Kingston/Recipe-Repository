@@ -14,12 +14,8 @@ use axum::{
     extract::{FromRequest, Multipart, Path, Query, State},
     http::{Request, StatusCode, header},
 };
-use parking_lot::Mutex;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
+use sqlx::SqlitePool;
+use std::sync::Arc;
 
 /// A 4×4 grey PPM, which ffmpeg (installed in the test image) converts to a
 /// JPEG.
@@ -39,16 +35,7 @@ fn is_jpeg(bytes: &[u8]) -> bool {
 /// Two accounts, each with one recipe: u1 owns "r", u2 owns "r2". "r" has
 /// no version history yet.
 async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
+    let db = super::memory_db().await;
     let now = stamp();
     sqlx::query(
         "INSERT INTO recipes(id,title,user_id,created_at,updated_at)
@@ -61,25 +48,7 @@ async fn database() -> SqlitePool {
     db
 }
 
-fn state(db: SqlitePool) -> Arc<AppState> {
-    Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
-    })
-}
+use super::test_state as state;
 
 fn user(id: &str) -> AuthUser {
     AuthUser { id: id.into() }

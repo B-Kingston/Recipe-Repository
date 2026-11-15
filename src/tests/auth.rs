@@ -15,50 +15,14 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
 use serde_json::json;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::{
-    collections::HashMap, collections::HashSet, fs, net::SocketAddr, sync::Arc, time::Instant,
-};
+use sqlx::SqlitePool;
+use std::{fs, net::SocketAddr, sync::Arc, time::Instant};
 use tower::ServiceExt;
 
-async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    db
-}
+use super::memory_db as database;
 
-fn state(db: SqlitePool) -> Arc<AppState> {
-    Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
-    })
-}
+use super::test_state as state;
 
 fn credential(access: &str, account_id: &str) -> serde_json::Value {
     json!({

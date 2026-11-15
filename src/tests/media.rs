@@ -8,47 +8,17 @@ use crate::media::MediaChannels;
 use crate::{AppError, AppState, MediaDebugForm};
 use axum::extract::{Form, Path, Query, State};
 use parking_lot::Mutex;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    db
-}
+use super::memory_db as database;
 
 fn state(db: SqlitePool, runs: DebugRunMap) -> Arc<AppState> {
     Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
         media_debug_runs: runs,
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
+        ..(*super::test_state(db)).clone()
     })
 }
 

@@ -5,10 +5,7 @@ use crate::moments::{
     refresh_recipe, stills_around,
 };
 use crate::stamp;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::SqlitePool;
 use std::time::Duration;
 
 /// A unit vector along one axis of a small test space, slightly mixed with a
@@ -235,16 +232,7 @@ fn step_vector(text: &str) -> Vec<f32> {
 }
 
 async fn recipe_with_a_pool() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
+    let db = super::memory_db().await;
     sqlx::query(
         "INSERT INTO recipes(id,title,description,user_id,created_at,updated_at) VALUES('r','Stew','','u1',?1,?1)",
     )

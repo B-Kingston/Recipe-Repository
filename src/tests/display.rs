@@ -4,15 +4,12 @@ use crate::display::{
     uses_eink,
 };
 use crate::htmx::Flash;
-use crate::{AppError, AppState, routes};
+use crate::{AppError, routes};
 use axum::{
     Form,
     body::{Body, to_bytes},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 };
-use parking_lot::Mutex;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tower::ServiceExt;
 
 const KINDLE: &str = "Mozilla/5.0 (X11; U; Linux armv7l like Android; en-us) AppleWebKit/531.2+ (KHTML, like Gecko) Version/5.0 Safari/533.2+ Kindle/3.0+";
@@ -74,29 +71,7 @@ async fn display_css_imports_the_eink_sheet_only_in_eink_mode() {
 
 #[tokio::test]
 async fn display_css_is_served_without_signing_in() {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().in_memory(true))
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    let state = Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
-    });
+    let state = super::test_state(super::memory_db().await);
     let response = routes(state)
         .oneshot(
             Request::get("/display.css")

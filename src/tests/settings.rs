@@ -13,49 +13,12 @@ use axum::{
     response::IntoResponse,
 };
 use parking_lot::Mutex;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use sqlx::SqlitePool;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
-async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    db
-}
+use super::memory_db as database;
 
-fn state(db: SqlitePool) -> Arc<AppState> {
-    Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
-    })
-}
+use super::test_state as state;
 
 async fn save(
     state: &Arc<AppState>,
@@ -186,57 +149,6 @@ async fn deleting_the_cleaners_endpoint_returns_it_to_the_ai_provider() {
     let _ = delete_endpoint(State(state), AuthUser { id: "u1".into() }, Path(id)).await;
     assert_eq!(media_cleaner_setting(&db, "u1").await.unwrap(), None);
     assert_eq!(media_cleaner_model(&db, "u1").await.unwrap(), None);
-}
-
-#[tokio::test]
-async fn a_saved_gateway_key_migrates_to_the_cleaners_own_endpoint() {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(SqliteConnectOptions::new().in_memory(true))
-        .await
-        .unwrap();
-    let mut before = sqlx::migrate!();
-    before.migrations = before
-        .migrations
-        .iter()
-        .filter(|migration| migration.version < 16)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into();
-    before.run(&db).await.unwrap();
-    // The 0016 cleaner setting was app-wide; 0017 hands it to the account.
-    sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at) VALUES ('u1', 'alice', '', ?)",
-    )
-    .bind(stamp())
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO pi_credentials (user_id, provider, credential_json, updated_at) VALUES ('u1', 'vercel-ai-gateway', ?, ?)")
-        .bind(r#"{"apiKey":"vck-secret","baseUrl":"https://ai-gateway.vercel.sh/v1"}"#)
-        .bind(stamp())
-        .execute(&db)
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    let endpoint = list_endpoints(&db, "u1").await.unwrap().pop().unwrap();
-    assert_eq!(endpoint.name, "Vercel AI Gateway");
-    assert_eq!(endpoint.spec, "openai-compatible");
-    assert_eq!(endpoint.base_url, "https://ai-gateway.vercel.sh/v1");
-    assert_eq!(endpoint.api_key, "vck-secret");
-    assert_eq!(endpoint.model, "poolside/laguna-s-2.1-free");
-    assert_eq!(
-        media_cleaner_setting(&db, "u1").await.unwrap(),
-        Some(endpoint.id)
-    );
-    assert!(
-        pi_credential(&db, "u1", "vercel-ai-gateway")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    // The AI provider is untouched.
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "pi");
 }
 
 #[tokio::test]

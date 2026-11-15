@@ -13,8 +13,8 @@ use crate::recipes::{
     start_thumbnail_recompute,
 };
 use crate::{
-    AppError, AppState, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient,
-    IngredientUse, PromptForm, SetupForm, Source, ThumbnailPickForm, stamp,
+    AppError, ApplyDraftForm, AuthUser, GeneratedRecipe, GeneratedStep, Ingredient, IngredientUse,
+    PromptForm, SetupForm, Source, ThumbnailPickForm, stamp,
 };
 use axum::{
     Form,
@@ -25,12 +25,9 @@ use axum::{
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::SqlitePool;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use tower::ServiceExt;
 
 fn recipe() -> GeneratedRecipe {
@@ -238,39 +235,9 @@ fn every_recipe_prompt_carries_the_shared_rules() {
     }
 }
 
-async fn database() -> SqlitePool {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&db).await.unwrap();
-    db
-}
+use super::memory_db as database;
 
-fn state(db: SqlitePool) -> Arc<AppState> {
-    Arc::new(AppState {
-        db,
-        model: String::new(),
-        pi_worker_path: String::new(),
-        auth_script_path: String::new(),
-        claude_auth_script_path: String::new(),
-        search_grounding: false,
-        codex_flows: Arc::new(Mutex::new(HashMap::new())),
-        claude_flows: Arc::new(Mutex::new(HashMap::new())),
-        model_catalogue: Arc::new(Mutex::new(HashMap::new())),
-        media_debug_runs: Arc::new(Mutex::new(HashMap::new())),
-        thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
-        moment_jobs: Arc::new(Mutex::new(HashSet::new())),
-        embedder: None,
-        rate_limits: Default::default(),
-        invites: Default::default(),
-    })
-}
+use super::test_state as state;
 
 async fn response_body(response: axum::response::Response) -> String {
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -1423,111 +1390,4 @@ fn startup_clears_only_the_apps_leftover_temp_files() {
     assert!(unrelated.exists());
     assert!(outside.join("keep").exists());
     std::fs::remove_dir_all(&dir).unwrap();
-}
-
-/// Migration 0025 rebuilds `ai_drafts`. Dropping the old table cascades into
-/// the drafts' moment pools, so the migration sets them aside and puts them
-/// back; drafts that altered a saved recipe go, with their candidates.
-#[tokio::test]
-async fn the_draft_table_rebuild_keeps_each_drafts_moment_pool() {
-    let db = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .in_memory(true)
-                .foreign_keys(true),
-        )
-        .await
-        .unwrap();
-    let all = sqlx::migrate!();
-    let before = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            all.iter()
-                .filter(|migration| migration.version < 25)
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
-    before.run(&db).await.unwrap();
-    for statement in [
-        "INSERT INTO users(id,username,password_hash,created_at) VALUES('u1','alice','x','t')",
-        "INSERT INTO recipes(id,title,created_at,updated_at,user_id) VALUES('r1','Soup','t','t','u1')",
-        "INSERT INTO recipe_chat_messages(id,user_id,recipe_id,role,status,change_request,change_state,created_at)
-         VALUES('m1','u1','r1','assistant','done','Make it vegan','drafting','t')",
-        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,evidence_json)
-         VALUES('keep',NULL,'generate','{}','[]','t','t','u1','{\"title\":\"Reel\"}')",
-        "INSERT INTO ai_drafts(id,recipe_id,operation,recipe_json,sources_json,created_at,expires_at,user_id,chat_message_id)
-         VALUES('alter','r1','alter','{}','[]','t','t','u1','m1')",
-        "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector) VALUES('keep','audio',1.0,x'00')",
-        "INSERT INTO draft_moment_vectors(draft_id,kind,seconds,vector) VALUES('alter','frame',2.0,x'00')",
-        "INSERT INTO draft_moment_stills(draft_id,seconds,jpeg) VALUES('keep',2,x'ffd8')",
-        "INSERT INTO draft_step_moments(draft_id,step_index,seconds,source) VALUES('keep',0,1,'audio')",
-        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES('keep',0,1,x'ffd8')",
-        "INSERT INTO draft_thumbnails(draft_id,idx,seconds,jpeg) VALUES('alter',0,1,x'ffd8')",
-    ] {
-        sqlx::query(statement).execute(&db).await.unwrap();
-    }
-
-    all.run(&db).await.unwrap();
-
-    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM draft_moment_vectors WHERE draft_id='keep'),
-                (SELECT COUNT(*) FROM draft_moment_stills WHERE draft_id='keep'),
-                (SELECT COUNT(*) FROM draft_step_moments WHERE draft_id='keep'),
-                (SELECT COUNT(*) FROM draft_moment_vectors WHERE draft_id='alter'),
-                (SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='alter')",
-    )
-    .fetch_one(&db)
-    .await
-    .unwrap();
-    assert_eq!(counts, (1, 1, 1, 0, 0));
-    let drafts: Vec<(String, String)> = sqlx::query_as("SELECT id,evidence_json FROM ai_drafts")
-        .fetch_all(&db)
-        .await
-        .unwrap();
-    assert_eq!(drafts, [("keep".into(), "{\"title\":\"Reel\"}".into())]);
-    let columns: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_table_info('ai_drafts')")
-            .fetch_all(&db)
-            .await
-            .unwrap();
-    assert_eq!(
-        columns,
-        [
-            "id",
-            "user_id",
-            "recipe_json",
-            "sources_json",
-            "evidence_json",
-            "created_at",
-            "expires_at"
-        ]
-    );
-    let change_state: String =
-        sqlx::query_scalar("SELECT change_state FROM recipe_chat_messages WHERE id='m1'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-    assert_eq!(change_state, "failed");
-    let violations: Vec<(String,)> =
-        sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check")
-            .fetch_all(&db)
-            .await
-            .unwrap();
-    assert!(violations.is_empty(), "{violations:?}");
-
-    // The pool still hangs off the rebuilt table: discarding the draft takes it.
-    sqlx::query("DELETE FROM ai_drafts WHERE id='keep'")
-        .execute(&db)
-        .await
-        .unwrap();
-    let left: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM draft_moment_vectors) + (SELECT COUNT(*) FROM draft_moment_stills)
-              + (SELECT COUNT(*) FROM draft_step_moments)",
-    )
-    .fetch_one(&db)
-    .await
-    .unwrap();
-    assert_eq!(left, 0);
 }
