@@ -391,7 +391,7 @@ const SESSION_DAYS: i64 = 30;
 const SESSION_REFRESH_HOURS: i64 = 24;
 
 /// Two `Set-Cookie` headers: the session cookie, then the accounts cookie.
-type BrowserCookies = AppendHeaders<[(HeaderName, HeaderValue); 2]>;
+pub(crate) type BrowserCookies = AppendHeaders<[(HeaderName, HeaderValue); 2]>;
 
 /// SHA-256 of a session token, as stored in `sessions.token_hash`. The table
 /// never holds the token itself.
@@ -536,6 +536,16 @@ async fn browser_sessions(db: &SqlitePool, headers: &HeaderMap) -> Result<Vec<Br
     Ok(sessions)
 }
 
+/// The browser's active account, for pages outside the sign-in wall (a
+/// group invite link): the user of its first live session, if any.
+pub(crate) async fn signed_in_user(db: &SqlitePool, headers: &HeaderMap) -> Result<Option<String>> {
+    Ok(browser_sessions(db, headers)
+        .await?
+        .into_iter()
+        .next()
+        .map(|session| session.user_id))
+}
+
 /// Whether a session was extended in the last SESSION_REFRESH_HOURS, so it
 /// needs no new expiry yet.
 fn extended_recently(expires_at: &str) -> bool {
@@ -559,7 +569,7 @@ async fn extend_session(db: &SqlitePool, token: &str) -> Result<()> {
 /// active one. The browser's other accounts stay signed in behind it, up to
 /// MAX_BROWSER_ACCOUNTS in all. An older session of the same user on this
 /// browser ends, as does the oldest one that no longer fits.
-async fn sign_in_browser(
+pub(crate) async fn sign_in_browser(
     db: &SqlitePool,
     headers: &HeaderMap,
     user_id: &str,
@@ -1161,23 +1171,9 @@ pub(crate) async fn reset_password(
         .into_response())
 }
 
-/// The account that takes over the shared AI logins when `user_id`, the
-/// shared account, is deleted: the next oldest, as (id, username).
-async fn next_shared_ai_account(
-    db: &SqlitePool,
-    user_id: &str,
-) -> Result<Option<(String, String)>> {
-    Ok(sqlx::query_as(
-        "SELECT id, username FROM users WHERE id <> ? ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(user_id)
-    .fetch_optional(db)
-    .await?)
-}
-
-/// The confirmation page for deleting the signed-in account. When it is the
-/// shared account and others exist, it names the account whose AI setup the
-/// others switch to.
+/// The confirmation page for deleting the signed-in account. It names the
+/// group members whose generations run on this account's AI logins, which
+/// they lose with it.
 pub(crate) async fn delete_account_page(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -1187,30 +1183,8 @@ pub(crate) async fn delete_account_page(
         .fetch_optional(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let owns_shared = crate::shared_ai_account(&state.db)
-        .await?
-        .is_some_and(|(id, _)| id == user.id);
-    let mut successor = String::new();
-    let mut sharing = Vec::new();
-    if owns_shared && let Some((_, name)) = next_shared_ai_account(&state.db, &user.id).await? {
-        successor = name;
-        let others: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, username FROM users WHERE id <> ? ORDER BY username COLLATE NOCASE, username",
-        )
-        .bind(&user.id)
-        .fetch_all(&state.db)
-        .await?;
-        for (id, name) in others {
-            if !crate::uses_own_ai(&state.db, &id).await? {
-                sharing.push(name);
-            }
-        }
-    }
-    render(DeleteAccountTemplate {
-        username,
-        successor,
-        sharing,
-    })
+    let sharing = crate::groups::ai_dependents(&state.db, &user.id).await?;
+    render(DeleteAccountTemplate { username, sharing })
 }
 
 /// Deletes everything `user_id` owns and the account itself, in one
@@ -1232,6 +1206,9 @@ pub(crate) async fn delete_user(
         .bind(user_id)
         .fetch_all(&mut *tx)
         .await?;
+    // Out of its group first: grants go, and a group left with one member
+    // is dissolved.
+    crate::groups::leave_group_in(&mut tx, user_id).await?;
     // Every statement binds the id once as ?1; never mix ? and ?N.
     for statement in [
         // No foreign keys: thumbnail candidates of the recipes and drafts.
@@ -1252,7 +1229,8 @@ pub(crate) async fn delete_user(
         "DELETE FROM ai_endpoints WHERE user_id = ?1",
         "DELETE FROM pi_credentials WHERE user_id = ?1",
         "DELETE FROM sessions WHERE user_id = ?1",
-        // Cascades to every other table keyed to the user by a foreign key.
+        // Cascades to every other table keyed to the user by a foreign key
+        // (group_invites and group_invite_sends among them).
         "DELETE FROM users WHERE id = ?1",
     ] {
         sqlx::query(statement)

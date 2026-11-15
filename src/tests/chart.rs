@@ -43,6 +43,7 @@ fn chart_layout_merges_steps() {
         title: "Toast".into(),
         plate_name: String::new(),
         has_photo: false,
+        shared: false,
         description: String::new(),
         servings: None,
         prep_minutes: None,

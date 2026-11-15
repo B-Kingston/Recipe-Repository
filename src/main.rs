@@ -36,6 +36,7 @@ mod chat;
 mod display;
 mod embeddings;
 mod folders;
+mod groups;
 mod htmx;
 mod media;
 mod media_worker;
@@ -130,6 +131,9 @@ struct AppState {
     /// Brute-force limits on sign-in, the password page, and account
     /// creation; in-memory only, so a restart forgets them.
     rate_limits: Arc<auth::RateLimits>,
+    /// How group invites reach people: Resend mail, or the link shown to the
+    /// inviter when `RESEND_API_KEY` is unset.
+    invites: groups::Invites,
 }
 
 /// Last successfully discovered model catalogue for one source (a Pi provider
@@ -330,6 +334,8 @@ struct Recipe {
     plate_name: String,
     /// The recipe has a dish photo (`thumbnail_jpeg`, never loaded here).
     has_photo: bool,
+    /// Shared with the owner's group (`recipes.shared`).
+    shared: bool,
 }
 #[derive(Debug, Clone, FromRow)]
 struct Block {
@@ -459,8 +465,10 @@ struct HomeTemplate {
     results: bool,
     /// Search status shown above the recipes (indexing progress, service problems).
     notice: String,
-    /// The sign's toggle: "az", "folders" or "cuisines".
+    /// The sign's toggle: "az", "folders", "cuisines" or "group".
     view: &'static str,
+    /// The user is in a group, so the toggle offers the Group view.
+    in_group: bool,
     /// Every recipe of the library, whatever the page shows.
     total: usize,
     /// The Folders or Cuisines view's stacks; empty otherwise (and while a
@@ -502,11 +510,25 @@ struct ResetPasswordTemplate {
 #[template(path = "account_delete.html")]
 struct DeleteAccountTemplate {
     username: String,
-    /// The account deleting is the shared one and other accounts exist: the
-    /// next oldest account's AI setup takes over. Its username, else empty.
-    successor: String,
-    /// Usernames of the other accounts that use the shared AI logins now.
+    /// Usernames of the group members whose generations run on this
+    /// account's AI logins now (`groups::ai_dependents`).
     sharing: Vec<String>,
+}
+/// The page a group invite link opens (outside the sign-in wall).
+#[derive(Template)]
+#[template(path = "invite.html")]
+struct InviteTemplate {
+    token: String,
+    /// The inviter's username; empty when the invite is gone.
+    inviter: String,
+    /// One of the `groups::INVITE_*` states.
+    state: &'static str,
+    /// The browser's active account, when signed in.
+    viewer: String,
+    /// Why creating an account through the invite failed.
+    error: String,
+    /// The username typed into the sign-up form.
+    username: String,
 }
 #[derive(Template)]
 #[template(path = "display.html")]
@@ -543,18 +565,31 @@ struct RecipeTemplate {
     cook_value: String,
     /// The recipe chat drawer; None when the user has the chat off.
     chat: Option<chat::ChatPanel>,
-    /// The cook's notes on the recipe.
-    notes: notes::NotesPanel,
+    /// The cook's notes on the recipe; None on a recipe shared by another
+    /// member.
+    notes: Option<notes::NotesPanel>,
     /// The servings the amounts are shown for (`?serves=`).
     scale: scale::Scale,
-    /// The library folder and cuisine the recipe is filed in.
-    filing: folders::Filing,
+    /// The library folder and cuisine the recipe is filed in; None on a
+    /// recipe shared by another member (filing is the owner's).
+    filing: Option<folders::Filing>,
+    /// The owner's username when a group member opens a recipe someone else
+    /// shared, which shows read-only; empty on the owner's own page.
+    shared_by: String,
+    /// The owner's Share-with-group toggle: Some(shared) while the owner is
+    /// in a group, None otherwise and for other members.
+    share: Option<bool>,
 }
 /// Titles up to this many characters run around the top of the recipe
 /// page's plate rim; longer ones would not fit and leave it plain.
 const RIM_TITLE_MAX: usize = 26;
 
 impl RecipeTemplate {
+    /// A group member's view of someone else's shared recipe: no edits.
+    fn read_only(&self) -> bool {
+        !self.shared_by.is_empty()
+    }
+
     /// What the plate's well shows when there is no dish photo: the plate
     /// name, else the title's initial.
     fn plate_text(&self) -> String {
@@ -815,11 +850,13 @@ struct DraftTemplate {
 #[derive(Template)]
 #[template(path = "settings.html")]
 struct SettingsTemplate {
-    /// Username of the account whose AI setup the others share.
+    /// Username of the group member whose AI setup this account uses; empty
+    /// when it uses its own.
     shared_ai_owner: String,
-    /// This account is the one whose AI setup is shared.
+    /// This account shares its AI setup with at least one group member.
     owns_shared_ai: bool,
-    /// This account uses the shared AI setup, so its own is not shown.
+    /// This account generates with a group member's AI setup (its own has
+    /// no connected provider), so its cleaner and search key are not shown.
     uses_shared_ai: bool,
     /// What the shared setup generates with, e.g. "Claude (Pro/Max) · claude-opus-5-5".
     shared_ai_summary: String,
@@ -862,7 +899,8 @@ struct SettingsTemplate {
     /// (both empty when none is saved). The raw key never reaches the page.
     web_search_label: &'static str,
     web_search_key_masked: String,
-    /// The shared account's search provider label, empty when it has no key.
+    /// The search provider label of the member whose AI setup this account
+    /// uses, empty when it has no key.
     shared_web_search: &'static str,
     /// Whether video step moments are captured and shown for this user.
     step_moments: bool,
@@ -875,13 +913,16 @@ struct SettingsTemplate {
     embeddings_configured: bool,
     /// The user's saved search choice: "embeddings", "bm25" or "shared".
     search_choice: &'static str,
-    /// Whether the shared account searches with BM25 (what "shared" follows).
+    /// Whether the member whose AI setup this account uses searches with
+    /// BM25 (what "shared" follows).
     shared_search_bm25: bool,
     /// The provider refused the stored Codex / Claude sign-in on its last use.
     codex_refused: bool,
     claude_refused: bool,
     /// The login the AI setup in use generates with was refused (shared or own).
     active_login_refused: bool,
+    /// The Group block: members, invites, and AI sharing.
+    group: groups::GroupPanel,
 }
 struct SelectOption {
     value: String,
@@ -1170,11 +1211,6 @@ struct EndpointForm {
     #[serde(default)]
     model: String, // custom servers only; blank uses the preset default
 }
-/// Settings form for the AI-login choice: "own" or "shared".
-#[derive(Deserialize)]
-struct AiLoginsForm {
-    mode: String,
-}
 /// Settings form for the library search engine: "embeddings", "bm25" or "shared".
 #[derive(Deserialize)]
 struct SearchEngineForm {
@@ -1328,6 +1364,11 @@ async fn main() -> anyhowless::Result<()> {
             "TRUST_PROXY_HEADERS",
             false,
         ))),
+        invites: groups::Invites::new(
+            env::var("RESEND_API_KEY").ok(),
+            env::var("RESEND_FROM").ok(),
+            env::var("PUBLIC_BASE_URL").ok(),
+        ),
     });
     if state.embedder.is_some() {
         tokio::spawn(search::backfill(state.clone()));
@@ -1348,7 +1389,7 @@ async fn main() -> anyhowless::Result<()> {
 }
 /// Deletes expired drafts now and every hour after, so their dish-photo
 /// candidates and moment stills go soon after the draft expires rather than at
-/// the next generation or restart.
+/// the next generation or restart. Expired group invites go on the same tick.
 async fn prune_expired_drafts(db: SqlitePool) {
     let mut hourly = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
     loop {
@@ -1357,6 +1398,11 @@ async fn prune_expired_drafts(db: SqlitePool) {
             Ok(0) => {}
             Ok(removed) => info!(removed, "Removed expired AI drafts"),
             Err(error) => warn!(%error, "Expired AI drafts could not be removed"),
+        }
+        match groups::prune_invites(&db).await {
+            Ok(0) => {}
+            Ok(removed) => info!(removed, "Removed expired group invites"),
+            Err(error) => warn!(%error, "Expired group invites could not be removed"),
         }
     }
 }
@@ -1379,6 +1425,8 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/", get(home))
         .route("/library/view", post(folders::update_library_view))
         .route("/recipes/{id}/filing", post(folders::update_filing))
+        .route("/recipes/{id}/share", post(groups::update_share))
+        .route("/recipes/{id}/copy", post(recipes::copy_recipe))
         .route("/recipes/{id}/thumbnail", get(recipe_thumbnail))
         .route("/recipes/new", get(new_recipe))
         .route("/recipes/{id}", get(recipe_page).post(update_recipe))
@@ -1464,7 +1512,15 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings/web-search", post(add_web_search_key))
         .route("/settings/web-search/delete", post(delete_web_search_key))
         .route("/settings/search-engine", post(update_search_engine))
-        .route("/settings/ai-logins", post(update_ai_logins))
+        .route("/settings/group/invite", post(groups::send_invite))
+        .route(
+            "/settings/group/invites/{id}/cancel",
+            post(groups::cancel_invite),
+        )
+        .route("/settings/group/leave", post(groups::leave))
+        .route("/settings/group/ai-grants", post(groups::update_ai_grants))
+        .route("/settings/group/ai-source", post(groups::update_ai_source))
+        .route("/invites/{token}/accept", post(groups::accept_invite))
         .route("/settings/endpoints", post(add_endpoint))
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route("/settings/endpoints/{id}/check", post(check_endpoint))
@@ -1515,6 +1571,12 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/login", get(login_page).post(login))
         .route("/logout", post(logout))
         .route("/logout/all", post(logout_all))
+        .route("/invites/{token}", get(groups::invite_page))
+        .route("/invites/{token}/decline", post(groups::decline_invite))
+        .route(
+            "/invites/{token}/signup",
+            post(groups::signup_through_invite),
+        )
         .route("/display.css", get(display::display_css))
         .nest_service("/static", ServeDir::new("static"))
         .merge(protected)
@@ -1891,11 +1953,34 @@ async fn settings_page(
     user: AuthUser,
     flash: Flash,
 ) -> Result<Html<String>> {
-    let (shared_id, shared_ai_owner) = shared_ai_account(&s.db).await?.unwrap_or_default();
-    let owns_shared_ai = shared_id == user.id;
-    let uses_shared_ai = !owns_shared_ai && !uses_own_ai(&s.db, &user.id).await?;
+    settings_view(&s, &user, &flash, groups::GroupExtras::default()).await
+}
+
+/// The Settings page for the signed-in user. `extras` carries what only the
+/// request that made it can show in the Group block (a new invite's link, a
+/// refused invite), so the invite form answers with this page directly.
+pub(crate) async fn settings_view(
+    s: &Arc<AppState>,
+    user: &AuthUser,
+    flash: &Flash,
+    extras: groups::GroupExtras,
+) -> Result<Html<String>> {
+    // The account whose AI setup serves this one: its own, or a group
+    // member's it was granted while its own has no connected provider.
+    let shared_id = ai_account(&s.db, &user.id).await?;
+    let uses_shared_ai = shared_id != user.id;
+    let shared_ai_owner: String = if uses_shared_ai {
+        sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+            .bind(&shared_id)
+            .fetch_optional(&s.db)
+            .await?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let owns_shared_ai = !ai_grantees(&s.db, &user.id).await?.is_empty();
     let shared_ai_summary = if uses_shared_ai {
-        ai_summary(&s, &shared_id).await?
+        ai_summary(s, &shared_id).await?
     } else {
         String::new()
     };
@@ -1912,7 +1997,7 @@ async fn settings_page(
             key_masked: mask_key(&endpoint.api_key),
             default_model: spec_default_model(&endpoint.spec).to_string(),
             web_search: endpoint_has_web_search(&endpoint.spec, &endpoint.base_url),
-            model_options: cached_model_catalogue(&s, &endpoint.id),
+            model_options: cached_model_catalogue(s, &endpoint.id),
             auth_failed: endpoint.auth_failed,
             id: endpoint.id,
             name: endpoint.name,
@@ -1921,12 +2006,7 @@ async fn settings_page(
         .collect::<Vec<_>>();
     let codex_refused = subscription_login_refused(&s.db, &user.id, CODEX_PI_PROVIDER).await?;
     let claude_refused = subscription_login_refused(&s.db, &user.id, CLAUDE_PI_PROVIDER).await?;
-    let ai_user = if uses_shared_ai {
-        shared_id.as_str()
-    } else {
-        user.id.as_str()
-    };
-    let active_login_refused = active_login_refused(&s.db, ai_user).await?;
+    let active_login_refused = active_login_refused(&s.db, &shared_id).await?;
     let own_web_search = web_search_key(&s.db, &user.id).await?;
     let shared_web_search = if uses_shared_ai {
         web_search_key(&s.db, &shared_id)
@@ -1935,7 +2015,7 @@ async fn settings_page(
     } else {
         ""
     };
-    let cleaner_configured = ai::media_cleaner_configured(&s, &user.id).await;
+    let cleaner_configured = ai::media_cleaner_configured(s, &user.id).await;
     let cleaner_provider = media_cleaner_setting(&s.db, &user.id)
         .await?
         .unwrap_or_default();
@@ -1948,10 +2028,7 @@ async fn settings_page(
         cleaner_provider.as_str()
     };
     let cleaner_model_options = select_options(
-        cached_model_catalogue(
-            &s,
-            pi_provider_for(cleaner_source).unwrap_or(cleaner_source),
-        ),
+        cached_model_catalogue(s, pi_provider_for(cleaner_source).unwrap_or(cleaner_source)),
         &cleaner_model,
     );
     // First paint shows the cached catalogues; the page's script then replaces
@@ -1959,12 +2036,12 @@ async fn settings_page(
     let model = selected_model(&s.db, &user.id, &s.model).await?;
     let claude_model = selected_claude_model(&s.db, &user.id).await?;
     let codex_models = if codex_authorised {
-        cached_model_catalogue(&s, CODEX_PI_PROVIDER)
+        cached_model_catalogue(s, CODEX_PI_PROVIDER)
     } else {
         Vec::new()
     };
     let claude_models = if claude_authorised {
-        cached_model_catalogue(&s, CLAUDE_PI_PROVIDER)
+        cached_model_catalogue(s, CLAUDE_PI_PROVIDER)
     } else {
         Vec::new()
     };
@@ -1973,7 +2050,7 @@ async fn settings_page(
         owns_shared_ai,
         uses_shared_ai,
         shared_ai_summary,
-        ai_ready: ai::ai_configured(&s, &user).await,
+        ai_ready: ai::ai_configured(s, user).await,
         model_options: model_options(codex_models, &model, MODEL_OPTIONS),
         claude_model_options: model_options(claude_models, &claude_model, CLAUDE_MODEL_OPTIONS),
         effort_options: effort_options(
@@ -1993,7 +2070,7 @@ async fn settings_page(
         cleaner_model,
         cleaner_model_options,
         ai_notice: match flash.0.as_str() {
-            "provider_saved" | "logins_saved" => "Settings saved.",
+            "provider_saved" => "Settings saved.",
             "provider_added" => "Provider added.",
             "provider_removed" => "Provider removed.",
             "disconnected" => "Subscription disconnected.",
@@ -2062,11 +2139,12 @@ async fn settings_page(
         step_moments: step_moments_enabled(&s.db, &user.id).await?,
         embeddings_configured: s.embedder.is_some(),
         search_choice: match own_search_engine(&s.db, &user.id).await? {
-            SEARCH_SHARED if owns_shared_ai => SEARCH_EMBEDDINGS,
+            SEARCH_SHARED if !uses_shared_ai => SEARCH_EMBEDDINGS,
             choice => choice,
         },
-        shared_search_bm25: !owns_shared_ai
+        shared_search_bm25: uses_shared_ai
             && own_search_engine(&s.db, &shared_id).await? == SEARCH_BM25,
+        group: groups::panel(s, &user.id, flash, extras).await?,
         codex_refused,
         claude_refused,
         active_login_refused,
@@ -2365,27 +2443,6 @@ async fn ai_summary(s: &AppState, user_id: &str) -> Result<String> {
     })
 }
 
-/// Chooses between the shared AI setup and the user's own. The user's own
-/// providers, keys, and models are kept either way, so switching back and
-/// forth loses nothing.
-async fn update_ai_logins(
-    State(s): State<Arc<AppState>>,
-    user: AuthUser,
-    Form(form): Form<AiLoginsForm>,
-) -> Result<Response> {
-    let value = match form.mode.trim() {
-        "own" => "own",
-        "shared" => "shared",
-        _ => {
-            return Err(AppError::BadRequest(
-                "Choose shared or own AI logins.".into(),
-            ));
-        }
-    };
-    set_app_setting(&s.db, &user.id, AI_LOGINS_SETTING, value).await?;
-    Ok(flash_redirect("/settings#settings-ai", "logins_saved"))
-}
-
 /// Saves the units the signed-in user's recipes are generated in. Saved
 /// recipes keep their units; the recipe chat can convert one on request.
 async fn update_measurements(
@@ -2472,7 +2529,7 @@ async fn delete_web_search_key(State(s): State<Arc<AppState>>, user: AuthUser) -
 }
 
 /// Saves the signed-in user's library search engine. "shared" follows the
-/// shared account's choice; the shared account itself picks one of the two.
+/// choice of the group member whose AI logins the user uses.
 async fn update_search_engine(
     State(s): State<Arc<AppState>>,
     user: AuthUser,

@@ -993,6 +993,26 @@ label > input[type=checkbox] { margin-right: 8px; }
 .source-disclosure summary::after { content: "+"; margin-left: 8px; }
 .source-disclosure[open] summary::after { content: "\2212"; }
 .source-disclosure summary:hover { box-shadow: inset 0 0 0 2px var(--cobalt); }
+/* The owner's Share-with-group pill, and a member's "Shared by" label. */
+.share-toggle { margin: 0; }
+.share-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  box-shadow: inset 0 0 0 2px var(--cobalt-pale);
+  color: var(--cobalt-deep);
+  cursor: pointer;
+  font: 700 14px/1 var(--sans);
+}
+.share-pill:hover { box-shadow: inset 0 0 0 2px var(--cobalt); }
+.share-pill.is-shared { background: var(--cobalt); box-shadow: none; color: var(--on-ink); }
+.shared-by { margin: 0; color: var(--cobalt-deep); font: 700 14px/1.2 var(--sans); }
+.block-static:hover .block-text { text-decoration: none; }
+.ticket-owner { background: var(--cobalt-deep); }
 .source-popover {
   position: absolute;
   z-index: 5;
@@ -1618,3 +1638,9 @@ body.htmx-request::before {
 .serves-toggle .view-tab { min-height: 34px; padding: 0 12px; }
 .serves-toggle-label { padding: 0 8px 0 12px; color: var(--cobalt-deep); font: 700 12px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; }
 .serves-note { flex-basis: 100%; margin: 0; font-size: 14px; }
+
+/* Settings: the Group block's member list, pending invites, and the link of
+   an invite made without mail. */
+.group-members, .group-invites { margin: 0 0 12px; padding-left: 20px; }
+.group-invites li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+.invite-link input { width: 100%; }

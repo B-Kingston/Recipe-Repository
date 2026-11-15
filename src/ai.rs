@@ -402,8 +402,8 @@ async fn ensure_ai_configured(state: &AppState, user: &AuthUser) -> Result<()> {
     ensure_provider_configured(state, &ai_user, &provider).await
 }
 
-/// Whether the user's recipes can generate: the AI setup they use (shared or
-/// their own) has a connected provider.
+/// Whether the user's recipes can generate: the AI setup they use (their
+/// own, or a group member's they were granted) has a connected provider.
 pub(crate) async fn ai_configured(state: &AppState, user: &AuthUser) -> bool {
     configured(ensure_ai_configured(state, user).await)
 }
@@ -424,18 +424,11 @@ fn configured(check: Result<()>) -> bool {
 /// Whether a provider value can run: a connected subscription, or a saved
 /// endpoint with a key (a custom OpenAI-compatible server may have none).
 async fn ensure_provider_configured(state: &AppState, user_id: &str, provider: &str) -> Result<()> {
-    if let Some(pi_provider) = crate::pi_provider_for(provider) {
-        return crate::pi_credential(&state.db, user_id, pi_provider)
-            .await?
-            .map(|_| ())
-            .ok_or(AppError::AiNotConfigured);
+    if crate::provider_configured(&state.db, user_id, provider).await? {
+        Ok(())
+    } else {
+        Err(AppError::AiNotConfigured)
     }
-    let endpoint = crate::find_endpoint(&state.db, user_id, provider)
-        .await?
-        .filter(|endpoint| {
-            !endpoint.api_key.trim().is_empty() || endpoint.spec == crate::OPENAI_COMPATIBLE_SPEC
-        });
-    endpoint.map(|_| ()).ok_or(AppError::AiNotConfigured)
 }
 
 /// System prompt for the recipe-only video cleaner. It keeps the JSON schema

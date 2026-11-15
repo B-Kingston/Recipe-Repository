@@ -56,6 +56,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
         rate_limits: Default::default(),
+        invites: Default::default(),
     })
 }
 
@@ -1358,14 +1359,20 @@ const OWNED_TABLES: &[(&str, &str)] = &[
     ("pi_credentials", "user_id"),
     ("web_search_keys", "user_id"),
     ("sessions", "user_id"),
+    ("account_groups", "id"),
+    ("group_members", "user_id"),
+    ("ai_grants", "granter_id"),
+    ("group_invites", "id"),
+    ("group_invite_sends", "user_id"),
     ("users", "id"),
 ];
 
 /// Seeds a row in every per-account table for `user_id`, each keyed by an id
 /// that starts with the user id: a recipe with its blocks, sources, history,
 /// search vector, photos, moments, chat, and note; two drafts with
-/// thumbnails, one with moments; and settings, AI logins, and the web search
-/// key.
+/// thumbnails, one with moments; settings, AI logins, and the web search
+/// key; and a group of its own (with a grant to itself), an invite it sent,
+/// and the send log.
 async fn seed_account(db: &SqlitePool, user_id: &str) {
     for statement in [
         "INSERT INTO recipes(id,title,created_at,updated_at,user_id,thumbnail_jpeg)
@@ -1411,6 +1418,13 @@ async fn seed_account(db: &SqlitePool, user_id: &str) {
          VALUES(?1,'openai-codex','{}',?2)",
         "INSERT INTO web_search_keys(user_id,provider,api_key,created_at,updated_at)
          VALUES(?1,'brave','search-key',?2,?2)",
+        "INSERT INTO account_groups(id,created_at) VALUES(?1||'-group',?2)",
+        "INSERT INTO group_members(user_id,group_id,joined_at) VALUES(?1,?1||'-group',?2)",
+        "INSERT INTO ai_grants(group_id,granter_id,grantee_id,created_at)
+         VALUES(?1||'-group',?1,?1,?2)",
+        "INSERT INTO group_invites(id,token_hash,inviter_id,email_hash,email_masked,created_at,expires_at)
+         VALUES(?1||'-invite',?1||'-token',?1,'hash','j***@example.com',?2,?2)",
+        "INSERT INTO group_invite_sends(id,user_id,sent_at) VALUES(?1||'-send',?1,?2)",
     ] {
         let mut query = sqlx::query(statement).bind(user_id);
         if statement.contains("?2") {
@@ -1564,7 +1578,7 @@ async fn deleting_an_account_removes_everything_it_owns_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldest() {
+async fn deleting_an_account_that_shares_ai_warns_the_members_who_lose_it() {
     let db = database().await;
     let state = state(db.clone());
     let app = routes(state.clone());
@@ -1572,30 +1586,43 @@ async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldes
     let alice_id = user_id(&db, "alice").await;
     add_account(&db, "carol", "carol-secret").await;
     add_account(&db, "bob", "bob-secret").await;
-    for (id, created_at) in [
-        (alice_id.as_str(), "2026-01-01T00:00:00+00:00"),
-        ("bob-id", "2026-02-01T00:00:00+00:00"),
-        ("carol-id", "2026-03-01T00:00:00+00:00"),
-    ] {
-        sqlx::query("UPDATE users SET created_at = ? WHERE id = ?")
-            .bind(created_at)
-            .bind(id)
-            .execute(&db)
-            .await
-            .unwrap();
-    }
-    sqlx::query("INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('carol-id','ai_logins','own',?)")
-        .bind(stamp())
-        .execute(&db)
-        .await
-        .unwrap();
+    let group = super::groups::form_group(&db, &[&alice_id, "bob-id", "carol-id"]).await;
+    // Alice and carol have AI logins; alice shares hers with bob and carol,
+    // and carol shares hers with bob too, granted later.
+    super::groups::connect_codex(&db, &alice_id).await;
+    super::groups::connect_codex(&db, "carol-id").await;
+    super::groups::grant_ai(
+        &db,
+        &group,
+        &alice_id,
+        "bob-id",
+        "2026-01-01T00:00:00+00:00",
+    )
+    .await;
+    super::groups::grant_ai(
+        &db,
+        &group,
+        &alice_id,
+        "carol-id",
+        "2026-01-01T00:00:00+00:00",
+    )
+    .await;
+    super::groups::grant_ai(
+        &db,
+        &group,
+        "carol-id",
+        "bob-id",
+        "2026-02-01T00:00:00+00:00",
+    )
+    .await;
     assert_eq!(crate::ai_account(&db, "bob-id").await.unwrap(), alice_id);
     assert_eq!(
         crate::ai_account(&db, "carol-id").await.unwrap(),
-        "carol-id"
+        "carol-id",
+        "carol's own logins win"
     );
 
-    // An account that is not the shared one gets no warning.
+    // An account nobody depends on gets no warning.
     let bob = token(&sign_in(&app, "bob", "bob-secret").await).to_string();
     let response = app
         .clone()
@@ -1606,7 +1633,7 @@ async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldes
         .await
         .unwrap();
     let body = response_body(response).await;
-    assert!(!body.contains("AI logins are shared"), "{body}");
+    assert!(!body.contains("shares its AI logins"), "{body}");
 
     let response = app
         .clone()
@@ -1618,16 +1645,12 @@ async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldes
         .unwrap();
     let body = response_body(response).await;
     assert!(
-        body.contains("This account’s AI logins are shared."),
+        body.contains("This account shares its AI logins with your group."),
         "{body}"
     );
     assert!(
-        body.contains("bob uses them."),
+        body.contains("bob generates recipes with them now"),
         "carol uses her own: {body}"
-    );
-    assert!(
-        body.contains("AI setup of bob, the next oldest account"),
-        "{body}"
     );
     assert!(body.contains("Delete account alice</button>"));
 
@@ -1642,27 +1665,19 @@ async fn deleting_the_shared_account_warns_and_hands_ai_logins_to_the_next_oldes
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&response), "/login");
-    let response = app
-        .clone()
-        .oneshot(request("/login", Some("recipe_flash=account_deleted")))
+    // Bob moves to carol's shared logins; the group lives on with two.
+    assert_eq!(crate::ai_account(&db, "bob-id").await.unwrap(), "carol-id");
+    let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_members WHERE group_id = ?")
+        .bind(&group)
+        .fetch_one(&db)
         .await
         .unwrap();
-    let body = response_body(response).await;
-    assert!(body.contains("Account deleted."), "{body}");
-    assert_eq!(
-        crate::shared_ai_account(&db).await.unwrap(),
-        Some(("bob-id".to_string(), "bob".to_string()))
-    );
-    assert_eq!(crate::ai_account(&db, "bob-id").await.unwrap(), "bob-id");
-    assert_eq!(
-        crate::ai_account(&db, "carol-id").await.unwrap(),
-        "carol-id"
-    );
-    sqlx::query("DELETE FROM app_settings WHERE user_id='carol-id'")
-        .execute(&db)
+    assert_eq!(members, 2);
+    let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_grants")
+        .fetch_one(&db)
         .await
         .unwrap();
-    assert_eq!(crate::ai_account(&db, "carol-id").await.unwrap(), "bob-id");
+    assert_eq!(grants, 1, "only carol's grant to bob is left");
 }
 
 #[tokio::test]

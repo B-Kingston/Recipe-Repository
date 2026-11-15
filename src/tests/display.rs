@@ -95,6 +95,7 @@ async fn display_css_is_served_without_signing_in() {
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
         rate_limits: Default::default(),
+        invites: Default::default(),
     });
     let response = routes(state)
         .oneshot(

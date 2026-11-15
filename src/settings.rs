@@ -241,40 +241,133 @@ pub(crate) async fn ai_provider(db: &SqlitePool, user_id: &str) -> Result<String
         .unwrap_or_else(|| PROVIDER_CODEX.into()))
 }
 
-/// app_settings key of an account's AI-login choice: "own" uses the account's
-/// own providers, subscriptions, keys, and models; anything else uses the
-/// shared account's.
-pub(crate) const AI_LOGINS_SETTING: &str = "ai_logins";
-
-/// The account whose AI setup every other account shares by default: the
-/// first one created, as (id, username).
-pub(crate) async fn shared_ai_account(db: &SqlitePool) -> Result<Option<(String, String)>> {
-    Ok(
-        sqlx::query_as("SELECT id, username FROM users ORDER BY created_at, id LIMIT 1")
-            .fetch_optional(db)
-            .await?,
-    )
-}
-
-/// Whether the user chose their own AI setup over the shared one.
-pub(crate) async fn uses_own_ai(db: &SqlitePool, user_id: &str) -> Result<bool> {
-    Ok(app_setting(db, user_id, AI_LOGINS_SETTING)
+/// Whether one account's provider value can run: a connected subscription,
+/// or one of its endpoints with a key (a custom OpenAI-compatible server may
+/// have none). A subscription counts once any credential is stored; one the
+/// provider refused is flagged on its row instead.
+pub(crate) async fn provider_configured(
+    db: &SqlitePool,
+    user_id: &str,
+    provider: &str,
+) -> Result<bool> {
+    if let Some(pi_provider) = crate::pi_provider_for(provider) {
+        return Ok(pi_credential(db, user_id, pi_provider).await?.is_some());
+    }
+    Ok(find_endpoint(db, user_id, provider)
         .await?
-        .as_deref()
-        == Some("own"))
+        .is_some_and(|endpoint| {
+            !endpoint.api_key.trim().is_empty() || endpoint.spec == crate::OPENAI_COMPATIBLE_SPEC
+        }))
 }
 
-/// The account whose AI provider, subscriptions, API keys, models, and video
-/// cleaner serve `user_id`'s generations: the shared account's, unless the
-/// user chose their own. The shared account always uses its own. Resolving an
-/// AI account again returns it unchanged.
+/// Whether the account has an AI setup of its own: its active provider is a
+/// connected subscription or one of its endpoints.
+pub(crate) async fn own_ai_configured(db: &SqlitePool, user_id: &str) -> Result<bool> {
+    provider_configured(db, user_id, &ai_provider(db, user_id).await?).await
+}
+
+/// app_settings key of the group member whose AI logins a user picked when
+/// several members grant theirs (a user id; absent means the earliest grant).
+pub(crate) const AI_SOURCE_SETTING: &str = "ai_source";
+
+/// The members who let `user_id` use their AI logins, as (id, username),
+/// earliest grant first. Only grants between two current members of the
+/// grant's group count, so leaving or dissolving a group ends them even
+/// before their rows go.
+pub(crate) async fn ai_grants_received(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT g.granter_id, u.username FROM ai_grants g
+         JOIN group_members me ON me.user_id = g.grantee_id AND me.group_id = g.group_id
+         JOIN group_members them ON them.user_id = g.granter_id AND them.group_id = g.group_id
+         JOIN users u ON u.id = g.granter_id
+         WHERE g.grantee_id = ?
+         ORDER BY g.created_at, g.rowid",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// The members `granter_id` lets use its AI logins, by user id, under the
+/// same current-membership rule as `ai_grants_received`.
+pub(crate) async fn ai_grantees(db: &SqlitePool, granter_id: &str) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT g.grantee_id FROM ai_grants g
+         JOIN group_members me ON me.user_id = g.granter_id AND me.group_id = g.group_id
+         JOIN group_members them ON them.user_id = g.grantee_id AND them.group_id = g.group_id
+         WHERE g.granter_id = ?
+         ORDER BY g.created_at, g.rowid",
+    )
+    .bind(granter_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// Replaces the members `granter_id` lets use its AI logins with `grantees`
+/// (members of `group_id`; the caller checks). A grant kept keeps its date,
+/// so the grantees' default choice does not move.
+pub(crate) async fn set_ai_grants(
+    db: &SqlitePool,
+    group_id: &str,
+    granter_id: &str,
+    grantees: &[String],
+) -> Result<()> {
+    let mut tx = crate::recipes::begin_write(db).await?;
+    let existing: Vec<String> =
+        sqlx::query_scalar("SELECT grantee_id FROM ai_grants WHERE granter_id = ?")
+            .bind(granter_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for grantee in existing.iter().filter(|id| !grantees.contains(id)) {
+        sqlx::query("DELETE FROM ai_grants WHERE granter_id = ? AND grantee_id = ?")
+            .bind(granter_id)
+            .bind(grantee)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for grantee in grantees.iter().filter(|id| !existing.contains(id)) {
+        sqlx::query(
+            "INSERT INTO ai_grants (group_id, granter_id, grantee_id, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(group_id)
+        .bind(granter_id)
+        .bind(grantee)
+        .bind(stamp())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The account whose AI provider, subscriptions, API keys, models, effort,
+/// video cleaner, and search key serve `user_id`: its own when it has an AI
+/// setup of its own; else that of a group member who granted it theirs (the
+/// one it picked in Settings, else the earliest grant), skipping members
+/// with no AI setup either; else its own, which then fails as not
+/// configured. Resolving an AI account again returns it unchanged, since a
+/// member only serves others while its own setup is configured.
 pub(crate) async fn ai_account(db: &SqlitePool, user_id: &str) -> Result<String> {
-    if uses_own_ai(db, user_id).await? {
+    if own_ai_configured(db, user_id).await? {
         return Ok(user_id.to_string());
     }
-    Ok(shared_ai_account(db)
-        .await?
-        .map_or_else(|| user_id.to_string(), |(id, _)| id))
+    let mut grants = ai_grants_received(db, user_id).await?;
+    if let Some(picked) = app_setting(db, user_id, AI_SOURCE_SETTING).await?
+        && let Some(index) = grants.iter().position(|(id, _)| *id == picked)
+    {
+        let chosen = grants.remove(index);
+        grants.insert(0, chosen);
+    }
+    for (granter, _) in grants {
+        if own_ai_configured(db, &granter).await? {
+            return Ok(granter);
+        }
+    }
+    Ok(user_id.to_string())
 }
 
 pub(crate) async fn selected_model(
@@ -427,7 +520,7 @@ pub(crate) async fn step_moments_enabled(db: &SqlitePool, user_id: &str) -> Resu
 
 /// app_settings key of the user's library search engine: "embeddings" (search
 /// by meaning), "bm25" (word search) or "shared" (absent too), which follows
-/// the shared account's choice the way AI logins do.
+/// the choice of the account whose AI logins the user uses (`ai_account`).
 pub(crate) const SEARCH_ENGINE_SETTING: &str = "search_engine";
 pub(crate) const SEARCH_EMBEDDINGS: &str = "embeddings";
 pub(crate) const SEARCH_BM25: &str = "bm25";
@@ -446,18 +539,20 @@ pub(crate) async fn own_search_engine(db: &SqlitePool, user_id: &str) -> Result<
     .await
 }
 
-/// The engine that runs the user's searches: their own choice, else the
-/// shared account's, else search by meaning.
+/// The engine that runs the user's searches: their own choice, else that of
+/// the account whose AI logins they use, else search by meaning.
 async fn search_engine(db: &SqlitePool, user_id: &str) -> Result<&'static str> {
     let own = own_search_engine(db, user_id).await?;
     if own != SEARCH_SHARED {
         return Ok(own);
     }
-    let shared = match shared_ai_account(db).await? {
-        Some((id, _)) if id != user_id => own_search_engine(db, &id).await?,
-        _ => SEARCH_SHARED,
+    let ai_user = ai_account(db, user_id).await?;
+    let followed = if ai_user == user_id {
+        SEARCH_SHARED
+    } else {
+        own_search_engine(db, &ai_user).await?
     };
-    Ok(if shared == SEARCH_BM25 {
+    Ok(if followed == SEARCH_BM25 {
         SEARCH_BM25
     } else {
         SEARCH_EMBEDDINGS

@@ -53,6 +53,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
         rate_limits: Default::default(),
+        invites: Default::default(),
     })
 }
 
@@ -1087,26 +1088,21 @@ fn assert_flash(response: &axum::response::Response, location: &str, flash: &str
     );
 }
 
-async fn choose_ai_logins(state: &Arc<AppState>, user_id: &str, mode: &str) {
-    let result = crate::update_ai_logins(
-        State(state.clone()),
-        AuthUser { id: user_id.into() },
-        Form(crate::AiLoginsForm { mode: mode.into() }),
-    )
-    .await;
-    assert!(result.is_ok());
-}
-
 #[tokio::test]
-async fn other_accounts_share_the_first_accounts_ai_logins_until_they_override() {
+async fn a_group_member_generates_with_shared_ai_logins_until_connecting_their_own() {
     let db = database().await;
     let state = state(db.clone());
     // Without accounts every user is their own AI account.
     assert_eq!(crate::ai_account(&db, "u1").await.unwrap(), "u1");
     add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
     add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
-    assert_eq!(crate::ai_account(&db, "u1").await.unwrap(), "u1");
-    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u1");
+    // Out of a group nobody shares: the oldest account is nothing special.
+    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u2");
+
+    // Alice shares with bob, but has no AI login yet: bob keeps his own.
+    let group = super::groups::form_group(&db, &["u1", "u2"]).await;
+    super::groups::grant_ai(&db, &group, "u1", "u2", "2026-03-01T00:00:00+00:00").await;
+    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u2");
 
     // Alice connects Claude: bob can generate with it and sees what it is.
     let bob = AuthUser { id: "u2".into() };
@@ -1117,30 +1113,28 @@ async fn other_accounts_share_the_first_accounts_ai_logins_until_they_override()
         .await
         .unwrap();
     assert!(save(&state, claude_form("claude-opus-5-5")).await.is_ok());
+    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u1");
     assert!(crate::ai::ai_configured(&state, &bob).await);
     let body = settings_body(&state, "u2").await;
     assert!(body.contains("alice's AI logins"), "{body}");
     assert!(body.contains("Claude (Pro/Max) · claude-opus-5-5"));
-    assert!(body.contains("Use my own AI logins"));
-    assert!(!body.contains("Add a provider with an API key"));
+    assert!(body.contains("Connect a provider of your own below"));
+    assert!(body.contains("Add a provider with an API key"));
+    assert!(
+        !body.contains("id=\"settings-cleaner\""),
+        "the cleaner follows alice's"
+    );
     assert!(
         !body.contains("sk-ant"),
         "the shared credential never reaches the page"
     );
     let body = settings_body(&state, "u1").await;
-    assert!(body.contains("other accounts generate recipes with these logins"));
-    assert!(body.contains("Add a provider with an API key"));
+    assert!(
+        body.contains("Shared: members of your group you chose"),
+        "{body}"
+    );
 
-    // Bob overrides: his own (empty) setup applies and alice's stays put.
-    choose_ai_logins(&state, "u2", "own").await;
-    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u2");
-    assert!(!crate::ai::ai_configured(&state, &bob).await);
-    let body = settings_body(&state, "u2").await;
-    assert!(body.contains("Use alice's shared logins"));
-    assert!(body.contains("Add a provider with an API key"));
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "claude");
-
-    // Going back to the shared logins keeps bob's own settings for later.
+    // Bob connects his own: it wins, and alice's setup stays put.
     let id = insert_endpoint(
         &db,
         "u2",
@@ -1155,20 +1149,18 @@ async fn other_accounts_share_the_first_accounts_ai_logins_until_they_override()
     crate::set_app_setting(&db, "u2", "ai_provider", &id)
         .await
         .unwrap();
+    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u2");
     assert!(crate::ai::ai_configured(&state, &bob).await);
-    choose_ai_logins(&state, "u2", "shared").await;
-    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u1");
-    assert_eq!(ai_provider(&db, "u2").await.unwrap(), id);
+    assert!(
+        !settings_body(&state, "u2")
+            .await
+            .contains("alice's AI logins")
+    );
+    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "claude");
 
-    let result = crate::update_ai_logins(
-        State(state.clone()),
-        bob,
-        Form(crate::AiLoginsForm {
-            mode: "theirs".into(),
-        }),
-    )
-    .await;
-    assert!(matches!(result, Err(AppError::BadRequest(_))));
+    // Removing his own login goes back to alice's.
+    crate::remove_endpoint(&db, "u2", &id).await.unwrap();
+    assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u1");
 }
 
 async fn choose_search(state: &Arc<AppState>, user_id: &str, engine: &str) -> Result<(), AppError> {
@@ -1184,16 +1176,19 @@ async fn choose_search(state: &Arc<AppState>, user_id: &str, engine: &str) -> Re
 }
 
 #[tokio::test]
-async fn other_accounts_share_the_first_accounts_search_engine_until_they_override() {
+async fn members_using_shared_ai_logins_follow_the_sharers_search_engine_until_they_override() {
     let db = database().await;
     let state = state(db.clone());
     add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
     add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
+    let group = super::groups::form_group(&db, &["u1", "u2"]).await;
+    super::groups::connect_codex(&db, "u1").await;
+    super::groups::grant_ai(&db, &group, "u1", "u2", "2026-03-01T00:00:00+00:00").await;
     // Search by meaning by default, for everyone.
     assert!(!crate::keyword_search_selected(&db, "u1").await.unwrap());
     assert!(!crate::keyword_search_selected(&db, "u2").await.unwrap());
 
-    // The shared account's choice carries over to accounts left on "shared".
+    // The sharer's choice carries over to members left on "shared".
     choose_search(&state, "u1", "bm25").await.unwrap();
     assert!(crate::keyword_search_selected(&db, "u1").await.unwrap());
     assert!(crate::keyword_search_selected(&db, "u2").await.unwrap());
@@ -1207,7 +1202,7 @@ async fn other_accounts_share_the_first_accounts_search_engine_until_they_overri
     choose_search(&state, "u2", "shared").await.unwrap();
     assert!(crate::keyword_search_selected(&db, "u2").await.unwrap());
 
-    // The shared account has no "shared" option of its own.
+    // An account on its own AI logins has no "shared" option.
     let page = settings_body(&state, "u1").await;
     assert!(!page.contains(r#"value="shared""#));
     assert!(page.contains(r#"value="bm25" checked"#));
@@ -1329,6 +1324,8 @@ async fn a_rejected_endpoint_key_is_flagged_on_its_row_and_for_sharing_accounts(
     add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
     let id = add(&db, "Groq", "groq", "", "gsk-test-1234").await;
     set_provider(&db, &id).await;
+    let group = super::groups::form_group(&db, &["u1", "u2"]).await;
+    super::groups::grant_ai(&db, &group, "u1", "u2", "2026-03-01T00:00:00+00:00").await;
     let login = crate::Login::Endpoint { id: &id };
 
     match crate::ai::track_login(&state, login, "Groq", true, worker_output(1, REFUSED_LOGIN)).await
@@ -1546,6 +1543,9 @@ async fn an_account_sharing_ai_logins_sees_the_shared_search_key_but_not_its_for
     let state = state(db.clone());
     add_user(&db, "u1", "alice", "2026-01-01T00:00:00+00:00").await;
     add_user(&db, "u2", "bob", "2026-02-01T00:00:00+00:00").await;
+    let group = super::groups::form_group(&db, &["u1", "u2"]).await;
+    super::groups::connect_codex(&db, "u1").await;
+    super::groups::grant_ai(&db, &group, "u1", "u2", "2026-03-01T00:00:00+00:00").await;
     let html = settings_body(&state, "u2").await;
     assert!(html.contains("alice has no search key"), "{html}");
     save_search_key(&state, "u1", "tavily", "tvly-shared-4321")
@@ -1558,7 +1558,7 @@ async fn an_account_sharing_ai_logins_sees_the_shared_search_key_but_not_its_for
     assert!(
         settings_body(&state, "u1")
             .await
-            .contains("Shared: accounts using these AI logins use this key too.")
+            .contains("Shared: group members using your AI logins use this key too.")
     );
 }
 

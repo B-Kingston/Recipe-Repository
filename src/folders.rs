@@ -389,6 +389,8 @@ const VIEW_SETTING: &str = "library_view";
 const VIEW_AZ: &str = "az";
 const VIEW_FOLDERS: &str = "folders";
 const VIEW_CUISINES: &str = "cuisines";
+/// The Group view: every recipe the members of the user's group share.
+pub(crate) const VIEW_GROUP: &str = "group";
 
 /// The user's library view: None files A to Z.
 pub(crate) async fn library_view(db: &sqlx::SqlitePool, user_id: &str) -> Result<Option<Shelf>> {
@@ -401,19 +403,26 @@ pub(crate) async fn library_view(db: &sqlx::SqlitePool, user_id: &str) -> Result
     )
 }
 
+/// Whether the user's saved library view is the Group view (which applies
+/// only while they are in a group).
+pub(crate) async fn group_view_selected(db: &sqlx::SqlitePool, user_id: &str) -> Result<bool> {
+    Ok(app_setting(db, user_id, VIEW_SETTING).await?.as_deref() == Some(VIEW_GROUP))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ViewForm {
     view: String,
 }
 
-/// `POST /library/view`: the A–Z / Folders / Cuisines toggle on the sign.
+/// `POST /library/view`: the A–Z / Folders / Cuisines / Group toggle on the
+/// sign.
 pub(crate) async fn update_library_view(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     Form(form): Form<ViewForm>,
 ) -> Result<Response> {
     let view = match form.view.as_str() {
-        VIEW_AZ | VIEW_FOLDERS | VIEW_CUISINES => form.view.as_str(),
+        VIEW_AZ | VIEW_FOLDERS | VIEW_CUISINES | VIEW_GROUP => form.view.as_str(),
         _ => return Err(AppError::BadRequest("Unknown library view.".into())),
     };
     set_app_setting(&state.db, &user.id, VIEW_SETTING, view).await?;
