@@ -41,7 +41,7 @@ To debug the reel pipeline itself, open **Settings → Media extraction debugger
 
 ## Deployment note
 
-Access is by account: the first is created on first visit, and any signed-in user can add more from the account menu. Passwords are stored only as Argon2 hashes in the database. Each sign-in gets a random session token in an `HttpOnly` cookie, and the database stores only the token's hash. The cookie has no `Secure` flag, because the app serves plain HTTP. Every signed-in user can see the other usernames and create accounts. Expose it only on a trusted LAN or behind a VPN/reverse proxy with access control. Do not place it directly on the public internet.
+Access is by account: the first is created on first visit, and any signed-in user can add more from the account menu. Passwords are stored only as Argon2 hashes in the database. Each sign-in gets a random session token in an `HttpOnly` cookie, and the database stores only the token's hash. The cookie has no `Secure` flag, because the app serves plain HTTP. The account menu lists only the accounts the browser is signed in to, but every signed-in user can create accounts (at most 10 an hour from one address). Failed sign-ins are limited per address (30 per 15 minutes) and per username (10 per 15 minutes), and wrong current passwords on the password page per account; the limits live in memory and reset on restart. Behind a reverse proxy, set `TRUST_PROXY_HEADERS=true` so the limits see the client's address from `X-Forwarded-For` (the proxy must set that header itself), and finish setup before exposing the server, because `/setup` is open until the first account exists. Without `Secure` cookies, put a TLS proxy in front of anything beyond a trusted LAN.
 
 ## Verification
 

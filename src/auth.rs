@@ -6,8 +6,8 @@ use crate::{
 };
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::PasswordHash};
 use axum::{
-    extract::{FromRequestParts, Query, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, header, request::Parts},
+    extract::{ConnectInfo, FromRequestParts, Query, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::Next,
     response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
 };
@@ -17,8 +17,11 @@ use rand_core::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
+    collections::{HashMap, VecDeque},
     fmt::Write,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, LazyLock},
+    time::{Duration as StdDuration, Instant},
 };
 use uuid::Uuid;
 
@@ -81,6 +84,254 @@ async fn check_password(password: String, stored: Option<String>) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// What a brute-force limit counts. Each kind has its own allowance and
+/// window, and its own keys: an address, a username, or a user id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Limit {
+    /// Failed sign-ins from one address.
+    LoginAddress,
+    /// Failed sign-ins to one username, known or not, letter case ignored.
+    LoginUsername,
+    /// Wrong current passwords on the password page, per user.
+    Password,
+    /// Accounts created, or refused as a taken username, from one address.
+    NewAccount,
+}
+
+impl Limit {
+    /// Most hits a key may gather inside the window.
+    pub(crate) fn allowance(self) -> usize {
+        match self {
+            Self::LoginAddress => 30,
+            Self::LoginUsername | Self::Password | Self::NewAccount => 10,
+        }
+    }
+
+    /// The sliding window a key's hits are counted over.
+    pub(crate) fn window(self) -> StdDuration {
+        StdDuration::from_secs(match self {
+            Self::LoginAddress | Self::LoginUsername | Self::Password => 15 * 60,
+            Self::NewAccount => 60 * 60,
+        })
+    }
+}
+
+/// Most keys the limiter holds at once. A new key past the cap first drops
+/// every key whose hits have all left their window, then the key hit least
+/// recently.
+pub(crate) const MAX_LIMIT_KEYS: usize = 10_000;
+/// Usernames are keyed by at most this many characters: no username is
+/// longer, so a longer one signs in nowhere, and a huge one makes no huge key.
+const MAX_LIMIT_KEY_CHARS: usize = 64;
+
+pub(crate) type LimitKey = (Limit, String);
+
+/// The limiter's key for a username typed at sign-in: trimmed and lower-cased
+/// in ASCII, the way SQLite's `NOCASE` matches it to an account.
+pub(crate) fn username_key(username: &str) -> LimitKey {
+    let name: String = username.trim().chars().take(MAX_LIMIT_KEY_CHARS).collect();
+    (Limit::LoginUsername, name.to_ascii_lowercase())
+}
+
+/// In-memory brute-force limits for sign-in, the password page, and account
+/// creation, shared by every request of this process. Each key keeps the
+/// times of its recent hits, never more than its allowance, so a key frees
+/// up as its oldest hit leaves the window. A restart forgets them all.
+pub(crate) struct RateLimits {
+    /// Take the client address from the left-most `X-Forwarded-For` entry
+    /// (`TRUST_PROXY_HEADERS`) instead of the connection's peer address.
+    trust_proxy_headers: bool,
+    hits: parking_lot::Mutex<HashMap<LimitKey, VecDeque<Instant>>>,
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl RateLimits {
+    pub(crate) fn new(trust_proxy_headers: bool) -> Self {
+        Self {
+            trust_proxy_headers,
+            hits: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records one hit on every key, unless one of them is already at its
+    /// allowance: then nothing is recorded and the longest wait comes back.
+    /// The check and the hits are one step under the lock, so requests sent
+    /// at once cannot slip past the allowance together.
+    pub(crate) fn attempt(&self, keys: &[LimitKey]) -> std::result::Result<(), StdDuration> {
+        self.attempt_at(keys, Instant::now())
+    }
+
+    pub(crate) fn attempt_at(
+        &self,
+        keys: &[LimitKey],
+        now: Instant,
+    ) -> std::result::Result<(), StdDuration> {
+        let mut hits = self.hits.lock();
+        let wait = keys
+            .iter()
+            .filter_map(|key| {
+                hits.get_mut(key)
+                    .and_then(|times| wait_for(key.0, times, now))
+            })
+            .max();
+        if let Some(wait) = wait {
+            return Err(wait);
+        }
+        for key in keys {
+            hit(&mut hits, key.clone(), now);
+        }
+        Ok(())
+    }
+
+    /// The wait before `key` may take another hit, or `None` when it may.
+    pub(crate) fn blocked(&self, key: &LimitKey) -> Option<StdDuration> {
+        let mut hits = self.hits.lock();
+        wait_for(key.0, hits.get_mut(key)?, Instant::now())
+    }
+
+    /// Records one hit on `key`, for a limit checked with `blocked` before
+    /// the work and counted only by how it ended.
+    pub(crate) fn record(&self, key: LimitKey) {
+        hit(&mut self.hits.lock(), key, Instant::now());
+    }
+
+    /// Takes back the newest hit on `key`, for an attempt that succeeded.
+    pub(crate) fn forgive(&self, key: &LimitKey) {
+        let mut hits = self.hits.lock();
+        if let Some(times) = hits.get_mut(key) {
+            times.pop_back();
+            if times.is_empty() {
+                hits.remove(key);
+            }
+        }
+    }
+
+    /// Forgets every hit on `key`.
+    pub(crate) fn clear(&self, key: &LimitKey) {
+        self.hits.lock().remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_count(&self) -> usize {
+        self.hits.lock().len()
+    }
+}
+
+/// Drops the hits that have left the window.
+fn expire(limit: Limit, times: &mut VecDeque<Instant>, now: Instant) {
+    while times
+        .front()
+        .is_some_and(|oldest| now.duration_since(*oldest) >= limit.window())
+    {
+        times.pop_front();
+    }
+}
+
+/// How long until a key at its allowance takes a hit again; `None` when it
+/// is below its allowance.
+fn wait_for(limit: Limit, times: &mut VecDeque<Instant>, now: Instant) -> Option<StdDuration> {
+    expire(limit, times, now);
+    if times.len() < limit.allowance() {
+        return None;
+    }
+    let oldest = times.front()?;
+    Some(limit.window().saturating_sub(now.duration_since(*oldest)))
+}
+
+/// Adds one hit to `key`, keeping no more than its allowance, and makes room
+/// first when a new key would pass MAX_LIMIT_KEYS.
+fn hit(hits: &mut HashMap<LimitKey, VecDeque<Instant>>, key: LimitKey, now: Instant) {
+    if !hits.contains_key(&key) && hits.len() >= MAX_LIMIT_KEYS {
+        hits.retain(|key, times| {
+            expire(key.0, times, now);
+            !times.is_empty()
+        });
+        if hits.len() >= MAX_LIMIT_KEYS {
+            let stalest = hits
+                .iter()
+                .min_by_key(|(_, times)| times.back().copied())
+                .map(|(key, _)| key.clone());
+            if let Some(stalest) = stalest {
+                hits.remove(&stalest);
+            }
+        }
+    }
+    let limit = key.0;
+    let times = hits.entry(key).or_default();
+    expire(limit, times, now);
+    times.push_back(now);
+    while times.len() > limit.allowance() {
+        times.pop_front();
+    }
+}
+
+/// "Try again in N minutes.", rounded up, for a limited request's message.
+pub(crate) fn try_again(wait: StdDuration) -> String {
+    let minutes = wait.as_secs().div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("Try again in {minutes} {unit}.")
+}
+
+/// The client's address for the per-address limits: the connection's peer
+/// address, or with `TRUST_PROXY_HEADERS` the left-most `X-Forwarded-For`
+/// entry when it parses. IPv6 addresses count per /64, the block one client
+/// usually holds. `None` when neither is known (a router served without
+/// connect info, as in tests): the per-address limits are then skipped, and
+/// the per-username and per-user ones still apply.
+pub(crate) struct ClientAddress(pub(crate) Option<String>);
+
+impl FromRequestParts<Arc<AppState>> for ClientAddress {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let forwarded = if state.rate_limits.trust_proxy_headers {
+            forwarded_for(&parts.headers)
+        } else {
+            None
+        };
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        Ok(Self(forwarded.or(peer).map(address_bucket)))
+    }
+}
+
+/// The left-most address in `X-Forwarded-For`, the client as the first proxy
+/// saw it. The proxy in front must set the header itself rather than pass on
+/// one the client sent.
+fn forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
+    let value = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    first
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| first.parse::<SocketAddr>().ok().map(|address| address.ip()))
+}
+
+/// The limiter's key for an address: an IPv4 address as written (an
+/// IPv4-mapped IPv6 one too), or an IPv6 address's /64.
+pub(crate) fn address_bucket(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                format!("{a:x}:{b:x}:{c:x}:{d:x}::/64")
+            }
+        },
+    }
 }
 
 const MIN_PASSWORD_CHARS: usize = 8;
@@ -373,24 +624,17 @@ fn login_redirect(req: &Request) -> Response {
     crate::htmx::full_page_redirect(req.headers(), &to)
 }
 
-/// The sign-in page for one account, its username filled in.
-fn sign_in_url(username: &str) -> String {
-    format!("/login?username={}", encode_query_value(username))
-}
-
-/// One other account in the header's account menu.
+/// Another account this browser is signed in to, in the header's account
+/// menu; choosing it switches at once.
 pub(crate) struct MenuAccount {
     pub(crate) id: String,
     pub(crate) username: String,
     pub(crate) initial: String,
-    /// The browser holds a live session for it, so choosing it switches at
-    /// once; otherwise it links to the sign-in page.
-    pub(crate) signed_in: bool,
-    pub(crate) sign_in_url: String,
 }
 
-/// The header's account menu: the signed-in account and every other account
-/// on this server.
+/// The header's account menu: the signed-in account and the other accounts
+/// this browser is signed in to. Accounts the browser holds no session for
+/// never appear, so the menu does not list who else uses the server.
 pub(crate) struct AccountMenu {
     pub(crate) username: String,
     pub(crate) initial: String,
@@ -425,21 +669,26 @@ async fn load_account_menu(
     user_id: &str,
     sessions: &[BrowserSession],
 ) -> Result<AccountMenu> {
-    let users: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, username FROM users ORDER BY username COLLATE NOCASE, username")
-            .fetch_all(db)
-            .await?;
+    // Only the browser's own sessions (at most MAX_BROWSER_ACCOUNTS), so
+    // the placeholders are few.
+    let placeholders = vec!["?"; sessions.len()].join(",");
+    let query = format!(
+        "SELECT id, username FROM users WHERE id IN ({placeholders})
+         ORDER BY username COLLATE NOCASE, username"
+    );
+    let mut users = sqlx::query_as::<_, (String, String)>(&query);
+    for session in sessions {
+        users = users.bind(&session.user_id);
+    }
     let mut username = String::new();
     let mut others = Vec::new();
-    for (id, name) in users {
+    for (id, name) in users.fetch_all(db).await? {
         if id == user_id {
             username = name;
             continue;
         }
         others.push(MenuAccount {
-            signed_in: sessions.iter().any(|session| session.user_id == id),
             initial: initial(&name),
-            sign_in_url: sign_in_url(&name),
             id,
             username: name,
         });
@@ -501,6 +750,9 @@ pub(crate) async fn create_user(
     Ok(user_id)
 }
 
+/// The refusal of a username another account has, letter case ignored.
+const USERNAME_TAKEN: &str = "That username is taken.";
+
 /// Adds another account and returns its id. It starts with an empty library
 /// and default settings. Usernames are unique regardless of letter case.
 pub(crate) async fn add_user(
@@ -529,7 +781,7 @@ pub(crate) async fn add_user(
     .await?
     .rows_affected();
     if created == 0 {
-        return Err(AppError::BadRequest("That username is taken.".into()));
+        return Err(AppError::BadRequest(USERNAME_TAKEN.into()));
     }
     Ok(user_id)
 }
@@ -583,36 +835,70 @@ pub(crate) async fn new_account_page(_user: AuthUser) -> Result<Html<String>> {
 
 /// Creates another account from the account menu and switches the browser to
 /// it. The account that made it stays signed in behind it.
+///
+/// Each client address may create Limit::NewAccount accounts an hour; a
+/// username refused as taken counts too, so the form cannot test usernames
+/// at will. Past that the form comes back with 429 before any hashing.
 pub(crate) async fn create_account(
     State(state): State<Arc<AppState>>,
     _user: AuthUser,
+    ClientAddress(address): ClientAddress,
     headers: HeaderMap,
     axum::Form(form): axum::Form<SetupForm>,
 ) -> Result<Response> {
-    match add_user(
+    let address_key = address.map(|address| (Limit::NewAccount, address));
+    let again = |status: StatusCode, error: String| -> Result<Response> {
+        let page = render(NewAccountTemplate {
+            error,
+            username: trim(&form.username),
+        })?;
+        Ok((status, page).into_response())
+    };
+    if let Some(wait) = address_key
+        .as_ref()
+        .and_then(|key| state.rate_limits.blocked(key))
+    {
+        let error = AppError::TooManyRequests(format!(
+            "Too many accounts were created from this network. {}",
+            try_again(wait)
+        ));
+        return again(StatusCode::TOO_MANY_REQUESTS, error.user_message());
+    }
+    let created = add_user(
         &state.db,
         &form.username,
         &form.password,
         &form.confirm_password,
     )
-    .await
+    .await;
+    if let Some(address_key) = address_key
+        && is_counted(&created)
     {
+        state.rate_limits.record(address_key);
+    }
+    match created {
         Ok(user_id) => {
             let cookies = sign_in_browser(&state.db, &headers, &user_id).await?;
             Ok((cookies, Redirect::to("/")).into_response())
         }
-        Err(AppError::BadRequest(error)) => render(NewAccountTemplate {
-            error,
-            username: trim(&form.username),
-        })
-        .map(IntoResponse::into_response),
+        Err(AppError::BadRequest(error)) => again(StatusCode::OK, error),
         Err(error) => Err(error),
     }
 }
 
+/// Whether an account-creation outcome counts against Limit::NewAccount: a
+/// new account, or a username refused as taken.
+fn is_counted(created: &Result<String>) -> bool {
+    match created {
+        Ok(_) => true,
+        Err(AppError::BadRequest(error)) => error == USERNAME_TAKEN,
+        Err(_) => false,
+    }
+}
+
 /// Makes another account this browser is signed in to the active one and
-/// opens its library. An account the browser is not signed in to goes to the
-/// sign-in page with its username filled in.
+/// opens its library. Any other id goes to the sign-in page, whether or not
+/// the account exists, so the form tells nothing about other accounts.
 pub(crate) async fn switch_account(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -627,13 +913,7 @@ pub(crate) async fn switch_account(
         .iter()
         .find(|session| session.user_id == form.user_id)
     else {
-        let username: Option<String> =
-            sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
-                .bind(&form.user_id)
-                .fetch_optional(&state.db)
-                .await?;
-        let username = username.ok_or(AppError::NotFound)?;
-        return Ok(Redirect::to(&sign_in_url(&username)).into_response());
+        return Ok(Redirect::to("/login").into_response());
     };
     // The account that was active moves to the front of the others, so
     // signing out of the new one returns to it.
@@ -669,17 +949,64 @@ pub(crate) async fn login_page(
     .map(IntoResponse::into_response)
 }
 
+/// The sign-in form again, with `error` under it and the given status.
+async fn login_again(
+    state: &AppState,
+    headers: &HeaderMap,
+    status: StatusCode,
+    error: String,
+    username: String,
+    next: String,
+) -> Result<Response> {
+    let page = render(LoginTemplate {
+        error,
+        username,
+        next,
+        adding: !browser_sessions(&state.db, headers).await?.is_empty(),
+        notice: "",
+    })?;
+    Ok((status, page).into_response())
+}
+
 /// Checks the username and password, then starts a session and returns to the
 /// page the visitor asked for. A failure re-renders the form with one message
 /// for an unknown user and a wrong password alike. Accounts the browser is
 /// already signed in to stay signed in behind the new one.
+///
+/// Every attempt first takes a hit on the client address and the username
+/// (`RateLimits::attempt`); one at its allowance answers 429 with the form
+/// before the database or Argon2 is touched, the same for a username that
+/// exists and one that does not. A success forgets the username's failures
+/// and takes back its own hit on the address, whose other failures stay.
 pub(crate) async fn login(
     State(state): State<Arc<AppState>>,
+    ClientAddress(address): ClientAddress,
     headers: HeaderMap,
     axum::Form(form): axum::Form<LoginForm>,
 ) -> Result<Response> {
     let next = local_target(&form.next).to_string();
     let username = trim(&form.username);
+    let username_key = username_key(&username);
+    let address_key = address.map(|address| (Limit::LoginAddress, address));
+    let keys: Vec<LimitKey> = address_key
+        .iter()
+        .cloned()
+        .chain([username_key.clone()])
+        .collect();
+    if let Err(wait) = state.rate_limits.attempt(&keys) {
+        tracing::warn!(address = ?address_key.map(|key| key.1), "Sign-in attempts limited");
+        let error =
+            AppError::TooManyRequests(format!("Too many sign-in attempts. {}", try_again(wait)));
+        return login_again(
+            &state,
+            &headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            error.user_message(),
+            username,
+            next,
+        )
+        .await;
+    }
     // Letter case is ignored, as it is when a username is taken, so "alice"
     // signs in to the account set up as "Alice".
     let row: Option<(String, String)> =
@@ -692,15 +1019,20 @@ pub(crate) async fn login(
     // cost the same Argon2 work.
     let verified = check_password(form.password, stored_hash).await;
     let Some(user_id) = user_id.filter(|_| verified) else {
-        return render(LoginTemplate {
-            error: "Username or password is incorrect.".into(),
+        return login_again(
+            &state,
+            &headers,
+            StatusCode::OK,
+            "Username or password is incorrect.".into(),
             username,
             next,
-            adding: !browser_sessions(&state.db, &headers).await?.is_empty(),
-            notice: "",
-        })
-        .map(IntoResponse::into_response);
+        )
+        .await;
     };
+    state.rate_limits.clear(&username_key);
+    if let Some(address_key) = &address_key {
+        state.rate_limits.forgive(address_key);
+    }
     sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
         .bind(stamp())
         .execute(&state.db)
@@ -758,11 +1090,25 @@ pub(crate) async fn reset_password_page(_user: AuthUser) -> Result<Html<String>>
 /// with the new one. The change ends every session of the user, and this
 /// browser gets a new one. Failures re-render the form with an error,
 /// mirroring `setup_create`.
+///
+/// Each check takes a hit on the user's Limit::Password key first; at its
+/// allowance the form comes back with 429 and Argon2 never runs. The right
+/// current password forgets the user's earlier misses.
 pub(crate) async fn reset_password(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
     axum::Form(form): axum::Form<ResetPasswordForm>,
 ) -> Result<Response> {
+    let limit_key = (Limit::Password, user.id.clone());
+    if let Err(wait) = state.rate_limits.attempt(std::slice::from_ref(&limit_key)) {
+        tracing::warn!(user_id = %user.id, "Password checks limited");
+        let error =
+            AppError::TooManyRequests(format!("Too many password attempts. {}", try_again(wait)));
+        let page = render(ResetPasswordTemplate {
+            error: error.user_message(),
+        })?;
+        return Ok((StatusCode::TOO_MANY_REQUESTS, page).into_response());
+    }
     let stored_hash: Option<String> =
         sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
             .bind(&user.id)
@@ -777,6 +1123,7 @@ pub(crate) async fn reset_password(
         })
         .map(IntoResponse::into_response);
     }
+    state.rate_limits.clear(&limit_key);
     match check_new_password(
         &form.new_password,
         &form.confirm_password,
