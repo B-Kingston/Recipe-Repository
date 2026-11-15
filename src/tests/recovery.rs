@@ -889,3 +889,28 @@ async fn links_are_stored_hashed_and_neither_tokens_nor_addresses_are_logged() {
         assert!(!logged.contains(token.as_str()), "a token was logged");
     }
 }
+
+#[tokio::test]
+async fn changing_the_password_cancels_an_emailed_reset_link() {
+    let db = database().await;
+    let (state, sent) = mail_state(db.clone());
+    let app = routes(state);
+    let alice = account(&db, "alice").await;
+    verified(&db, "alice-id", "jane@example.com").await;
+
+    let token = reset_link(&app, &sent).await;
+    let response = send(
+        &app,
+        post(
+            "/settings/password",
+            Some(&alice),
+            &format!(
+                "current_password={PASSWORD}&new_password=new-secret-1&confirm_password=new-secret-1"
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let (_, expired) = page(&app, get(&format!("/reset/{token}"), None)).await;
+    assert!(expired.contains("This link has expired"), "{expired}");
+}

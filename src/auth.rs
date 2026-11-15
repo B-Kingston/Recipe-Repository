@@ -1155,6 +1155,11 @@ pub(crate) async fn reset_password(
         .bind(&user.id)
         .execute(&mut *tx)
         .await?;
+    // An emailed reset link must not outlive the password it was sent to replace.
+    sqlx::query("DELETE FROM email_tokens WHERE user_id = ? AND purpose = 'reset'")
+        .bind(&user.id)
+        .execute(&mut *tx)
+        .await?;
     let cookie = create_session(&mut *tx, &user.id).await?;
     tx.commit().await?;
     Ok((
