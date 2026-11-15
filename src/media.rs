@@ -352,11 +352,9 @@ impl MediaDebug {
 
 /// Emits every warning appended since the previous checkpoint so the debugger
 /// stream matches what production would record in the evidence.
-fn flush_new_warnings(warnings: &[String], seen: &mut usize, debug: Option<&MediaDebug>) {
-    if let Some(debug) = debug {
-        for message in warnings[*seen..].iter() {
-            debug.event("warning", json!({ "message": message }));
-        }
+fn flush_new_warnings(warnings: &[String], seen: &mut usize, debug: &MediaDebug) {
+    for message in warnings[*seen..].iter() {
+        debug.event("warning", json!({ "message": message }));
     }
     *seen = warnings.len();
 }
@@ -497,7 +495,7 @@ pub(crate) async fn extract_social_evidence_debug(
             page,
             channels,
             workdir,
-            Some(debug),
+            debug,
             &extras,
             embedder,
         )
@@ -909,7 +907,7 @@ struct ExtrasJob {
     thumbnails: bool,
     moments: bool,
     embedder: Option<BlockingEmbedder>,
-    debug: Option<Arc<MediaDebug>>,
+    debug: Arc<MediaDebug>,
     deadline: Instant,
 }
 
@@ -933,37 +931,31 @@ struct OcrLane {
 fn run_audio_lane(
     video_path: &Path,
     workdir: &Path,
-    debug: Option<&MediaDebug>,
+    debug: &MediaDebug,
     deadline: Instant,
 ) -> AudioLane {
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
-    if let Some(debug) = debug {
-        debug.event(
-            "phase",
-            json!({ "phase": "audio", "state": "preparing audio" }),
-        );
-    }
+    debug.event(
+        "phase",
+        json!({ "phase": "audio", "state": "preparing audio" }),
+    );
     let audio_path = extract_audio(video_path, workdir, &mut warnings, deadline);
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
-    if let Some(debug) = debug {
-        debug.event("phase", json!({ "phase": "audio", "state": "running" }));
-    }
+    debug.event("phase", json!({ "phase": "audio", "state": "running" }));
     let transcript = audio_path
         .as_deref()
         .map(|path| transcribe_audio(path, &mut warnings, deadline))
         .unwrap_or_default();
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
-    if let Some(debug) = debug {
-        debug.event(
-            "audio",
-            json!({
-                "chars": transcript.text.len(),
-                "transcript": transcript.text,
-            }),
-        );
-        debug.event("phase", json!({ "phase": "audio", "state": "done" }));
-    }
+    debug.event(
+        "audio",
+        json!({
+            "chars": transcript.text.len(),
+            "transcript": transcript.text,
+        }),
+    );
+    debug.event("phase", json!({ "phase": "audio", "state": "done" }));
     AudioLane {
         transcript,
         audio_path,
@@ -976,29 +968,23 @@ fn run_ocr_lane(
     video_path: &Path,
     workdir: &Path,
     frame_rate: f64,
-    debug: Option<&MediaDebug>,
+    debug: &MediaDebug,
     deadline: Instant,
 ) -> OcrLane {
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
-    if let Some(debug) = debug {
-        debug.event(
-            "phase",
-            json!({ "phase": "ocr", "state": "sampling frames" }),
-        );
-    }
+    debug.event(
+        "phase",
+        json!({ "phase": "ocr", "state": "sampling frames" }),
+    );
     let sample = extract_frames(video_path, workdir, frame_rate, &mut warnings, deadline);
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
-    if let Some(debug) = debug {
-        debug.event("phase", json!({ "phase": "ocr", "state": "running" }));
-    }
+    debug.event("phase", json!({ "phase": "ocr", "state": "running" }));
     let snippets = sample
         .map(|sample| read_video_text(&sample, frame_rate, &mut warnings, deadline, debug))
         .unwrap_or_default();
     flush_new_warnings(&warnings, &mut seen_warnings, debug);
-    if let Some(debug) = debug {
-        debug.event("phase", json!({ "phase": "ocr", "state": "done" }));
-    }
+    debug.event("phase", json!({ "phase": "ocr", "state": "done" }));
     OcrLane { snippets, warnings }
 }
 
@@ -1019,12 +1005,12 @@ fn extract_in_directory(
     page: PageMetadata,
     channels: MediaChannels,
     workdir: &Path,
-    debug: Option<Arc<MediaDebug>>,
+    debug: Arc<MediaDebug>,
     extras: &VideoExtras,
     embedder: Option<BlockingEmbedder>,
 ) -> Result<(MediaEvidence, Option<Followup<VideoExtrasOutput>>)> {
     let deadline = Instant::now() + Duration::from_secs(MAX_MEDIA_JOB_SECONDS);
-    let observer = debug.as_deref();
+    let observer: &MediaDebug = &debug;
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
     let mut title = page.title;
@@ -1036,7 +1022,7 @@ fn extract_in_directory(
     // the video is needed; a description-only import keeps the cheap
     // metadata-only call and never spends the download budget.
     let needs_video = channels.audio || channels.ocr;
-    if needs_video && let Some(observer) = observer {
+    if needs_video {
         observer.event("phase", json!({ "phase": "download", "state": "running" }));
     }
     let VideoFetch { metadata, video } = if needs_video {
@@ -1055,7 +1041,7 @@ fn extract_in_directory(
         }
     };
     flush_new_warnings(&warnings, &mut seen_warnings, observer);
-    if needs_video && let Some(observer) = observer {
+    if needs_video {
         observer.event("download", json!({ "ok": video.is_some() }));
         observer.event("phase", json!({ "phase": "download", "state": "done" }));
     }
@@ -1079,17 +1065,15 @@ fn extract_in_directory(
     }
     title = account_title(&title, &description);
     let announce_description = |duration: Option<u64>| {
-        if let Some(observer) = observer {
-            observer.event(
-                "description",
-                json!({
-                    "title": title,
-                    "description": description,
-                    "durationSeconds": duration,
-                }),
-            );
-            observer.event("phase", json!({ "phase": "description", "state": "done" }));
-        }
+        observer.event(
+            "description",
+            json!({
+                "title": title,
+                "description": description,
+                "durationSeconds": duration,
+            }),
+        );
+        observer.event("phase", json!({ "phase": "description", "state": "done" }));
     };
 
     let mut transcript = Transcript::default();
@@ -1157,15 +1141,13 @@ fn extract_in_directory(
         seen_warnings = warnings.len();
     } else {
         announce_description(duration_seconds);
-        if let Some(observer) = observer {
-            if channels.audio {
-                observer.event("audio", json!({ "chars": 0, "transcript": "" }));
-                observer.event("phase", json!({ "phase": "audio", "state": "done" }));
-            }
-            if channels.ocr {
-                observer.event("ocr-captures", json!({ "captures": [], "cards": [] }));
-                observer.event("phase", json!({ "phase": "ocr", "state": "done" }));
-            }
+        if channels.audio {
+            observer.event("audio", json!({ "chars": 0, "transcript": "" }));
+            observer.event("phase", json!({ "phase": "audio", "state": "done" }));
+        }
+        if channels.ocr {
+            observer.event("ocr-captures", json!({ "captures": [], "cards": [] }));
+            observer.event("phase", json!({ "phase": "ocr", "state": "done" }));
         }
     }
 
@@ -1252,19 +1234,17 @@ fn extract_in_directory(
 /// pool. Warnings go to the log and the progress feed rather than the stored
 /// evidence, which was already handed on.
 fn capture_video_extras(job: ExtrasJob, workdir: &Path, cancel: &AtomicBool) -> VideoExtrasOutput {
-    let observer = job.debug.as_deref();
+    let observer: &MediaDebug = &job.debug;
     let mut warnings = Vec::new();
     let mut seen_warnings = 0usize;
     let mut output = VideoExtrasOutput::default();
     if job.thumbnails
         && let Some(probe) = job.probe.as_ref()
     {
-        if let Some(observer) = observer {
-            observer.event(
-                "phase",
-                json!({ "phase": "thumbnails", "state": "running" }),
-            );
-        }
+        observer.event(
+            "phase",
+            json!({ "phase": "thumbnails", "state": "running" }),
+        );
         // No dish hint here: a post title reads "<creator> on Instagram: …",
         // and the creator's name pulls the ranking toward talking-head shots.
         output.thumbnails = thumbs::extract_thumbnails(
@@ -1279,9 +1259,7 @@ fn capture_video_extras(job: ExtrasJob, workdir: &Path, cancel: &AtomicBool) -> 
             job.deadline,
         );
         flush_new_warnings(&warnings, &mut seen_warnings, observer);
-        if let Some(observer) = observer {
-            observer.event("phase", json!({ "phase": "thumbnails", "state": "done" }));
-        }
+        observer.event("phase", json!({ "phase": "thumbnails", "state": "done" }));
     }
     // The step-moment pool needs the sidecar; without it the draft simply
     // shows no per-step moments.
@@ -1289,9 +1267,7 @@ fn capture_video_extras(job: ExtrasJob, workdir: &Path, cancel: &AtomicBool) -> 
         && !cancel.load(Ordering::SeqCst)
         && let Some(embedder) = job.embedder.as_ref()
     {
-        if let Some(observer) = observer {
-            observer.event("phase", json!({ "phase": "moments", "state": "running" }));
-        }
+        observer.event("phase", json!({ "phase": "moments", "state": "running" }));
         output.moments = moments::capture(
             &job.video_path,
             job.audio_path.as_deref(),
@@ -1302,9 +1278,7 @@ fn capture_video_extras(job: ExtrasJob, workdir: &Path, cancel: &AtomicBool) -> 
             cancel,
         );
         flush_new_warnings(&warnings, &mut seen_warnings, observer);
-        if let Some(observer) = observer {
-            observer.event("phase", json!({ "phase": "moments", "state": "done" }));
-        }
+        observer.event("phase", json!({ "phase": "moments", "state": "done" }));
     }
     for warning in &warnings {
         warn!(%warning, "Video extras warning");
@@ -1766,18 +1740,14 @@ fn read_video_text(
     frame_rate: f64,
     warnings: &mut Vec<String>,
     deadline: Instant,
-    debug: Option<&MediaDebug>,
+    debug: &MediaDebug,
 ) -> Vec<OcrSnippet> {
     let jobs = plan_ocr_jobs(sample, frame_rate, warnings);
     if jobs.is_empty() {
         return Vec::new();
     }
-    if let Some(debug) = debug {
-        debug.event("ocr-plan", json!({ "planned": jobs.len() }));
-    }
-    let retained = debug
-        .map(|debug| debug.retain_frames(&jobs, warnings))
-        .unwrap_or_default();
+    debug.event("ocr-plan", json!({ "planned": jobs.len() }));
+    let retained = debug.retain_frames(&jobs, warnings);
     let Some(slots) = read_frames(&jobs, warnings, deadline) else {
         return Vec::new();
     };
@@ -1786,37 +1756,35 @@ fn read_video_text(
         .map(|capture| capture.as_ref().and_then(|c| c.cleaned.clone()))
         .collect();
     let outcome = collapse_ocr_readings(&jobs, readings);
-    if let Some(debug) = debug {
-        let captures = jobs
-            .iter()
-            .enumerate()
-            .map(|(slot, job)| {
-                json!({
-                    "slot": slot,
-                    "seconds": job.seconds.round().max(0.0) as u64,
-                    "image": retained.get(slot).filter(|name| !name.is_empty()),
-                    "raw": slots[slot].as_ref().map(|c| c.raw.clone()).unwrap_or_default(),
-                    "text": slots[slot].as_ref().and_then(|c| c.cleaned.as_ref().map(OcrReading::display)),
-                    "card": outcome.card_of_slot.get(slot).copied().flatten(),
-                })
+    let captures = jobs
+        .iter()
+        .enumerate()
+        .map(|(slot, job)| {
+            json!({
+                "slot": slot,
+                "seconds": job.seconds.round().max(0.0) as u64,
+                "image": retained.get(slot).filter(|name| !name.is_empty()),
+                "raw": slots[slot].as_ref().map(|c| c.raw.clone()).unwrap_or_default(),
+                "text": slots[slot].as_ref().and_then(|c| c.cleaned.as_ref().map(OcrReading::display)),
+                "card": outcome.card_of_slot.get(slot).copied().flatten(),
             })
-            .collect::<Vec<_>>();
-        let cards = outcome
-            .cards
-            .iter()
-            .map(|card| {
-                json!({
-                    "seconds": card.seconds,
-                    "kept": card.kept,
-                    "text": card.text,
-                })
+        })
+        .collect::<Vec<_>>();
+    let cards = outcome
+        .cards
+        .iter()
+        .map(|card| {
+            json!({
+                "seconds": card.seconds,
+                "kept": card.kept,
+                "text": card.text,
             })
-            .collect::<Vec<_>>();
-        debug.event(
-            "ocr-captures",
-            json!({ "captures": captures, "cards": cards }),
-        );
-    }
+        })
+        .collect::<Vec<_>>();
+    debug.event(
+        "ocr-captures",
+        json!({ "captures": captures, "cards": cards }),
+    );
     outcome.snippets
 }
 
