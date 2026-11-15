@@ -2187,7 +2187,7 @@ fn read_frames(
     deadline: Instant,
 ) -> Option<Vec<Option<SlotCapture>>> {
     // The persistent OCR worker keeps PaddleOCR loaded between imports. It
-    // reads the score threshold and text-gate settings from its environment.
+    // fixes the language, batch size, score threshold, and text gate itself.
     let request = json!({
         "command": "ocr",
         "frames": sampled
@@ -2844,7 +2844,7 @@ fn directory_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Runs ffmpeg (`MEDIA_FFMPEG_PATH`, default `ffmpeg`) through [`run_tool`]
+/// Runs ffmpeg through [`run_tool`]
 /// with the flags every media pass shares: never read the terminal,
 /// overwrite outputs, and print only errors. `args` follow those flags.
 pub(crate) fn run_ffmpeg(
@@ -3453,13 +3453,6 @@ fn normalize_ocr_token(value: &str) -> Option<String> {
     (!latin || !arabic).then_some(token)
 }
 
-#[cfg(test)]
-fn looks_like_ocr_token(value: &str) -> bool {
-    split_raw_ocr_token(value)
-        .iter()
-        .any(|token| normalize_ocr_token(token).is_some())
-}
-
 fn is_numeric_ocr_token(value: &str) -> bool {
     value.chars().any(is_ocr_digit)
 }
@@ -4065,11 +4058,16 @@ mod tests {
         FrameSample, FrameSignal, MAX_IMPORT_URL_CHARS, MediaEvidence, OCR_MAX_FRAME_JOBS,
         OcrSnippet, PageHtml, canonical_social_url, clean_ocr_batch, clean_ocr_rows,
         cleaner_prompt, decode_entities, frame_capture, frame_rows, has_real_words,
-        is_numeric_ocr_token, looks_like_ocr_token, oriented_dimensions, parse_frame_signals,
-        plan_ocr_jobs, reading_is_useful, recipe_prompt, standalone_reading_is_strong,
-        string_field,
+        is_numeric_ocr_token, oriented_dimensions, parse_frame_signals, plan_ocr_jobs,
+        reading_is_useful, recipe_prompt, standalone_reading_is_strong, string_field,
     };
     use std::{fs, path::PathBuf};
+
+    fn looks_like_ocr_token(value: &str) -> bool {
+        super::split_raw_ocr_token(value)
+            .iter()
+            .any(|token| super::normalize_ocr_token(token).is_some())
+    }
 
     #[test]
     fn accepts_the_supported_social_url_shapes() {
