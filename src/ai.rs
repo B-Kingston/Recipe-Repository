@@ -2241,7 +2241,8 @@ pub(crate) fn dedupe_sources(sources: Vec<Source>) -> Vec<Source> {
 /// global media slot, so URLs in a run (and any concurrent video import) are
 /// processed sequentially regardless of this cap.
 pub(crate) const MAX_DEBUG_URLS: usize = 5;
-/// Runs kept at once; starting another evicts the oldest.
+/// Runs kept at once; a new start evicts the oldest finished run, and is
+/// refused while every kept run is still working.
 pub(crate) const DEBUG_RUN_LIMIT: usize = 4;
 const DEBUG_RUN_TTL_SECONDS: u64 = 2 * 60 * 60;
 /// Upper bound on buffered events per run before the oldest are dropped.
@@ -2580,16 +2581,13 @@ pub(crate) fn absorb_event(urls: &[Arc<Mutex<DebugUrlState>>], event: &Value) {
 pub(crate) fn prune_debug_runs(runs: &DebugRunMap) {
     let mut runs = runs.lock();
     let now = Instant::now();
-    let expired: Vec<String> = runs
-        .iter()
-        .filter(|(_, run)| now.duration_since(run.created).as_secs() > DEBUG_RUN_TTL_SECONDS)
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in expired {
-        if let Some(run) = runs.remove(&id) {
+    runs.retain(|_, run| {
+        let live = now.duration_since(run.created).as_secs() <= DEBUG_RUN_TTL_SECONDS;
+        if !live {
             let _ = fs::remove_dir_all(&run.dir);
         }
-    }
+        live
+    });
     while runs.len() >= DEBUG_RUN_LIMIT {
         // Never evict a live import just because another browser tab starts a
         // job. Completed runs are disposable; if every slot is active the
