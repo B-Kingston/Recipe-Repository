@@ -2866,64 +2866,17 @@ pub(crate) fn run_tool(
     max_output_bytes: usize,
 ) -> std::result::Result<CommandOutput, String> {
     let mut command = Command::new(program);
-    // A yt-dlp merge can spawn ffmpeg, and configured tools may spawn their
-    // own helpers. Put the whole subprocess tree in a private process group so
-    // a timeout does not leave descendants writing into the temp directory.
-    command.process_group(0);
-    // A tool in a background process group that touches a terminal on stdin
-    // (ffmpeg does) is stopped by SIGTTOU, so no tool gets the app's stdin.
-    let mut child = command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start {program}: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("{program} stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| format!("{program} stderr was not piped"))?;
-    // Drain both pipes while the process runs. Waiting for the child before
-    // reading output can deadlock yt-dlp or another media tool once its pipe
-    // buffer fills, especially when metadata contains many formats.
-    let stdout_thread = thread::spawn(move || drain_output(stdout, max_output_bytes));
-    let stderr_thread = thread::spawn(move || drain_output(stderr, max_output_bytes));
-    let started = Instant::now();
-    let mut timed_out = false;
-    let monitor = loop {
-        match has_exited(&child) {
-            Ok(true) => break Ok(()),
-            Ok(false) if started.elapsed() >= timeout => {
-                timed_out = true;
-                break Ok(());
-            }
-            Ok(false) => thread::sleep(Duration::from_millis(100)),
-            Err(error) => break Err(error),
-        }
-    };
-    // A helper that outlives the leader can keep the output pipes open, so the
-    // group is killed on every path before the readers are joined. The leader
-    // is still unreaped here, so its group ID cannot have been reused.
-    kill_process_group(&mut child);
-    let status = child.wait();
-    let stdout = stdout_thread.join().unwrap_or_default();
-    let stderr = stderr_thread.join().unwrap_or_default();
-    if let Err(error) = monitor {
-        return Err(format!("could not monitor {program}: {error}"));
-    }
-    let status = status.map_err(|error| format!("could not wait for {program}: {error}"))?;
-    if timed_out {
+    command.args(args);
+    let run = run_process(command, None, timeout, max_output_bytes)
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    let Some(status) = run.status else {
         return Err(format!(
             "{program} timed out after {} seconds",
             timeout.as_secs()
         ));
-    }
+    };
     if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
+        let detail = String::from_utf8_lossy(&run.stderr);
         let detail = detail.trim();
         return Err(if detail.is_empty() {
             format!("{program} exited with {status}")
@@ -2934,7 +2887,76 @@ pub(crate) fn run_tool(
             )
         });
     }
-    Ok(CommandOutput { stdout })
+    Ok(CommandOutput { stdout: run.stdout })
+}
+
+/// A finished child process; `status` is None when it ran out of time.
+pub(crate) struct ProcessRun {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Runs `command` in a private process group with `stdin` (or none), keeping
+/// at most `max_output_bytes` of each output, and kills the whole group once
+/// it exits or `timeout` passes. A yt-dlp merge spawns ffmpeg, so a timeout
+/// must not leave descendants writing into the temp directory; and a child in
+/// a background group that touches a terminal on stdin (ffmpeg does) would be
+/// stopped by SIGTTOU, so it never gets the app's stdin.
+pub(crate) fn run_process(
+    mut command: Command,
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> std::io::Result<ProcessRun> {
+    let mut child = command
+        .process_group(0)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_process_group(&mut child);
+        let _ = child.wait();
+        return Err(std::io::Error::other("output was not piped"));
+    };
+    // Drain both pipes while the process runs: waiting first deadlocks a
+    // child whose pipe buffer fills (yt-dlp metadata with many formats).
+    let stdout_thread = thread::spawn(move || drain_output(stdout, max_output_bytes));
+    let stderr_thread = thread::spawn(move || drain_output(stderr, max_output_bytes));
+    let fed = match (stdin, child.stdin.take()) {
+        (Some(payload), Some(mut pipe)) => std::io::Write::write_all(&mut pipe, payload),
+        _ => Ok(()),
+    };
+    let started = Instant::now();
+    let monitor = fed.and_then(|()| {
+        loop {
+            match has_exited(&child) {
+                Ok(true) => break Ok(true),
+                Ok(false) if started.elapsed() >= timeout => break Ok(false),
+                Ok(false) => thread::sleep(Duration::from_millis(25)),
+                Err(error) => break Err(error),
+            }
+        }
+    });
+    // A helper that outlives the leader can keep the output pipes open, so the
+    // group is killed on every path before the readers are joined. The leader
+    // is still unreaped here, so its group ID cannot have been reused.
+    kill_process_group(&mut child);
+    let status = child.wait();
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let exited = monitor?;
+    let status = status?;
+    Ok(ProcessRun {
+        status: exited.then_some(status),
+        stdout,
+        stderr,
+    })
 }
 
 /// Whether the child has exited, leaving it unreaped (`WNOWAIT`). Until

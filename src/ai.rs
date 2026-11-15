@@ -29,15 +29,14 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path as FsPath, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
-    thread,
     time::Instant,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -1551,8 +1550,7 @@ pub(crate) fn endpoint_search_mode(
 /// kills it once `timeout` has passed. When the run fails, times out, or
 /// cannot be fed its payload, its stderr goes to the app log under `label`;
 /// a successful run's stderr is the caller's to log. Credentials reach a
-/// script only in its payload, and the variables of the retired Vercel AI
-/// Gateway setup are stripped so a stale gateway key is never picked up.
+/// script only in its payload.
 pub(crate) fn run_node(
     label: &str,
     script: &str,
@@ -1560,68 +1558,23 @@ pub(crate) fn run_node(
     payload: &[u8],
     timeout: std::time::Duration,
 ) -> io::Result<std::process::Output> {
-    let mut child = Command::new("node")
-        .arg(script)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout_reader = spawn_pipe_reader(
-        child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("stdout was not piped"))?,
-    );
-    let stderr_reader = spawn_pipe_reader(
-        child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("stderr was not piped"))?,
-    );
-    let status = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("stdin was not piped"))
-        .and_then(|mut stdin| stdin.write_all(payload))
-        .and_then(|()| wait_until(&mut child, Instant::now() + timeout))
-        .and_then(|status| {
-            status.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("{label} exceeded its {} second timeout", timeout.as_secs()),
-                )
-            })
-        });
-    if status.is_err() {
-        let _ = kill_and_reap(&mut child);
+    let mut command = Command::new("node");
+    command.arg(script).args(args);
+    let run = crate::media::run_process(command, Some(payload), timeout, usize::MAX)?;
+    if !run.status.is_some_and(|status| status.success()) {
+        log_stderr(label, &run.stderr);
     }
-    let stdout = join_pipe_reader(stdout_reader);
-    let stderr = join_pipe_reader(stderr_reader).unwrap_or_default();
-    if !status.as_ref().is_ok_and(std::process::ExitStatus::success) {
-        log_stderr(label, &stderr);
-    }
+    let status = run.status.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{label} exceeded its {} second timeout", timeout.as_secs()),
+        )
+    })?;
     Ok(std::process::Output {
-        status: status?,
-        stdout: stdout?,
-        stderr,
+        status,
+        stdout: run.stdout,
+        stderr: run.stderr,
     })
-}
-
-/// Waits for a child until `deadline`; None when the deadline came first.
-fn wait_until(
-    child: &mut Child,
-    deadline: Instant,
-) -> io::Result<Option<std::process::ExitStatus>> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        thread::sleep(std::time::Duration::from_millis(25));
-    }
 }
 
 /// Copies a Node script's stderr into the app log, a line at a time.
@@ -1648,29 +1601,6 @@ fn run_pi_worker(
         log_stderr("Pi worker", &output.stderr);
     }
     Ok(output)
-}
-
-fn spawn_pipe_reader<R>(reader: R) -> thread::JoinHandle<io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut reader = reader;
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
-        Ok(output)
-    })
-}
-
-fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    handle
-        .join()
-        .map_err(|_| io::Error::other("Pi worker pipe reader panicked"))?
-}
-
-fn kill_and_reap(child: &mut Child) -> io::Result<std::process::ExitStatus> {
-    let _ = child.kill();
-    child.wait()
 }
 
 /// Runs one worker process on a blocking thread under an AI worker slot.
