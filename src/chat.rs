@@ -77,11 +77,6 @@ async fn ensure_enabled(db: &SqlitePool, user_id: &str) -> Result<()> {
     }
 }
 
-/// Opens the drawer, so a page sent to `#recipe-chat` shows the chat.
-pub(crate) async fn open_drawer(db: &SqlitePool, user_id: &str) -> Result<()> {
-    set_app_setting(db, user_id, DRAWER_SETTING, "on").await
-}
-
 async fn drawer_open(db: &SqlitePool, user_id: &str) -> Result<bool> {
     Ok(app_setting(db, user_id, DRAWER_SETTING).await?.as_deref() == Some("on"))
 }
@@ -245,7 +240,8 @@ pub(crate) async fn ask(
     }
     let back = return_target(&recipe.id, &form.back);
     let to = format!("{back}#recipe-chat");
-    open_drawer(&s.db, &user.id).await?;
+    // Open the drawer, so the page sent to `#recipe-chat` shows the chat.
+    set_app_setting(&s.db, &user.id, DRAWER_SETTING, "on").await?;
     let Some(answer_id) = start_chat_turn(&s.db, &user.id, &recipe.id, &question).await? else {
         return Ok(flash_redirect(&to, "chat_busy"));
     };
@@ -952,10 +948,6 @@ fn minutes(value: Option<i64>) -> String {
     value.map_or_else(|| "none".to_string(), |minutes| format!("{minutes} min"))
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
-}
-
 /// Lists what a proposal changes, for the drawer.
 pub(crate) fn proposal_view(proposal: &ChatProposal, stale: bool) -> ProposalView {
     let before = &proposal.before;
@@ -1030,13 +1022,17 @@ pub(crate) fn proposal_view(proposal: &ChatProposal, stale: bool) -> ProposalVie
     );
     let mut parts = Vec::new();
     if !details.is_empty() {
-        parts.push(plural(details.len(), "detail", "details"));
+        parts.push(crate::plural(details.len(), "detail", "details"));
     }
     if !ingredients.is_empty() {
-        parts.push(plural(ingredients.len(), "ingredient", "ingredients"));
+        parts.push(crate::plural(
+            ingredients.len(),
+            "ingredient",
+            "ingredients",
+        ));
     }
     if !steps.is_empty() {
-        parts.push(plural(steps.len(), "step", "steps"));
+        parts.push(crate::plural(steps.len(), "step", "steps"));
     }
     ProposalView {
         summary: parts.join(" · "),

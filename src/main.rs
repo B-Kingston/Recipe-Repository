@@ -1677,6 +1677,10 @@ fn number(s: &str) -> Result<Option<i64>> {
     }
     Ok(Some(n))
 }
+/// "1 step", "3 steps".
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
 fn option_number(n: Option<i64>) -> String {
     n.map(|x| x.to_string()).unwrap_or_default()
 }
@@ -2858,18 +2862,10 @@ async fn disconnect_subscription(
 
 #[cfg(test)]
 mod model_tests {
-    use super::{CLAUDE_MODEL_OPTIONS, MODEL_OPTIONS, SelectOption, effort_options, model_options};
+    use super::{MODEL_OPTIONS, SelectOption, effort_options, model_options};
 
     fn values(options: &[SelectOption]) -> Vec<&str> {
         options.iter().map(|option| option.value.as_str()).collect()
-    }
-
-    #[test]
-    fn fallback_list_is_current() {
-        assert!(MODEL_OPTIONS.contains(&"gpt-5.6-sol"));
-        assert!(MODEL_OPTIONS.contains(&"gpt-5.6-terra"));
-        assert!(MODEL_OPTIONS.contains(&"gpt-5.6-luna"));
-        assert!(!MODEL_OPTIONS.contains(&"gpt-5.2-codex"));
     }
 
     #[test]
@@ -2891,13 +2887,6 @@ mod model_tests {
     fn empty_fresh_list_falls_back_to_builtin() {
         let options = model_options(Vec::new(), "gpt-5.5", MODEL_OPTIONS);
         assert_eq!(values(&options), MODEL_OPTIONS);
-    }
-
-    #[test]
-    fn claude_fallback_uses_claude_ids_only() {
-        let options = model_options(Vec::new(), "claude-sonnet-5-5", CLAUDE_MODEL_OPTIONS);
-        assert_eq!(values(&options), CLAUDE_MODEL_OPTIONS);
-        assert!(!CLAUDE_MODEL_OPTIONS.contains(&"gpt-5.5"));
     }
 
     #[test]

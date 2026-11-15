@@ -2858,10 +2858,6 @@ fn retry_url(source_url: &str) -> String {
     format!("{}?{}", url.path(), url.query().unwrap_or_default())
 }
 
-fn count(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
 /// What each evidence source of an import has found, worded for the reader.
 /// `stopped` turns a lane that never reported into "not read". The page
 /// script words its live updates the same way.
@@ -2897,7 +2893,7 @@ pub(crate) fn import_sources(
     };
     let caption_words = state.description.split_whitespace().count();
     let caption = if caption_words > 0 {
-        Some(count(caption_words, "word", "words"))
+        Some(crate::plural(caption_words, "word", "words"))
     } else if !state.title.trim().is_empty() {
         Some("Title only".to_string())
     } else {
@@ -2929,7 +2925,7 @@ pub(crate) fn import_sources(
             "Speech",
             channels.audio,
             state.audio_read,
-            (speech_words > 0).then(|| count(speech_words, "word", "words")),
+            (speech_words > 0).then(|| crate::plural(speech_words, "word", "words")),
             "No speech",
             "Listening…",
         ),
@@ -2938,7 +2934,7 @@ pub(crate) fn import_sources(
             "On-screen text",
             channels.ocr,
             state.ocr_read,
-            (cards > 0).then(|| count(cards, "card", "cards")),
+            (cards > 0).then(|| crate::plural(cards, "card", "cards")),
             "No text found",
             "Reading frames…",
         ),
