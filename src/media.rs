@@ -364,9 +364,6 @@ fn flush_new_warnings(warnings: &[String], seen: &mut usize, debug: Option<&Medi
 impl MediaEvidence {
     pub(crate) fn source(&self) -> Source {
         Source {
-            id: None,
-            recipe_id: None,
-            position: None,
             title: if self.title.trim().is_empty() {
                 "Social recipe video".into()
             } else {

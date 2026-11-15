@@ -349,9 +349,6 @@ struct Block {
 }
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 struct Source {
-    id: Option<String>,
-    recipe_id: Option<String>,
-    position: Option<i64>,
     title: String,
     url: String,
 }

@@ -348,11 +348,6 @@ export function readNotes(html: string): Note[] {
   }));
 }
 
-/** The answers in a thread, oldest first. */
-export function answers(chat: ChatView): ChatAnswer[] {
-  return chat.rows.filter((row): row is ChatAnswer => row.kind === "answer");
-}
-
 /** The answer that follows the last time `question` was asked. */
 export function answerTo(chat: ChatView, question: string): ChatAnswer | null {
   let asked = -1;

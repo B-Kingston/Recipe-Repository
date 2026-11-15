@@ -6,7 +6,7 @@
  * good answer would very likely contain.
  */
 import { readFileSync } from "node:fs";
-import { Client, answerTo, answers, content, readChat, readNotes, readRecipe, readVersions, sleep, text } from "./lib.ts";
+import { Client, answerTo, content, readChat, readNotes, readRecipe, readVersions, sleep, text } from "./lib.ts";
 import type { ChatAnswer, ChatView, RecipeView } from "./lib.ts";
 
 export interface Settings {

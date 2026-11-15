@@ -1132,23 +1132,6 @@ const SHORTBREAD = {
   steps: [{ text: "Cream the butter and sugar.", ingredients: ["200 g butter", "100 g sugar"] }],
 };
 
-const USAGE = { input_tokens: 10, output_tokens: 5, total_tokens: 15, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
-
-/** One Responses API turn whose output items are given in order. */
-function responsesTurn(id: string, items: Record<string, unknown>[]): Response {
-  const events: Record<string, unknown>[] = [{ type: "response.created", response: { id, status: "in_progress", output: [] } }];
-  items.forEach((item, index) => {
-    events.push({ type: "response.output_item.added", output_index: index, item: { ...item, ...(item.type === "function_call" ? { arguments: "" } : {}) } });
-    events.push({ type: "response.output_item.done", output_index: index, item });
-  });
-  events.push({ type: "response.completed", response: { id, status: "completed", output: items, usage: USAGE } });
-  return sse(events);
-}
-
-function answerItem(text: string): Record<string, unknown> {
-  return { type: "message", id: "msg_2", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
-}
-
 /** One Anthropic Messages turn: content blocks in order, then the stop reason. */
 function anthropicStream(blocks: Record<string, unknown>[], stopReason: string): Response {
   const events: Record<string, unknown>[] = [{

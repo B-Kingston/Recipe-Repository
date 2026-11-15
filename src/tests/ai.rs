@@ -142,9 +142,6 @@ fn chart_flow_accepts_branch_and_merge_and_rejects_bad_references() {
 #[test]
 fn duplicate_citation_urls_are_removed() {
     let source = |url: &str| Source {
-        id: None,
-        recipe_id: None,
-        position: None,
         title: "A".into(),
         url: url.into(),
     };

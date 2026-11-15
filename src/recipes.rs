@@ -1812,7 +1812,7 @@ async fn touch_recipe(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, recipe_id: &
 
 pub(crate) async fn sources(db: &SqlitePool, user_id: &str, id: &str) -> Result<Vec<Source>> {
     Ok(sqlx::query_as(
-        "SELECT s.id,s.recipe_id,s.position,s.title,s.url
+        "SELECT s.title,s.url
          FROM recipe_sources s
          JOIN recipes r ON r.id=s.recipe_id
          WHERE s.recipe_id=? AND r.user_id=?
@@ -3506,9 +3506,6 @@ mod tests {
     #[test]
     fn social_sources_are_detected_while_other_urls_are_ignored() {
         let social = Source {
-            id: None,
-            recipe_id: None,
-            position: None,
             title: "Reel".into(),
             url: "https://www.instagram.com/reel/AbCdEf123/".into(),
         };
