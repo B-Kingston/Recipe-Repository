@@ -49,12 +49,13 @@
                 <span class="account-avatar" aria-hidden="true">{{ menu.initial }}</span>
                 <p><span class="account-name">{{ menu.username }}</span><span class="account-state">Signed in</span></p>
               </div>
+              {# Only accounts this browser is signed in to; the menu never
+                 lists the server's other accounts. #}
               {% if !menu.others.is_empty() %}
               <p class="account-label">Switch account</p>
               <ul class="account-list">
                 {% for account in menu.others %}
                 <li>
-                  {% if account.signed_in %}
                   <form method="post" action="/accounts/switch">
                     <input type="hidden" name="user_id" value="{{ account.id }}">
                     <button class="account-row" type="submit">
@@ -62,18 +63,12 @@
                       <span class="account-name">{{ account.username }}</span>
                     </button>
                   </form>
-                  {% else %}
-                  <a class="account-row" href="{{ account.sign_in_url }}">
-                    <span class="account-avatar" aria-hidden="true">{{ account.initial }}</span>
-                    <span class="account-name">{{ account.username }}</span>
-                    <span class="account-state">sign in</span>
-                  </a>
-                  {% endif %}
                 </li>
                 {% endfor %}
               </ul>
               {% endif %}
               <div class="account-actions">
+                <a class="account-row account-action" href="/login">Sign in to another account</a>
                 <a class="account-row account-action" href="/accounts/new">
                   <span class="account-avatar account-avatar-add" aria-hidden="true">+</span>
                   <span class="account-name">Create account</span>

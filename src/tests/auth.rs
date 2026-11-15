@@ -1,6 +1,7 @@
 use super::config::ENV_LOCK;
 use crate::auth::{
-    AuthUser, create_user, hash_password, reset_password, setup_create, verify_password,
+    AuthUser, Limit, MAX_LIMIT_KEYS, RateLimits, address_bucket, create_user, hash_password,
+    reset_password, setup_create, try_again, verify_password,
 };
 use crate::{
     AppState, CODEX_PI_PROVIDER, ResetPasswordForm, SetupForm, import_legacy_codex_auth,
@@ -9,7 +10,7 @@ use crate::{
 use axum::{
     Router,
     body::{Body, to_bytes},
-    extract::{Form, State},
+    extract::{ConnectInfo, Form, State},
     http::{Request, StatusCode, header},
     response::Response,
 };
@@ -20,7 +21,9 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use std::{collections::HashMap, collections::HashSet, fs, sync::Arc};
+use std::{
+    collections::HashMap, collections::HashSet, fs, net::SocketAddr, sync::Arc, time::Instant,
+};
 use tower::ServiceExt;
 
 async fn database() -> SqlitePool {
@@ -52,6 +55,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
+        rate_limits: Default::default(),
     })
 }
 
@@ -968,39 +972,50 @@ async fn the_account_menu_creates_accounts_and_switches_between_them() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // An account this browser is not signed in to needs its password, and
-    // an unknown account is not found.
+    // An account this browser is not signed in to goes to the plain
+    // sign-in page, the same as an id no account has, so the switch form
+    // tells nothing about other accounts.
     add_account(&db, "carol", "carol-secret").await;
-    let response = app
-        .clone()
-        .oneshot(post(
-            "/accounts/switch",
-            Some(&browser(&alice, &[&bob])),
-            "user_id=carol-id",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&response), "/login?username=carol");
-    assert!(set_cookies(&response).is_empty());
-    let response = app
-        .clone()
-        .oneshot(post(
-            "/accounts/switch",
-            Some(&browser(&alice, &[&bob])),
-            "user_id=nobody",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    for user_id in ["carol-id", "nobody"] {
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/accounts/switch",
+                Some(&browser(&alice, &[&bob])),
+                &format!("user_id={user_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{user_id}");
+        assert_eq!(location(&response), "/login", "{user_id}");
+        assert!(set_cookies(&response).is_empty(), "{user_id}");
+    }
+
+    // The menu lists the accounts this browser is signed in to and links
+    // the sign-in page for any other; carol, on the server but not on this
+    // browser, never appears.
     let response = app
         .clone()
         .oneshot(request("/", Some(&browser(&alice, &[&bob]))))
         .await
         .unwrap();
     let body = response_body(response).await;
-    assert!(body.contains("href=\"/login?username=carol\""), "{body}");
     assert!(body.contains(&format!("name=\"user_id\" value=\"{bob_id}\"")));
+    assert!(body.contains("<span class=\"account-name\">bob</span>"));
+    assert!(
+        body.contains("href=\"/login\">Sign in to another account</a>"),
+        "{body}"
+    );
+    assert!(!body.contains("carol"), "{body}");
+    let response = app
+        .clone()
+        .oneshot(request("/", Some(&browser(&alice, &[]))))
+        .await
+        .unwrap();
+    let body = response_body(response).await;
+    assert!(!body.contains("Switch account"), "{body}");
+    assert!(!body.contains("bob") && !body.contains("carol"), "{body}");
+    assert!(body.contains("Sign in to another account"));
 }
 
 #[tokio::test]
@@ -1311,10 +1326,10 @@ async fn a_browser_remembers_no_more_accounts_than_fit_behind_the_active_one() {
         .await
         .unwrap();
     let body = response_body(response).await;
-    // Seven fit behind alice; the eighth needs its password again.
+    // Seven fit behind alice; the eighth needs its password again and is
+    // left out of the menu.
     assert!(body.contains("name=\"user_id\" value=\"user7\""), "{body}");
-    assert!(!body.contains("name=\"user_id\" value=\"user8\""));
-    assert!(body.contains("href=\"/login?username=user8\""));
+    assert!(!body.contains("user8"), "{body}");
 }
 
 /// Every table that holds an account's data, with the column whose value
@@ -1782,4 +1797,400 @@ async fn forms_sent_from_another_origin_are_refused() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{headers:?}");
     }
+}
+
+/// `request` as if it came over a connection from `peer`.
+fn from_peer(mut request: Request<Body>, peer: &str) -> Request<Body> {
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+    request
+}
+
+fn failed_login(username: &str) -> Request<Body> {
+    post(
+        "/login",
+        None,
+        &format!("username={username}&password=wrong-password"),
+    )
+}
+
+const SIGN_IN_LIMITED: &str = "Too many sign-in attempts. Try again in 15 minutes.";
+
+#[tokio::test]
+async fn failed_sign_ins_are_limited_per_username_known_or_not() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    setup_alice(&state, "secret-pass").await;
+    add_account(&db, "carol", "carol-secret").await;
+
+    // Ten misses in any letter case or padding count against one username.
+    for username in ["alice", "ALICE", "+Alice+"].iter().cycle().take(10) {
+        let response = app.clone().oneshot(failed_login(username)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{username}");
+        assert!(
+            response_body(response)
+                .await
+                .contains("Username or password is incorrect.")
+        );
+    }
+    // The eleventh is refused before the password is checked, so even the
+    // right password does not sign in.
+    let response = app
+        .clone()
+        .oneshot(post("/login", None, "username=alice&password=secret-pass"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(set_cookies(&response).is_empty());
+    let limited_alice = response_body(response).await;
+    assert!(limited_alice.contains(SIGN_IN_LIMITED), "{limited_alice}");
+    assert!(limited_alice.contains(r#"name="username" type="text" value="alice""#));
+
+    // A username no account has is limited the same way, with the same page,
+    // so the limit tells nothing about which usernames exist.
+    for _ in 0..10 {
+        let response = app.clone().oneshot(failed_login("nobody")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app.clone().oneshot(failed_login("nobody")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let limited_nobody = response_body(response).await;
+    assert_eq!(
+        limited_nobody.replace("value=\"nobody\"", "value=\"alice\""),
+        limited_alice
+    );
+
+    // Other usernames are untouched (these requests carry no address, so no
+    // per-address limit applies).
+    sign_in(&app, "carol", "carol-secret").await;
+}
+
+#[tokio::test]
+async fn a_successful_sign_in_forgets_the_usernames_misses() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    setup_alice(&state, "secret-pass").await;
+    for _ in 0..9 {
+        app.clone().oneshot(failed_login("alice")).await.unwrap();
+    }
+    sign_in(&app, "Alice", "secret-pass").await;
+    for _ in 0..10 {
+        let response = app.clone().oneshot(failed_login("alice")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = app.clone().oneshot(failed_login("alice")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn failed_sign_ins_are_limited_per_address() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    setup_alice(&state, "secret-pass").await;
+
+    // Thirty misses on thirty usernames from one address use up its
+    // allowance; a success in between takes back only its own attempt.
+    for n in 0..30 {
+        if n == 15 {
+            let response = app
+                .clone()
+                .oneshot(from_peer(
+                    post("/login", None, "username=alice&password=secret-pass"),
+                    "192.0.2.1:5000",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        }
+        let response = app
+            .clone()
+            .oneshot(from_peer(
+                failed_login(&format!("user{n}")),
+                "192.0.2.1:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{n}");
+    }
+    // Another port of the same address is the same client.
+    let response = app
+        .clone()
+        .oneshot(from_peer(
+            post("/login", None, "username=alice&password=secret-pass"),
+            "192.0.2.1:6000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response_body(response).await.contains(SIGN_IN_LIMITED));
+
+    // Another address signs in as usual.
+    let response = app
+        .clone()
+        .oneshot(from_peer(
+            post("/login", None, "username=alice&password=secret-pass"),
+            "192.0.2.2:5000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // Without TRUST_PROXY_HEADERS a client cannot dodge the limit by
+    // sending its own X-Forwarded-For.
+    let mut forged = from_peer(
+        post("/login", None, "username=alice&password=secret-pass"),
+        "192.0.2.1:5000",
+    );
+    forged
+        .headers_mut()
+        .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+    let response = app.clone().oneshot(forged).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn behind_a_trusted_proxy_the_forwarded_address_is_limited() {
+    let db = database().await;
+    let mut state = state(db.clone());
+    Arc::get_mut(&mut state).unwrap().rate_limits = Arc::new(RateLimits::new(true));
+    let app = routes(state.clone());
+    setup_alice(&state, "secret-pass").await;
+    // Every request reaches the app from the proxy at 10.0.0.1.
+    let through_proxy = |request: Request<Body>, client: &str| {
+        let mut request = from_peer(request, "10.0.0.1:40000");
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", client.parse().unwrap());
+        request
+    };
+    for n in 0..30 {
+        let response = app
+            .clone()
+            .oneshot(through_proxy(
+                failed_login(&format!("user{n}")),
+                "198.51.100.7, 10.0.0.1",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{n}");
+    }
+    let correct = || post("/login", None, "username=alice&password=secret-pass");
+    let response = app
+        .clone()
+        .oneshot(through_proxy(correct(), "198.51.100.7"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Another client behind the same proxy is not limited.
+    let response = app
+        .clone()
+        .oneshot(through_proxy(correct(), "198.51.100.8"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
+#[test]
+fn addresses_are_bucketed_per_ipv4_address_and_ipv6_64() {
+    let bucket = |address: &str| address_bucket(address.parse().unwrap());
+    assert_eq!(bucket("192.0.2.1"), "192.0.2.1");
+    assert_eq!(bucket("::ffff:192.0.2.1"), "192.0.2.1");
+    assert_eq!(bucket("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+    assert_eq!(bucket("2001:db8:1:2:bbbb::9"), "2001:db8:1:2::/64");
+    assert_ne!(bucket("2001:db8:1:3::1"), bucket("2001:db8:1:2::1"));
+}
+
+#[test]
+fn limits_slide_with_their_window_and_hold_a_bounded_number_of_keys() {
+    let limits = RateLimits::default();
+    let start = Instant::now();
+    let key = (Limit::LoginUsername, "alice".to_string());
+    let window = Limit::LoginUsername.window();
+    let minute = std::time::Duration::from_secs(60);
+    for n in 0..10 {
+        assert!(
+            limits
+                .attempt_at(&[key.clone()], start + minute * n)
+                .is_ok()
+        );
+    }
+    // Full: the wait runs until the oldest hit leaves the window.
+    let wait = limits
+        .attempt_at(&[key.clone()], start + minute * 10)
+        .unwrap_err();
+    assert_eq!(wait, window - minute * 10);
+    assert_eq!(try_again(wait), "Try again in 5 minutes.");
+    assert_eq!(
+        try_again(std::time::Duration::from_secs(61)),
+        "Try again in 2 minutes."
+    );
+    assert_eq!(
+        try_again(std::time::Duration::from_secs(1)),
+        "Try again in 1 minute."
+    );
+    // Once the oldest hit has left the window, one more fits.
+    assert!(limits.attempt_at(&[key.clone()], start + window).is_ok());
+    assert!(limits.attempt_at(&[key.clone()], start + window).is_err());
+
+    // A refused attempt records nothing on any of its keys.
+    let address = (Limit::LoginAddress, "192.0.2.1".to_string());
+    assert!(
+        limits
+            .attempt_at(&[address.clone(), key.clone()], start + window)
+            .is_err()
+    );
+    assert_eq!(limits.blocked(&address), None);
+
+    // The map never grows past its cap, however many keys arrive.
+    let limits = RateLimits::default();
+    for n in 0..MAX_LIMIT_KEYS + 50 {
+        let key = (Limit::LoginUsername, format!("user{n}"));
+        limits.attempt_at(&[key], start).unwrap();
+    }
+    assert_eq!(limits.key_count(), MAX_LIMIT_KEYS);
+    // Expired keys are the first to go.
+    let later = start + window;
+    limits
+        .attempt_at(&[(Limit::LoginUsername, "fresh".into())], later)
+        .unwrap();
+    assert_eq!(limits.key_count(), 1);
+}
+
+#[tokio::test]
+async fn wrong_current_passwords_are_limited_per_user() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let cookie = setup_alice(&state, "old-secret").await;
+    let user = AuthUser {
+        id: user_id(&db, "alice").await,
+    };
+    let change = |current: &str| {
+        Form(ResetPasswordForm {
+            current_password: current.into(),
+            new_password: "reset-secret".into(),
+            confirm_password: "reset-secret".into(),
+        })
+    };
+    for _ in 0..10 {
+        let response = reset_password(State(state.clone()), user.clone(), change("wrong"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = reset_password(State(state.clone()), user.clone(), change("old-secret"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response_body(response)
+            .await
+            .contains("Too many password attempts. Try again in 15 minutes.")
+    );
+    // Nothing changed: the old password still signs in, and the old session
+    // still works.
+    sign_in(&app, "alice", "old-secret").await;
+    let response = app
+        .clone()
+        .oneshot(request("/settings/password", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Another account's allowance is its own.
+    add_account(&db, "carol", "carol-secret").await;
+    let carol = AuthUser {
+        id: "carol-id".into(),
+    };
+    let response = reset_password(State(state.clone()), carol, change("wrong"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn one_address_creates_a_limited_number_of_accounts() {
+    let db = database().await;
+    let state = state(db.clone());
+    let app = routes(state.clone());
+    let alice = token(&setup_alice(&state, "secret-pass").await).to_string();
+    let create = |form: String, peer: &str| {
+        from_peer(
+            post("/accounts/new", Some(&browser(&alice, &[])), &form),
+            peer,
+        )
+    };
+    let form = |username: &str| {
+        format!("username={username}&password=new-secret&confirm_password=new-secret")
+    };
+    // A form that fails its own checks does not count.
+    let response = app
+        .clone()
+        .oneshot(create(
+            "username=short&password=short&confirm_password=short".into(),
+            "192.0.2.1:5000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Nine new accounts and one taken username use up the hour's ten.
+    for n in 0..9 {
+        let response = app
+            .clone()
+            .oneshot(create(form(&format!("cook{n}")), "192.0.2.1:5000"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{n}");
+    }
+    let response = app
+        .clone()
+        .oneshot(create(form("ALICE"), "192.0.2.1:5000"))
+        .await
+        .unwrap();
+    assert!(
+        response_body(response)
+            .await
+            .contains("That username is taken.")
+    );
+    let response = app
+        .clone()
+        .oneshot(create(form("cook9"), "192.0.2.1:5000"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(set_cookies(&response).is_empty());
+    let body = response_body(response).await;
+    assert!(
+        body.contains("Too many accounts were created from this network. Try again in 60 minutes."),
+        "{body}"
+    );
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = 'cook9'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(users, 0);
+    // Another address still can.
+    let response = app
+        .clone()
+        .oneshot(create(form("cook9"), "192.0.2.2:5000"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn a_limited_request_renders_the_429_error_page_for_too_many_requests() {
+    use axum::response::IntoResponse;
+    let response = crate::AppError::TooManyRequests(
+        "Too many sign-in attempts. Try again in 3 minutes.".into(),
+    )
+    .into_response();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = response_body(response).await;
+    assert!(body.contains("Too many attempts"), "{body}");
+    assert!(body.contains("Try again in 3 minutes."));
 }

@@ -127,6 +127,9 @@ struct AppState {
     /// EmbeddingGemma 2 sidecar client (`EMBEDDING_URL`); `None` turns off
     /// library search, video step moments, and dish-photo ranking.
     embedder: Option<embeddings::Embedder>,
+    /// Brute-force limits on sign-in, the password page, and account
+    /// creation; in-memory only, so a restart forgets them.
+    rate_limits: Arc<auth::RateLimits>,
 }
 
 /// Last successfully discovered model catalogue for one source (a Pi provider
@@ -210,6 +213,10 @@ enum AppError {
     ClaudeAuth(String),
     #[error("This form was sent from another site, so it was refused.")]
     CrossOrigin,
+    /// A brute-force limit refused the request (`auth::RateLimits`). The
+    /// text says what was limited and how long to wait.
+    #[error("{0}")]
+    TooManyRequests(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -268,6 +275,12 @@ impl IntoResponse for AppError {
                 StatusCode::FORBIDDEN,
                 "Request refused",
                 format!("{self} Open the page here and try again."),
+                false,
+            ),
+            Self::TooManyRequests(message) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many attempts",
+                message.clone(),
                 false,
             ),
             Self::AiLoginRefused(message) => (
@@ -1010,7 +1023,7 @@ pub(crate) struct LoginForm {
 #[derive(Deserialize)]
 struct LoginQuery {
     next: Option<String>,
-    /// Prefills the username, e.g. from the account menu.
+    /// Prefills the username.
     username: Option<String>,
 }
 #[derive(Deserialize)]
@@ -1311,6 +1324,10 @@ async fn main() -> anyhowless::Result<()> {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: embeddings::Embedder::from_env(),
+        rate_limits: Arc::new(auth::RateLimits::new(env_bool(
+            "TRUST_PROXY_HEADERS",
+            false,
+        ))),
     });
     if state.embedder.is_some() {
         tokio::spawn(search::backfill(state.clone()));
@@ -1321,7 +1338,12 @@ async fn main() -> anyhowless::Result<()> {
         .parse()?;
     info!(%addr, "Recipe Repository listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // The peer address feeds the per-address sign-in limits.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 /// Deletes expired drafts now and every hour after, so their dish-photo
