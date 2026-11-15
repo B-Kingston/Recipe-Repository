@@ -28,10 +28,8 @@ per JPEG; it takes precedence over the fixed step. The selected source indexes
 and seconds are included in the report and passed into the production cleaner,
 so a capped or adaptive set does not acquire fake consecutive timestamps.
 
-`--expected-file` is optional. The fresh URL runs in
-`bench/benchmark-report.md` intentionally omit recall/precision because no
-human reference transcript was supplied; they report frame coverage, final
-snippets, and safety checks instead. The default Paddle line-confidence gate
+`--expected-file` is optional; without it the report gives frame coverage,
+final snippets, and safety checks instead of recall/precision. The default Paddle line-confidence gate
 is 0.70; override it with `MEDIA_OCR_SCORE_THRESHOLD` when testing another
 calibration. The `production.invalid_symbol_tokens` and
 `production.digit_soup_tokens` lists are hard checks for random symbols and
