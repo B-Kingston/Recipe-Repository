@@ -3,7 +3,7 @@ use crate::htmx::Flash;
 use crate::{SetupForm, routes};
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     extract::{Form, State},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::Response,
@@ -76,15 +76,7 @@ fn header_value<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
         .map(|value| value.to_str().unwrap())
 }
 
-async fn body(response: Response) -> String {
-    String::from_utf8(
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap()
-}
+use super::body_text as body;
 
 #[test]
 fn flash_reads_only_short_lowercase_keys() {

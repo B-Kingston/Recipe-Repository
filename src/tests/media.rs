@@ -1,9 +1,9 @@
+use super::user;
 use crate::ai::{
     DebugEventsQuery, DebugRunMap, DebugUrlState, MAX_DEBUG_URLS, MediaDebugRun, MediaRunPurpose,
     absorb_event, find_run, import_events, media_debug_frame, media_debug_start, parse_debug_urls,
     valid_frame_file, valid_run_id,
 };
-use crate::auth::AuthUser;
 use crate::media::MediaChannels;
 use crate::{AppError, AppState, MediaDebugForm};
 use axum::extract::{Form, Path, Query, State};
@@ -158,7 +158,7 @@ async fn starting_a_run_with_only_invalid_urls_rerenders_with_errors() {
     let runs = DebugRunMap::default();
     let response = media_debug_start(
         State(state(database().await, runs.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(MediaDebugForm {
             urls: "not a url at all".into(),
         }),
@@ -186,7 +186,7 @@ async fn import_event_feeds_are_scoped_to_the_run_owner() {
 
     let payload = import_events(
         State(app.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(run_id.clone()),
         Query(DebugEventsQuery { since: 0 }),
     )
@@ -196,7 +196,7 @@ async fn import_event_feeds_are_scoped_to_the_run_owner() {
 
     let foreign = import_events(
         State(app),
-        AuthUser { id: "u2".into() },
+        user("u2"),
         Path(run_id),
         Query(DebugEventsQuery { since: 0 }),
     )
@@ -286,7 +286,7 @@ async fn frames_are_served_only_from_the_retained_directory() {
     // A valid capture is served as JPEG.
     let response = media_debug_frame(
         State(app.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path((run_id.clone(), 0usize, "f0001.jpg".into())),
     )
     .await
@@ -297,7 +297,7 @@ async fn frames_are_served_only_from_the_retained_directory() {
     for evil in ["../../boot", "f0001.jpg%00", "sub/f0001.jpg"] {
         let outcome = media_debug_frame(
             State(app.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             Path((run_id.clone(), 0usize, evil.into())),
         )
         .await;

@@ -6,7 +6,7 @@ use crate::groups::{Invites, Mailer, OutgoingMail, mask_email, valid_email};
 use crate::{AppState, CODEX_PI_PROVIDER, routes, stamp, store_pi_credential};
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     http::{Request, StatusCode, header},
     response::Response,
 };
@@ -141,10 +141,7 @@ async fn send(app: &Router, request: Request<Body>) -> Response {
     app.clone().oneshot(request).await.unwrap()
 }
 
-async fn body(response: Response) -> String {
-    let bytes = to_bytes(response.into_body(), 1 << 22).await.unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
+use super::body_text as body;
 
 fn location(response: &Response) -> &str {
     response.headers()[header::LOCATION].to_str().unwrap()

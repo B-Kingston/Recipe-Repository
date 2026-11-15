@@ -1,4 +1,3 @@
-use crate::auth::AuthUser;
 use crate::folders::{
     CUISINES, DISH_FOLDERS, Prototypes, STACK_TITLES, Shelf, cuisine_of, dish_folder, file_recipe,
     filing, match_query, resolve, stacks, update_filing, update_library_view,
@@ -37,10 +36,7 @@ async fn database() -> SqlitePool {
 }
 
 use super::test_state as state;
-
-fn user() -> AuthUser {
-    AuthUser { id: "u1".into() }
-}
+use super::user;
 
 /// A unit vector at `degrees` in the x/y plane.
 fn at(degrees: f32) -> Vec<f32> {
@@ -67,7 +63,7 @@ fn card(id: &str, title: &str) -> LibraryCard {
 async fn library(db: &SqlitePool, folder: Option<&str>) -> String {
     home(
         State(state(db.clone())),
-        user(),
+        user("u1"),
         crate::htmx::Flash::default(),
         Query(HomeQuery {
             folder: folder.map(Into::into),
@@ -245,14 +241,14 @@ async fn the_folders_view_stacks_pinned_recipes_and_waits_on_the_rest() {
 
     update_library_view(
         State(state(db.clone())),
-        user(),
+        user("u1"),
         Form(serde_json::from_value(serde_json::json!({"view": "folders"})).unwrap()),
     )
     .await
     .unwrap();
     update_filing(
         State(state(db.clone())),
-        user(),
+        user("u1"),
         Path("tart".into()),
         Form(
             serde_json::from_value(serde_json::json!({"folder": "desserts", "cuisine": "french"}))
@@ -297,7 +293,7 @@ async fn pinning_checks_the_folder_and_the_owner_and_leaves_the_recipe_alone() {
         async move {
             update_filing(
                 State(state(db)),
-                user(),
+                user("u1"),
                 Path(id),
                 Form(serde_json::from_value(form).unwrap()),
             )
@@ -351,7 +347,7 @@ async fn the_library_view_accepts_only_its_three_values() {
     let db = database().await;
     let result = update_library_view(
         State(state(db)),
-        user(),
+        user("u1"),
         Form(serde_json::from_value(serde_json::json!({"view": "shelves"})).unwrap()),
     )
     .await;

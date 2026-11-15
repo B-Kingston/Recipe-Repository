@@ -1,4 +1,3 @@
-use crate::auth::AuthUser;
 use crate::display::{
     DisplayForm, DisplayMode, chosen_mode, display_css, display_page, is_kindle, update_display,
     uses_eink,
@@ -7,7 +6,7 @@ use crate::htmx::Flash;
 use crate::{AppError, routes};
 use axum::{
     Form,
-    body::{Body, to_bytes},
+    body::Body,
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
 };
 use tower::ServiceExt;
@@ -24,14 +23,7 @@ fn headers(cookie: Option<&str>, agent: &str) -> HeaderMap {
     headers
 }
 
-fn user() -> AuthUser {
-    AuthUser { id: "u1".into() }
-}
-
-async fn body(response: axum::response::Response) -> String {
-    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
+use super::{body_text as body, user};
 
 #[test]
 fn automatic_mode_uses_eink_only_on_a_kindle() {
@@ -88,7 +80,7 @@ async fn display_css_is_served_without_signing_in() {
 #[tokio::test]
 async fn saving_a_mode_sets_or_clears_the_cookie() {
     let saved = update_display(
-        user(),
+        user("u1"),
         Form(DisplayForm {
             mode: "eink".into(),
         }),
@@ -114,7 +106,7 @@ async fn saving_a_mode_sets_or_clears_the_cookie() {
     );
 
     let auto = update_display(
-        user(),
+        user("u1"),
         Form(DisplayForm {
             mode: "auto".into(),
         }),
@@ -128,7 +120,7 @@ async fn saving_a_mode_sets_or_clears_the_cookie() {
     );
 
     let unknown = update_display(
-        user(),
+        user("u1"),
         Form(DisplayForm {
             mode: "sepia".into(),
         }),
@@ -140,7 +132,7 @@ async fn saving_a_mode_sets_or_clears_the_cookie() {
 #[tokio::test]
 async fn display_page_checks_the_saved_mode() {
     let page = display_page(
-        user(),
+        user("u1"),
         headers(Some("recipe_display=colour"), KINDLE),
         Flash("display_saved".into()),
     )

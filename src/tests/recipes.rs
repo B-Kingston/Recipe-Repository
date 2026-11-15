@@ -1,4 +1,5 @@
-use crate::auth::{AuthUser, setup_create};
+use super::user;
+use crate::auth::setup_create;
 use crate::recipes::{
     AcceptOutcome, AnswerProposal, LibraryCard, ProposalRow, TICKET_COLUMNS_AFTER,
     accept_chat_proposal, add_block, clean_plate_name, delete_block, delete_recipe, delete_version,
@@ -40,7 +41,7 @@ async fn moving_a_block_swaps_positions_without_changing_ids() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('first','r','step',0,'First'),('second','r','step',1,'Second')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "first".into(), "down".into())),
         Ok(Form(BlockForm::default())),
     )
@@ -60,7 +61,7 @@ async fn moving_a_block_without_a_neighbour_records_no_version() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('only','r','step',0,'Only')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "only".into(), "down".into())),
         Ok(Form(BlockForm::default())),
     )
@@ -75,7 +76,7 @@ async fn moving_a_block_saves_the_text_submitted_with_the_move_buttons() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('first','r','step',0,'First'),('second','r','step',1,'Second')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "first".into(), "down".into())),
         Ok(Form(BlockForm {
             text: "First, edited".into(),
@@ -122,7 +123,7 @@ async fn moving_the_top_block_still_saves_its_submitted_text() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('first','r','step',0,'First')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "first".into(), "up".into())),
         Ok(Form(BlockForm {
             text: "First, edited".into(),
@@ -151,7 +152,7 @@ async fn moving_a_block_with_an_unchanged_form_records_only_the_move() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('first','r','step',0,'First'),('second','r','step',1,'Second')").execute(&db).await.unwrap();
     move_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "first".into(), "down".into())),
         Ok(Form(BlockForm {
             text: "First".into(),
@@ -226,7 +227,7 @@ async fn deleting_a_block_compacts_the_remaining_positions() {
     sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('a','r','ingredient',0,'A'),('b','r','ingredient',1,'B'),('c','r','ingredient',2,'C')").execute(&db).await.unwrap();
     delete_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "b".into())),
     )
     .await
@@ -246,7 +247,7 @@ async fn first_edit_keeps_the_original_recipe_as_version_one() {
         .execute(&db).await.unwrap();
     update_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "i1".into())),
         Form(BlockForm {
             section: None,
@@ -274,7 +275,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         .execute(&db).await.unwrap();
     update_recipe(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("r".into()),
         Form(RecipeForm {
             title: "Edited".into(),
@@ -305,7 +306,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
     ));
     let page = view_version(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), 1)),
         crate::htmx::Flash::default(),
     )
@@ -317,7 +318,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
     // offers no Delete.
     let newest = view_version(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), 2)),
         crate::htmx::Flash::default(),
     )
@@ -325,12 +326,7 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
     .unwrap();
     assert!(!newest.0.contains("Delete version"));
     assert!(matches!(
-        delete_version(
-            State(state(db.clone())),
-            AuthUser { id: "u1".into() },
-            Path(("r".into(), 2)),
-        )
-        .await,
+        delete_version(State(state(db.clone())), user("u1"), Path(("r".into(), 2)),).await,
         Err(AppError::BadRequest(_))
     ));
     let mut tx = db.begin().await.unwrap();
@@ -338,13 +334,9 @@ async fn revisions_store_version_snapshots_and_render_read_only() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    delete_version(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path(("r".into(), 2)),
-    )
-    .await
-    .unwrap();
+    delete_version(State(state(db.clone())), user("u1"), Path(("r".into(), 2)))
+        .await
+        .unwrap();
     assert!(matches!(
         find_version(&db, "u1", "r", 2).await,
         Err(AppError::NotFound)
@@ -380,7 +372,7 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
     .unwrap();
     update_recipe(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("r".into()),
         Form(RecipeForm {
             title: "Edited".into(),
@@ -395,7 +387,7 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
     .unwrap();
     delete_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "s1".into())),
     )
     .await
@@ -404,20 +396,16 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
     assert!(matches!(
         restore_version(
             State(state(db.clone())),
-            AuthUser { id: "other".into() },
+            user("other"),
             Path(("r".into(), 1)),
         )
         .await,
         Err(AppError::NotFound)
     ));
     let original = find_version(&db, "u1", "r", 1).await.unwrap().snapshot;
-    restore_version(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path(("r".into(), 1)),
-    )
-    .await
-    .unwrap();
+    restore_version(State(state(db.clone())), user("u1"), Path(("r".into(), 1)))
+        .await
+        .unwrap();
     let restored = find_version(&db, "u1", "r", 4).await.unwrap();
     assert_eq!(restored.label, "Restored version 1");
     assert_eq!(restored.snapshot, original);
@@ -437,13 +425,9 @@ async fn restoring_a_version_makes_it_current_and_keeps_the_history() {
         0
     );
     // Restoring what is already current records nothing.
-    restore_version(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path(("r".into(), 1)),
-    )
-    .await
-    .unwrap();
+    restore_version(State(state(db.clone())), user("u1"), Path(("r".into(), 1)))
+        .await
+        .unwrap();
     assert_eq!(recipe_versions(&db, "u1", "r").await.unwrap().len(), 4);
 }
 
@@ -572,7 +556,7 @@ async fn library_tickets_are_pinned_print_ingredients_and_pack_long_lists() {
     }
     let page = home(
         State(state(db)),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         crate::htmx::Flash::default(),
         Query(HomeQuery::default()),
     )
@@ -625,7 +609,7 @@ async fn recipe_plate_rim_carries_a_short_title_and_the_timings() {
         async move {
             recipe_page(
                 State(s),
-                AuthUser { id: "u1".into() },
+                user("u1"),
                 Path(id.into()),
                 Query(RecipeQuery {
                     edit: None,
@@ -683,7 +667,7 @@ async fn recipe_page_scales_amounts_to_the_chosen_servings() {
         async move {
             recipe_page(
                 State(s),
-                AuthUser { id: "u1".into() },
+                user("u1"),
                 Path("r".into()),
                 Query(RecipeQuery {
                     edit: None,
@@ -723,7 +707,7 @@ async fn recipe_view(
 ) -> String {
     recipe_page(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("r".into()),
         Query(RecipeQuery {
             edit: None,
@@ -747,7 +731,7 @@ async fn every_block_edit_drops_the_chart_and_stamps_the_recipe() {
     for edit in ["add", "edit", "move", "delete", "restore"] {
         let db = database().await;
         let s = state(db.clone());
-        let user = || AuthUser { id: "u1".into() };
+        let user = || user("u1");
         sqlx::query("INSERT INTO recipe_blocks(id,recipe_id,section,position,text) VALUES('a','r','step',0,'First'),('b','r','step',1,'Second')").execute(&db).await.unwrap();
         if edit == "restore" {
             // Version 1 is the original; version 2 has the edited step.
@@ -828,7 +812,7 @@ async fn saving_an_unchanged_block_keeps_the_chart_and_records_nothing() {
         .unwrap();
     update_block(
         State(state(db.clone())),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "i1".into())),
         Form(BlockForm {
             text: "Flour".into(),
@@ -866,7 +850,7 @@ async fn inferred_step_ingredients_show_but_an_untouched_form_does_not_save_them
     // The move arrows post the step's form as the page shows it.
     move_block(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(("r".into(), "mix".into(), "down".into())),
         Ok(Form(BlockForm {
             text: "Mix 200 g flour with water.".into(),
@@ -912,7 +896,7 @@ async fn plate_name(db: &SqlitePool) -> String {
 async fn versions_keep_and_restore_the_plate_name() {
     let db = database().await;
     let s = state(db.clone());
-    let user = || AuthUser { id: "u1".into() };
+    let user = || user("u1");
     // A plate name alone is an edit worth a version, and one that restores.
     update_recipe(
         State(s.clone()),
@@ -1115,21 +1099,12 @@ async fn deleting_a_recipe_takes_its_frame_candidates_along() {
     }
     // Another account cannot delete it.
     assert!(matches!(
-        delete_recipe(
-            State(state(db.clone())),
-            AuthUser { id: "u2".into() },
-            Path("r".into())
-        )
-        .await,
+        delete_recipe(State(state(db.clone())), user("u2"), Path("r".into())).await,
         Err(AppError::NotFound)
     ));
-    delete_recipe(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path("r".into()),
-    )
-    .await
-    .unwrap();
+    delete_recipe(State(state(db.clone())), user("u1"), Path("r".into()))
+        .await
+        .unwrap();
     let candidates: Vec<String> =
         sqlx::query_scalar("SELECT recipe_id FROM recipe_thumbnail_candidates")
             .fetch_all(&db)

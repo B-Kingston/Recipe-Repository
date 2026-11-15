@@ -59,3 +59,15 @@ pub(crate) fn test_state(db: SqlitePool) -> Arc<AppState> {
         invites: Default::default(),
     })
 }
+
+pub(crate) fn user(id: &str) -> crate::AuthUser {
+    crate::AuthUser { id: id.into() }
+}
+
+/// A response's body as text.
+pub(crate) async fn body_text(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}

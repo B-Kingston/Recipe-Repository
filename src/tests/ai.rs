@@ -1,3 +1,4 @@
+use super::user;
 use crate::ai::{
     DebugCardRow, DebugUrlState, MediaDebugRun, MediaRunPurpose, PromptRoute, SearchMode,
     acquire_subscription_worker, apply_draft, cancel_draft, dedupe_sources, draft_page,
@@ -239,12 +240,7 @@ use super::memory_db as database;
 
 use super::test_state as state;
 
-async fn response_body(response: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
+use super::body_text as response_body;
 
 /// The Add recipe card as posted, with its video tick boxes.
 fn card_form(prompt: &str, use_description: bool, use_audio: bool, use_ocr: bool) -> PromptForm {
@@ -302,7 +298,7 @@ async fn import_requires_a_ticked_evidence_source() {
     let prompt = "https://www.instagram.com/reel/AbCdEf123/";
     let response = generate_recipe(
         State(state.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(card_form(prompt, false, false, false)),
     )
     .await
@@ -324,7 +320,7 @@ async fn import_requires_a_ticked_evidence_source() {
     ] {
         let response = generate_recipe(
             State(state.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             Form(card_form(prompt, description, audio, ocr)),
         )
         .await
@@ -404,7 +400,7 @@ async fn the_card_sends_a_reel_link_to_the_video_import() {
     let prompt = "serves four https://www.instagram.com/reel/AbC123/";
     let response = generate_recipe(
         State(state.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(PromptForm {
             prompt: prompt.into(),
             ..PromptForm::default()
@@ -422,7 +418,7 @@ async fn the_card_sends_a_reel_link_to_the_video_import() {
 
     let response = generate_recipe(
         State(state),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(card_form(
             "https://www.instagram.com/reel/AbC123/ https://www.facebook.com/reel/42",
             true,
@@ -537,13 +533,9 @@ async fn preview_offers_candidates_and_apply_persists_the_chosen_photo() {
     insert_draft_with_candidates(&db, "td1").await;
 
     let html = response_body(
-        draft_page(
-            State(s.clone()),
-            AuthUser { id: "u1".into() },
-            Path("td1".into()),
-        )
-        .await
-        .unwrap(),
+        draft_page(State(s.clone()), user("u1"), Path("td1".into()))
+            .await
+            .unwrap(),
     )
     .await;
     assert!(html.contains("Dish photo"), "picker missing from preview");
@@ -552,7 +544,7 @@ async fn preview_offers_candidates_and_apply_persists_the_chosen_photo() {
 
     let response = apply_draft(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("td1".into()),
         Form(ApplyDraftForm {
             thumbnail: Some("1".into()),
@@ -619,13 +611,9 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
     .unwrap();
 
     let preview = response_body(
-        draft_page(
-            State(s.clone()),
-            AuthUser { id: "u1".into() },
-            Path("tm1".into()),
-        )
-        .await
-        .unwrap(),
+        draft_page(State(s.clone()), user("u1"), Path("tm1".into()))
+            .await
+            .unwrap(),
     )
     .await;
     assert_eq!(
@@ -641,7 +629,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
 
     let response = apply_draft(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("tm1".into()),
         Form(ApplyDraftForm { thumbnail: None }),
     )
@@ -684,7 +672,7 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
 
     let page = recipe_page(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path(recipe_id.clone()),
         axum::extract::Query(crate::RecipeQuery {
             edit: None,
@@ -701,13 +689,9 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
     assert!(page.contains(r#"title="Matched to the narration">0:06 in the video"#));
     assert!(page.contains(&format!("/recipes/{recipe_id}/stills/12\"")));
 
-    let still = recipe_still(
-        State(s.clone()),
-        AuthUser { id: "u1".into() },
-        Path((recipe_id.clone(), 12)),
-    )
-    .await
-    .unwrap();
+    let still = recipe_still(State(s.clone()), user("u1"), Path((recipe_id.clone(), 12)))
+        .await
+        .unwrap();
     assert_eq!(response_body(still).await, "still-12");
 
     // "Find step moments" stores a fresh pool: it replaces the old one.
@@ -737,21 +721,13 @@ async fn applying_a_video_draft_moves_its_moments_onto_the_recipe_steps() {
     .await
     .unwrap();
     assert_eq!(counts, (1, 2));
-    let still = recipe_still(
-        State(s.clone()),
-        AuthUser { id: "u1".into() },
-        Path((recipe_id.clone(), 12)),
-    )
-    .await
-    .unwrap();
+    let still = recipe_still(State(s.clone()), user("u1"), Path((recipe_id.clone(), 12)))
+        .await
+        .unwrap();
     assert_eq!(response_body(still).await, "fresh-12");
-    let stranger = recipe_still(
-        State(s.clone()),
-        AuthUser { id: "u2".into() },
-        Path((recipe_id, 12)),
-    )
-    .await
-    .unwrap_err();
+    let stranger = recipe_still(State(s.clone()), user("u2"), Path((recipe_id, 12)))
+        .await
+        .unwrap_err();
     assert!(matches!(stranger, AppError::NotFound));
 }
 
@@ -761,40 +737,24 @@ async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
     let s = state(db.clone());
     insert_draft_with_candidates(&db, "td2").await;
 
-    let stranger = draft_thumbnail(
-        State(s.clone()),
-        AuthUser { id: "u2".into() },
-        Path(("td2".into(), 0)),
-    )
-    .await
-    .unwrap_err();
+    let stranger = draft_thumbnail(State(s.clone()), user("u2"), Path(("td2".into(), 0)))
+        .await
+        .unwrap_err();
     assert!(matches!(stranger, AppError::NotFound));
 
-    let owner_bytes = draft_thumbnail(
-        State(s.clone()),
-        AuthUser { id: "u1".into() },
-        Path(("td2".into(), 0)),
-    )
-    .await
-    .unwrap();
+    let owner_bytes = draft_thumbnail(State(s.clone()), user("u1"), Path(("td2".into(), 0)))
+        .await
+        .unwrap();
     assert_eq!(owner_bytes.status(), StatusCode::OK);
 
-    let missing = draft_thumbnail(
-        State(s.clone()),
-        AuthUser { id: "u1".into() },
-        Path(("td2".into(), 5)),
-    )
-    .await
-    .unwrap_err();
+    let missing = draft_thumbnail(State(s.clone()), user("u1"), Path(("td2".into(), 5)))
+        .await
+        .unwrap_err();
     assert!(matches!(missing, AppError::NotFound));
 
-    cancel_draft(
-        State(s.clone()),
-        AuthUser { id: "u2".into() },
-        Path("td2".into()),
-    )
-    .await
-    .unwrap();
+    cancel_draft(State(s.clone()), user("u2"), Path("td2".into()))
+        .await
+        .unwrap();
     let kept: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM draft_thumbnails WHERE draft_id='td2'")
             .fetch_one(&db)
@@ -803,7 +763,7 @@ async fn candidate_bytes_and_choices_stay_scoped_to_the_owner() {
     assert_eq!(kept, 2, "a stranger cannot discard the candidates");
 
     // Discarding the draft removes its candidates too.
-    cancel_draft(State(s), AuthUser { id: "u1".into() }, Path("td2".into()))
+    cancel_draft(State(s), user("u1"), Path("td2".into()))
         .await
         .unwrap();
     let leftovers: i64 =
@@ -836,7 +796,7 @@ async fn a_draft_is_saved_as_one_new_recipe() {
     let apply = |draft: &'static str| {
         apply_draft(
             State(s.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             Path(draft.into()),
             Form(ApplyDraftForm { thumbnail: None }),
         )
@@ -894,7 +854,7 @@ async fn a_second_save_of_a_consumed_draft_saves_nothing() {
 
     let response = apply_draft(
         State(s),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("tr1".into()),
         Form(ApplyDraftForm { thumbnail: None }),
     )
@@ -912,13 +872,9 @@ async fn a_second_save_of_a_consumed_draft_saves_nothing() {
 #[tokio::test]
 async fn expired_or_saved_drafts_show_the_expired_page() {
     let db = database().await;
-    let response = draft_page(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path("gone".into()),
-    )
-    .await
-    .unwrap();
+    let response = draft_page(State(state(db.clone())), user("u1"), Path("gone".into()))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(
         response_body(response)
@@ -948,7 +904,7 @@ async fn library_cards_flag_recipes_that_have_a_dish_photo() {
     let html = response_body(
         home(
             State(s),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             crate::htmx::Flash::default(),
             axum::extract::Query(crate::HomeQuery::default()),
         )
@@ -1088,7 +1044,7 @@ async fn choose_persists_the_pick_while_discard_and_remove_behave() {
 
     let response = choose_thumbnail(
         State(s.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Path("r2".into()),
         Form(ThumbnailPickForm { choice: "1".into() }),
     )
@@ -1114,13 +1070,9 @@ async fn choose_persists_the_pick_while_discard_and_remove_behave() {
     .execute(&db)
     .await
     .unwrap();
-    discard_thumbnail(
-        State(s.clone()),
-        AuthUser { id: "u1".into() },
-        Path("r2".into()),
-    )
-    .await
-    .unwrap();
+    discard_thumbnail(State(s.clone()), user("u1"), Path("r2".into()))
+        .await
+        .unwrap();
     let still_there: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id='r2'")
             .fetch_one(&db)
@@ -1129,7 +1081,7 @@ async fn choose_persists_the_pick_while_discard_and_remove_behave() {
     assert_eq!(still_there.as_deref(), Some(&b"BB"[..]));
 
     // Remove clears both.
-    remove_thumbnail(State(s), AuthUser { id: "u1".into() }, Path("r2".into()))
+    remove_thumbnail(State(s), user("u1"), Path("r2".into()))
         .await
         .unwrap();
     let gone: Option<Vec<u8>> =
@@ -1145,8 +1097,7 @@ async fn recompute_needs_a_social_video_source() {
     let db = database().await;
     let s = state(db.clone());
     seed_recipe_with_source(&db, "r3", "https://example.com/not-a-reel").await;
-    let outcome =
-        start_thumbnail_recompute(State(s), AuthUser { id: "u1".into() }, Path("r3".into())).await;
+    let outcome = start_thumbnail_recompute(State(s), user("u1"), Path("r3".into())).await;
     match outcome {
         Err(AppError::BadRequest(message)) => {
             assert!(message.contains("no social-video source"));
@@ -1179,7 +1130,7 @@ async fn an_overlong_request_is_refused_on_the_card() {
     let card = |prompt: String| {
         generate_recipe(
             State(state.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             Form(PromptForm {
                 prompt,
                 ..PromptForm::default()
@@ -1242,8 +1193,8 @@ async fn debugger_runs_belong_to_the_account_that_started_them() {
     s.media_debug_runs
         .lock()
         .insert(run_id.clone(), debug_run("u1", dir.clone()));
-    let owner = || AuthUser { id: "u1".into() };
-    let stranger = || AuthUser { id: "u2".into() };
+    let owner = || user("u1");
+    let stranger = || user("u2");
 
     let listed = media_debug_page(State(s.clone()), owner()).await.unwrap().0;
     assert!(listed.contains(&run_id));

@@ -7,7 +7,7 @@ use crate::notes::{
 use crate::recipes::{
     chat_notes, recipe_notes, recipe_page, recipe_versions, start_chat_turn, view_version,
 };
-use crate::{AppError, AppState, AuthUser, ChatDrawerForm, NoteForm, RecipeQuery, stamp};
+use crate::{AppError, AppState, ChatDrawerForm, NoteForm, RecipeQuery, stamp};
 use axum::{
     Form,
     body::Body,
@@ -50,9 +50,7 @@ async fn database() -> SqlitePool {
 
 use super::test_state as state;
 
-fn user(id: &str) -> AuthUser {
-    AuthUser { id: id.into() }
-}
+use super::user;
 
 /// The add-note form as a browser posts it.
 async fn multipart(fields: &[(&str, &str)], photo: Option<&[u8]>) -> Multipart {

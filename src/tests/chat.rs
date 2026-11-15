@@ -8,9 +8,8 @@ use crate::recipes::{
     finish_chat_answer, recipe_page, recipe_snapshot, start_chat_turn,
 };
 use crate::{
-    AppError, AppState, AuthUser, ChatDrawerForm, ChatForm, ChatProposal, ProposedIngredient,
-    ProposedStep, RecipeProposal, RecipeQuery, RecipeSnapshot, SnapshotIngredient, SnapshotStep,
-    stamp,
+    AppError, AppState, ChatDrawerForm, ChatForm, ChatProposal, ProposedIngredient, ProposedStep,
+    RecipeProposal, RecipeQuery, RecipeSnapshot, SnapshotIngredient, SnapshotStep, stamp,
 };
 use axum::{
     Form,
@@ -40,9 +39,7 @@ async fn database() -> SqlitePool {
 
 use super::test_state as state;
 
-fn user(id: &str) -> AuthUser {
-    AuthUser { id: id.into() }
-}
+use super::user;
 
 fn question(text: &str) -> Form<ChatForm> {
     Form(ChatForm {

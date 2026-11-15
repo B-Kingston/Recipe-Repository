@@ -1,3 +1,4 @@
+use super::user;
 use crate::auth::AuthUser;
 use crate::{
     AppError, AppState, CLAUDE_PI_PROVIDER, CODEX_PI_PROVIDER, ClaudeExchangeForm, ClaudeFlow,
@@ -24,12 +25,7 @@ async fn save(
     state: &Arc<AppState>,
     form: SettingsForm,
 ) -> Result<axum::response::Response, AppError> {
-    update_settings(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Form(form),
-    )
-    .await
+    update_settings(State(state.clone()), user("u1"), Form(form)).await
 }
 
 fn settings_form(provider: &str) -> SettingsForm {
@@ -87,7 +83,7 @@ async fn the_media_cleaner_follows_the_ai_provider_until_one_is_chosen() {
     let groq = add(&db, "Groq", "groq", "", "gsk-key").await;
     let _ = update_media_cleaner(
         State(state.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(cleaner_form(&groq, " llama-3.1-8b-instant ")),
     )
     .await
@@ -101,13 +97,9 @@ async fn the_media_cleaner_follows_the_ai_provider_until_one_is_chosen() {
         Some("llama-3.1-8b-instant")
     );
     // Back to following the AI provider, with the provider's own model.
-    let _ = update_media_cleaner(
-        State(state),
-        AuthUser { id: "u1".into() },
-        Form(cleaner_form("", "")),
-    )
-    .await
-    .unwrap();
+    let _ = update_media_cleaner(State(state), user("u1"), Form(cleaner_form("", "")))
+        .await
+        .unwrap();
     assert_eq!(media_cleaner_setting(&db, "u1").await.unwrap(), None);
     assert_eq!(media_cleaner_model(&db, "u1").await.unwrap(), None);
 }
@@ -125,7 +117,7 @@ async fn the_media_cleaner_rejects_unknown_and_foreign_providers() {
     for provider in ["missing-id", foreign.as_str()] {
         let result = update_media_cleaner(
             State(state.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             Form(cleaner_form(provider, "")),
         )
         .await;
@@ -141,12 +133,12 @@ async fn deleting_the_cleaners_endpoint_returns_it_to_the_ai_provider() {
     let id = add(&db, "Groq", "groq", "", "gsk-key").await;
     let _ = update_media_cleaner(
         State(state.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         Form(cleaner_form(&id, "llama-3.1-8b-instant")),
     )
     .await
     .unwrap();
-    let _ = delete_endpoint(State(state), AuthUser { id: "u1".into() }, Path(id)).await;
+    let _ = delete_endpoint(State(state), user("u1"), Path(id)).await;
     assert_eq!(media_cleaner_setting(&db, "u1").await.unwrap(), None);
     assert_eq!(media_cleaner_model(&db, "u1").await.unwrap(), None);
 }
@@ -325,13 +317,9 @@ fn endpoint_form(provider: &str, base_url: &str, api_key: &str, model: &str) -> 
 }
 
 async fn add_from_form(state: &Arc<AppState>, form: EndpointForm) -> Result<(), AppError> {
-    add_endpoint(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Form(form),
-    )
-    .await
-    .map(|_| ())
+    add_endpoint(State(state.clone()), user("u1"), Form(form))
+        .await
+        .map(|_| ())
 }
 
 #[tokio::test]
@@ -525,8 +513,7 @@ async fn deleting_the_active_endpoint_falls_back_to_codex() {
     .await;
     set_provider(&db, &id).await;
     let state = state(db.clone());
-    let result =
-        delete_endpoint(State(state), AuthUser { id: "u1".into() }, Path(id.clone())).await;
+    let result = delete_endpoint(State(state), user("u1"), Path(id.clone())).await;
     assert!(result.is_ok());
     assert!(find_endpoint(&db, "u1", &id).await.unwrap().is_none());
     assert_eq!(ai_provider(&db, "u1").await.unwrap(), "pi");
@@ -546,7 +533,7 @@ async fn deleting_an_inactive_endpoint_keeps_the_provider() {
     let inactive = add(&db, "Other", "openai", "https://api.example.com/v1", "sk-x").await;
     set_provider(&db, &active).await;
     let state = state(db.clone());
-    let _ = delete_endpoint(State(state), AuthUser { id: "u1".into() }, Path(inactive))
+    let _ = delete_endpoint(State(state), user("u1"), Path(inactive))
         .await
         .unwrap();
     assert_eq!(ai_provider(&db, "u1").await.unwrap(), active);
@@ -568,13 +555,9 @@ async fn deleting_another_users_endpoint_does_nothing() {
         .execute(&db)
         .await
         .unwrap();
-    let _ = delete_endpoint(
-        State(state(db.clone())),
-        AuthUser { id: "u1".into() },
-        Path(id.clone()),
-    )
-    .await
-    .unwrap();
+    let _ = delete_endpoint(State(state(db.clone())), user("u1"), Path(id.clone()))
+        .await
+        .unwrap();
     assert!(find_endpoint(&db, "u2", &id).await.unwrap().is_some());
 }
 
@@ -788,7 +771,7 @@ async fn failed_claude_exchange_keeps_the_flow_for_another_paste() {
     // The test state has no helper script, so the exchange fails.
     let response = authorise_claude_exchange(
         State(state.clone()),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         axum::http::HeaderMap::new(),
         Form(ClaudeExchangeForm {
             flow_id: "flow".into(),
@@ -822,13 +805,9 @@ async fn disconnecting_claude_keeps_codex_and_falls_back_to_it() {
         .unwrap();
     set_provider(&db, "claude").await;
 
-    let redirect = disconnect_subscription(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Path("claude".into()),
-    )
-    .await
-    .unwrap();
+    let redirect = disconnect_subscription(State(state.clone()), user("u1"), Path("claude".into()))
+        .await
+        .unwrap();
     assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
@@ -860,13 +839,9 @@ async fn disconnecting_active_codex_without_a_fallback_leaves_the_setting() {
         .unwrap();
     set_provider(&db, "pi").await;
 
-    let redirect = disconnect_subscription(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Path("codex".into()),
-    )
-    .await
-    .unwrap();
+    let redirect = disconnect_subscription(State(state.clone()), user("u1"), Path("codex".into()))
+        .await
+        .unwrap();
     assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CODEX_PI_PROVIDER)
@@ -899,7 +874,7 @@ async fn empty_claude_code_keeps_the_flow_for_a_retry() {
     for code in ["", "   "] {
         let response = authorise_claude_exchange(
             State(state.clone()),
-            AuthUser { id: "u1".into() },
+            user("u1"),
             axum::http::HeaderMap::new(),
             Form(ClaudeExchangeForm {
                 flow_id: "flow".into(),
@@ -982,7 +957,7 @@ async fn a_group_member_generates_with_shared_ai_logins_until_connecting_their_o
     assert_eq!(crate::ai_account(&db, "u2").await.unwrap(), "u2");
 
     // Alice connects Claude: bob can generate with it and sees what it is.
-    let bob = AuthUser { id: "u2".into() };
+    let bob = user("u2");
     assert!(!crate::ai::ai_configured(&state, &bob).await);
     let claude =
         serde_json::json!({"type":"oauth","access":"sk-ant-oat-x","refresh":"r","expires":1});
@@ -1293,28 +1268,21 @@ async fn login_checks_flash_their_outcome_in_the_ai_block() {
 async fn checking_an_unknown_login_is_not_found() {
     let db = database().await;
     let state = state(db.clone());
-    let unknown = crate::check_subscription(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Path("gemini".into()),
-    )
-    .await;
+    let unknown =
+        crate::check_subscription(State(state.clone()), user("u1"), Path("gemini".into())).await;
     assert!(matches!(unknown, Err(AppError::NotFound)));
     let foreign = crate::check_endpoint(
         State(state.clone()),
-        AuthUser { id: "u2".into() },
+        user("u2"),
         Path(add(&db, "Groq", "groq", "", "gsk-test-1234").await),
     )
     .await;
     assert!(matches!(foreign, Err(AppError::NotFound)));
     // Without a stored sign-in there is nothing to check.
-    let missing = crate::check_subscription(
-        State(state.clone()),
-        AuthUser { id: "u1".into() },
-        Path("claude".into()),
-    )
-    .await
-    .unwrap();
+    let missing =
+        crate::check_subscription(State(state.clone()), user("u1"), Path("claude".into()))
+            .await
+            .unwrap();
     assert_eq!(missing.headers()[header::LOCATION], "/settings#settings-ai");
 }
 
@@ -1403,7 +1371,7 @@ async fn a_search_key_is_saved_masked_replaced_and_removed() {
         ("brave", "brave-key-1111")
     );
 
-    let response = crate::delete_web_search_key(State(state.clone()), AuthUser { id: "u1".into() })
+    let response = crate::delete_web_search_key(State(state.clone()), user("u1"))
         .await
         .unwrap();
     assert_flash(

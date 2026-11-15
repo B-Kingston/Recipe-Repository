@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::{
     Router,
-    body::{Body, to_bytes},
+    body::Body,
     extract::{ConnectInfo, Form, State},
     http::{Request, StatusCode, header},
     response::Response,
@@ -468,10 +468,7 @@ async fn sessions_scope_items_and_end_on_logout_or_expiry() {
     assert_eq!(location(&response), "/login");
 }
 
-async fn response_body(response: axum::response::Response) -> String {
-    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
+use super::body_text as response_body;
 
 #[tokio::test]
 async fn reset_password_requires_current_password_and_updates_login() {

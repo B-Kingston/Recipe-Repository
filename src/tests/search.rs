@@ -1,4 +1,4 @@
-use crate::auth::AuthUser;
+use super::user;
 use crate::embeddings::{DIMENSIONS, Embedder, Input};
 use crate::recipes::{home, recipe_vector, store_embedding};
 use crate::search::{
@@ -323,7 +323,7 @@ async fn storing_a_vector_for_a_deleted_or_since_edited_recipe_is_skipped() {
 async fn search_page(db: SqlitePool, query: &str) -> String {
     home(
         State(state(db)),
-        AuthUser { id: "u1".into() },
+        user("u1"),
         crate::htmx::Flash::default(),
         Query(HomeQuery {
             q: Some(query.into()),
