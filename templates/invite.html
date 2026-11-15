@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="referrer" content="no-referrer">
+  <title>Group invite · Recipe Repository</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/display.css">
+</head>
+<body class="setup-page">
+  {# Opened from an invite email, signed in or not, so it stands alone like
+     the sign-in page: no htmx, plain forms. #}
+  <main class="app-shell">
+    <div class="paper setup-card">
+      <div class="form-intro">
+        <p class="eyebrow">Recipe Repository</p>
+        {% if state == "gone" %}
+        <h1>This invite has ended</h1>
+        <p class="deck">The link was already used, was cancelled, or is more than 7 days old. Ask for a new invite.</p>
+        {% else if state == "declined" %}
+        <h1>Invite declined</h1>
+        <p class="deck">Nothing was joined, and the link no longer works.</p>
+        {% else %}
+        <h1>Join {{ inviter }}’s group</h1>
+        <p class="deck">Members of a group can open the recipes each other shares, read-only, and save copies to their own library. A member can also let others generate recipes with their AI logins.</p>
+        {% endif %}
+      </div>
+      <div class="compact-panel">
+        {% if state == "gone" || state == "declined" %}
+        <p class="actions"><a class="button" href="/">Open Recipe Repository</a></p>
+        {% else if state == "accept" %}
+        <form method="post" action="/invites/{{ token }}/accept">
+          <p class="actions"><button class="button primary" type="submit">Join as {{ viewer }}</button></p>
+        </form>
+        <p class="muted">Not {{ viewer }}? <a href="/login?next=/invites/{{ token }}">Sign in to another account</a> to join with it.</p>
+        {% else if state == "own" %}
+        <p>You sent this invite. Send the link to the person you invited; it works once.</p>
+        <p class="muted"><a href="/login?next=/invites/{{ token }}">Sign in to another account</a> to accept it with that account.</p>
+        {% else if state == "member" %}
+        <p>{{ viewer }} is already in {{ inviter }}’s group.</p>
+        <p class="actions"><a class="button" href="/settings#settings-group">Open the group in Settings</a></p>
+        {% else if state == "other_group" %}
+        <p role="alert">{{ viewer }} is already in another group, and an account can be in only one. Leave that group in Settings first, then open this link again.</p>
+        <p class="actions"><a class="button" href="/settings#settings-group">Open Settings</a></p>
+        <p class="muted"><a href="/login?next=/invites/{{ token }}">Sign in to another account</a> to join with it instead.</p>
+        {% else %}
+        <p><a class="button primary" href="/login?next=/invites/{{ token }}">Sign in to join</a></p>
+        <h2>New here? Create an account</h2>
+        <form method="post" action="/invites/{{ token }}/signup">
+          <label for="username">Username</label>
+          <input id="username" name="username" type="text" value="{{ username }}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="40" required>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="new-password" required aria-describedby="password-hint">
+          <p class="muted" id="password-hint">At least 8 characters.</p>
+          <label for="confirm_password">Confirm password</label>
+          <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required>
+          {% if !error.is_empty() %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          <p class="actions"><button class="button primary" type="submit">Create account and join</button></p>
+        </form>
+        {% endif %}
+        {% if state != "gone" && state != "declined" && state != "own" && state != "member" %}
+        <form method="post" action="/invites/{{ token }}/decline">
+          <p class="actions"><button class="button quiet" type="submit">Decline the invite</button></p>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </main>
+</body>
+</html>

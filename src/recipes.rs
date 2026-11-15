@@ -38,7 +38,8 @@ fn block_label(section: &str, action: &str) -> String {
 
 /// The library page. Without `?q=` it lists every recipe filed A to Z, or,
 /// in the Folders or Cuisines view, one ticket stack per folder (`?folder=`
-/// opens one). With `?q=`, the recipes ranked by embedding similarity or
+/// opens one), or, in the Group view, every recipe the members of the
+/// user's group share, with their owners' names. With `?q=`, the recipes ranked by embedding similarity or
 /// BM25 (the user's choice, and the fallback when the embedding service is
 /// missing or down); a query that names a folder ("thai", "desserts") lists
 /// that folder's recipes first.
@@ -50,6 +51,12 @@ pub(crate) async fn home(
 ) -> Result<Html<String>> {
     let query = search::normalize_query(params.q.as_deref().unwrap_or(""));
     let view = folders::library_view(&state.db, &user.id).await?;
+    let in_group = crate::groups::group_of(&state.db, &user.id)
+        .await?
+        .is_some();
+    // The Group view lists the group's shared recipes; out of a group the
+    // saved choice falls back to A to Z.
+    let group_view = in_group && folders::group_view_selected(&state.db, &user.id).await?;
     let cards: Vec<LibraryCard> = sqlx::query_as(
         "SELECT id,title,description,servings,prep_minutes,cook_minutes,
                 thumbnail_jpeg IS NOT NULL AS has_thumbnail,created_at
@@ -101,6 +108,11 @@ pub(crate) async fn home(
             String::new()
         };
         match view {
+            _ if group_view => {
+                let mut shared = group_cards(&state.db, &user.id).await?;
+                file_a_to_z(&mut shared);
+                (shared, false, notice)
+            }
             Some(shelf) if total > 0 => {
                 let filed = folders::shelve(&state, &user.id, shelf).await?;
                 stacks = folders::stacks(shelf, &filed, &cards);
@@ -120,7 +132,12 @@ pub(crate) async fn home(
         query,
         results,
         notice,
-        view: view.map_or("az", folders::Shelf::key),
+        view: if group_view {
+            folders::VIEW_GROUP
+        } else {
+            view.map_or("az", folders::Shelf::key)
+        },
+        in_group,
         total,
         stacks,
         open_folder,
@@ -139,6 +156,9 @@ pub(crate) struct LibraryCard {
     pub(crate) cook_minutes: Option<i64>,
     pub(crate) has_thumbnail: bool,
     pub(crate) created_at: String,
+    /// The owner's username, in the Group view only; empty elsewhere.
+    #[sqlx(default)]
+    pub(crate) owner: String,
     /// The ingredient lines printed on the ticket, in recipe order; filled
     /// by `attach_ingredients`.
     #[sqlx(skip)]
@@ -286,7 +306,8 @@ pub(crate) fn stamp_added(cards: &mut [LibraryCard]) {
     }
 }
 
-/// Loads the ingredient lines of the cards shown, in one query.
+/// Loads the ingredient lines of the cards shown, in one query: the
+/// viewer's own recipes, or recipes shared with their group.
 async fn attach_ingredients(
     db: &SqlitePool,
     user_id: &str,
@@ -295,18 +316,22 @@ async fn attach_ingredients(
     if cards.is_empty() {
         return Ok(());
     }
-    let ids = vec!["?"; cards.len()].join(",");
+    // Numbered throughout: the viewer is ?1, the cards ?2 onwards.
+    let ids = (2..cards.len() + 2)
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT recipe_id,id,section,position,text,quantity,unit,optional FROM recipe_blocks
          WHERE section='ingredient' AND recipe_id IN ({ids})
-           AND recipe_id IN (SELECT id FROM recipes WHERE user_id=?)
+           AND recipe_id IN (SELECT r.id FROM recipes r WHERE {READABLE_BY_VIEWER})
          ORDER BY recipe_id, position"
     );
-    let mut query = sqlx::query_as::<_, IndexBlockRow>(&sql);
+    let mut query = sqlx::query_as::<_, IndexBlockRow>(&sql).bind(user_id);
     for card in cards.iter() {
         query = query.bind(&card.id);
     }
-    let rows = query.bind(user_id).fetch_all(db).await?;
+    let rows = query.fetch_all(db).await?;
     let mut by_recipe: HashMap<String, Vec<Block>> = HashMap::new();
     for row in rows {
         by_recipe.entry(row.recipe_id).or_default().push(row.block);
@@ -612,7 +637,8 @@ pub(crate) async fn recipe_vector(db: &SqlitePool, recipe_id: &str) -> Result<Op
     Ok(blob.and_then(|blob| crate::embeddings::from_blob(&blob)))
 }
 
-/// Streams a recipe's chosen dish photo to its owning user only.
+/// Streams a recipe's chosen dish photo to its owner, or to a member of the
+/// owner's group while the recipe is shared.
 pub(crate) async fn recipe_thumbnail(
     State(state): State<Arc<AppState>>,
     user: AuthUser,
@@ -646,7 +672,13 @@ pub(crate) async fn recipe_page(
     Query(query): Query<RecipeQuery>,
     flash: Flash,
 ) -> Result<Html<String>> {
-    let recipe = find_recipe(&state.db, &user.id, &id).await?;
+    // A recipe another group member shares opens read-only: the card, the
+    // chart, scaling, photo and moments, but none of the owner's tools.
+    let (recipe, owner) = find_readable_recipe(&state.db, &user.id, &id).await?;
+    let read_only = owner.is_some();
+    let owner_id = owner
+        .as_ref()
+        .map_or(user.id.as_str(), |owner| owner.id.as_str());
     let (ingredient_blocks, step_blocks): (Vec<Block>, Vec<Block>) = blocks(&state.db, &id)
         .await?
         .into_iter()
@@ -659,17 +691,19 @@ pub(crate) async fn recipe_page(
         .map(|block| ViewBlock::from_block(block, edit, &scale))
         .collect();
     let mut uses = step_ingredients_by_step(&state.db, &id).await?;
-    let recipe_sources = sources(&state.db, &user.id, &id).await?;
+    let recipe_sources = sources(&state.db, owner_id, &id).await?;
     let video_url = social_source_url(&recipe_sources);
+    // Moments show by the owner's switch, as they do on the owner's page.
     let moments_shown =
-        video_url.is_some() && crate::step_moments_enabled(&state.db, &user.id).await?;
+        video_url.is_some() && crate::step_moments_enabled(&state.db, owner_id).await?;
     let mut step_moments = if moments_shown {
         recipe_step_moments(&state.db, &id).await?
     } else {
         HashMap::new()
     };
-    let moments_pending = moments_shown && state.moment_jobs.lock().contains(&id);
-    let can_find_moments = moments_shown
+    let moments_pending = !read_only && moments_shown && state.moment_jobs.lock().contains(&id);
+    let can_find_moments = !read_only
+        && moments_shown
         && state.embedder.is_some()
         && !moments_pending
         && !recipe_has_moment_pool(&state.db, &id).await?;
@@ -707,8 +741,10 @@ pub(crate) async fn recipe_page(
     let chart_view = query.view.as_deref() == Some("chart");
     let chart = build_chart(&recipe, &ingredient_blocks, &steps, query.step, &scale);
     let has_photo = recipe.has_photo;
-    let pending_frames = state.thumbnail_jobs.lock().contains(&id);
-    let thumb_options: Vec<crate::DraftThumbView> =
+    let pending_frames = !read_only && state.thumbnail_jobs.lock().contains(&id);
+    let thumb_options: Vec<crate::DraftThumbView> = if read_only {
+        Vec::new()
+    } else {
         find_recipe_thumbnails(&state.db, &user.id, &id)
             .await?
             .into_iter()
@@ -716,7 +752,8 @@ pub(crate) async fn recipe_page(
                 index: row.idx.max(0) as usize,
                 seconds: row.seconds.max(0) as u64,
             })
-            .collect();
+            .collect()
+    };
     let thumb_state = if pending_frames {
         "pending"
     } else if !thumb_options.is_empty() {
@@ -724,8 +761,12 @@ pub(crate) async fn recipe_page(
     } else {
         "idle"
     };
-    let can_pick_video_frames = thumbs::enabled() && video_url.is_some();
-    let versions = recipe_versions(&state.db, &user.id, &id).await?;
+    let can_pick_video_frames = !read_only && thumbs::enabled() && video_url.is_some();
+    let versions = if read_only {
+        Vec::new()
+    } else {
+        recipe_versions(&state.db, &user.id, &id).await?
+    };
     // The chat drawer's forms and poll come back to this view, step, and
     // servings; the notes (shown on the card only) to the card's servings.
     let back = match (chart_view, query.step) {
@@ -733,11 +774,24 @@ pub(crate) async fn recipe_page(
         (true, None) => format!("/recipes/{id}?view=chart{}", scale.query),
         (false, _) => format!("/recipes/{id}{}", scale.page_query()),
     };
-    let chat = crate::chat::panel(&state, &user, &recipe, back, &flash).await?;
-    let notes_back = format!("/recipes/{id}{}", scale.page_query());
-    let notes =
-        crate::notes::panel(&state, &user, &id, &versions, None, notes_back, &flash).await?;
-    let filing = folders::filing(&state, &user.id, &id).await?;
+    let (chat, notes, filing, share) = if read_only {
+        (None, None, None, None)
+    } else {
+        let chat = crate::chat::panel(&state, &user, &recipe, back, &flash).await?;
+        let notes_back = format!("/recipes/{id}{}", scale.page_query());
+        let notes =
+            crate::notes::panel(&state, &user, &id, &versions, None, notes_back, &flash).await?;
+        let filing = folders::filing(&state, &user.id, &id).await?;
+        let in_group = crate::groups::group_of(&state.db, &user.id)
+            .await?
+            .is_some();
+        (
+            chat,
+            Some(notes),
+            Some(filing),
+            in_group.then_some(recipe.shared),
+        )
+    };
     render(RecipeTemplate {
         servings_value: option_number(recipe.servings),
         prep_value: option_number(recipe.prep_minutes),
@@ -761,6 +815,8 @@ pub(crate) async fn recipe_page(
         notes,
         scale,
         filing,
+        shared_by: owner.map(|owner| owner.username).unwrap_or_default(),
+        share,
     })
 }
 
@@ -1401,7 +1457,7 @@ pub(crate) async fn find_recipe<'c>(
 ) -> Result<Recipe> {
     sqlx::query_as(
         "SELECT id,title,description,servings,prep_minutes,cook_minutes,chart_json,updated_at,
-                plate_name,thumbnail_jpeg IS NOT NULL AS has_photo
+                plate_name,thumbnail_jpeg IS NOT NULL AS has_photo,shared<>0 AS shared
          FROM recipes WHERE user_id=? AND id=?",
     )
     .bind(user_id)
@@ -1409,6 +1465,183 @@ pub(crate) async fn find_recipe<'c>(
     .fetch_optional(conn)
     .await?
     .ok_or(AppError::NotFound)
+}
+
+/// SQL condition on a recipe `r` that the viewer bound as `?1` may read:
+/// their own, or one its owner shared while both are members of the same
+/// group. Access follows membership, so it ends when either leaves. Queries
+/// using it bind only numbered parameters (never mix `?` and `?N`).
+const READABLE_BY_VIEWER: &str = "(r.user_id = ?1 OR (r.shared <> 0 AND r.user_id IN (
+    SELECT theirs.user_id FROM group_members mine
+    JOIN group_members theirs ON theirs.group_id = mine.group_id
+    WHERE mine.user_id = ?1)))";
+
+/// The owner of a recipe a group member shared, as the read-only page names
+/// them.
+pub(crate) struct SharedOwner {
+    pub(crate) id: String,
+    pub(crate) username: String,
+}
+
+/// A recipe the viewer may open: their own (owner None), or one another
+/// member of their group shares with it (read-only, owner Some). NotFound
+/// for anything else, unshared recipes of members included.
+pub(crate) async fn find_readable_recipe(
+    db: &SqlitePool,
+    viewer_id: &str,
+    id: &str,
+) -> Result<(Recipe, Option<SharedOwner>)> {
+    match find_recipe(db, viewer_id, id).await {
+        Err(AppError::NotFound) => {}
+        own => return own.map(|recipe| (recipe, None)),
+    }
+    let sql = format!(
+        "SELECT r.id,r.title,r.description,r.servings,r.prep_minutes,r.cook_minutes,r.chart_json,
+                r.updated_at,r.plate_name,r.thumbnail_jpeg IS NOT NULL AS has_photo,
+                r.shared<>0 AS shared
+         FROM recipes r WHERE r.id = ?2 AND r.user_id <> ?1 AND {READABLE_BY_VIEWER}"
+    );
+    let recipe: Recipe = sqlx::query_as(&sql)
+        .bind(viewer_id)
+        .bind(id)
+        .fetch_optional(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let (owner_id, username): (String, String) = sqlx::query_as(
+        "SELECT u.id, u.username FROM recipes r JOIN users u ON u.id = r.user_id WHERE r.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    Ok((
+        recipe,
+        Some(SharedOwner {
+            id: owner_id,
+            username,
+        }),
+    ))
+}
+
+/// Shares one of the owner's recipes with their group, or stops sharing it.
+/// Not an edit: `updated_at` stays and no version is recorded.
+pub(crate) async fn set_recipe_shared(
+    db: &SqlitePool,
+    user_id: &str,
+    id: &str,
+    shared: bool,
+) -> Result<()> {
+    let done = sqlx::query("UPDATE recipes SET shared=? WHERE user_id=? AND id=?")
+        .bind(shared)
+        .bind(user_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
+}
+
+/// The library's Group view: every recipe shared by a member of the
+/// viewer's group (the viewer's own shared recipes included), each with its
+/// owner's username.
+pub(crate) async fn group_cards(db: &SqlitePool, viewer_id: &str) -> Result<Vec<LibraryCard>> {
+    Ok(sqlx::query_as(
+        "SELECT r.id,r.title,r.description,r.servings,r.prep_minutes,r.cook_minutes,
+                r.thumbnail_jpeg IS NOT NULL AS has_thumbnail,r.created_at,u.username AS owner
+         FROM recipes r JOIN users u ON u.id = r.user_id
+         WHERE r.shared <> 0 AND r.user_id IN (
+           SELECT theirs.user_id FROM group_members mine
+           JOIN group_members theirs ON theirs.group_id = mine.group_id
+           WHERE mine.user_id = ?1)",
+    )
+    .bind(viewer_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// `POST /recipes/{id}/copy`: saves a copy of a recipe the viewer may read
+/// (one a group member shares) into the viewer's own library: its details,
+/// ingredients, steps with their ingredient lines, sources, dish photo, and
+/// chart. Notes, chats, versions, and step moments stay with the original.
+pub(crate) async fn copy_recipe(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    let (recipe, owner) = find_readable_recipe(&state.db, &user.id, &id).await?;
+    let owner_id = owner
+        .as_ref()
+        .map_or(user.id.as_str(), |owner| owner.id.as_str());
+    let new_id = Uuid::new_v4().to_string();
+    let now = stamp();
+    let mut tx = begin_write(&state.db).await?;
+    sqlx::query(
+        "INSERT INTO recipes(id,title,description,servings,prep_minutes,cook_minutes,chart_json,
+                             plate_name,thumbnail_jpeg,user_id,created_at,updated_at)
+         SELECT ?1,title,description,servings,prep_minutes,cook_minutes,chart_json,
+                plate_name,thumbnail_jpeg,?2,?3,?3
+         FROM recipes WHERE id=?4 AND user_id=?5",
+    )
+    .bind(&new_id)
+    .bind(&user.id)
+    .bind(&now)
+    .bind(&recipe.id)
+    .bind(owner_id)
+    .execute(&mut *tx)
+    .await?;
+    let source_blocks = blocks(&mut *tx, &recipe.id).await?;
+    let uses = step_ingredients_by_step(&mut *tx, &recipe.id).await?;
+    for block in source_blocks {
+        let block_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO recipe_blocks(id,recipe_id,section,position,text,quantity,unit,optional)
+             VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .bind(&block_id)
+        .bind(&new_id)
+        .bind(&block.section)
+        .bind(block.position)
+        .bind(&block.text)
+        .bind(&block.quantity)
+        .bind(&block.unit)
+        .bind(block.optional)
+        .execute(&mut *tx)
+        .await?;
+        for (position, text) in uses.get(&block.id).into_iter().flatten().enumerate() {
+            sqlx::query(
+                "INSERT INTO recipe_step_ingredients(id,step_id,position,text) VALUES(?,?,?,?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&block_id)
+            .bind(position as i64)
+            .bind(text)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    let recipe_sources: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT position,title,url FROM recipe_sources WHERE recipe_id=? ORDER BY position",
+    )
+    .bind(&recipe.id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (position, title, url) in recipe_sources {
+        sqlx::query(
+            "INSERT INTO recipe_sources(id,recipe_id,position,title,url) VALUES(?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&new_id)
+        .bind(position)
+        .bind(title)
+        .bind(url)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(user_id = %user.id, from = %recipe.id, recipe_id = %new_id, "Recipe copied to library");
+    Ok(Redirect::to(&format!("/recipes/{new_id}")).into_response())
 }
 
 async fn find_block<'c>(
@@ -1714,18 +1947,22 @@ pub(crate) async fn find_draft_thumbnail_jpeg(
     .await?)
 }
 
+/// A recipe's dish photo, for its owner or a member of the owner's group
+/// while the recipe is shared (`READABLE_BY_VIEWER`).
 pub(crate) async fn find_recipe_thumbnail(
     db: &SqlitePool,
-    user_id: &str,
+    viewer_id: &str,
     recipe_id: &str,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(
-        sqlx::query_scalar("SELECT thumbnail_jpeg FROM recipes WHERE id=? AND user_id=?")
-            .bind(recipe_id)
-            .bind(user_id)
-            .fetch_optional(db)
-            .await?,
-    )
+    let sql = format!(
+        "SELECT r.thumbnail_jpeg FROM recipes r
+         WHERE r.id=?2 AND r.thumbnail_jpeg IS NOT NULL AND {READABLE_BY_VIEWER}"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(viewer_id)
+        .bind(recipe_id)
+        .fetch_optional(db)
+        .await?)
 }
 
 /// Content snapshot of a recipe, read inside the caller's transaction so a
@@ -2483,21 +2720,24 @@ pub(crate) async fn find_draft_still(
     .await?)
 }
 
+/// One still of a recipe's moment pool, for the same readers as the dish
+/// photo (`find_recipe_thumbnail`).
 pub(crate) async fn find_recipe_still(
     db: &SqlitePool,
-    user_id: &str,
+    viewer_id: &str,
     recipe_id: &str,
     seconds: i64,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(sqlx::query_scalar(
+    let sql = format!(
         "SELECT s.jpeg FROM recipe_moment_stills s JOIN recipes r ON r.id=s.recipe_id
-         WHERE r.id=? AND r.user_id=? AND s.seconds=?",
-    )
-    .bind(recipe_id)
-    .bind(user_id)
-    .bind(seconds)
-    .fetch_optional(db)
-    .await?)
+         WHERE r.id=?2 AND s.seconds=?3 AND {READABLE_BY_VIEWER}"
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(viewer_id)
+        .bind(recipe_id)
+        .bind(seconds)
+        .fetch_optional(db)
+        .await?)
 }
 
 /// Inside `apply_draft`'s transaction: a video draft's pool replaces the
@@ -2621,7 +2861,8 @@ pub(crate) async fn recipe_step_moments(
         .collect())
 }
 
-/// Serves one still of a recipe's moment pool to its owner.
+/// Serves one still of a recipe's moment pool to its owner, or to a member
+/// of the owner's group while the recipe is shared.
 pub(crate) async fn recipe_still(
     State(state): State<Arc<AppState>>,
     user: AuthUser,

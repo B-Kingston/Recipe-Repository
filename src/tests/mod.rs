@@ -5,6 +5,7 @@ mod chat;
 mod config;
 mod display;
 mod folders;
+mod groups;
 mod htmx;
 mod media;
 mod moments;

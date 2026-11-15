@@ -47,6 +47,7 @@ fn state(db: SqlitePool, runs: DebugRunMap) -> Arc<AppState> {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
+        invites: Default::default(),
     })
 }
 

@@ -94,6 +94,7 @@ async fn display_css_is_served_without_signing_in() {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
+        invites: Default::default(),
     });
     let response = routes(state)
         .oneshot(

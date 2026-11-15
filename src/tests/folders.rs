@@ -64,6 +64,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
+        invites: Default::default(),
     })
 }
 
@@ -87,6 +88,7 @@ fn card(id: &str, title: &str) -> LibraryCard {
         cook_minutes: None,
         has_thumbnail: false,
         created_at: String::new(),
+        owner: String::new(),
         ingredients: Vec::new(),
         added: String::new(),
     }

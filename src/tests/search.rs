@@ -62,6 +62,7 @@ fn state(db: SqlitePool) -> Arc<AppState> {
         thumbnail_jobs: Arc::new(Mutex::new(HashSet::new())),
         moment_jobs: Arc::new(Mutex::new(HashSet::new())),
         embedder: None,
+        invites: Default::default(),
     })
 }
 
@@ -577,6 +578,7 @@ pub(super) async fn fake_sidecar(vector: fn(&str) -> Vec<f32>) -> FakeSidecar {
 pub(super) fn sidecar_state(db: SqlitePool, url: &str) -> Arc<AppState> {
     Arc::new(AppState {
         embedder: Some(Embedder::new(url)),
+        invites: Default::default(),
         ..(*state(db)).clone()
     })
 }

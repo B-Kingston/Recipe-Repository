@@ -51,9 +51,20 @@
   {% if scale.is_scaled() %}<p class="muted serves-note">Amounts scaled from {{ original }} servings. Pan size and cooking times may need adjusting.</p>{% endif %}
   {% endif %}
   {% include "recipe_sources.html" %}
+  {% if read_only() %}<p class="shared-by">Shared by {{ shared_by }}</p>{% endif %}
+  {# The owner's Share-with-group toggle, shown while they are in a group.
+     Saving swaps only this pill; sharing is not an edit, so it records no
+     version. #}
+  {% if let Some(shared) = share %}
+  <form class="share-toggle" method="post" action="/recipes/{{ recipe.id }}/share" hx-target="this" hx-select=".share-toggle" hx-swap="outerHTML show:none" hx-push-url="false">
+    <input type="hidden" name="shared" value="{% if shared %}off{% else %}on{% endif %}">
+    <button class="share-pill{% if shared %} is-shared{% endif %}" aria-pressed="{{ shared }}">{% if shared %}&#10003; Shared with group{% else %}Share with group{% endif %}</button>
+  </form>
+  {% endif %}
   {# The library folder and cuisine: sorted automatically by EmbeddingGemma
      unless the cook picks one here. Saving swaps only this pill, so the
      chart's step, its timer, and the servings stay as they are. #}
+  {% if let Some(filing) = filing %}
   <details class="source-disclosure filing-disclosure">
     <summary><svg class="filing-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3.5h4.5l1.5 1.8h7v8.2h-13z"/></svg>{% if filing.summary() != "" %}{{ filing.summary() }}{% else %}Folder{% endif %}</summary>
     <form class="source-popover filing-form" method="post" action="/recipes/{{ recipe.id }}/filing" hx-target="closest .filing-disclosure" hx-select=".filing-disclosure" hx-swap="outerHTML show:none" hx-push-url="false">
@@ -72,6 +83,7 @@
       <p class="actions"><button class="primary compact">Save</button></p>
     </form>
   </details>
+  {% endif %}
 </div>
 <div class="card-actions">
   <div class="actions page-actions">
@@ -83,8 +95,14 @@
       <button class="chat-toggle{% if chat.open %} is-pressed{% endif %}" aria-pressed="{{ chat.open }}">Ask</button>
     </form>
     {% endif %}
+    {% if read_only() %}
+    <form class="inline" method="post" action="/recipes/{{ recipe.id }}/copy" data-busy-label="Saving…">
+      <button class="quiet">Save a copy to my library</button>
+    </form>
+    {% else %}
     <a class="button quiet" href="/recipes/{{ recipe.id }}?edit_meta=1{{ scale.query }}#recipe-details">Edit</a>
     <a class="button quiet danger" href="/recipes/{{ recipe.id }}/delete">Delete</a>
+    {% endif %}
   </div>
   {# The card and the chart swap in place without adding history entries. #}
   <nav class="view-toggle" aria-label="Recipe view" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">
@@ -97,7 +115,7 @@
 {% if chart_view %}{% if let Some(chat) = chat %}{% if chat.open %}{% include "recipe_chat.html" %}{% endif %}{% endif %}{% endif %}
 
 {% if !chart_view %}
-{% if edit_meta %}
+{% if edit_meta && !read_only() %}
 <form id="recipe-details" class="panel form-panel recipe-details-form" method="post" action="/recipes/{{ recipe.id }}">
   <p class="eyebrow">Edit recipe details</p>
   <label>Title<input name="title" value="{{ recipe.title }}" required maxlength="180"></label>
@@ -118,10 +136,16 @@
 <div class="card-side">
 <section class="recipe-section ingredients-section">
   <h2 class="section-label">Ingredients</h2>
-  {% if ingredients.is_empty() %}<p class="muted empty-section">No ingredients yet. Add the first one below.</p>{% endif %}
+  {% if ingredients.is_empty() %}<p class="muted empty-section">No ingredients yet.{% if !read_only() %} Add the first one below.{% endif %}</p>{% endif %}
   <ul class="ingredient-list">
     {% for block in ingredients %}
     <li>
+      {% if read_only() %}
+      <div class="ingredient-row">
+        <span class="ingredient-qty">{{ block.shown_quantity }}</span>
+        <span class="block-text">{{ block.text }}{% if block.optional %} <em>(optional)</em>{% endif %}</span>
+      </div>
+      {% else %}
       <a class="block-link ingredient-row" data-edit-block="{{ block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ block.id }}{{ scale.query }}#edit-{{ block.id }}">
         <span class="ingredient-qty">{{ block.shown_quantity }}</span>
         <span class="block-text">{{ block.text }}{% if block.optional %} <em>(optional)</em>{% endif %}</span>
@@ -134,9 +158,11 @@
         <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/up" aria-label="Move ingredient up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/move/down" aria-label="Move ingredient down">↓</button><a class="button quiet" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}" data-edit-cancel="{{ block.id }}" hx-boost="false">Cancel</a></p>
         <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ block.id }}/delete" data-confirm="Delete this ingredient? This cannot be undone.">Delete ingredient</button></p>
       </form>
+      {% endif %}
     </li>
     {% endfor %}
   </ul>
+  {% if !read_only() %}
   <details class="add-block"{% if ingredients.is_empty() %} open{% endif %}>
     <summary>Add ingredient</summary>
     <form class="add-form" method="post" action="/recipes/{{ recipe.id }}/blocks" data-busy-label="Adding…" hx-swap="innerHTML show:none">
@@ -148,17 +174,21 @@
       <p class="actions"><button class="primary">Add ingredient</button></p>
     </form>
   </details>
+  {% endif %}
 </section>
 {% if let Some(chat) = chat %}{% if chat.open %}{% include "recipe_chat.html" %}{% endif %}{% endif %}
 </div>
 
 <section class="recipe-section method-section">
   <h2 class="section-label">Method</h2>
-  {% if steps.is_empty() %}<p class="muted empty-section">No steps yet. Add the first one below.</p>{% endif %}
+  {% if steps.is_empty() %}<p class="muted empty-section">No steps yet.{% if !read_only() %} Add the first one below.{% endif %}</p>{% endif %}
   <ol class="step-list">
   {% for step in steps %}
   <li class="step-group">
     <article class="block step-block">
+      {% if read_only() %}
+      <p class="block-link block-static"><span class="block-index">{{ step.block.position + 1 }}</span><span class="block-text">{{ step.block.text }}</span></p>
+      {% else %}
       <a class="block-link" data-edit-block="{{ step.block.id }}" hx-boost="false" href="/recipes/{{ recipe.id }}?edit={{ step.block.id }}{{ scale.query }}#edit-{{ step.block.id }}">
         <span class="block-index">{{ step.block.position + 1 }}</span><span class="block-text">{{ step.block.text }}</span>
       </a>
@@ -168,6 +198,7 @@
         <p class="actions"><button>Save</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/up" aria-label="Move step up">↑</button><button class="move" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/move/down" aria-label="Move step down">↓</button><a class="button quiet" href="/recipes/{{ recipe.id }}{{ scale.page_query() }}" data-edit-cancel="{{ step.block.id }}" hx-boost="false">Cancel</a></p>
         <p class="actions edit-danger"><button class="danger" formaction="/recipes/{{ recipe.id }}/blocks/{{ step.block.id }}/delete" data-confirm="Delete this step? This cannot be undone.">Delete step</button></p>
       </form>
+      {% endif %}
     </article>
     {% let step_number = step.block.position + 1 %}{% include "step_ingredients.html" %}
     {% match step.moment %}{% when Some with (moment) %}{% include "step_moment.html" %}{% when None %}{% endmatch %}
@@ -185,6 +216,7 @@
     <button class="compact">Find step moments in the video</button>
   </form>
   {% endif %}
+  {% if !read_only() %}
   <details class="add-block"{% if steps.is_empty() %} open{% endif %}>
     <summary>Add step</summary>
     <form class="add-form" method="post" action="/recipes/{{ recipe.id }}/blocks" data-busy-label="Adding…" hx-swap="innerHTML show:none">
@@ -194,11 +226,13 @@
       <p class="actions"><button class="primary">Add step</button></p>
     </form>
   </details>
+  {% endif %}
 </section>
 </div>
 
-{% include "recipe_notes.html" %}
+{% if let Some(notes) = notes %}{% include "recipe_notes.html" %}{% endif %}
 
+{% if !read_only() %}
 <section class="thumb-manage"{% if thumb_state == "pending" %} data-thumb-pending="{{ recipe.id }}"{% endif %}>
   <h2 class="section-label">Dish photo</h2>
   {% if thumb_state == "pending" %}
@@ -239,6 +273,7 @@
   </div>
   {% endif %}
 </section>
+{% endif %}
 {% else %}
 {# Every link in the chart swaps the page in place without adding history. #}
 <section class="chart-view" hx-target=".paper" hx-select=".paper" hx-swap="outerHTML show:none" hx-replace-url="true">

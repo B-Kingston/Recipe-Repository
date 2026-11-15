@@ -7,39 +7,20 @@
    and keeps the scroll position, and the block that saved shows its notice.
    Without JavaScript the redirect's #fragment brings the block into view. #}
 <div class="compact-panel" id="settings">
-  {% if uses_shared_ai %}
   <div class="block" id="settings-ai">
-    <h2>AI provider <span class="codex-status{% if ai_ready %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if ai_ready %}&#10003; Shared{% else %}Not connected{% endif %}</span></h2>
-    {% if ai_ready %}
-    <p class="muted block-note">Recipes are generated with {{ shared_ai_owner }}'s AI logins: <strong>{{ shared_ai_summary }}</strong>. The video cleaner and reasoning effort follow {{ shared_ai_owner }}'s settings too.</p>
-    {% else %}
-    <p class="muted block-note">This account shares {{ shared_ai_owner }}'s AI logins, but {{ shared_ai_owner }} has not connected an AI provider yet. Use your own logins to connect one for this account.</p>
-    {% endif %}
+    <h2>AI provider{% if uses_shared_ai %} <span class="codex-status{% if ai_ready %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if ai_ready %}&#10003; Shared by {{ shared_ai_owner }}{% else %}Not connected{% endif %}</span>{% endif %}</h2>
+    {% if uses_shared_ai %}
+    {# A group member shares their AI logins with this account, and it has
+       none of its own: show what it generates with, never their keys. #}
+    <p class="muted block-note">Recipes are generated with {{ shared_ai_owner }}'s AI logins, which they share with you in your group: <strong>{{ shared_ai_summary }}</strong>. The video cleaner and reasoning effort follow {{ shared_ai_owner }}'s settings too. Connect a provider of your own below to use it instead.</p>
     <p class="muted block-note">{% if shared_web_search != "" %}The recipe chat searches the web with {{ shared_ai_owner }}'s {{ shared_web_search }} key when the model has no search of its own.{% else %}The recipe chat searches the web only with models that have search built in: {{ shared_ai_owner }} has no search key.{% endif %}</p>
-    {% if active_login_refused %}<p class="error" role="alert">The provider refused this sign-in: it has expired or was revoked. {{ shared_ai_owner }} needs to reconnect it in Settings, or you can use your own AI logins.</p>{% endif %}
-    {% if ai_notice != "" %}<p class="notice" role="status">{{ ai_notice }}</p>{% endif %}
-    <form method="post" action="/settings/ai-logins" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
-      <input type="hidden" name="mode" value="own">
-      <button type="submit">Use my own AI logins</button>
-    </form>
-  </div>
-  {% else %}
-  <div class="block" id="settings-ai">
-    <h2>AI provider</h2>
-    {% if owns_shared_ai %}<p class="muted block-note">Shared: other accounts generate recipes with these logins unless they choose their own.</p>
-    {% else %}
-    <div class="block-note">
-      <p class="muted">You are using your own AI logins instead of {{ shared_ai_owner }}'s shared ones.</p>
-      <form method="post" action="/settings/ai-logins" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
-        <input type="hidden" name="mode" value="shared">
-        <button class="compact" type="submit">Use {{ shared_ai_owner }}'s shared logins</button>
-      </form>
-    </div>
+    {% if active_login_refused %}<p class="error" role="alert">The provider refused {{ shared_ai_owner }}'s sign-in: it has expired or was revoked. {{ shared_ai_owner }} needs to reconnect it in Settings, or you can connect your own below.</p>{% endif %}
+    {% else if owns_shared_ai %}<p class="muted block-note">Shared: members of your group you chose in the Group block generate recipes with these logins while they have none of their own.</p>
     {% endif %}
     {% if ai_notice != "" %}<p class="notice" role="status">{{ ai_notice }}</p>{% endif %}
     {% if ai_error != "" %}<p class="error" role="alert">{{ ai_error }}</p>{% endif %}
     {# A check's own error already says so; show the standing banner only without one. #}
-    {% if active_login_refused && ai_error == "" %}<p class="error" role="alert">The provider you generate with refused its sign-in: it has expired or was revoked. Reconnect it (or replace its key) below.</p>{% endif %}
+    {% if active_login_refused && ai_error == "" && !uses_shared_ai %}<p class="error" role="alert">The provider you generate with refused its sign-in: it has expired or was revoked. Reconnect it (or replace its key) below.</p>{% endif %}
     {# The Reconnect / Connect links inside name their own target, select, and swap, so they load into the sign-in popup rather than taking this form's #settings swap. #}
     <form method="post" action="/settings" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" data-provider-form>
       <fieldset>
@@ -155,6 +136,7 @@
       </form>
     </details>
   </div>
+  {% if !uses_shared_ai %}
   <div class="block" id="settings-cleaner">
     <h2>Video cleaner <span class="codex-status{% if cleaner_configured %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if cleaner_configured %}&#10003; Ready{% else %}Not connected{% endif %}</span></h2>
     <p class="muted block-note">Before a video recipe is written, the cleaner strips chatter from the caption, speech and on-screen text. A small, fast model is enough.</p>
@@ -181,7 +163,7 @@
   </div>
   <div class="block" id="settings-web-search">
     <h2>Web search <span class="codex-status{% if web_search_label != "" %} codex-status--connected{% else %} codex-status--missing{% endif %}">{% if web_search_label != "" %}&#10003; {{ web_search_label }}{% else %}Built-in only{% endif %}</span></h2>
-    <p class="muted block-note">The recipe chat can look things up on the web. Codex, Claude, and OpenAI or Anthropic keys search on their own; every other model searches with the key you add here.{% if owns_shared_ai %} Shared: accounts using these AI logins use this key too.{% endif %}</p>
+    <p class="muted block-note">The recipe chat can look things up on the web. Codex, Claude, and OpenAI or Anthropic keys search on their own; every other model searches with the key you add here.{% if owns_shared_ai %} Shared: group members using your AI logins use this key too.{% endif %}</p>
     {% if web_search_notice != "" %}<p class="notice" role="status">{{ web_search_notice }}</p>{% endif %}
     {% if web_search_label != "" %}
     <div class="actions">
@@ -207,6 +189,79 @@
     </details>
   </div>
   {% endif %}
+  <div class="block" id="settings-group">
+    <h2>Group{% if group.in_group() %} <span class="codex-status codex-status--connected">{{ group.members.len() }} members</span>{% endif %}</h2>
+    {% if group.in_group() %}
+    <p class="muted block-note">Members open the recipes each other shares, read-only, from the Group view of the library, and can save copies. Share a recipe from its page.</p>
+    <ul class="group-members">
+      {% for member in group.members %}<li>{{ member.username }}{% if member.id == group.user_id %} <span class="muted">(you)</span>{% endif %}</li>{% endfor %}
+    </ul>
+    {% else %}
+    <p class="muted block-note">Invite the people you cook with. Once someone accepts, you form a group: each of you can share recipes with the others, and let them generate recipes with your AI logins. An account can be in one group.</p>
+    {% endif %}
+    {% if group.notice != "" %}<p class="notice" role="status">{{ group.notice }}</p>{% endif %}
+    {% if group.extras.error != "" %}<p class="error" role="alert">{{ group.extras.error }}</p>{% endif %}
+    {% if group.extras.invite_link != "" %}
+    <div class="notice invite-link" role="status">
+      <p>Invite for {{ group.extras.invite_to }} created. Send them this link; it works once, for 7 days, and is shown only now:</p>
+      <input type="text" readonly value="{{ group.extras.invite_link }}" aria-label="Invite link">
+    </div>
+    {% else if group.extras.invite_to != "" %}
+    <p class="notice" role="status">Invite sent to {{ group.extras.invite_to }}.</p>
+    {% endif %}
+    {% if !group.invites.is_empty() %}
+    <h3>Pending invites</h3>
+    <ul class="group-invites">
+      {% for invite in group.invites %}
+      <li><span>{{ invite.email }} <span class="muted">until {{ invite.expires }}</span></span>
+        <form class="inline" method="post" action="/settings/group/invites/{{ invite.id }}/cancel" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none"><button class="compact" type="submit" aria-label="Cancel the invite for {{ invite.email }}">Cancel</button></form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    <details class="add-block"{% if group.extras.error != "" %} open{% endif %}>
+      <summary>Invite someone</summary>
+      <form method="post" action="/settings/group/invite" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" data-busy-label="Inviting…">
+        <label for="invite_email">Email address</label>
+        <input type="email" id="invite_email" name="email" autocomplete="off" maxlength="254" required>
+        <p class="muted">{% if group.mail_enabled %}They get an email with a link to join{% if !group.in_group() %} you{% endif %}.{% else %}This server sends no email: you get a link to send them yourself.{% endif %}</p>
+        <button class="primary" type="submit">Invite</button>
+      </form>
+    </details>
+    {% if group.in_group() %}
+    <h3>AI sharing</h3>
+    {% if group.shows_grant_form() %}
+    <form method="post" action="/settings/group/ai-grants" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
+      <fieldset>
+        <legend class="muted">Members who may generate with your AI logins (only while they have none of their own; they never see your keys)</legend>
+        {% for choice in group.grants %}
+        <label><input type="checkbox" name="grantee" value="{{ choice.id }}"{% if choice.checked %} checked{% endif %}> {{ choice.username }}</label>
+        {% endfor %}
+      </fieldset>
+      {% if !group.can_grant %}<p class="muted">You have no AI provider connected now, so you can only take sharing back.</p>{% endif %}
+      <button class="primary" type="submit">Save AI sharing</button>
+    </form>
+    {% else if !group.can_grant %}
+    <p class="muted">Connect an AI provider above to share it with your group.</p>
+    {% endif %}
+    {% if group.received.len() > 1 %}
+    <form method="post" action="/settings/group/ai-source" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
+      <fieldset>
+        <legend class="muted">{% if group.uses_own_ai %}These members share their AI logins with you; you use your own while it is connected. Without it, use{% else %}Generate recipes with the AI logins of{% endif %}</legend>
+        {% for choice in group.received %}
+        <label><input type="radio" name="granter" value="{{ choice.id }}"{% if choice.checked %} checked{% endif %}> {{ choice.username }}</label>
+        {% endfor %}
+      </fieldset>
+      <button type="submit">Save</button>
+    </form>
+    {% else %}{% for choice in group.received %}
+    <p class="muted">{{ choice.username }} shares their AI logins with you{% if group.uses_own_ai %}; you use your own while it is connected{% endif %}.</p>
+    {% endfor %}{% endif %}
+    <form method="post" action="/settings/group/leave" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none" data-confirm="Leave the group? You lose access to the recipes the others share, AI sharing to and from you ends, and your recipes stop being shared.">
+      <p class="actions"><button class="danger" type="submit">Leave group</button></p>
+    </form>
+    {% endif %}
+  </div>
   <div class="block" id="settings-units">
     <h2>Units <span class="codex-status codex-status--connected">{% if measurement == "metric" %}Metric{% else if measurement == "imperial" %}Imperial{% else %}As written{% endif %}</span></h2>
     <p class="muted block-note">The units new recipes are written in, and the units the recipe chat uses when it changes a recipe. Saved recipes keep theirs; ask the chat to convert one.</p>
@@ -262,11 +317,11 @@
     <h3 id="settings-search">Library search</h3>
     {% if search_notice != "" %}<p class="notice" role="status">{{ search_notice }}</p>{% endif %}
     <p class="muted">Search by meaning ranks recipes with the embedding service and falls back to word search while that service is missing or down. Word search (BM25) matches the words of every recipe: title, description, ingredients, and method.</p>
-    {% if owns_shared_ai %}<p class="muted">Shared: other accounts search the same way unless they choose their own.</p>{% endif %}
+    {% if owns_shared_ai %}<p class="muted">Shared: group members using your AI logins search the same way unless they choose their own.</p>{% endif %}
     <form method="post" action="/settings/search-engine" hx-target="#settings" hx-select="#settings" hx-swap="outerHTML show:none">
       <fieldset>
         <legend class="muted">Search the library with</legend>
-        {% if !owns_shared_ai %}<label class="toggle-row"><input type="radio" name="engine" value="shared"{% if search_choice == "shared" %} checked{% endif %}><span>Same as {{ shared_ai_owner }}</span><span class="muted">{% if shared_search_bm25 %}Word search{% else %}Search by meaning{% endif %}</span></label>{% endif %}
+        {% if uses_shared_ai %}<label class="toggle-row"><input type="radio" name="engine" value="shared"{% if search_choice == "shared" %} checked{% endif %}><span>Same as {{ shared_ai_owner }}</span><span class="muted">{% if shared_search_bm25 %}Word search{% else %}Search by meaning{% endif %}</span></label>{% endif %}
         <label class="toggle-row"><input type="radio" name="engine" value="embeddings"{% if search_choice == "embeddings" %} checked{% endif %}><span>Search by meaning (EmbeddingGemma)</span>{% if !embeddings_configured %}<span class="muted">Not configured</span>{% endif %}</label>
         <label class="toggle-row"><input type="radio" name="engine" value="bm25"{% if search_choice == "bm25" %} checked{% endif %}><span>Word search (BM25)</span></label>
       </fieldset>
