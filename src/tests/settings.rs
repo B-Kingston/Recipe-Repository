@@ -2,10 +2,10 @@ use crate::auth::AuthUser;
 use crate::{
     AppError, AppState, CLAUDE_PI_PROVIDER, CODEX_PI_PROVIDER, ClaudeExchangeForm, ClaudeFlow,
     EndpointForm, MediaCleanerForm, SettingsForm, add_endpoint, ai_provider,
-    authorise_claude_exchange, delete_endpoint, disconnect_claude, disconnect_codex, find_endpoint,
+    authorise_claude_exchange, delete_endpoint, disconnect_subscription, find_endpoint,
     insert_endpoint, list_endpoints, mask_key, media_cleaner_model, media_cleaner_setting,
-    pi_credential, reconcile_ai_provider, selected_claude_model, selected_effort, selected_model,
-    stamp, store_pi_credential, update_media_cleaner, update_settings,
+    pi_credential, selected_claude_model, selected_effort, selected_model, stamp,
+    store_pi_credential, update_media_cleaner, update_settings,
 };
 use axum::{
     extract::{Form, Path, State},
@@ -578,36 +578,6 @@ async fn deleting_another_users_endpoint_does_nothing() {
     assert!(find_endpoint(&db, "u2", &id).await.unwrap().is_some());
 }
 
-#[tokio::test]
-async fn reconcile_resolves_a_dangling_endpoint_to_codex() {
-    let db = database().await;
-    set_provider(&db, "deleted-endpoint-id").await;
-    reconcile_ai_provider(&db).await.unwrap();
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "pi");
-}
-
-#[tokio::test]
-async fn reconcile_resolves_a_dangling_endpoint_to_the_first_registered() {
-    let db = database().await;
-    let first = add(&db, "A", "openai", "https://api.example.com/v1", "sk-1").await;
-    add(&db, "B", "anthropic", "https://api.anthropic.com", "sk-2").await;
-    set_provider(&db, "openai").await;
-    reconcile_ai_provider(&db).await.unwrap();
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), first);
-}
-
-#[tokio::test]
-async fn reconcile_leaves_pi_and_live_endpoints_alone() {
-    let db = database().await;
-    let id = add(&db, "A", "openai", "https://api.example.com/v1", "sk-1").await;
-    set_provider(&db, "pi").await;
-    reconcile_ai_provider(&db).await.unwrap();
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), "pi");
-    set_provider(&db, &id).await;
-    reconcile_ai_provider(&db).await.unwrap();
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), id);
-}
-
 #[test]
 fn mask_key_never_exposes_the_full_key() {
     assert_eq!(mask_key("sk-ant-test-abcdefgh"), "••••efgh");
@@ -852,9 +822,13 @@ async fn disconnecting_claude_keeps_codex_and_falls_back_to_it() {
         .unwrap();
     set_provider(&db, "claude").await;
 
-    let redirect = disconnect_claude(State(state.clone()), AuthUser { id: "u1".into() })
-        .await
-        .unwrap();
+    let redirect = disconnect_subscription(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Path("claude".into()),
+    )
+    .await
+    .unwrap();
     assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CLAUDE_PI_PROVIDER)
@@ -886,9 +860,13 @@ async fn disconnecting_active_codex_without_a_fallback_leaves_the_setting() {
         .unwrap();
     set_provider(&db, "pi").await;
 
-    let redirect = disconnect_codex(State(state.clone()), AuthUser { id: "u1".into() })
-        .await
-        .unwrap();
+    let redirect = disconnect_subscription(
+        State(state.clone()),
+        AuthUser { id: "u1".into() },
+        Path("codex".into()),
+    )
+    .await
+    .unwrap();
     assert_flash(&redirect, "/settings#settings-ai", "disconnected");
     assert!(
         pi_credential(&db, "u1", CODEX_PI_PROVIDER)
@@ -949,19 +927,6 @@ async fn settings_belong_to_each_user() {
         "low",
         "another user's saved effort does not leak"
     );
-
-    // A provider value naming another user's endpoint is stale for this user.
-    sqlx::query(
-        "INSERT INTO app_settings (user_id, key, value, updated_at) VALUES ('u2', 'ai_provider', ?, ?)",
-    )
-    .bind(&id)
-    .bind(stamp())
-    .execute(&db)
-    .await
-    .unwrap();
-    reconcile_ai_provider(&db).await.unwrap();
-    assert_eq!(ai_provider(&db, "u1").await.unwrap(), id);
-    assert_eq!(ai_provider(&db, "u2").await.unwrap(), "pi");
 }
 
 async fn add_user(db: &SqlitePool, id: &str, username: &str, created_at: &str) {

@@ -544,8 +544,6 @@ export async function signedOutChecks(base: string): Promise<{ name: string; ok:
     const reply = await anonymous.post(route, { back: "/recipes/e2e-missing" });
     record(`POST ${route} → sign-in`, reply.status === 303 && reply.location === "/login", `${reply.status} → ${reply.location}`);
   }
-  const alter = await anonymous.get("/recipes/e2e-missing/ai/alter");
-  record("GET the old alter page → sign-in", alter.status === 303 && alter.location.startsWith("/login"), `${alter.status} → ${alter.location}`);
   const login = await anonymous.get("/login");
   record("sign-in page renders", login.status === 200 && /name="password"/.test(login.body), String(login.status));
   return results;

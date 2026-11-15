@@ -717,51 +717,19 @@ pub(crate) async fn user_count(db: &SqlitePool) -> Result<i64> {
         .await?)
 }
 
-/// Creates the first account at setup and returns its id. The account claims
-/// every row left without an owner ('').
+/// The refusal of a username another account has, letter case ignored.
+const USERNAME_TAKEN: &str = "That username is taken.";
+
+/// Creates the first account at setup and returns its id; refused once any
+/// account exists.
 pub(crate) async fn create_user(
     db: &SqlitePool,
     username: &str,
     password: &str,
     confirm: &str,
 ) -> Result<String> {
-    let username = check_new_username(username)?;
-    check_new_password(password, confirm, "Password is required.")?;
-    let password_hash = hash_off_runtime(password.to_string()).await?;
-    let user_id = Uuid::new_v4().to_string();
-    let mut tx = crate::recipes::begin_write(db).await?;
-    // Conditional insert: the check and the write are one statement, so two
-    // racing setup requests cannot both create the account.
-    let created = sqlx::query(
-        "INSERT INTO users(id,username,password_hash,created_at)
-         SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM users)",
-    )
-    .bind(&user_id)
-    .bind(&username)
-    .bind(password_hash)
-    .bind(stamp())
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if created == 0 {
-        return Err(AppError::BadRequest("A user already exists.".into()));
-    }
-    for table in [
-        "recipes",
-        "ai_drafts",
-        "pi_credentials",
-        "ai_endpoints",
-        "app_settings",
-    ] {
-        let query = format!("UPDATE {table} SET user_id=? WHERE user_id='' ");
-        sqlx::query(&query).bind(&user_id).execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(user_id)
+    insert_user(db, username, password, confirm, true).await
 }
-
-/// The refusal of a username another account has, letter case ignored.
-const USERNAME_TAKEN: &str = "That username is taken.";
 
 /// Adds another account and returns its id. It starts with an empty library
 /// and default settings. Usernames are unique regardless of letter case.
@@ -771,27 +739,43 @@ pub(crate) async fn add_user(
     password: &str,
     confirm: &str,
 ) -> Result<String> {
+    insert_user(db, username, password, confirm, false).await
+}
+
+/// Inserts a checked account: the first only while no account exists, any
+/// other only while no account has its username. The check and the write are
+/// one statement, so racing requests cannot both pass it.
+async fn insert_user(
+    db: &SqlitePool,
+    username: &str,
+    password: &str,
+    confirm: &str,
+    first: bool,
+) -> Result<String> {
     let username = check_new_username(username)?;
     check_new_password(password, confirm, "Password is required.")?;
     let password_hash = hash_off_runtime(password.to_string()).await?;
     let user_id = Uuid::new_v4().to_string();
-    // The check and the write are one statement, so two racing requests
-    // cannot both take the username.
     let created = sqlx::query(
         "INSERT INTO users(id,username,password_hash,created_at)
-         SELECT ?,?,?,? WHERE NOT EXISTS
-           (SELECT 1 FROM users WHERE username = ? COLLATE NOCASE)",
+         SELECT ?1,?2,?3,?4 WHERE NOT EXISTS
+           (SELECT 1 FROM users WHERE ?5 OR username = ?2 COLLATE NOCASE)",
     )
     .bind(&user_id)
     .bind(&username)
     .bind(password_hash)
     .bind(stamp())
-    .bind(&username)
+    .bind(first)
     .execute(db)
     .await?
     .rows_affected();
     if created == 0 {
-        return Err(AppError::BadRequest(USERNAME_TAKEN.into()));
+        let refusal = if first {
+            "A user already exists."
+        } else {
+            USERNAME_TAKEN
+        };
+        return Err(AppError::BadRequest(refusal.into()));
     }
     Ok(user_id)
 }

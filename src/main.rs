@@ -1302,20 +1302,6 @@ async fn main() -> anyhowless::Result<()> {
     if args.iter().any(|arg| arg == "--healthcheck") {
         return healthcheck().await;
     }
-    if let Some(index) = args
-        .iter()
-        .position(|arg| arg == "--extract-media-evidence")
-    {
-        let url = args.get(index + 1).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--extract-media-evidence requires a social-media URL",
-            )
-        })?;
-        let evidence = media::extract_social_evidence(url, media::MediaChannels::default()).await?;
-        println!("{}", serde_json::to_string_pretty(&evidence)?);
-        return Ok(());
-    }
     if args.iter().any(|arg| arg == "--clean-ocr") {
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input)?;
@@ -1338,10 +1324,7 @@ async fn main() -> anyhowless::Result<()> {
         .await?;
     sqlx::migrate!().run(&db).await?;
     ai::remove_leftover_temp_files(&env::temp_dir());
-    import_legacy_codex_auth(&db).await?;
     let configured_model = env::var("PI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-    retire_codex_models(&db, &configured_model).await?;
-    reconcile_ai_provider(&db).await?;
     crate::recipes::fail_interrupted_chats(&db).await?;
     tokio::spawn(prune_expired_drafts(db.clone()));
     let state = Arc::new(AppState {
@@ -1448,14 +1431,12 @@ fn routes(state: Arc<AppState>) -> Router {
         )
         .route("/recipes/{id}/blocks/{block_id}/delete", post(delete_block))
         .route("/ai/generate", get(generate_page).post(generate_recipe))
-        .route("/ai/import", get(generate_page))
         .route("/ai/import/{run_id}", get(import_run_page))
         .route("/ai/import/{run_id}/events", get(import_events))
         .route(
             "/ai/import/{run_id}/frames/{url_index}/{file}",
             get(import_frame),
         )
-        .route("/recipes/{id}/ai/alter", get(chat::alter_redirect))
         .route("/ai/drafts/{id}", get(draft_page))
         .route("/ai/drafts/{id}/alter", post(alter_draft))
         .route("/ai/drafts/{id}/apply", post(apply_draft))
@@ -1525,8 +1506,10 @@ fn routes(state: Arc<AppState>) -> Router {
         .route("/settings/endpoints/{id}/delete", post(delete_endpoint))
         .route("/settings/endpoints/{id}/check", post(check_endpoint))
         .route("/settings/check/{provider}", post(check_subscription))
-        .route("/settings/disconnect/codex", post(disconnect_codex))
-        .route("/settings/disconnect/claude", post(disconnect_claude))
+        .route(
+            "/settings/disconnect/{provider}",
+            post(disconnect_subscription),
+        )
         .route(
             "/settings/password",
             get(reset_password_page).post(reset_password),
@@ -1907,32 +1890,6 @@ fn mask_key(key: &str) -> String {
         .rev()
         .collect();
     format!("{MASK}{tail}")
-}
-
-/// One-time migration of a credential previously written by the Pi CLI to
-/// `<agent dir>/auth.json` into the database. Only runs before the first user
-/// exists; the setup transaction claims the orphan credential for that user.
-async fn import_legacy_codex_auth(db: &SqlitePool) -> Result<()> {
-    if auth::user_count(db).await? > 0 || pi_credential(db, "", CODEX_PI_PROVIDER).await?.is_some()
-    {
-        return Ok(());
-    }
-    let agent_dir = env::var("PI_CODING_AGENT_DIR").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_default();
-        format!("{home}/.pi/agent")
-    });
-    let auth_path = std::path::Path::new(&agent_dir).join("auth.json");
-    let Ok(text) = std::fs::read_to_string(auth_path) else {
-        return Ok(());
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return Ok(());
-    };
-    if let Some(credential) = value.get(CODEX_PI_PROVIDER) {
-        store_pi_credential(db, "", CODEX_PI_PROVIDER, credential).await?;
-        info!("Imported existing Codex credential into the database");
-    }
-    Ok(())
 }
 
 /// Whether the user has a stored credential for a Pi provider. Any stored
@@ -2881,16 +2838,20 @@ async fn authorise_claude_exchange(
     .map(IntoResponse::into_response)
 }
 
-/// Removes one subscription credential and leaves the other provider's alone.
-/// When the removed provider was active, Codex takes over if it is still
-/// connected; otherwise the setting stays and generation reports that AI is
-/// not set up.
+/// Removes one subscription credential (`codex` or `claude`) and leaves the
+/// other provider's alone. When the removed provider was active, Codex takes
+/// over if it is still connected; otherwise the setting stays and generation
+/// reports that AI is not set up.
 async fn disconnect_subscription(
-    s: &Arc<AppState>,
-    user: &AuthUser,
-    pi_provider: &str,
-    provider: &str,
+    State(s): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(provider): Path<String>,
 ) -> Result<Response> {
+    let (pi_provider, provider) = match provider.as_str() {
+        "codex" => (CODEX_PI_PROVIDER, PROVIDER_CODEX),
+        "claude" => (CLAUDE_PI_PROVIDER, PROVIDER_CLAUDE),
+        _ => return Err(AppError::NotFound),
+    };
     remove_pi_credential(&s.db, &user.id, pi_provider).await?;
     if ai_provider(&s.db, &user.id).await? == provider
         && pi_authorised(&s.db, &user.id, CODEX_PI_PROVIDER).await
@@ -2898,14 +2859,6 @@ async fn disconnect_subscription(
         set_app_setting(&s.db, &user.id, "ai_provider", PROVIDER_CODEX).await?;
     }
     Ok(flash_redirect("/settings#settings-ai", "disconnected"))
-}
-
-async fn disconnect_codex(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
-    disconnect_subscription(&s, &user, CODEX_PI_PROVIDER, PROVIDER_CODEX).await
-}
-
-async fn disconnect_claude(State(s): State<Arc<AppState>>, user: AuthUser) -> Result<Response> {
-    disconnect_subscription(&s, &user, CLAUDE_PI_PROVIDER, PROVIDER_CLAUDE).await
 }
 
 #[cfg(test)]

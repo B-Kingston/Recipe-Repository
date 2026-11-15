@@ -5,13 +5,11 @@
 //! re-exports these, so callers name them from the crate root.
 
 use crate::{
-    AppError, DEFAULT_CLAUDE_MODEL, Endpoint, PROVIDER_CLAUDE, PROVIDER_CODEX, Result,
-    WebSearchKey, stamp,
+    AppError, DEFAULT_CLAUDE_MODEL, Endpoint, PROVIDER_CODEX, Result, WebSearchKey, stamp,
 };
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tracing::info;
 use uuid::Uuid;
 
 /// The stored subscription OAuth credential for a Pi provider id, if any. The
@@ -232,9 +230,8 @@ async fn choice_setting(
 
 /// The user's active AI provider: "pi" (Codex), "claude" (Claude
 /// subscription) or one of their ai_endpoints row ids. Stored per user like
-/// the model; reconcile_ai_provider keeps the value valid at startup and the
-/// endpoint handlers keep it valid at runtime. Anything absent resolves to
-/// "pi".
+/// the model; the endpoint handlers keep it valid. Anything absent resolves
+/// to "pi".
 pub(crate) async fn ai_provider(db: &SqlitePool, user_id: &str) -> Result<String> {
     Ok(app_setting(db, user_id, "ai_provider")
         .await?
@@ -396,62 +393,6 @@ pub(crate) async fn selected_effort(
     Ok(app_setting(db, user_id, "reasoning_effort")
         .await?
         .unwrap_or_else(|| fallback.into()))
-}
-
-/// Heals stale ai_provider settings at startup: the pre-endpoint "openai"
-/// value or an id that is not one of the user's endpoints resolves to their
-/// first registered endpoint, falling back to Codex ("pi"). Missing settings
-/// are left alone (the read path defaults to "pi").
-pub(crate) async fn reconcile_ai_provider(db: &SqlitePool) -> Result<()> {
-    let settings: Vec<(String, String)> =
-        sqlx::query_as("SELECT user_id, value FROM app_settings WHERE key = 'ai_provider'")
-            .fetch_all(db)
-            .await?;
-    for (user_id, current) in settings {
-        if current == PROVIDER_CODEX || current == PROVIDER_CLAUDE {
-            continue;
-        }
-        let live: Option<(i64,)> =
-            sqlx::query_as("SELECT 1 FROM ai_endpoints WHERE id=? AND user_id=? LIMIT 1")
-                .bind(&current)
-                .bind(&user_id)
-                .fetch_optional(db)
-                .await?;
-        if live.is_some() {
-            continue;
-        }
-        let first: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM ai_endpoints WHERE user_id=? ORDER BY created_at LIMIT 1",
-        )
-        .bind(&user_id)
-        .fetch_optional(db)
-        .await?;
-        let value = first
-            .map(|(id,)| id)
-            .unwrap_or_else(|| PROVIDER_CODEX.into());
-        set_app_setting(db, &user_id, "ai_provider", &value).await?;
-        info!(%user_id, from = %current, to = %value, "Reconciled stale AI provider setting");
-    }
-    Ok(())
-}
-
-/// Codex models the pi SDK no longer serves. A stored choice of one of these
-/// would fail every generation, so startup moves it to the default model.
-const RETIRED_CODEX_MODELS: &[&str] = &["gpt-5.4-mini", "gpt-5.4"];
-
-/// Replaces every user's stored Codex model that the pi SDK no longer serves
-/// with the PI_MODEL default. A user without a stored choice already gets the
-/// default from `selected_model`.
-pub(crate) async fn retire_codex_models(db: &SqlitePool, model: &str) -> Result<()> {
-    for retired in RETIRED_CODEX_MODELS {
-        sqlx::query("UPDATE app_settings SET value=?, updated_at=? WHERE key='model' AND value=?")
-            .bind(model)
-            .bind(stamp())
-            .bind(retired)
-            .execute(db)
-            .await?;
-    }
-    Ok(())
 }
 
 pub(crate) const MEDIA_CLEANER_PROVIDER_SETTING: &str = "media_cleaner_provider";

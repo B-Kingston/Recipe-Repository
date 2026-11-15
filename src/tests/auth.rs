@@ -1,11 +1,10 @@
-use super::config::ENV_LOCK;
 use crate::auth::{
     AuthUser, Limit, MAX_LIMIT_KEYS, RateLimits, address_bucket, create_user, hash_password,
     reset_password, setup_create, try_again, verify_password,
 };
 use crate::{
-    AppState, CODEX_PI_PROVIDER, ResetPasswordForm, SetupForm, import_legacy_codex_auth,
-    pi_credential, routes, stamp, store_pi_credential,
+    AppState, CODEX_PI_PROVIDER, ResetPasswordForm, SetupForm, pi_credential, routes, stamp,
+    store_pi_credential,
 };
 use axum::{
     Router,
@@ -17,7 +16,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::{fs, net::SocketAddr, sync::Arc, time::Instant};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tower::ServiceExt;
 
 use super::memory_db as database;
@@ -143,65 +142,6 @@ async fn credential_round_trips_through_the_database() {
     );
 }
 
-// The env lock spans awaits on purpose: the runtime is current-thread, so the
-// guard never crosses threads and serialises env access against other tests.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn legacy_auth_json_is_imported_once_and_never_overrides_the_database() {
-    let _lock = ENV_LOCK.lock();
-    let agent_dir =
-        std::env::temp_dir().join(format!("kindle-recipes-auth-test-{}", std::process::id()));
-    fs::create_dir_all(&agent_dir).unwrap();
-    unsafe {
-        std::env::set_var("PI_CODING_AGENT_DIR", &agent_dir);
-    }
-    let db = database().await;
-
-    // No file yet: nothing to import.
-    import_legacy_codex_auth(&db).await.unwrap();
-    assert!(
-        pi_credential(&db, "", CODEX_PI_PROVIDER)
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    // A legacy Pi CLI credential is imported once.
-    fs::write(
-        agent_dir.join("auth.json"),
-        r#"{"openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":1,"accountId":"x"}}"#,
-    )
-    .unwrap();
-    import_legacy_codex_auth(&db).await.unwrap();
-    assert_eq!(
-        pi_credential(&db, "", CODEX_PI_PROVIDER)
-            .await
-            .unwrap()
-            .unwrap()["accountId"],
-        "x"
-    );
-
-    // Later changes to the file never overwrite the database.
-    fs::write(
-        agent_dir.join("auth.json"),
-        r#"{"openai-codex":{"type":"oauth","access":"b","refresh":"r","expires":1,"accountId":"y"}}"#,
-    )
-    .unwrap();
-    import_legacy_codex_auth(&db).await.unwrap();
-    assert_eq!(
-        pi_credential(&db, "", CODEX_PI_PROVIDER)
-            .await
-            .unwrap()
-            .unwrap()["accountId"],
-        "x"
-    );
-
-    unsafe {
-        std::env::remove_var("PI_CODING_AGENT_DIR");
-    }
-    fs::remove_dir_all(&agent_dir).ok();
-}
-
 #[test]
 fn password_hashes_verify_and_reject() {
     let hash = hash_password("hunter2").unwrap();
@@ -230,42 +170,8 @@ async fn whitespace_only_passwords_are_rejected_and_stored_exactly() {
 }
 
 #[tokio::test]
-async fn first_setup_creates_user_and_claims_orphans() {
+async fn setup_creates_the_first_user_only() {
     let db = database().await;
-    let now = stamp();
-    sqlx::query(
-        "INSERT INTO recipes(id,title,created_at,updated_at) VALUES('orphan','Orphan',?,?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO ai_drafts(id,recipe_json,sources_json,created_at,expires_at)
-         VALUES('draft','{}','[]',?,?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO pi_credentials(user_id,provider,credential_json,updated_at)
-         VALUES('','openai-codex','{}',?)",
-    )
-    .bind(&now)
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO app_settings(user_id,key,value,updated_at) VALUES('','ai_provider','claude',?)",
-    )
-    .bind(&now)
-    .execute(&db)
-    .await
-    .unwrap();
-
     let response = setup_create(
         State(state(db.clone())),
         Form(SetupForm {
@@ -277,33 +183,6 @@ async fn first_setup_creates_user_and_claims_orphans() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
-
-    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username='alice'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    let recipe_owner: String = sqlx::query_scalar("SELECT user_id FROM recipes WHERE id='orphan'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    let draft_owner: String = sqlx::query_scalar("SELECT user_id FROM ai_drafts WHERE id='draft'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    let credential_owner: String =
-        sqlx::query_scalar("SELECT user_id FROM pi_credentials WHERE provider='openai-codex'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-    let setting_owner: String =
-        sqlx::query_scalar("SELECT user_id FROM app_settings WHERE key='ai_provider'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-    assert_eq!(recipe_owner, user_id);
-    assert_eq!(draft_owner, user_id);
-    assert_eq!(credential_owner, user_id);
-    assert_eq!(setting_owner, user_id);
 
     setup_create(
         State(state(db.clone())),

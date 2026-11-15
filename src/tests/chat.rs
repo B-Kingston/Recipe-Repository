@@ -1,7 +1,6 @@
 use crate::chat::{
-    Segment, accept_change, alter_redirect, ask, change_summary, chat_prompt, clear,
-    decline_change, divider_label, model_label, proposal_view, return_target, toggle_drawer,
-    valid_proposal, word_diff,
+    Segment, accept_change, ask, change_summary, chat_prompt, clear, decline_change, divider_label,
+    model_label, proposal_view, return_target, toggle_drawer, valid_proposal, word_diff,
 };
 use crate::htmx::Flash;
 use crate::recipes::{
@@ -872,23 +871,6 @@ fn change_summaries_name_what_differs() {
     assert_eq!(change_summary(&before, &after), "Recipe changed");
     assert_eq!(divider_label("Serves 6", &before, &after), "Serves 6");
     assert_eq!(divider_label("", &before, &after), "Recipe changed");
-}
-
-#[tokio::test]
-async fn the_old_alter_page_opens_the_chat_instead() {
-    let db = database().await;
-    let s = state(db.clone());
-    assert!(
-        !page(&s, "u1", "r").await.contains("/ai/alter"),
-        "no Alter with AI button"
-    );
-    let response = alter_redirect(State(s.clone()), user("u1"), Path("r".into()))
-        .await
-        .unwrap();
-    assert_eq!(response.headers()["location"], "/recipes/r#recipe-chat");
-    assert!(page(&s, "u1", "r").await.contains("id=\"recipe-chat\""));
-    let other = alter_redirect(State(s.clone()), user("u2"), Path("r".into())).await;
-    assert!(matches!(other, Err(AppError::NotFound)));
 }
 
 fn proposal_over(before: &RecipeSnapshot) -> RecipeProposal {

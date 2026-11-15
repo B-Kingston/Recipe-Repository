@@ -460,21 +460,10 @@ pub(crate) fn canonical_social_url(raw: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-/// Fetches the page description as a cheap first pass, then uses local
-/// command-line media tools in a blocking worker. A description-only result is
-/// still useful when a platform blocks the video download.
-pub(crate) async fn extract_social_evidence(
-    raw: &str,
-    channels: MediaChannels,
-) -> Result<MediaEvidence> {
-    // The CLI extractor prints evidence only; no video extras run.
-    extract_social_evidence_inner(raw, channels, None, VideoExtras::default())
-        .await
-        .map(|extraction| extraction.evidence)
-}
-
-/// Same pipeline as [`extract_social_evidence`], but reporting progress and
-/// retaining OCR frames for the debugger page. `extras` selects dish-photo
+/// Fetches the page description as a cheap first pass, then runs the local
+/// media tools in a blocking job, reporting progress and retaining OCR frames
+/// for the import and debugger pages. A description-only result is still
+/// useful when a platform blocks the video download. `extras` selects dish-photo
 /// candidates and the step-moment pool. They are computed on the same
 /// blocking thread after the evidence is returned, while the caller runs its
 /// own slow steps, and are collected with `MediaExtraction::extras`.
@@ -484,36 +473,21 @@ pub(crate) async fn extract_social_evidence_debug(
     debug: Arc<MediaDebug>,
     extras: VideoExtras,
 ) -> Result<MediaExtraction> {
-    extract_social_evidence_inner(raw, channels, Some(debug), extras).await
-}
-
-async fn extract_social_evidence_inner(
-    raw: &str,
-    channels: MediaChannels,
-    debug: Option<Arc<MediaDebug>>,
-    extras: VideoExtras,
-) -> Result<MediaExtraction> {
     let source_url = canonical_social_url(raw)?;
     // A single media import keeps several browser tabs from multiplying page
     // fetches, yt-dlp downloads, Whisper model memory, and OCR processes. The
     // permit moves into the blocking job and stays there until the job's
     // extras and cleanup finish, even if the HTTP client drops the handler
     // future.
-    if let Some(observer) = debug.as_deref() {
-        observer.event("phase", json!({ "phase": "worker", "state": "waiting" }));
-    }
+    debug.event("phase", json!({ "phase": "worker", "state": "waiting" }));
     let permit = acquire_media_slot().await?;
     // The caption fetch is a separate HTTP round trip; skip it entirely when
     // the importer disabled the description channel.
-    if channels.description
-        && let Some(observer) = debug.as_deref()
-    {
-        observer.event(
+    let page = if channels.description {
+        debug.event(
             "phase",
             json!({ "phase": "description", "state": "running" }),
         );
-    }
-    let page = if channels.description {
         fetch_page_metadata(&source_url).await
     } else {
         PageMetadata::default()
@@ -526,7 +500,7 @@ async fn extract_social_evidence_inner(
             page,
             channels,
             workdir,
-            debug,
+            Some(debug),
             &extras,
             embedder,
         )

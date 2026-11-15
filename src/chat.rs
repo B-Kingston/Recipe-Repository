@@ -199,21 +199,6 @@ pub(crate) fn return_target(recipe_id: &str, back: &str) -> String {
     }
 }
 
-/// The old "Alter with AI" page, whose job the chat took over: it opens the
-/// drawer on the recipe, so bookmarks and history still land somewhere.
-pub(crate) async fn alter_redirect(
-    State(s): State<Arc<AppState>>,
-    user: AuthUser,
-    Path(id): Path<String>,
-) -> Result<Response> {
-    let recipe = find_recipe(&s.db, &user.id, &id).await?;
-    if !chat_enabled(&s.db, &user.id).await? {
-        return Ok(Redirect::to(&format!("/recipes/{}", recipe.id)).into_response());
-    }
-    open_drawer(&s.db, &user.id).await?;
-    Ok(Redirect::to(&format!("/recipes/{}#recipe-chat", recipe.id)).into_response())
-}
-
 /// Opens or closes the chat drawer. The choice is the user's, not the
 /// recipe's, so the drawer stays as it is from recipe to recipe.
 pub(crate) async fn toggle_drawer(
